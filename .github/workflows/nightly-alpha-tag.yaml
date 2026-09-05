@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Create nightly alpha tag
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Create the nightly alpha tag at 08:12 UTC (04:12 UTC-4).
+    - cron: '12 8 * * *'
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.ref }}'
+  cancel-in-progress: false
+
+jobs:
+  nightly-alpha-config:
+    name: Load nightly alpha branches
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      branches: ${{ steps.config.outputs.branches }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load nightly alpha branch config
+        id: config
+        run: |
+          set -euo pipefail
+          branches_json="$(ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_file(".github/nightly-alpha-branches.yaml").fetch("branches"))')"
+          printf 'branches=%s\n' "$branches_json" >> "$GITHUB_OUTPUT"
+
+  tag-nightly-alpha:
+    name: Tag nightly alpha
+    needs: nightly-alpha-config
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.nightly-alpha-config.outputs.branches) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ matrix.branch }}
+
+      - name: Create nightly alpha tag
+        env:
+          NEMO_RELAY_NIGHTLY_BRANCH: ${{ matrix.branch }}
+          NEMO_RELAY_NIGHTLY_TAG_TOKEN: ${{ secrets.NEMO_RELAY_NIGHTLY_TAG_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$NEMO_RELAY_NIGHTLY_TAG_TOKEN" ]]; then
+            echo "Error: NEMO_RELAY_NIGHTLY_TAG_TOKEN is required so the tag push can trigger tag CI." >&2
+            exit 1
+          fi
+
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "$version" ]]; then
+            echo "Error: failed to read workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: workspace version must be a stable SemVer base for nightly alpha tags: ${version}" >&2
+            exit 1
+          fi
+
+          tag_date="$(date -u +%Y%m%d)"
+          tag="${version}-alpha.${tag_date}"
+          target_sha="$(git rev-parse HEAD)"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            existing_sha="$(git ls-remote --tags origin "refs/tags/${tag}^{}" | awk '{print $1}' || true)"
+            if [[ -z "$existing_sha" ]]; then
+              existing_sha="$(git ls-remote --tags origin "refs/tags/${tag}" | awk '{print $1}' || true)"
+            fi
+            if [[ "$existing_sha" == "$target_sha" ]]; then
+              echo "Nightly alpha tag already exists for ${NEMO_RELAY_NIGHTLY_BRANCH}: ${tag}"
+              exit 0
+            fi
+            echo "Error: nightly alpha tag ${tag} already exists at ${existing_sha}, not ${NEMO_RELAY_NIGHTLY_BRANCH} HEAD ${target_sha}" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag \
+            --annotate \
+            --message "NeMo Relay ${version} Nightly ${tag_date}" \
+            "$tag" \
+            "$target_sha"
+          git remote set-url origin "https://x-access-token:${NEMO_RELAY_NIGHTLY_TAG_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "refs/tags/${tag}"
+          echo "Created nightly alpha tag for ${NEMO_RELAY_NIGHTLY_BRANCH}: ${tag}"

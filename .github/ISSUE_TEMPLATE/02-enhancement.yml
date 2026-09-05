@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Enhancement
+description: Propose a focused improvement to existing NeMo Relay behavior.
+title: "[Enhancement]: "
+type: Enhancement
+body:
+  - type: dropdown
+    id: affected_area
+    attributes:
+      label: Affected area
+      description: Select every area that would be affected by this enhancement.
+      multiple: true
+      options:
+        - Rust core runtime
+        - Python binding
+        - Node.js binding
+        - Go binding
+        - C FFI
+        - Adaptive runtime
+        - Middleware or guardrails
+        - Plugins
+        - Observability or exporters
+        - Framework integrations
+        - Build, packaging, or CI
+        - Documentation or examples
+        - Not sure
+    validations: {required: true}
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: Describe the limitation, friction, or opportunity this enhancement addresses.
+      placeholder: Today, users cannot...
+    validations: {required: true}
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed enhancement
+      description: Describe the change you want to make.
+      placeholder: Add support for...
+    validations: {required: true}
+  - type: textarea
+    id: runtime_contract
+    attributes:
+      label: Runtime contract and binding impact
+      description: Describe how this should behave across Rust, Python, Node.js, and any experimental bindings. Enter N/A if not applicable.
+      placeholder: This should affect...
+    validations: {required: true}
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe alternatives, workarounds, or reasons not to make the change. Enter N/A if none.
+      placeholder: Alternatives include...
+    validations: {required: true}
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: List the conditions that should be true when the enhancement is complete.
+      placeholder: |
+        - Users can...
+        - Tests cover...
+        - Docs explain...
+    validations: {required: true}

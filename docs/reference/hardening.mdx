@@ -1,0 +1,42 @@
+---
+title: "Hardened runtime qualification"
+description: "Qualification boundaries and reliability controls in the NeMo Relay 0.9.1 hardened development line."
+position: 8
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+The hardened development line adds runtime controls and qualification evidence
+without treating scaffolding as enforcement. Run
+`scripts/qualification/run.sh` inside the pinned `.devcontainer` to create the
+machine-readable reports in `qualification/`.
+
+The subscriber dispatcher uses a bounded queue with reserved capacity for
+scope, lifecycle, security, authority, and audit events. Lower-priority events
+are dropped with an explicit warning when that reserve is needed; high-priority
+events apply backpressure. Queue counters are available as
+`relay_event_queue_depth`, `relay_event_queue_capacity`,
+`relay_event_queue_high_watermark`, `relay_events_enqueued_total`,
+`relay_events_dropped_total`, and `relay_events_backpressured_total` in the
+Rust, Python, and Node APIs. `flush_subscribers()` remains the graceful drain
+barrier for queued callbacks and terminal publications.
+
+`plugins validate` reports `policy_mode = declared` by default. Pass
+`--effective` to apply secure activation defaults (`required` startup and
+`signature_required` attestation) before evaluating the manifest.
+
+Response-cache identity is explicit and fail-closed. The default session
+partition includes the root scope and policy epoch; principal and tenant modes
+require identity metadata. Buffered LLM and tool misses use process-local
+single-flight coalescing. Cache writes expose `flush_cache_writes()` and
+`wait_for_cache_idle()` for deterministic shutdown.
+
+The authority, ledger, executor, isolation, and DLP crates are disabled
+contract skeletons. They define package boundaries and invariants for later
+releases; they do not authorize actions, persist an evidence ledger, sandbox
+workers, or enforce outbound DLP in this release.
+
+The built-in `nemo_guardrails` component remains available for compatibility and
+is formally deprecated. New deployments should use current guardrail and
+intercept APIs; removal is deferred to the next breaking release with a
+migration notice.

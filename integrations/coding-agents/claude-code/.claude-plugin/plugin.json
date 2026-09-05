@@ -1,0 +1,19 @@
+{
+  "name": "nemo-relay-plugin",
+  "version": "0.9.1-rc.1",
+  "description": "Native Relay gateway lifecycle and Claude Code hooks for complete local observability.",
+  "author": {
+    "name": "NVIDIA Corporation and Affiliates",
+    "url": "https://github.com/NVIDIA/NeMo-Relay"
+  },
+  "homepage": "https://github.com/NVIDIA/NeMo-Relay",
+  "repository": "https://github.com/NVIDIA/NeMo-Relay",
+  "license": "Apache-2.0",
+  "mcpServers": "./.mcp.json",
+  "keywords": [
+    "nemo-relay",
+    "claude-code",
+    "hooks",
+    "observability"
+  ]
+}

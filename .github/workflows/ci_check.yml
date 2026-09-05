@@ -1,0 +1,231 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check
+
+on:
+  workflow_call:
+    inputs:
+      full_ci:
+        description: 'Whether to run checks across all files'
+        required: false
+        default: false
+        type: boolean
+      run_python_integration_langchain:
+        description: 'Whether LangChain, LangGraph, and DeepAgents Python integration checks may need optional extras'
+        required: false
+        default: false
+        type: boolean
+      base:
+        description: 'The comparison base used for filtered pre-commit checks'
+        required: false
+        default: ''
+        type: string
+      run_installer:
+        description: 'Whether installer jobs should run'
+        required: false
+        default: false
+        type: boolean
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: "${{ github.token }}"
+  GIT_COMMIT: "${{ github.sha }}"
+  NEMO_RELAY_CI_WORKSPACE: "${{ github.workspace }}"
+  NEMO_RELAY_CI_WORKSPACE_TMP: "${{ github.workspace }}/tmp"
+  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON_PREFERENCE: only-system
+
+jobs:
+  install-script:
+    name: Install script (${{ matrix.platform }})
+    if: ${{ inputs.run_installer }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            shell: sh
+            run_mock_tests: true
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            shell: sh
+            run_mock_tests: false
+          - platform: macos-arm64
+            runner: macos-15
+            shell: sh
+            run_mock_tests: false
+          - platform: windows-x86_64
+            runner: windows-2022
+            shell: pwsh
+          - platform: windows-ARM64
+            runner: windows-11-arm
+            shell: pwsh
+    permissions:
+      contents: read
+
+    steps:
+      - name: Remove untrusted Homebrew tap
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          if [ -d "$(brew --repository aws/tap)" ]; then
+            brew untap aws/tap
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate installer
+        if: ${{ matrix.shell == 'sh' }}
+        run: |
+          sh -n install.sh
+          sh -n scripts/test-install.sh
+          sh -n scripts/test-install-mocks.sh
+
+      - name: Run live installer tests
+        if: ${{ matrix.shell == 'sh' }}
+        run: sh scripts/test-install.sh
+
+      - name: Run mock-only installer tests
+        if: ${{ matrix.shell == 'sh' && matrix.run_mock_tests }}
+        run: sh scripts/test-install-mocks.sh
+
+      - name: Validate PowerShell installer syntax
+        if: ${{ matrix.shell == 'pwsh' }}
+        shell: pwsh
+        run: |
+          $scripts = @('install.ps1', 'scripts/test-install.ps1')
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_ }
+              exit 1
+            }
+          }
+
+      - name: Run PowerShell installer tests
+        if: ${{ matrix.shell == 'pwsh' }}
+        shell: pwsh
+        run: ./scripts/test-install.ps1
+
+  check:
+    name: Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ env.NEMO_RELAY_CI_WORKSPACE }}/uv.lock
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ steps.ci-config.outputs.go_version }}
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.ci-config.outputs.node_version }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-rust-linux-amd64-${{ steps.ci-config.outputs.rust_version }}-debug
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: false
+
+      - name: Install cargo-deny and just
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: cargo-deny@${{ steps.ci-config.outputs.cargo_deny_version }},just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: cargo-about@${{ steps.ci-config.outputs.cargo_about_version }}
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/.cache/pre-commit
+          key: >-
+            nemo-relay-pre-commit-${{ runner.os }}-${{ runner.arch }}-py${{ steps.ci-config.outputs.default_python_version }}-node${{ steps.ci-config.outputs.node_version }}-rust${{ steps.ci-config.outputs.rust_version }}-pc${{ steps.ci-config.outputs.pre_commit_version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            nemo-relay-pre-commit-${{ runner.os }}-${{ runner.arch }}-py${{ steps.ci-config.outputs.default_python_version }}-node${{ steps.ci-config.outputs.node_version }}-rust${{ steps.ci-config.outputs.rust_version }}-pc${{ steps.ci-config.outputs.pre_commit_version }}-
+
+      - name: pre-commit
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        env:
+          FULL_CI: ${{ inputs.full_ci }}
+          PRE_COMMIT_BASE: ${{ inputs.base }}
+          PRE_COMMIT_HOME: ${{ runner.temp }}/.cache/pre-commit
+          PYTHON_INTEGRATION_LANGCHAIN: ${{ inputs.run_python_integration_langchain }}
+          # The attribution hook syncs docs deps; do not apply repo warning policy to third-party Rust builds.
+          RUSTFLAGS: ""
+        run: |
+          set -e
+          uv tool install pre-commit==${{ steps.ci-config.outputs.pre_commit_version }}
+          FLOW_CI_UV_SYNC_EXTRA_ARGS=()
+          if [[ "$PYTHON_INTEGRATION_LANGCHAIN" == "true" ]]; then
+            FLOW_CI_UV_SYNC_EXTRA_ARGS+=(--extra langchain --extra langchain-nvidia --extra langgraph --extra deepagents)
+          fi
+
+          uv sync --frozen --inexact --no-install-project --no-install-package nemo-relay "${FLOW_CI_UV_SYNC_EXTRA_ARGS[@]}"
+          if [[ "$FULL_CI" == "true" || -z "$PRE_COMMIT_BASE" ]]; then
+            pre-commit run --all-files --show-diff-on-failure
+          else
+            if [[ "$PRE_COMMIT_BASE" =~ ^[0-9a-f]{40}$ || "$PRE_COMMIT_BASE" == refs/* ]]; then
+              base_ref="$PRE_COMMIT_BASE"
+            else
+              base_ref="origin/$PRE_COMMIT_BASE"
+            fi
+            if [[ ! "$PRE_COMMIT_BASE" =~ ^[0-9a-f]{40}$ && "$base_ref" != "$GITHUB_REF" ]]; then
+              base_ref="$(git merge-base "$base_ref" HEAD)"
+            fi
+            pre-commit run --from-ref "$base_ref" --to-ref HEAD --show-diff-on-failure
+          fi
+
+      - name: Test binary package assembly
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          # SONAR_IGNORE_START: offline mode makes this a no-network execution.
+          uv run --no-project --offline --no-build python -m unittest \
+            scripts.tests.test_package_cli_bin \
+            scripts.tests.test_package_node_bin
+          # SONAR_IGNORE_END

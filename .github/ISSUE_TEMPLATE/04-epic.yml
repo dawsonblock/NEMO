@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Epic
+description: Define a coordinated body of work that spans multiple tasks or enhancements.
+title: "[Epic]: "
+type: Epic
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: Describe the user-visible or maintainer-visible outcome this epic should deliver.
+      placeholder: This epic delivers...
+    validations: {required: true}
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Explain why this work matters now and what problem it solves.
+      placeholder: This is needed because...
+    validations: {required: true}
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: List the major areas, components, or workflows included in this epic.
+      placeholder: |
+        Included:
+        - ...
+    validations: {required: true}
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: List explicitly out-of-scope work. Enter N/A if none.
+      placeholder: |
+        Not included:
+        - ...
+    validations: {required: true}
+  - type: textarea
+    id: child_work
+    attributes:
+      label: Child work
+      description: Link child issues or list planned tasks and enhancements. Enter N/A if not yet created.
+      placeholder: |
+        - #123
+        - Add ...
+    validations: {required: true}
+  - type: textarea
+    id: completion_criteria
+    attributes:
+      label: Completion criteria
+      description: Define the conditions for closing this epic.
+      placeholder: |
+        - All child issues are complete.
+        - Docs and tests are updated.
+    validations: {required: true}

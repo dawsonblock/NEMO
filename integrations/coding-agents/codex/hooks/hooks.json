@@ -1,0 +1,118 @@
+{
+  "description": "SPDX-License-Identifier: Apache-2.0",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-closed",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-closed",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nemo-relay hook-forward codex --gateway-url http://127.0.0.1:47632 --forward-only --fail-open",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

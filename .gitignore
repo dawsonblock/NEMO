@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Rust
+/target
+
+# Python
+/.venv
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.so
+python/nemo_relay/_native*.so
+
+# Python (Windows)
+python/nemo_relay/_native*.pyd
+
+# Go
+go/nemo_relay/nemo_relay_test
+go/nemo_relay/nemo_relay_test.exe
+
+# Node.js (NAPI-RS)
+node_modules/
+crates/node/*.node
+crates/node/index.js
+crates/node/index.d.ts
+crates/node/coverage/
+crates/node/junit.xml
+integrations/openclaw/dist/
+integrations/openclaw/.test-dist/
+
+# Shared libraries
+*.dylib
+*.dll
+
+# Testing / caches
+.pytest_cache/
+.uv-cache/
+.cache/pre-commit/
+.coverage
+*.profraw
+*.profdata
+go/nemo_relay/coverage.out
+go_junit_report.xml
+*.dSYM/
+
+# OS — macOS
+.DS_Store
+
+# OS — Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# OS — Linux
+*~
+.directory
+
+# Temporary files
+.tmp/
+.planning/
+.claude/commands/
+/.codex/
+/.cursor/
+.env
+benchmarks/
+
+# Documentation
+docs/_build/
+docs/reference/api/nodejs-library-reference/
+docs/reference/api/python-library-reference/
+docs/reference/api/rust-library-reference/
+docs/reference/api/**/_generated/
+docs/reference/api/**/_source/
+**/release-notes.md
+CHANGELOG.md
+
+.scannerwork/
+
+# VSCode
+/.vscode
+
+# Relay
+/.nemo-relay
+/artifacts/
+
+# Generated per machine by the dynamic-plugin recipe: local dylib name + sha256.
+examples/**/relay-plugin.local.toml

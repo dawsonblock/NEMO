@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Documentation
+description: Report missing, incorrect, confusing, or outdated documentation.
+title: "[Documentation]: "
+type: Documentation
+body:
+  - type: dropdown
+    id: documentation_area
+    attributes:
+      label: Documentation area
+      description: Select every documentation area that applies.
+      multiple: true
+      options:
+        - README
+        - Documentation site
+        - Rust API reference
+        - Python API reference
+        - Node.js API reference
+        - Examples or tutorials
+        - Integration guide
+        - Plugin guide
+        - Observability guide
+        - Packaging or release documentation
+        - Contributor documentation
+        - Not sure
+    validations: {required: true}
+  - type: textarea
+    id: problem
+    attributes:
+      label: Documentation problem
+      description: Describe what is missing, incorrect, confusing, or outdated.
+      placeholder: The current documentation...
+    validations: {required: true}
+  - type: textarea
+    id: affected_pages
+    attributes:
+      label: Affected pages or files
+      description: Link to pages or list file paths. Enter N/A if you are not sure.
+      placeholder: |
+        - https://...
+        - fern/... or docs/...
+    validations: {required: true}
+  - type: textarea
+    id: proposed_change
+    attributes:
+      label: Proposed documentation change
+      description: Describe the change you think would resolve the issue.
+      placeholder: Update the documentation to...
+    validations: {required: true}
+  - type: textarea
+    id: audience
+    attributes:
+      label: Audience and use case
+      description: Describe who needs this documentation and what they are trying to do.
+      placeholder: This helps users who...
+    validations: {required: true}
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: List the conditions that should be true when the documentation issue is resolved.
+      placeholder: |
+        - The docs explain...
+        - The example shows...
+    validations: {required: true}

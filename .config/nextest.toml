@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[profile.ci]
+junit = { path = "rust_junit_report.xml" }
+retries = { backoff = "fixed", count = 3, delay = "2s" }
+
+[[profile.ci.overrides]]
+filter = 'test(typed_async_llm_sanitize_context_decodes_all_builtin_identities) | test(typed_async_llm_sanitize_context_decodes_oci_genai_builtin_identity)'
+threads-required = "num-cpus"
+
+[[profile.ci.overrides]]
+filter = 'test(windows_supervision_assigns_before_a_wrapper_can_spawn_a_descendant)'
+slow-timeout = { period = "20s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'test(cli_hook_recovery_consumes_the_same_restart_as_an_overlapping_mcp)'
+slow-timeout = { period = "20s", terminate-after = 2 }

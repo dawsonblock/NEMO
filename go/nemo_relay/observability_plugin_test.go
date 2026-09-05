@@ -1,0 +1,637 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package nemo_relay
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+const observabilityDevProject = "observability-dev"
+
+const (
+	ClearPluginConfigurationFailed = "ClearPluginConfiguration failed"
+	InitializePluginsFailed        = "InitializePlugins failed"
+	TrajectoryFilenamePrefix       = "trajectory-"
+	FirstAgentName                 = "go-first-agent"
+	NestedAgentName                = "go-nested-agent"
+	SecondAgentName                = "go-second-agent"
+	testAccessKeyID                = "test-access-key"
+	testAtifEndpoint               = "https://example.com/atif"
+	testRegion                     = "us-west-2"
+	testStaticHeader               = "x-static"
+	fatalErrorFormat               = "%s: %v"
+	failedSuffix                   = " failed"
+)
+
+func TestObservabilityConfigHelpers(t *testing.T) {
+	config := NewObservabilityConfig()
+	if config.Version != 4 {
+		t.Fatalf("expected version 4, got %d", config.Version)
+	}
+	if config.EnableFullPayloads {
+		t.Fatal("full payloads should be disabled by default")
+	}
+	atof := NewObservabilityAtofConfig()
+	if atof.Enabled || len(atof.Sinks) != 0 {
+		t.Fatalf("unexpected ATOF defaults: %#v", atof)
+	}
+	atof.Sinks = []ObservabilityAtofSinkConfigurer{ObservabilityAtofEndpoint{
+		Name:            "archive",
+		URL:             "http://localhost:8080/events",
+		Transport:       "http_post",
+		Headers:         map[string]string{"X-Test": "yes"},
+		HeaderEnv:       map[string]string{"authorization": "NEMO_RELAY_ATOF_AUTH"},
+		TimeoutMillis:   1000,
+		FieldNamePolicy: "replace_dots",
+	}}
+	atif := NewObservabilityAtifConfig()
+	if atif.Enabled || atif.AgentName != "NeMo Relay" || atif.ModelName != "unknown" || atif.FilenameTemplate != "nemo-relay-atif-{session_id}.json" {
+		t.Fatalf("unexpected ATIF defaults: %#v", atif)
+	}
+	allowHTTP := false
+	s3Storage := NewObservabilityS3StorageConfig("archive")
+	s3Storage.KeyPrefix = "runs/"
+	s3Storage.AccessKeyID = testAccessKeyID
+	s3Storage.SecretAccessKeyVar = "NEMO_RELAY_TEST_SECRET"
+	s3Storage.Region = testRegion
+	s3Storage.AllowHTTP = &allowHTTP
+	httpStorage := NewObservabilityHttpStorageConfig(testAtifEndpoint)
+	httpStorage.Headers = map[string]string{testStaticHeader: "value"}
+	httpStorage.HeaderEnv = map[string]string{"authorization": "NEMO_RELAY_ATIF_HTTP_AUTH"}
+	httpStorage.TimeoutMillis = 1500
+	assertS3StorageConfig(t, s3Storage)
+	assertHTTPStorageConfig(t, httpStorage)
+	atif.Storage = []ObservabilityAtifStorageConfigurer{
+		s3Storage,
+		httpStorage,
+	}
+	otel := NewObservabilityOpenTelemetryConfig()
+	otel.Enabled = true
+	otel.Endpoints = []ObservabilityOpenTelemetryEndpointConfig{
+		NewObservabilityOpenTelemetryEndpointConfig(OpenTelemetryTypeFull, "http://localhost:4318/v1/traces"),
+	}
+	otel.Endpoints[0].HeaderEnv["authorization"] = "OTEL_AUTHORIZATION"
+	otel.Endpoints[0].PromoteMetadataPrefixes = []string{"nv."}
+	maxQueueSize := uint64(4096)
+	maxExportBatchSize := uint64(256)
+	scheduledDelayMillis := uint64(750)
+	completedSpanContextTTLMillis := uint64(60000)
+	otel.Endpoints[0].MaxQueueSize = &maxQueueSize
+	otel.Endpoints[0].MaxExportBatchSize = &maxExportBatchSize
+	otel.Endpoints[0].ScheduledDelayMillis = &scheduledDelayMillis
+	otel.Endpoints[0].CompletedSpanContextTTLMillis = &completedSpanContextTTLMillis
+	logs := NewObservabilityOpenTelemetryLogConfig()
+	logs.Enabled = true
+	metrics := NewObservabilityOpenTelemetryMetricConfig()
+	metrics.Enabled = true
+	metricEndpoint := NewObservabilityOpenTelemetrySignalEndpointConfig("https://collector.example/custom/metrics")
+	metricEndpoint.Headers["x-nv-project"] = observabilityDevProject
+	metricEndpoint.ResourceAttributes["nv.project"] = observabilityDevProject
+	metrics.Endpoints = ObservabilityOpenTelemetrySignalEndpoints(metricEndpoint)
+	otel.Logs = &logs
+	otel.Metrics = &metrics
+
+	config.Atof = &atof
+	config.Atif = &atif
+	config.OpenTelemetry = &otel
+	config.EnableFullPayloads = true
+	wrapped := ObservabilityComponent(config)
+	if wrapped.Kind != ObservabilityPluginKind || !wrapped.Enabled {
+		t.Fatalf("unexpected component wrapper: %#v", wrapped)
+	}
+	assertWrappedObservabilityConfig(t, wrapped)
+}
+
+func TestObservabilityAtofSinkConfigConstructorsSerializeTheirDiscriminators(t *testing.T) {
+	file := NewObservabilityAtofFileSinkConfig()
+	if file.Mode != "append" {
+		t.Fatalf("file sink mode = %q, want append", file.Mode)
+	}
+	fileJSON, err := json.Marshal(file)
+	if err != nil {
+		t.Fatalf("marshal file sink: %v", err)
+	}
+	if !strings.Contains(string(fileJSON), `"type":"file"`) {
+		t.Fatalf("file sink discriminator missing: %s", fileJSON)
+	}
+
+	stream := NewObservabilityAtofStreamSinkConfig("http://localhost:8080/events")
+	if stream.Transport != "http_post" || stream.TimeoutMillis != 3000 || stream.FieldNamePolicy != "preserve" {
+		t.Fatalf("unexpected stream sink defaults: %#v", stream)
+	}
+	streamJSON, err := json.Marshal(stream)
+	if err != nil {
+		t.Fatalf("marshal stream sink: %v", err)
+	}
+	if !strings.Contains(string(streamJSON), `"type":"stream"`) {
+		t.Fatalf("stream sink discriminator missing: %s", streamJSON)
+	}
+}
+
+func assertWrappedObservabilityConfig(t *testing.T, wrapped PluginComponentSpec) {
+	t.Helper()
+	if wrapped.Config["enable_full_payloads"] != true {
+		t.Fatalf("expected full payload policy in serialized config, got %#v", wrapped.Config)
+	}
+	if _, ok := wrapped.Config["atof"].(map[string]any); !ok {
+		t.Fatalf("expected serialized ATOF config object, got %#v", wrapped.Config)
+	}
+	atofConfig := wrapped.Config["atof"].(map[string]any)
+	sinks, ok := atofConfig["sinks"].([]any)
+	if !ok {
+		t.Fatalf("expected serialized ATOF sinks, got %#v", atofConfig)
+	}
+	firstSink, ok := sinks[0].(map[string]any)
+	if !ok || firstSink["name"] != "archive" || firstSink["field_name_policy"] != "replace_dots" ||
+		firstSink["header_env"].(map[string]any)["authorization"] != "NEMO_RELAY_ATOF_AUTH" {
+		t.Fatalf("expected serialized ATOF stream sink settings, got %#v", sinks)
+	}
+	serialized, err := json.Marshal(wrapped)
+	if err != nil {
+		t.Fatalf("marshal observability component failed: %v", err)
+	}
+	if !strings.Contains(string(serialized), `"name":"archive"`) || !strings.Contains(string(serialized), `"field_name_policy":"replace_dots"`) {
+		t.Fatalf("expected named ATOF endpoint in serialized component, got %s", serialized)
+	}
+	assertWrappedAtifStorageConfig(t, wrapped.Config["atif"].(map[string]any))
+	otelEndpoints := wrapped.Config["opentelemetry"].(map[string]any)["endpoints"].([]any)
+	if otelEndpoints[0].(map[string]any)["type"] != "full" {
+		t.Fatalf("expected typed OpenTelemetry endpoint in serialized config: %#v", wrapped.Config)
+	}
+	if otelEndpoints[0].(map[string]any)["header_env"].(map[string]any)["authorization"] != "OTEL_AUTHORIZATION" {
+		t.Fatalf("expected OpenTelemetry header_env in serialized config: %#v", wrapped.Config)
+	}
+	promotePrefixes := otelEndpoints[0].(map[string]any)["promote_metadata_prefixes"].([]any)
+	if len(promotePrefixes) != 1 || promotePrefixes[0] != "nv." {
+		t.Fatalf("expected OpenTelemetry metadata promotion prefixes in serialized config: %#v", wrapped.Config)
+	}
+	if otelEndpoints[0].(map[string]any)["max_queue_size"] != float64(4096) ||
+		otelEndpoints[0].(map[string]any)["max_export_batch_size"] != float64(256) ||
+		otelEndpoints[0].(map[string]any)["scheduled_delay_millis"] != float64(750) ||
+		otelEndpoints[0].(map[string]any)["completed_span_context_ttl_millis"] != float64(60000) {
+		t.Fatalf("expected OpenTelemetry batch settings in serialized config: %#v", wrapped.Config)
+	}
+	otelConfig := wrapped.Config["opentelemetry"].(map[string]any)
+	logs := otelConfig["logs"].(map[string]any)
+	if logs["minimum_severity"] != "info" || logs["max_queue_size"] != float64(2048) {
+		t.Fatalf("expected OpenTelemetry log defaults in serialized config: %#v", logs)
+	}
+	if _, explicit := logs["endpoints"]; explicit {
+		t.Fatalf("derived log endpoints should remain omitted: %#v", logs)
+	}
+	metrics := otelConfig["metrics"].(map[string]any)
+	metricEndpoints := metrics["endpoints"].([]any)
+	metricEndpoint := metricEndpoints[0].(map[string]any)
+	if metrics["temporality"] != "cumulative" || metrics["cardinality_limit"] != float64(2000) ||
+		metricEndpoint["endpoint"] != "https://collector.example/custom/metrics" ||
+		metricEndpoint["headers"].(map[string]any)["x-nv-project"] != observabilityDevProject ||
+		metricEndpoint["resource_attributes"].(map[string]any)["nv.project"] != observabilityDevProject {
+		t.Fatalf("expected OpenTelemetry metric settings in serialized config: %#v", metrics)
+	}
+}
+
+func TestObservabilitySignalEndpointOmittedVersusExplicitEmpty(t *testing.T) {
+	logs := NewObservabilityOpenTelemetryLogConfig()
+	logs.Enabled = true
+	metrics := NewObservabilityOpenTelemetryMetricConfig()
+	metrics.Enabled = true
+	cases := []struct {
+		name     string
+		omitted  any
+		explicit any
+	}{
+		{"logs", logs, func() any {
+			config := logs
+			config.Endpoints = ObservabilityOpenTelemetrySignalEndpoints()
+			return config
+		}()},
+		{"metrics", metrics, func() any {
+			config := metrics
+			config.Endpoints = ObservabilityOpenTelemetrySignalEndpoints()
+			return config
+		}()},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			omitted, err := json.Marshal(testCase.omitted)
+			if err != nil {
+				t.Fatalf("marshal omitted endpoints: %v", err)
+			}
+			if strings.Contains(string(omitted), `"endpoints"`) {
+				t.Fatalf("omitted endpoint list should derive from traces: %s", omitted)
+			}
+			explicitEmpty, err := json.Marshal(testCase.explicit)
+			if err != nil {
+				t.Fatalf("marshal explicit empty endpoints: %v", err)
+			}
+			if !strings.Contains(string(explicitEmpty), `"endpoints":[]`) {
+				t.Fatalf("explicit empty endpoint list must be preserved: %s", explicitEmpty)
+			}
+		})
+	}
+}
+
+func TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings(t *testing.T) {
+	zero := uint64(0)
+	config := NewObservabilityOpenTelemetryEndpointConfig(OpenTelemetryTypeFull, "http://localhost:4318/v1/traces")
+	config.MaxQueueSize = &zero
+	config.MaxExportBatchSize = &zero
+	config.ScheduledDelayMillis = &zero
+	config.CompletedSpanContextTTLMillis = &zero
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal OpenTelemetry endpoint config: %v", err)
+	}
+	for _, field := range []string{"max_queue_size", "max_export_batch_size", "scheduled_delay_millis", "completed_span_context_ttl_millis"} {
+		if !strings.Contains(string(payload), `"`+field+`":0`) {
+			t.Fatalf("expected explicit zero %s in serialized config: %s", field, payload)
+		}
+	}
+}
+
+func assertS3StorageConfig(t *testing.T, storage ObservabilityS3StorageConfig) {
+	t.Helper()
+	if storage.Bucket != "archive" ||
+		storage.KeyPrefix != "runs/" ||
+		storage.AccessKeyID != testAccessKeyID ||
+		storage.SecretAccessKeyVar != "NEMO_RELAY_TEST_SECRET" ||
+		storage.Region != testRegion ||
+		storage.AllowHTTP == nil ||
+		*storage.AllowHTTP {
+		t.Fatalf("unexpected S3 constructor values: %#v", storage)
+	}
+
+	serialized := marshalStorageConfig(t, storage)
+	if serialized["type"] != "s3" ||
+		serialized["bucket"] != "archive" ||
+		serialized["key_prefix"] != "runs/" ||
+		serialized["access_key_id"] != testAccessKeyID ||
+		serialized["secret_access_key_var"] != "NEMO_RELAY_TEST_SECRET" ||
+		serialized["region"] != testRegion ||
+		serialized["allow_http"] != false {
+		t.Fatalf("unexpected serialized S3 storage config: %#v", serialized)
+	}
+}
+
+func assertHTTPStorageConfig(t *testing.T, storage ObservabilityHttpStorageConfig) {
+	t.Helper()
+	if storage.Endpoint != testAtifEndpoint ||
+		storage.Headers[testStaticHeader] != "value" ||
+		storage.HeaderEnv["authorization"] != "NEMO_RELAY_ATIF_HTTP_AUTH" ||
+		storage.TimeoutMillis != 1500 {
+		t.Fatalf("unexpected HTTP constructor values: %#v", storage)
+	}
+
+	serialized := marshalStorageConfig(t, storage)
+	headers := serialized["headers"].(map[string]any)
+	headerEnv := serialized["header_env"].(map[string]any)
+	if serialized["type"] != "http" ||
+		serialized["endpoint"] != testAtifEndpoint ||
+		serialized["timeout_millis"] != float64(1500) ||
+		headers[testStaticHeader] != "value" ||
+		headerEnv["authorization"] != "NEMO_RELAY_ATIF_HTTP_AUTH" {
+		t.Fatalf("unexpected serialized HTTP storage config: %#v", serialized)
+	}
+}
+
+func assertWrappedAtifStorageConfig(t *testing.T, atifConfig map[string]any) {
+	t.Helper()
+	storage := atifConfig["storage"].([]any)
+	if len(storage) != 2 {
+		t.Fatalf("expected two ATIF storage destinations, got %#v", storage)
+	}
+	s3 := storage[0].(map[string]any)
+	if s3["type"] != "s3" || s3["bucket"] != "archive" || s3["key_prefix"] != "runs/" || s3["allow_http"] != false {
+		t.Fatalf("unexpected S3 storage config: %#v", s3)
+	}
+	http := storage[1].(map[string]any)
+	if http["type"] != "http" || http["endpoint"] != testAtifEndpoint || http["timeout_millis"] != float64(1500) {
+		t.Fatalf("unexpected HTTP storage config: %#v", http)
+	}
+}
+
+func marshalStorageConfig(t *testing.T, config ObservabilityAtifStorageConfigurer) map[string]any {
+	t.Helper()
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal storage config: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		t.Fatalf("unmarshal storage config: %v", err)
+	}
+	return parsed
+}
+
+func TestObservabilityPluginAtofAndAtifFiles(t *testing.T) {
+	if err := ClearPluginConfiguration(); err != nil {
+		t.Fatalf(fatalErrorFormat, ClearPluginConfigurationFailed, err)
+	}
+	t.Cleanup(func() {
+		requireNoError(t, ClearPluginConfiguration(), ClearPluginConfigurationFailed)
+	})
+	dir := t.TempDir()
+	config := NewAtofAndAtifTestConfig(dir)
+	pluginConfig := PluginConfig{Version: 1, Components: []PluginComponentSpec{ObservabilityComponent(config)}}
+
+	if report, err := ValidatePluginConfig(pluginConfig); err != nil {
+		t.Fatalf("ValidatePluginConfig failed: %v", err)
+	} else if len(report.Diagnostics) != 0 {
+		t.Fatalf("unexpected diagnostics: %#v", report.Diagnostics)
+	}
+	if _, err := InitializePlugins(pluginConfig); err != nil {
+		t.Fatalf(fatalErrorFormat, InitializePluginsFailed, err)
+	}
+
+	handle := EmitObservabilityTestTrajectory(t)
+	if err := ClearPluginConfiguration(); err != nil {
+		t.Fatalf(fatalErrorFormat, ClearPluginConfigurationFailed, err)
+	}
+
+	AssertAtofRecordCount(t, filepath.Join(dir, eventsJSONLFilename), 3)
+	AssertAtifAgentMetadata(t, TrajectoryFilePath(dir, handle))
+}
+
+func TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics(t *testing.T) {
+	if err := ClearPluginConfiguration(); err != nil {
+		t.Fatalf(fatalErrorFormat, ClearPluginConfigurationFailed, err)
+	}
+	t.Cleanup(func() {
+		requireNoError(t, ClearPluginConfiguration(), ClearPluginConfigurationFailed)
+	})
+
+	derivedRequests := make(chan otelRequest, 4)
+	derivedServer := NewOtelTestServer(t, derivedRequests)
+	defer derivedServer.Close()
+	metricRequests := make(chan otelRequest, 2)
+	metricServer := NewOtelTestServer(t, metricRequests)
+	defer metricServer.Close()
+
+	config := NewObservabilityConfig()
+	openTelemetry := NewObservabilityOpenTelemetryConfig()
+	openTelemetry.Enabled = true
+	openTelemetry.Endpoints = []ObservabilityOpenTelemetryEndpointConfig{
+		NewObservabilityOpenTelemetryEndpointConfig(OpenTelemetryTypeFull, derivedServer.URL+otelTestPath),
+	}
+	logs := NewObservabilityOpenTelemetryLogConfig()
+	logs.Enabled = true
+	openTelemetry.Logs = &logs
+	metrics := NewObservabilityOpenTelemetryMetricConfig()
+	metrics.Enabled = true
+	metrics.Endpoints = ObservabilityOpenTelemetrySignalEndpoints(
+		NewObservabilityOpenTelemetrySignalEndpointConfig(metricServer.URL),
+	)
+	openTelemetry.Metrics = &metrics
+	config.OpenTelemetry = &openTelemetry
+
+	if _, err := InitializePlugins(PluginConfig{
+		Version:    1,
+		Components: []PluginComponentSpec{ObservabilityComponent(config)},
+	}); err != nil {
+		t.Fatalf(fatalErrorFormat, InitializePluginsFailed, err)
+	}
+
+	runWithTestScopeStack(t, func() {
+		requireNoError(t, EmitEvent("go_plugin_exported_log", WithEventSeverity(LogSeverityError)), "EmitEvent failed")
+		requireNoError(t, EmitMetric("go_plugin_exported_metric", []MetricMeasurement{{
+			Name:      "example.go.plugin.requests",
+			Kind:      MetricKindCounter,
+			ValueType: MetricValueTypeU64,
+			Value:     uint64(1),
+		}}), "EmitMetric failed")
+	})
+	if err := ClearPluginConfiguration(); err != nil {
+		t.Fatalf(fatalErrorFormat, ClearPluginConfigurationFailed, err)
+	}
+
+	requireOtelRequest(t, derivedRequests, "/v1/logs", "go_plugin_exported_log")
+	requireOtelRequest(t, metricRequests, "/v1/metrics", "example.go.plugin.requests")
+}
+
+func requireOtelRequest(t *testing.T, requests <-chan otelRequest, path, bodyFragment string) {
+	t.Helper()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case request := <-requests:
+			if request.Path != path {
+				continue
+			}
+			if !strings.Contains(string(request.Body), bodyFragment) {
+				t.Fatalf("OTLP %s export did not contain %q", path, bodyFragment)
+			}
+			return
+		case <-timeout.C:
+			t.Fatalf("timed out waiting for OTLP %s export", path)
+		}
+	}
+}
+
+func NewAtofAndAtifTestConfig(dir string) ObservabilityConfig {
+	config := NewObservabilityConfig()
+	atof := NewObservabilityAtofConfig()
+	atof.Enabled = true
+	atof.Sinks = []ObservabilityAtofSinkConfigurer{ObservabilityAtofFileSinkConfig{OutputDirectory: dir, Filename: eventsJSONLFilename, Mode: "overwrite"}}
+	config.Atof = &atof
+
+	atif := NewObservabilityAtifConfig()
+	atif.Enabled = true
+	atif.AgentName = "go-agent"
+	atif.AgentVersion = "1.2.3"
+	atif.ModelName = "go-model"
+	atif.ToolDefinitions = []map[string]any{{"name": "search"}}
+	atif.Extra = map[string]any{"binding": "go"}
+	atif.OutputDirectory = dir
+	atif.FilenameTemplate = TrajectoryFilenamePrefix + "{session_id}.json"
+	config.Atif = &atif
+	return config
+}
+
+func EmitObservabilityTestTrajectory(t *testing.T) *ScopeHandle {
+	t.Helper()
+	var handle *ScopeHandle
+	runWithTestScopeStack(t, func() {
+		var err error
+		handle, err = PushScope("go-observability-agent", ScopeTypeAgent, WithInput(json.RawMessage(`{"agent":true}`)))
+		requireNoError(t, err, "PushScope failed")
+		requireNoError(t, EmitEvent("go-mark", WithEventParent(handle), WithEventData(json.RawMessage(`{"step":1}`))), "EmitEvent failed")
+		requireNoError(t, PopScope(handle, WithOutput(json.RawMessage(`{"done":true}`))), "PopScope failed")
+	})
+	return handle
+}
+
+func AssertAtofRecordCount(t *testing.T, path string, want int) {
+	t.Helper()
+	jsonl := string(mustReadFile(t, path))
+	if got := strings.Count(strings.TrimSpace(jsonl), "\n") + 1; got != want {
+		t.Fatalf("expected %d JSONL records, got %d: %s", want, got, jsonl)
+	}
+}
+
+func AssertAtifAgentMetadata(t *testing.T, trajectoryPath string) {
+	t.Helper()
+	var trajectory map[string]any
+	if err := json.Unmarshal(mustReadFile(t, trajectoryPath), &trajectory); err != nil {
+		t.Fatalf("failed to read trajectory: %v", err)
+	}
+	agent := trajectory["agent"].(map[string]any)
+	if agent["name"] != "go-agent" || agent["version"] != "1.2.3" || agent["model_name"] != "go-model" {
+		t.Fatalf("unexpected ATIF agent metadata: %#v", agent)
+	}
+	if !strings.Contains(string(mustReadFile(t, trajectoryPath)), "go-observability-agent") {
+		t.Fatalf("expected top-level agent event in ATIF file")
+	}
+}
+
+func TestObservabilityPluginAtifSplitsMultipleTopLevelAgents(t *testing.T) {
+	Dir := t.TempDir()
+	InitializeAtifPlugin(t, Dir)
+	var First, Nested, Second *ScopeHandle
+	runWithTestScopeStack(t, func() {
+		First = EmitAgentStart(t, "first", FirstAgentName)
+		Nested = EmitAgentStart(t, "nested", NestedAgentName)
+		EmitAgentEnd(t, "nested", Nested)
+		EmitAgentEnd(t, "first", First)
+		Second = EmitAgentTrajectory(t, "second", SecondAgentName)
+	})
+	requireNoError(t, ClearPluginConfiguration(), ClearPluginConfigurationFailed)
+
+	Files, err := filepath.Glob(filepath.Join(Dir, TrajectoryFilenamePrefix+"*.json"))
+	if err != nil {
+		t.Fatalf("Glob failed: %v", err)
+	}
+	if len(Files) != 2 {
+		t.Fatalf("expected 2 ATIF trajectory files, got %d: %#v", len(Files), Files)
+	}
+
+	FirstPayload := string(mustReadFile(t, TrajectoryFilePath(Dir, First)))
+	SecondPayload := string(mustReadFile(t, TrajectoryFilePath(Dir, Second)))
+	if !strings.Contains(FirstPayload, FirstAgentName) || !strings.Contains(FirstPayload, NestedAgentName) {
+		t.Fatalf("expected first trajectory to include first and nested agents: %s", FirstPayload)
+	}
+	if strings.Contains(FirstPayload, SecondAgentName) {
+		t.Fatalf("first trajectory leaked second agent events: %s", FirstPayload)
+	}
+	if !strings.Contains(SecondPayload, SecondAgentName) {
+		t.Fatalf("expected second trajectory to include second agent: %s", SecondPayload)
+	}
+	if strings.Contains(SecondPayload, FirstAgentName) || strings.Contains(SecondPayload, NestedAgentName) {
+		t.Fatalf("second trajectory leaked first trajectory events: %s", SecondPayload)
+	}
+}
+
+func TestObservabilityPluginValidationRejectsBadValues(t *testing.T) {
+	config := NewObservabilityConfig()
+	atof := NewObservabilityAtofConfig()
+	atof.Sinks = []ObservabilityAtofSinkConfigurer{ObservabilityAtofFileSinkConfig{Mode: "bad"}}
+	config.Atof = &atof
+	atif := NewObservabilityAtifConfig()
+	atif.FilenameTemplate = "missing-placeholder.json"
+	config.Atif = &atif
+
+	report, err := ValidatePluginConfig(PluginConfig{Version: 1, Components: []PluginComponentSpec{ObservabilityComponent(config)}})
+	if err != nil {
+		t.Fatalf("ValidatePluginConfig failed: %v", err)
+	}
+	if len(report.Diagnostics) < 2 {
+		t.Fatalf("expected validation diagnostics, got %#v", report.Diagnostics)
+	}
+}
+
+func TestObservabilityPluginListKindIsAutomatic(t *testing.T) {
+	kinds, err := ListPluginKinds()
+	if err != nil {
+		t.Fatalf("ListPluginKinds failed: %v", err)
+	}
+	for _, kind := range kinds {
+		if kind == ObservabilityPluginKind {
+			return
+		}
+	}
+	t.Fatalf("expected %q in registered kinds: %#v", ObservabilityPluginKind, kinds)
+}
+
+func TestObservabilityAtifOpenAgentFlushesOnClear(t *testing.T) {
+	if err := ClearPluginConfiguration(); err != nil {
+		t.Fatalf(fatalErrorFormat, ClearPluginConfigurationFailed, err)
+	}
+	t.Cleanup(func() {
+		requireNoError(t, ClearPluginConfiguration(), ClearPluginConfigurationFailed)
+	})
+	dir := t.TempDir()
+	config := NewObservabilityConfig()
+	atif := NewObservabilityAtifConfig()
+	atif.Enabled = true
+	atif.OutputDirectory = dir
+	config.Atif = &atif
+	if _, err := InitializePlugins(PluginConfig{Version: 1, Components: []PluginComponentSpec{ObservabilityComponent(config)}}); err != nil {
+		t.Fatalf(fatalErrorFormat, InitializePluginsFailed, err)
+	}
+	var handle *ScopeHandle
+	runWithTestScopeStack(t, func() {
+		var err error
+		handle, err = PushScope("go-open-agent", ScopeTypeAgent)
+		if err != nil {
+			t.Fatalf("PushScope failed: %v", err)
+		}
+		if err := ClearPluginConfiguration(); err != nil {
+			t.Fatalf(fatalErrorFormat, ClearPluginConfigurationFailed, err)
+		}
+		if err := PopScope(handle); err != nil {
+			t.Fatalf("PopScope failed: %v", err)
+		}
+	})
+	path := filepath.Join(dir, "nemo-relay-atif-"+handle.UUID()+".json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected open-agent ATIF file at %s: %v", path, err)
+	}
+}
+
+func InitializeAtifPlugin(t *testing.T, Dir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		requireNoError(t, ClearPluginConfiguration(), ClearPluginConfigurationFailed)
+	})
+	requireNoError(t, ClearPluginConfiguration(), ClearPluginConfigurationFailed)
+
+	Config := NewObservabilityConfig()
+	Atif := NewObservabilityAtifConfig()
+	Atif.Enabled = true
+	Atif.OutputDirectory = Dir
+	Atif.FilenameTemplate = TrajectoryFilenamePrefix + "{session_id}.json"
+	Config.Atif = &Atif
+
+	_, Err := InitializePlugins(PluginConfig{Version: 1, Components: []PluginComponentSpec{ObservabilityComponent(Config)}})
+	requireNoError(t, Err, InitializePluginsFailed)
+}
+
+func EmitAgentTrajectory(t *testing.T, Label string, Name string) *ScopeHandle {
+	t.Helper()
+	Handle := EmitAgentStart(t, Label, Name)
+	EmitAgentEnd(t, Label, Handle)
+	return Handle
+}
+
+func EmitAgentStart(t *testing.T, Label string, Name string) *ScopeHandle {
+	t.Helper()
+	Handle, Err := PushScope(Name, ScopeTypeAgent, WithInput(json.RawMessage(`{"agent":"`+Label+`"}`)))
+	requireNoError(t, Err, "PushScope "+Label+failedSuffix)
+	requireNoError(t, EmitEvent("go-"+Label+"-mark", WithEventParent(Handle), WithEventData(json.RawMessage(`{"agent":"`+Label+`"}`))), "EmitEvent "+Label+failedSuffix)
+	return Handle
+}
+
+func EmitAgentEnd(t *testing.T, Label string, Handle *ScopeHandle) {
+	t.Helper()
+	requireNoError(t, PopScope(Handle, WithOutput(json.RawMessage(`{"done":true}`))), "PopScope "+Label+failedSuffix)
+}
+
+func TrajectoryFilePath(Dir string, Handle *ScopeHandle) string {
+	return filepath.Join(Dir, TrajectoryFilenamePrefix+Handle.UUID()+".json")
+}

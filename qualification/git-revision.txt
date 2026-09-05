@@ -1,0 +1,2 @@
+SOURCE_ARCHIVE
+git metadata unavailable in supplied tree

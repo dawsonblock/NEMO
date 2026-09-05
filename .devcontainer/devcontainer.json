@@ -1,0 +1,21 @@
+{
+  "name": "NeMo Relay 0.9 hardened qualification",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace/NeMo-Relay",
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace/NeMo-Relay,type=bind,consistency=cached"
+  ],
+  "remoteUser": "vscode",
+  "postCreateCommand": "uv sync --locked && npm ci --ignore-scripts",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "charliermarsh.ruff"
+      ]
+    }
+  }
+}

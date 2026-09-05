@@ -1,0 +1,438 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for NeMo Relay subscriber and event handling."""
+
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, cast
+
+import pytest
+
+from nemo_relay import (
+    LLMRequest,
+    MarkEvent,
+    ScopeEvent,
+    ScopeType,
+    ToolExecutionResult,
+    llm,
+    scope,
+    subscribers,
+    tools,
+)
+
+EVENT_VARIANTS = (
+    ScopeEvent,
+    MarkEvent,
+)
+
+
+def make_request():
+    return LLMRequest({}, {"messages": [], "model": "test-model"})
+
+
+def parse_event_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+class TestSubscribers:
+    def test_dispatcher_metrics_are_exposed(self):
+        metrics = subscribers.metrics()
+        assert metrics["relay_event_queue_capacity"] > 0
+        assert metrics["relay_event_queue_depth"] >= 0
+        assert metrics["relay_events_dropped_total"] >= 0
+
+    def test_register_and_deregister(self):
+        events = []
+        subscribers.register("py_test_sub", lambda e: events.append(e))
+        handle = scope.push("sub_test", ScopeType.Function)
+        scope.pop(handle)
+        subscribers.flush()
+        assert subscribers.deregister("py_test_sub")
+        assert len(events) >= 2
+
+    def test_event_emission_does_not_wait_for_blocked_subscriber(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def block(_event: Any) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+
+        subscribers.register("py_blocked_sub", block)
+        try:
+            before = time.perf_counter()
+            scope.event("py_nonblocking_mark")
+            elapsed = time.perf_counter() - before
+            assert started.wait(timeout=2)
+            assert elapsed < 1.0
+        finally:
+            release.set()
+            subscribers.flush()
+            subscribers.deregister("py_blocked_sub")
+
+    def test_flush_waits_for_queued_subscriber_delivery(self):
+        events = []
+        subscribers.register("py_flush_sub", events.append)
+        try:
+            scope.event("py_flush_mark")
+            subscribers.flush()
+            assert any(isinstance(event, MarkEvent) and event.name == "py_flush_mark" for event in events)
+        finally:
+            subscribers.deregister("py_flush_sub")
+
+    def test_subscriber_receives_event_objects(self):
+        events = []
+        subscribers.register("py_evt_sub", events.append)
+        handle = scope.push("evt_obj_test", ScopeType.Agent)
+        scope.pop(handle)
+        subscribers.flush()
+        subscribers.deregister("py_evt_sub")
+
+        assert len(events) >= 2
+        for e in events:
+            assert isinstance(e, EVENT_VARIANTS)
+            assert e.uuid is not None
+            assert e.kind is not None
+
+    def test_duplicate_subscriber_raises(self):
+        subscribers.register("py_dup_sub", lambda e: None)
+        with pytest.raises(RuntimeError):
+            subscribers.register("py_dup_sub", lambda e: None)
+        subscribers.deregister("py_dup_sub")
+
+    def test_deregister_nonexistent(self):
+        assert not subscribers.deregister("nonexistent_sub")
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+    def test_fork_does_not_wait_for_pending_async_sanitizer(self):
+        script = textwrap.dedent(
+            """
+            import asyncio
+            import os
+            import threading
+
+            from nemo_relay import guardrails, scope, subscribers
+
+            entered = threading.Event()
+
+            async def stuck(_event, fields):
+                entered.set()
+                await asyncio.Event().wait()
+                return fields
+
+            subscribers.register("fork-pending-sink", lambda _event: None)
+            guardrails.register_mark_sanitize("fork-pending-sanitizer", 0, stuck)
+            scope.event("fork-pending")
+            assert entered.wait(2)
+            child = os.fork()
+            if child == 0:
+                async def flush():
+                    await asyncio.wait_for(subscribers.flush_async(), timeout=1)
+
+                try:
+                    asyncio.run(flush())
+                except BaseException:
+                    os._exit(42)
+                os._exit(0)
+
+            _, status = os.waitpid(child, 0)
+            os._exit(os.waitstatus_to_exitcode(status))
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_concurrent_cancelled_async_flushes_share_one_bridge_thread(self):
+        script = textwrap.dedent(
+            """
+            import asyncio
+            import threading
+
+            from nemo_relay import subscribers
+
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_flush():
+                entered.set()
+                release.wait(2)
+
+            subscribers._native_flush = blocked_flush
+
+            async def run():
+                tasks = [
+                    asyncio.create_task(subscribers.flush_async())
+                    for _ in range(100)
+                ]
+                assert await asyncio.to_thread(entered.wait, 1)
+                await asyncio.sleep(0.05)
+                bridge_threads = [
+                    thread
+                    for thread in threading.enumerate()
+                    if thread.name == "nemo-relay-flush"
+                ]
+                assert len(bridge_threads) == 1
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                release.set()
+
+            asyncio.run(run())
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_cancelled_async_flush_does_not_block_process_exit(self):
+        script = textwrap.dedent(
+            """
+            import asyncio
+            import threading
+
+            from nemo_relay import guardrails, scope, subscribers
+
+            entered = threading.Event()
+
+            async def stuck(_event, fields):
+                entered.set()
+                await asyncio.Event().wait()
+                return fields
+
+            subscribers.register("cancel-flush-sink", lambda _event: None)
+            guardrails.register_mark_sanitize("cancel-flush-sanitizer", 0, stuck)
+            scope.event("cancel-flush")
+
+            async def run():
+                flush = asyncio.create_task(subscribers.flush_async())
+                assert await asyncio.to_thread(entered.wait, 2)
+                flush.cancel()
+                try:
+                    await flush
+                except asyncio.CancelledError:
+                    pass
+
+            asyncio.run(run())
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+
+class TestSubscriberEventDetails:
+    def test_scope_events_have_correct_types(self):
+        events = []
+        subscribers.register("py_detail_sub", lambda e: events.append(e))
+        handle = scope.push("detail_test", ScopeType.Evaluator)
+        scope.pop(handle)
+        subscribers.flush()
+        subscribers.deregister("py_detail_sub")
+
+        assert len(events) >= 2
+        assert isinstance(events[0], ScopeEvent)
+        assert isinstance(events[1], ScopeEvent)
+        assert events[0].scope_category == "start"
+        assert events[1].scope_category == "end"
+        assert events[0].category == "evaluator"
+        assert events[1].category == "evaluator"
+
+    def test_tool_events(self):
+        events = []
+        subscribers.register("py_tool_evt", lambda e: events.append(e))
+        handle = tools.call("evt_tool", {"x": 1})
+        tools.call_end(handle, ToolExecutionResult({"y": 2}))
+        subscribers.flush()
+        subscribers.deregister("py_tool_evt")
+
+        start_events = [
+            e for e in events if isinstance(e, ScopeEvent) and e.category == "tool" and e.scope_category == "start"
+        ]
+        end_events = [
+            e for e in events if isinstance(e, ScopeEvent) and e.category == "tool" and e.scope_category == "end"
+        ]
+        assert len(start_events) >= 1
+        assert len(end_events) >= 1
+
+    def test_llm_events(self):
+        events = []
+        subscribers.register("py_llm_evt", lambda e: events.append(e))
+        request = make_request()
+        handle = llm.call("evt_llm", request)
+        llm.call_end(handle, {"done": True})
+        subscribers.flush()
+        subscribers.deregister("py_llm_evt")
+
+        start_events = [
+            e for e in events if isinstance(e, ScopeEvent) and e.category == "llm" and e.scope_category == "start"
+        ]
+        end_events = [
+            e for e in events if isinstance(e, ScopeEvent) and e.category == "llm" and e.scope_category == "end"
+        ]
+        assert len(start_events) >= 1
+        assert len(end_events) >= 1
+
+    def test_mark_event(self):
+        events = []
+        subscribers.register("py_mark_evt", lambda e: events.append(e))
+        scope.event("test_mark", data={"info": "test"})
+        subscribers.flush()
+        subscribers.deregister("py_mark_evt")
+
+        mark_events = [e for e in events if isinstance(e, MarkEvent)]
+        assert len(mark_events) >= 1
+
+    def test_manual_lifecycle_timestamps_accept_datetime(self):
+        events = []
+        subscribers.register("py_timestamp_evt", lambda e: events.append(e))
+        timestamps = [
+            datetime(2026, 1, 1, 0, 0, second, 123456 + (second * 1000), tzinfo=timezone.utc) for second in range(7)
+        ]
+        scope_handle = scope.push("py_ts_scope", ScopeType.Agent, timestamp=timestamps[0])
+        scope.event("py_ts_mark", handle=scope_handle, timestamp=timestamps[1])
+        tool_handle = tools.call("py_ts_tool", {"x": 1}, timestamp=timestamps[2])
+        tools.call_end(tool_handle, ToolExecutionResult({"ok": True}), timestamp=timestamps[3])
+        llm_handle = llm.call("py_ts_llm", make_request(), timestamp=timestamps[4])
+        llm.call_end(llm_handle, {"ok": True}, timestamp=timestamps[5])
+        scope.pop(scope_handle, timestamp=timestamps[6])
+        subscribers.flush()
+        subscribers.deregister("py_timestamp_evt")
+
+        observed = [
+            (event.name, parse_event_timestamp(event.timestamp)) for event in events if event.name.startswith("py_ts_")
+        ]
+        assert observed == [
+            ("py_ts_scope", timestamps[0]),
+            ("py_ts_mark", timestamps[1]),
+            ("py_ts_tool", timestamps[2]),
+            ("py_ts_tool", timestamps[3]),
+            ("py_ts_llm", timestamps[4]),
+            ("py_ts_llm", timestamps[5]),
+            ("py_ts_scope", timestamps[6]),
+        ]
+
+    @pytest.mark.parametrize(
+        ("bad_timestamp", "error_type", "message"),
+        [
+            (cast(Any, "2026-01-01T00:00:00Z"), TypeError, "datetime.datetime"),
+            (datetime(2026, 1, 1), ValueError, "timezone-aware"),
+        ],
+    )
+    def test_manual_lifecycle_timestamps_reject_invalid_datetime_values(self, bad_timestamp, error_type, message):
+        with pytest.raises(error_type, match=message):
+            scope.push("py_bad_ts_scope_start", ScopeType.Agent, timestamp=bad_timestamp)
+
+        scope_handle = scope.push("py_bad_ts_scope", ScopeType.Agent)
+        try:
+            with pytest.raises(error_type, match=message):
+                scope.event("py_bad_ts_mark", handle=scope_handle, timestamp=bad_timestamp)
+
+            with pytest.raises(error_type, match=message):
+                tools.call("py_bad_ts_tool_start", {"x": 1}, timestamp=bad_timestamp)
+
+            tool_handle = tools.call("py_bad_ts_tool", {"x": 1})
+            try:
+                with pytest.raises(error_type, match=message):
+                    tools.call_end(tool_handle, ToolExecutionResult({"ok": True}), timestamp=bad_timestamp)
+            finally:
+                tools.call_end(tool_handle, ToolExecutionResult({"ok": True}))
+
+            with pytest.raises(error_type, match=message):
+                llm.call("py_bad_ts_llm_start", make_request(), timestamp=bad_timestamp)
+
+            llm_handle = llm.call("py_bad_ts_llm", make_request())
+            try:
+                with pytest.raises(error_type, match=message):
+                    llm.call_end(llm_handle, {"ok": True}, timestamp=bad_timestamp)
+            finally:
+                llm.call_end(llm_handle, {"ok": True})
+
+            with pytest.raises(error_type, match=message):
+                scope.pop(scope_handle, timestamp=bad_timestamp)
+        finally:
+            scope.pop(scope_handle)
+
+    @pytest.mark.parametrize(
+        ("bad_timestamp", "error_type", "message"),
+        [
+            (cast(Any, "2026-01-01T00:00:00Z"), TypeError, "datetime.datetime"),
+            (datetime(2026, 1, 1), ValueError, "timezone-aware"),
+        ],
+    )
+    def test_scope_context_manager_timestamps_reject_invalid_datetime_values(self, bad_timestamp, error_type, message):
+        with pytest.raises(error_type, match=message):
+            with scope.scope("py_bad_ts_context_start", ScopeType.Agent, timestamp=bad_timestamp):
+                raise AssertionError("invalid start timestamp should fail before entering the body")
+
+        pushed_handle = None
+        with pytest.raises(error_type, match=message):
+            with scope.scope("py_bad_ts_context_end", ScopeType.Agent, end_timestamp=bad_timestamp) as handle:
+                pushed_handle = handle
+        if pushed_handle is not None:
+            scope.pop(pushed_handle)
+
+
+class TestHandleProperties:
+    def test_scope_handle_all_properties(self):
+        handle = scope.push("prop_test", ScopeType.Embedder)
+        assert isinstance(handle.uuid, str)
+        assert len(handle.uuid) > 0
+        assert handle.name == "prop_test"
+        assert handle.scope_type == ScopeType.Embedder
+        assert handle.parent_uuid is not None  # root is parent
+        # data and metadata are None by default for scope handles
+        scope.pop(handle)
+
+    def test_tool_handle_all_properties(self):
+        handle = tools.call("prop_tool", {"x": 1}, data={"d": "v"}, metadata={"m": "v"})
+        assert isinstance(handle.uuid, str)
+        assert handle.name == "prop_tool"
+        # data includes sanitized_args from the call
+        assert handle.data is not None
+        tools.call_end(handle, ToolExecutionResult({}))
+
+    def test_llm_handle_all_properties(self):
+        request = make_request()
+        handle = llm.call("prop_llm", request, data={"d": 1}, metadata={"m": 2})
+        assert isinstance(handle.uuid, str)
+        assert handle.name == "prop_llm"
+        assert handle.data is not None
+        llm.call_end(handle, {})
+
+    def test_event_all_properties(self):
+        events = []
+        subscribers.register("py_prop_evt", lambda e: events.append(e))
+        scope.event("prop_mark", data={"key": "val"}, metadata={"meta": "data"})
+        subscribers.flush()
+        subscribers.deregister("py_prop_evt")
+
+        assert len(events) >= 1
+        e = events[0]
+        assert isinstance(e, MarkEvent)
+        assert isinstance(e.uuid, str)
+        assert e.name == "prop_mark"
+        assert e.kind == "mark"
+        assert e.timestamp is not None
+        assert isinstance(e.timestamp, str)

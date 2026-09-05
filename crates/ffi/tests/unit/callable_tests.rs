@@ -1,0 +1,749 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Unit tests for callable in the NeMo Relay FFI crate.
+
+use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use nemo_relay::api::event::{Event, EventSanitizeFields};
+use nemo_relay::api::llm::{LlmAttributes, LlmHandle};
+use nemo_relay::api::tool::ToolExecutionResult;
+use serde_json::json;
+use tokio_stream::StreamExt;
+
+use super::test_support::resolve;
+
+extern "C" fn free_arc_counter(user_data: *mut libc::c_void) {
+    let counter = unsafe { Box::from_raw(user_data as *mut Arc<AtomicUsize>) };
+    counter.fetch_add(1, Ordering::SeqCst);
+}
+
+fn user_data_counter() -> (*mut libc::c_void, Arc<AtomicUsize>) {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let ptr = Box::into_raw(Box::new(counter.clone())) as *mut libc::c_void;
+    (ptr, counter)
+}
+
+unsafe extern "C" fn tool_sanitize_cb(
+    user_data: *mut libc::c_void,
+    name: *const c_char,
+    args_json: *const c_char,
+) -> *mut c_char {
+    let counter = unsafe { &*(user_data as *const Arc<AtomicUsize>) };
+    counter.fetch_add(1, Ordering::SeqCst);
+    let mut args: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(args_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap();
+    args["name"] = json!(unsafe { CStr::from_ptr(name) }.to_str().unwrap_or_default());
+    CString::new(args.to_string()).unwrap().into_raw()
+}
+
+unsafe extern "C" fn tool_conditional_cb(
+    _user_data: *mut libc::c_void,
+    _name: *const c_char,
+    args_json: *const c_char,
+) -> *mut c_char {
+    let args: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(args_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap();
+    if args["block"] == json!(true) {
+        CString::new("blocked").unwrap().into_raw()
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+unsafe extern "C" fn tool_exec_cb(
+    _user_data: *mut libc::c_void,
+    args_json: *const c_char,
+) -> *mut c_char {
+    let mut args: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(args_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap();
+    args["executed"] = json!(true);
+    CString::new(json!({ "result": args, "annotation": { "source": "ffi" } }).to_string())
+        .unwrap()
+        .into_raw()
+}
+
+unsafe extern "C" fn tool_exec_error_cb(
+    _user_data: *mut libc::c_void,
+    _args_json: *const c_char,
+) -> *mut c_char {
+    set_last_error("tool callback failed");
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn legacy_tool_exec_cb(
+    _user_data: *mut libc::c_void,
+    _args_json: *const c_char,
+) -> *mut c_char {
+    CString::new(r#"{"legacy_result":true}"#)
+        .unwrap()
+        .into_raw()
+}
+
+unsafe extern "C" fn tool_exec_intercept_cb(
+    _user_data: *mut libc::c_void,
+    args_json: *const c_char,
+    next_fn: NemoRelayToolExecNextFn,
+    next_ctx: *mut libc::c_void,
+) -> *mut c_char {
+    let result_ptr = unsafe { next_fn(args_json, next_ctx) };
+    if result_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut execution_result: Json =
+        serde_json::from_str(unsafe { CStr::from_ptr(result_ptr) }.to_str().unwrap()).unwrap();
+    unsafe { nemo_relay_string_free_internal(result_ptr) };
+    execution_result["result"]["intercepted"] = json!(true);
+    CString::new(
+        json!({
+            "result": execution_result["result"],
+            "annotation": execution_result["annotation"],
+            "pending_marks": [{
+                "name": "ffi.tool.execution",
+                "category": "custom",
+                "category_profile": { "subtype": "ffi.tool.execution" },
+                "data": { "source": "c" },
+                "metadata": { "fixture": true },
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_raw()
+}
+
+unsafe extern "C" fn tool_exec_legacy_intercept_cb(
+    _user_data: *mut libc::c_void,
+    _args_json: *const c_char,
+    _next_fn: NemoRelayToolExecNextFn,
+    _next_ctx: *mut libc::c_void,
+) -> *mut c_char {
+    CString::new(r#"{"legacy_result":true}"#)
+        .unwrap()
+        .into_raw()
+}
+
+/// Intercept-specific callback with the unified annotated-aware signature
+/// for callable.rs unit tests.
+unsafe extern "C" fn llm_request_intercept_cb(
+    _user_data: *mut libc::c_void,
+    _name: *const c_char,
+    request: *const FfiLLMRequest,
+    annotated_json: *const c_char,
+    out_outcome_json: *mut *mut c_char,
+) -> NemoRelayStatus {
+    let mut req = unsafe { (&*request).0.clone() };
+    req.content["intercepted"] = json!(true);
+    let annotated = if annotated_json.is_null() {
+        Json::Null
+    } else {
+        let s = unsafe { CStr::from_ptr(annotated_json) }
+            .to_string_lossy()
+            .into_owned();
+        serde_json::from_str(&s).unwrap()
+    };
+    let outcome = json!({
+        "request": req,
+        "annotated_request": annotated,
+        "pending_marks": [],
+    });
+    unsafe { *out_outcome_json = CString::new(outcome.to_string()).unwrap().into_raw() };
+    NemoRelayStatus::Ok
+}
+
+unsafe extern "C" fn llm_request_null_cb(
+    _user_data: *mut libc::c_void,
+    _request: *const FfiLLMRequest,
+    _context: NemoRelayLlmSanitizeRequestContext,
+) -> *mut FfiLLMRequest {
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn llm_request_alias_cb(
+    _user_data: *mut libc::c_void,
+    request: *const FfiLLMRequest,
+    _context: NemoRelayLlmSanitizeRequestContext,
+) -> *mut FfiLLMRequest {
+    request.cast_mut()
+}
+
+unsafe extern "C" fn llm_conditional_cb(
+    _user_data: *mut libc::c_void,
+    request: *const FfiLLMRequest,
+) -> *mut c_char {
+    if unsafe { (&*request).0.content.get("block").cloned() } == Some(json!(true)) {
+        CString::new("blocked llm").unwrap().into_raw()
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+unsafe extern "C" fn json_cb(
+    _user_data: *mut libc::c_void,
+    json: *const c_char,
+    _context: NemoRelayLlmSanitizeResponseContext,
+) -> *mut c_char {
+    let mut value: Json =
+        serde_json::from_str(unsafe { CStr::from_ptr(json) }.to_str().unwrap()).unwrap();
+    value["wrapped"] = json!(true);
+    CString::new(value.to_string()).unwrap().into_raw()
+}
+
+unsafe extern "C" fn json_alias_cb(
+    _user_data: *mut libc::c_void,
+    json: *const c_char,
+    _context: NemoRelayLlmSanitizeResponseContext,
+) -> *mut c_char {
+    json.cast_mut()
+}
+
+unsafe extern "C" fn invalid_json_cb(
+    _user_data: *mut libc::c_void,
+    _json: *const c_char,
+    _context: NemoRelayLlmSanitizeResponseContext,
+) -> *mut c_char {
+    CString::new("not-json").unwrap().into_raw()
+}
+
+unsafe extern "C" fn invalid_utf8_cb(
+    _user_data: *mut libc::c_void,
+    _json: *const c_char,
+    _context: NemoRelayLlmSanitizeResponseContext,
+) -> *mut c_char {
+    CString::new([0xff]).unwrap().into_raw()
+}
+
+unsafe extern "C" fn llm_exec_cb(
+    _user_data: *mut libc::c_void,
+    native_json: *const c_char,
+) -> *mut c_char {
+    let request: Json =
+        serde_json::from_str(unsafe { CStr::from_ptr(native_json) }.to_str().unwrap()).unwrap();
+    let response = json!({
+        "model": request["content"]["model"].clone(),
+        "ok": true,
+    });
+    CString::new(response.to_string()).unwrap().into_raw()
+}
+
+unsafe extern "C" fn llm_exec_error_cb(
+    _user_data: *mut libc::c_void,
+    _native_json: *const c_char,
+) -> *mut c_char {
+    set_last_error("llm callback failed");
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn llm_exec_intercept_cb(
+    _user_data: *mut libc::c_void,
+    native_json: *const c_char,
+    next_fn: NemoRelayLlmExecNextFn,
+    next_ctx: *mut libc::c_void,
+) -> *mut c_char {
+    let result_ptr = unsafe { next_fn(native_json, next_ctx) };
+    if result_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut value: Json =
+        serde_json::from_str(unsafe { CStr::from_ptr(result_ptr) }.to_str().unwrap()).unwrap();
+    unsafe { nemo_relay_string_free_internal(result_ptr) };
+    value["intercepted"] = json!(true);
+    CString::new(value.to_string()).unwrap().into_raw()
+}
+
+unsafe extern "C" fn llm_exec_short_circuit_cb(
+    _user_data: *mut libc::c_void,
+    native_json: *const c_char,
+    _next_fn: NemoRelayLlmExecNextFn,
+    _next_ctx: *mut libc::c_void,
+) -> *mut c_char {
+    let request: Json =
+        serde_json::from_str(unsafe { CStr::from_ptr(native_json) }.to_str().unwrap()).unwrap();
+    let response = json!({
+        "model": request["content"]["model"].clone(),
+        "intercepted": true,
+    });
+    CString::new(response.to_string()).unwrap().into_raw()
+}
+
+static COLLECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn collector_cb(_chunk: *const c_char) {
+    COLLECTED_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn finalizer_cb() -> *mut c_char {
+    CString::new(r#"{"done":true}"#).unwrap().into_raw()
+}
+
+unsafe extern "C" fn subscriber_cb(user_data: *mut libc::c_void, event: *const FfiEvent) {
+    let counter = unsafe { &*(user_data as *const Arc<AtomicUsize>) };
+    if unsafe { (&*event).0.name() } == "ffi-event" {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+unsafe extern "C" fn event_sanitize_cb(
+    user_data: *mut libc::c_void,
+    event: *const FfiEvent,
+    fields_json: *const c_char,
+) -> *mut c_char {
+    let counter = unsafe { &*(user_data as *const Arc<AtomicUsize>) };
+    counter.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(unsafe { (&*event).0.name() }, "ffi-event");
+    let mut fields: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(fields_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap();
+    fields["data"] = json!({"safe": true});
+    fields["category_profile"] = json!({"subtype": "ffi"});
+    fields["metadata"] = Json::Null;
+    CString::new(fields.to_string()).unwrap().into_raw()
+}
+
+unsafe extern "C" fn invalid_event_sanitize_cb(
+    _user_data: *mut libc::c_void,
+    _event: *const FfiEvent,
+    _fields_json: *const c_char,
+) -> *mut c_char {
+    CString::new("invalid-json").unwrap().into_raw()
+}
+
+unsafe extern "C" fn null_event_sanitize_cb(
+    _user_data: *mut libc::c_void,
+    _event: *const FfiEvent,
+    _fields_json: *const c_char,
+) -> *mut c_char {
+    std::ptr::null_mut()
+}
+
+fn make_request() -> LlmRequest {
+    LlmRequest {
+        headers: serde_json::Map::new(),
+        content: json!({"model": "test-model"}),
+    }
+}
+
+#[test]
+fn test_wrap_tool_request_and_conditional_callbacks() {
+    let (user_data, called) = user_data_counter();
+    let wrapped = wrap_tool_sanitize_fn(tool_sanitize_cb, user_data, Some(free_arc_counter));
+    let result = resolve(wrapped("tool-name".into(), json!({"value": 1}))).unwrap();
+    assert_eq!(result["value"], json!(1));
+    assert_eq!(result["name"], json!("tool-name"));
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+    drop(wrapped);
+    assert_eq!(called.load(Ordering::SeqCst), 2);
+
+    let wrapped_conditional =
+        wrap_tool_conditional_fn(tool_conditional_cb, std::ptr::null_mut(), None);
+    assert_eq!(
+        resolve(wrapped_conditional("tool".into(), json!({"block": true}))).unwrap(),
+        Some("blocked".into())
+    );
+    assert_eq!(
+        resolve(wrapped_conditional("tool".into(), json!({"block": false}))).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_wrap_tool_exec_and_intercept_callbacks() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let exec = wrap_tool_exec_fn(tool_exec_cb, std::ptr::null_mut(), None);
+    let result = runtime.block_on(exec(json!({"value": 2}))).unwrap();
+    assert_eq!(result.result["executed"], json!(true));
+    assert_eq!(result.annotation, Some(json!({ "source": "ffi" })));
+
+    let exec_err = wrap_tool_exec_fn(tool_exec_error_cb, std::ptr::null_mut(), None);
+    let err = runtime.block_on(exec_err(json!({}))).unwrap_err();
+    assert!(err.to_string().contains("tool callback failed"));
+
+    let legacy_exec = wrap_tool_exec_fn(legacy_tool_exec_cb, std::ptr::null_mut(), None);
+    let err = runtime.block_on(legacy_exec(json!({}))).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("invalid tool execution result JSON")
+    );
+
+    let intercept = wrap_tool_exec_intercept_fn(tool_exec_intercept_cb, std::ptr::null_mut(), None);
+    let next: ToolExecutionNextFn = Arc::new(|args| {
+        Box::pin(async move {
+            Ok(ToolExecutionResult {
+                result: json!({"from_next": args}),
+                annotation: Some(json!({ "from": "next" })),
+            })
+        })
+    });
+    let intercepted = runtime
+        .block_on(intercept("tool", json!({"v": 1}), next))
+        .unwrap();
+    assert_eq!(intercepted.result["intercepted"], json!(true));
+    assert_eq!(intercepted.result["from_next"]["v"], json!(1));
+    assert_eq!(intercepted.annotation, Some(json!({ "from": "next" })));
+    assert_eq!(intercepted.pending_marks.len(), 1);
+    let mark = &intercepted.pending_marks[0];
+    assert_eq!(mark.name, "ffi.tool.execution");
+    assert_eq!(
+        mark.category.as_ref().map(|category| category.as_str()),
+        Some("custom")
+    );
+    assert_eq!(
+        mark.category_profile
+            .as_ref()
+            .and_then(|profile| profile.subtype.as_deref()),
+        Some("ffi.tool.execution")
+    );
+    assert_eq!(mark.data.as_ref().unwrap()["source"], "c");
+    assert_eq!(mark.metadata.as_ref().unwrap()["fixture"], true);
+
+    let legacy_intercept =
+        wrap_tool_exec_intercept_fn(tool_exec_legacy_intercept_cb, std::ptr::null_mut(), None);
+    let next: ToolExecutionNextFn =
+        Arc::new(|args| Box::pin(async move { Ok(ToolExecutionResult::new(args)) }));
+    let err = runtime
+        .block_on(legacy_intercept("tool", json!({}), next))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("invalid tool execution intercept outcome JSON")
+    );
+
+    let failing_intercept =
+        wrap_tool_exec_intercept_fn(tool_exec_intercept_cb, std::ptr::null_mut(), None);
+    let failing_next: ToolExecutionNextFn =
+        Arc::new(|_| Box::pin(async { Err(FlowError::Internal("next failed".into())) }));
+    let err = runtime
+        .block_on(failing_intercept("tool", json!({"v": 2}), failing_next))
+        .unwrap_err();
+    assert!(err.to_string().contains("next failed"));
+}
+
+#[test]
+fn test_wrap_llm_request_response_and_conditional_callbacks() {
+    let request_intercept =
+        wrap_llm_request_intercept_fn(llm_request_intercept_cb, std::ptr::null_mut(), None);
+    let outcome = resolve(request_intercept("llm".into(), make_request(), None)).unwrap();
+    assert_eq!(outcome.request.content["intercepted"], json!(true));
+
+    let sanitize_request =
+        wrap_llm_sanitize_request_fn(llm_request_null_cb, std::ptr::null_mut(), None);
+    assert_eq!(
+        resolve(sanitize_request(
+            make_request(),
+            nemo_relay::api::runtime::LlmSanitizeRequestContext::default(),
+        ))
+        .unwrap(),
+        None
+    );
+
+    let alias_request =
+        wrap_llm_sanitize_request_fn(llm_request_alias_cb, std::ptr::null_mut(), None);
+    assert_eq!(
+        resolve(alias_request(
+            make_request(),
+            nemo_relay::api::runtime::LlmSanitizeRequestContext::default(),
+        ))
+        .unwrap(),
+        Some(make_request())
+    );
+
+    let conditional = wrap_llm_conditional_fn(llm_conditional_cb, std::ptr::null_mut(), None);
+    assert_eq!(
+        resolve(conditional(LlmRequest {
+            headers: serde_json::Map::new(),
+            content: json!({"block": true}),
+        }))
+        .unwrap(),
+        Some("blocked llm".into())
+    );
+    assert_eq!(resolve(conditional(make_request())).unwrap(), None);
+
+    let wrapped_response = wrap_llm_sanitize_response_fn(json_cb, std::ptr::null_mut(), None);
+    assert_eq!(
+        resolve(wrapped_response(
+            json!({"value": 2}),
+            nemo_relay::api::runtime::LlmSanitizeResponseContext::default(),
+        ))
+        .unwrap()
+        .unwrap()["wrapped"],
+        json!(true)
+    );
+
+    let alias_response = wrap_llm_sanitize_response_fn(json_alias_cb, std::ptr::null_mut(), None);
+    assert_eq!(
+        resolve(alias_response(
+            json!({"value": 2}),
+            nemo_relay::api::runtime::LlmSanitizeResponseContext::default(),
+        ))
+        .unwrap(),
+        Some(json!({"value": 2}))
+    );
+
+    for callback in [invalid_json_cb, invalid_utf8_cb] {
+        let malformed_response =
+            wrap_llm_sanitize_response_fn(callback, std::ptr::null_mut(), None);
+        let error = resolve(malformed_response(
+            json!({"secret": "must be preserved"}),
+            nemo_relay::api::runtime::LlmSanitizeResponseContext::default(),
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid"),
+            "unexpected sanitizer error: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_llm_sanitizers_report_runtime_codec_ids_with_embedded_nul() {
+    let runtime_identity =
+        nemo_relay::api::runtime::LlmCodecIdentity::Runtime("runtime\0codec".to_string());
+
+    let request_sanitizer =
+        wrap_llm_sanitize_request_fn(llm_request_alias_cb, std::ptr::null_mut(), None);
+    let request_error = resolve(request_sanitizer(
+        make_request(),
+        nemo_relay::api::runtime::LlmSanitizeRequestContext::with_identity(
+            runtime_identity.clone(),
+        ),
+    ))
+    .unwrap_err();
+    assert!(
+        request_error
+            .to_string()
+            .contains("runtime codec ID contains an embedded NUL")
+    );
+    assert!(
+        last_error_message()
+            .unwrap()
+            .contains("runtime codec ID contains an embedded NUL")
+    );
+
+    let response_sanitizer =
+        wrap_llm_sanitize_response_fn(json_alias_cb, std::ptr::null_mut(), None);
+    let response_error = resolve(response_sanitizer(
+        json!({"secret": "must be preserved"}),
+        nemo_relay::api::runtime::LlmSanitizeResponseContext::with_identity(runtime_identity),
+    ))
+    .unwrap_err();
+    assert!(
+        response_error
+            .to_string()
+            .contains("runtime codec ID contains an embedded NUL")
+    );
+    assert!(
+        last_error_message()
+            .unwrap()
+            .contains("runtime codec ID contains an embedded NUL")
+    );
+}
+
+#[test]
+fn test_wrap_llm_request_intercept_with_annotated_input() {
+    let request_intercept =
+        wrap_llm_request_intercept_fn(llm_request_intercept_cb, std::ptr::null_mut(), None);
+    let annotated = nemo_relay::codec::request::AnnotatedLlmRequest {
+        instructions: None,
+        api_specific: None,
+        messages: vec![],
+        model: Some("test-model".into()),
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::from_iter([("annotated".into(), json!(true))]),
+    };
+    let outcome = resolve(request_intercept(
+        "llm".into(),
+        make_request(),
+        Some(annotated),
+    ))
+    .unwrap();
+    assert_eq!(outcome.request.content["intercepted"], json!(true));
+    let annotated_out = outcome
+        .annotated_request
+        .expect("expected annotated request output");
+    assert_eq!(annotated_out.model.as_deref(), Some("test-model"));
+    assert_eq!(annotated_out.extra.get("annotated"), Some(&json!(true)));
+}
+
+#[test]
+fn test_wrap_llm_exec_stream_and_event_callbacks() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    assert_llm_exec_callbacks(&runtime);
+    assert_llm_stream_callbacks(&runtime);
+    assert_collector_and_finalizer_callbacks();
+    assert_event_callbacks();
+}
+
+fn assert_llm_exec_callbacks(runtime: &tokio::runtime::Runtime) {
+    let exec = wrap_llm_exec_fn(llm_exec_cb, std::ptr::null_mut(), None);
+    let result = runtime.block_on(exec(make_request())).unwrap();
+    assert_eq!(result["ok"], json!(true));
+    assert_eq!(result["model"], json!("test-model"));
+
+    let exec_err = wrap_llm_exec_fn(llm_exec_error_cb, std::ptr::null_mut(), None);
+    let err = runtime.block_on(exec_err(make_request())).unwrap_err();
+    assert!(err.to_string().contains("llm callback failed"));
+
+    let intercept = wrap_llm_exec_intercept_fn(llm_exec_intercept_cb, std::ptr::null_mut(), None);
+    let next: LlmExecutionNextFn =
+        Arc::new(|request| Box::pin(async move { Ok(json!({"model": request.content["model"]})) }));
+    let intercepted = runtime
+        .block_on(intercept("llm", make_request(), next))
+        .unwrap();
+    assert_eq!(intercepted["intercepted"], json!(true));
+}
+
+fn assert_llm_stream_callbacks(runtime: &tokio::runtime::Runtime) {
+    let stream_exec = wrap_llm_stream_exec_fn(llm_exec_cb, std::ptr::null_mut(), None);
+    let mut stream = runtime.block_on(stream_exec(make_request())).unwrap();
+    let first = runtime.block_on(async { stream.next().await.unwrap().unwrap() });
+    assert_eq!(first["ok"], json!(true));
+
+    let stream_intercept =
+        wrap_llm_stream_exec_intercept_fn(llm_exec_short_circuit_cb, std::ptr::null_mut(), None);
+    let next_stream: LlmStreamExecutionNextFn = Arc::new(|_request| {
+        Box::pin(async {
+            Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                tokio_stream::iter(vec![Ok(json!({"ignored": true}))]),
+            ))
+        })
+    });
+    let mut intercepted_stream = runtime
+        .block_on(stream_intercept("llm", make_request(), next_stream))
+        .unwrap();
+    let first = runtime.block_on(async { intercepted_stream.next().await.unwrap().unwrap() });
+    assert_eq!(first["intercepted"], json!(true));
+
+    let stream_intercept_with_next =
+        wrap_llm_stream_exec_intercept_fn(llm_exec_intercept_cb, std::ptr::null_mut(), None);
+    let next_stream: LlmStreamExecutionNextFn = Arc::new(|request| {
+        Box::pin(async move {
+            Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                tokio_stream::iter(vec![Ok(json!({
+                    "model": request.content["model"].clone()
+                }))]),
+            ))
+        })
+    });
+    let mut intercepted_stream = runtime
+        .block_on(stream_intercept_with_next(
+            "llm",
+            make_request(),
+            next_stream,
+        ))
+        .unwrap();
+    let first = runtime.block_on(async { intercepted_stream.next().await.unwrap().unwrap() });
+    assert_eq!(first["intercepted"], json!(true));
+    assert_eq!(first["model"], json!("test-model"));
+}
+
+fn assert_collector_and_finalizer_callbacks() {
+    COLLECTED_COUNT.store(0, Ordering::SeqCst);
+    let mut collector = wrap_collector_fn(collector_cb);
+    collector(json!({"chunk": 1})).unwrap();
+    assert_eq!(COLLECTED_COUNT.load(Ordering::SeqCst), 1);
+
+    let finalizer = wrap_finalizer_fn(finalizer_cb);
+    assert_eq!(finalizer(), json!({"done": true}));
+}
+
+fn assert_event_callbacks() {
+    let (user_data, seen) = user_data_counter();
+    let subscriber = wrap_event_subscriber(subscriber_cb, user_data, Some(free_arc_counter));
+    let event = Event::Scope(nemo_relay::api::event::ScopeEvent::new(
+        nemo_relay::api::event::BaseEvent::builder()
+            .name("ffi-event")
+            .build(),
+        nemo_relay::api::event::ScopeCategory::Start,
+        Vec::new(),
+        nemo_relay::api::event::EventCategory::llm(),
+        Some(
+            nemo_relay::api::event::CategoryProfile::builder()
+                .model_name("test-model")
+                .build(),
+        ),
+    ));
+    subscriber(&event);
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    drop(subscriber);
+    assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+    let original_fields = EventSanitizeFields::builder()
+        .data(json!({"secret": true}))
+        .metadata(json!({"trace": true}))
+        .build();
+    let (user_data, sanitize_calls) = user_data_counter();
+    let sanitizer = wrap_event_sanitize_fn(event_sanitize_cb, user_data, Some(free_arc_counter));
+    let sanitized = resolve(sanitizer(Arc::new(event.clone()), original_fields.clone())).unwrap();
+    assert_eq!(sanitized.data, Some(json!({"safe": true})));
+    assert_eq!(
+        sanitized
+            .category_profile
+            .as_ref()
+            .and_then(|profile| profile.subtype.as_deref()),
+        Some("ffi")
+    );
+    assert_eq!(sanitized.metadata, None);
+    assert_eq!(sanitize_calls.load(Ordering::SeqCst), 1);
+    drop(sanitizer);
+    assert_eq!(sanitize_calls.load(Ordering::SeqCst), 2);
+
+    let invalid = wrap_event_sanitize_fn(invalid_event_sanitize_cb, std::ptr::null_mut(), None);
+    assert!(
+        resolve(invalid(Arc::new(event.clone()), original_fields.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid event sanitizer result")
+    );
+    let null = wrap_event_sanitize_fn(null_event_sanitize_cb, std::ptr::null_mut(), None);
+    assert!(
+        resolve(null(Arc::new(event), original_fields.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid event sanitizer result")
+    );
+
+    let handle = LlmHandle::builder()
+        .name("llm")
+        .attributes(LlmAttributes::STATEFUL)
+        .build();
+    assert_eq!(handle.name, "llm");
+}

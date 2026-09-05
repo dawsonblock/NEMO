@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Docs: https://docs.coderabbit.ai/reference/configuration
+language: "en-US"
+tone_instructions: "Be concise, technical, and specific. Prioritize correctness, safety, and maintainability over style nits."
+
+reviews:
+  profile: assertive
+  review_status: true
+  review_details: true
+  collapse_walkthrough: false
+  pre_merge_checks:
+    title:
+      mode: error
+      requirements: >-
+        Title must follow Conventional Commits format:
+        type(optional-scope)[!]: concise imperative summary
+
+        Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
+        Use lowercase type and scope. If the change is a breaking change, a ! suffix is required before the colon.
+        Keep it under 72 characters and do not use a trailing period.
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
+  auto_title_placeholder: "@coderabbitai"
+  auto_title_instructions: |
+    Generate the PR title using Conventional Commits format:
+    type(optional-scope)[!]: concise imperative summary
+
+    Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
+    Prefer scopes from this repository when clear: core, adaptive, python, ffi, node, go, docs, ci, deps
+    Use lowercase type and scope. If the change is a breaking change, add a ! suffix before the colon.
+    Keep it under 72 characters and do not use a trailing period.
+  auto_review:
+    base_branches: ["main", "release/.*"]
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+
+  path_filters:
+    - "!target/**"
+    - "!**/target/**"
+    - "!.venv/**"
+    - "!**/.venv/**"
+    - "!**/node_modules/**"
+    - "!crates/node/coverage/**"
+    - "!**/.pytest_cache/**"
+    - "!**/.ruff_cache/**"
+    - "!**/.scannerwork/**"
+    - "!**/junit.xml"
+    - "!**/*.profraw"
+    - "!**/*.profdata"
+    - "!**/*.lcov"
+
+  path_instructions:
+    - path: "crates/{core,adaptive}/**/*.rs"
+      instructions: |
+        Review the Rust runtime for async correctness, scope isolation, middleware ordering, and event lifecycle regressions.
+        Pay close attention to task-local/thread-local scope propagation, callback lifetimes, stream finalization, and root_uuid isolation.
+        Public API changes should preserve existing behavior unless tests and docs show the intended migration path.
+    - path: "crates/{python,ffi,node}/**/*"
+      instructions: |
+        Treat binding changes as public API changes. Check for parity with the other language bindings, FFI ownership/lifetime safety,
+        callback error propagation, stable type conversion, and consistent async/stream semantics.
+        Flag changes that update one binding without corresponding tests or documentation for the same surface elsewhere.
+    - path: "python/nemo_relay/**/*"
+      instructions: |
+        Review Python wrapper changes for typed API consistency, contextvars-based scope isolation, async behavior, and parity with the native extension.
+        Stubs and runtime implementations should stay aligned.
+    - path: "go/nemo_relay/**/*"
+      instructions: |
+        Review Go binding changes for cgo memory ownership, race safety, callback cleanup, idiomatic exported APIs, and parity with Rust/FFI behavior.
+        Any API change should include focused Go tests and consider race-test behavior.
+    - path: "{crates/**/tests/**,python/tests/**,go/nemo_relay/**/*_test.go}"
+      instructions: |
+        Tests should cover the behavior promised by the changed API surface, including error paths and cross-request isolation where relevant.
+        Prefer assertions on lifecycle events, scope stacks, middleware ordering, and binding parity over shallow smoke tests.
+    - path: "{docs/**,README.md,CONTRIBUTING.md,RELEASING.md,SECURITY.md}"
+      instructions: |
+        Review documentation for technical accuracy against the current API, command correctness, and consistency across language bindings.
+        Flag stale examples, missing SPDX headers where required, and instructions that no longer match CI or pre-commit behavior.
+    - path: "**/SKILL.md"
+      instructions: |
+        Do not flag SKILL.md files for missing SPDX headers. Skill entrypoints intentionally start with YAML frontmatter instead.
+        Verify that every SKILL.md keeps valid YAML frontmatter with at least name and description fields before the Markdown body.
+    - path: "{.github/**,.gitlab-ci.yml,.pre-commit-config.yaml,justfile,scripts/**}"
+      instructions: |
+        Review automation changes for reproducibility, pinned versions where appropriate, secret handling, and consistency with the documented validation matrix.
+        Pay attention to commands that need generated native artifacts, FFI libraries, or platform-specific environment variables.
+
+  poem: false
+  sequence_diagrams: true
+  suggested_reviewers: false
+
+  tools:
+    actionlint:
+      enabled: true
+    clippy:
+      enabled: true
+    golangci-lint:
+      enabled: true
+    ruff:
+      enabled: true
+    shellcheck:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    osvScanner:
+      enabled: true
+    semgrep:
+      enabled: true
+
+  auto_apply_labels: true
+  labeling_instructions:
+    - label: DO NOT MERGE
+      instructions: >-
+        Apply this label to PRs that should not be merged due to critical issues, incomplete work, or other blocking
+        concerns. Check the PR description for specific details about why it should not be merged. There is no need to
+        apply this label to draft PRs.
+    - label: duplicate
+      instructions: >-
+        Apply this label when the PR addresses the same issue or implements the same feature as another existing
+        PR or issue.
+    - label: invalid
+      instructions: >-
+        Apply this label when the PR contains invalid changes, doesn't follow project guidelines, or has fundamental
+        issues that make it unsuitable for the project.
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "AGENTS.md"
+      - "CLAUDE.md"
+      - "CONTRIBUTING.md"
+      - ".agents/skills/**/*.md"

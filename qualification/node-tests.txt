@@ -1,0 +1,1 @@
+Node.js 24+ and just are required

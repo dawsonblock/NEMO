@@ -1,0 +1,156 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: License Diff
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: 'The comparison base used for the license diff'
+        required: false
+        default: ''
+        type: string
+      default_branch:
+        description: 'The repository default branch used as the fallback comparison base'
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON_PREFERENCE: only-system
+
+jobs:
+  license-diff:
+    name: Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ github.workspace }}/uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: cargo-about@${{ steps.ci-config.outputs.cargo_about_version }}
+
+      - name: Compare lockfile licenses
+        id: compare
+        continue-on-error: true
+        env:
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+          LICENSE_DIFF_BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+
+          base_ref="${LICENSE_DIFF_BASE:-origin/${DEFAULT_BRANCH}}"
+          if [[ "$base_ref" =~ ^[0-9a-f]{40}$ || "$base_ref" == refs/tags/* ]]; then
+            compare_ref="$base_ref"
+          elif [[ "$base_ref" == refs/heads/* ]]; then
+            base_branch="${base_ref#refs/heads/}"
+            git fetch --no-tags origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            compare_ref="origin/${base_branch}"
+          else
+            base_branch="${base_ref#origin/}"
+            git fetch --no-tags origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            compare_ref="origin/${base_branch}"
+          fi
+
+          echo "Comparing lockfile licenses against ${compare_ref}"
+          printf 'compare_ref=%s\n' "$compare_ref" >> "$GITHUB_OUTPUT"
+
+          set +e
+          # SONAR_IGNORE_START: offline mode makes this a no-network execution.
+          uv run --no-project --offline --python ${{ steps.ci-config.outputs.default_python_version }} python scripts/licensing/license_diff.py --base-ref "$compare_ref" > license-diff.md 2> license-diff.status
+          # SONAR_IGNORE_END
+          diff_status=$?
+          set -e
+          printf 'diff_status=%s\n' "$diff_status" >> "$GITHUB_OUTPUT"
+
+          if [[ "$diff_status" -ne 0 ]]; then
+            echo "::warning title=License diff failed::license_diff.py exited with status ${diff_status}; see the PR comment for captured output."
+          fi
+
+          cat license-diff.status >&2
+          cat license-diff.md
+
+      - name: Build PR comment
+        id: comment
+        if: ${{ steps.compare.outcome == 'success' }}
+        env:
+          COMPARE_REF: ${{ steps.compare.outputs.compare_ref }}
+          DIFF_STATUS: ${{ steps.compare.outputs.diff_status }}
+        run: |
+          set -euo pipefail
+
+          pr_number="${GITHUB_REF_NAME#pull-request/}"
+          if [[ "$pr_number" == "$GITHUB_REF_NAME" || -z "$pr_number" ]]; then
+            echo "::warning title=License diff comment skipped::Unable to derive a PR number from ref '${GITHUB_REF_NAME}'."
+            exit 0
+          fi
+          printf 'pr_number=%s\n' "$pr_number" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## License Diff"
+            echo
+            echo "Compared against \`${COMPARE_REF}\`."
+            echo
+            if [[ "$DIFF_STATUS" != "0" ]]; then
+              echo "> License diff failed with exit code \`${DIFF_STATUS}\`; this informational check does not block CI."
+              echo
+            fi
+            if [[ -s license-diff.md ]]; then
+              echo "<details>"
+              echo "<summary>Lockfile license changes</summary>"
+              echo
+              cat license-diff.md
+              echo
+              echo "</details>"
+            else
+              echo "No license diff output was produced."
+            fi
+            echo
+            echo "<details><summary>Status output</summary>"
+            echo
+            echo '```text'
+            cat license-diff.status
+            echo '```'
+            echo "</details>"
+          } > license-diff-comment.md
+
+      - name: Upsert PR comment
+        if: ${{ steps.comment.outputs.pr_number != '' }}
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: nemo-relay-license-diff
+          number: ${{ steps.comment.outputs.pr_number }}
+          path: license-diff-comment.md

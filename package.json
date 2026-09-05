@@ -1,0 +1,18 @@
+{
+  "name": "nemo-relay-workspace",
+  "private": true,
+  "packageManager": "npm@11.11.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "crates/node",
+    "examples/language-binding-plugin/node",
+    "integrations/openclaw",
+    "integrations/pi"
+  ],
+  "devDependencies": {
+    "fern-api": "5.57.0",
+    "typescript": "^5.9.3"
+  }
+}

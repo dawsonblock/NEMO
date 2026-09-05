@@ -1,0 +1,132 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Changes
+
+on:
+  workflow_call:
+    inputs:
+      pr_info:
+        description: 'The JSON string containing the PR information'
+        required: true
+        type: string
+      full_ci:
+        description: 'Whether to run the full CI matrix without path filtering'
+        required: false
+        default: false
+        type: boolean
+      ref_name:
+        description: 'The ref name from the triggering workflow'
+        required: true
+        type: string
+      default_branch:
+        description: 'The repository default branch used as the fallback comparison base'
+        required: true
+        type: string
+    outputs:
+      base:
+        description: 'The comparison base used for filtered checks'
+        value: ${{ jobs.changes.outputs.base }}
+      run_dependencies:
+        description: 'Whether dependency-license checks should run'
+        value: ${{ jobs.changes.outputs.run_dependencies }}
+      run_docs:
+        description: 'Whether documentation jobs should run'
+        value: ${{ jobs.changes.outputs.run_docs }}
+      run_go:
+        description: 'Whether Go jobs should run'
+        value: ${{ jobs.changes.outputs.run_go }}
+      run_installer:
+        description: 'Whether installer jobs should run'
+        value: ${{ jobs.changes.outputs.run_installer }}
+      run_node:
+        description: 'Whether Node.js jobs should run'
+        value: ${{ jobs.changes.outputs.run_node }}
+      run_node_package:
+        description: 'Whether Node.js packaging jobs should run'
+        value: ${{ jobs.changes.outputs.run_node_package }}
+      run_openclaw:
+        description: 'Whether OpenClaw integration jobs should run'
+        value: ${{ jobs.changes.outputs.run_openclaw }}
+      run_pi:
+        description: 'Whether pi integration jobs should run'
+        value: ${{ jobs.changes.outputs.run_pi }}
+      run_python:
+        description: 'Whether Python jobs should run'
+        value: ${{ jobs.changes.outputs.run_python }}
+      run_python_integration_langchain:
+        description: 'Whether LangChain, LangGraph, and DeepAgents Python integration jobs should run'
+        value: ${{ jobs.changes.outputs.run_python_integration_langchain }}
+      run_python_package:
+        description: 'Whether Python packaging jobs should run'
+        value: ${{ jobs.changes.outputs.run_python_package }}
+      run_rust:
+        description: 'Whether Rust jobs should run'
+        value: ${{ jobs.changes.outputs.run_rust }}
+      run_rust_package:
+        description: 'Whether Rust packaging jobs should run'
+        value: ${{ jobs.changes.outputs.run_rust_package }}
+
+jobs:
+  changes:
+    name: Detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      base: ${{ steps.comparison-base.outputs.base }}
+      run_dependencies: ${{ inputs.full_ci || steps.filter.outputs.dependencies == 'true' }}
+      run_docs: ${{ (inputs.full_ci || startsWith(inputs.ref_name, 'pull-request/')) && (inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.docs == 'true') }}
+      run_go: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.go == 'true' }}
+      run_installer: ${{ inputs.full_ci || steps.filter.outputs.installer == 'true' }}
+      run_node: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.node == 'true' || steps.filter.outputs.openclaw == 'true' || steps.filter.outputs.pi == 'true' }}
+      run_node_package: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.node_package == 'true' }}
+      run_openclaw: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.node == 'true' || steps.filter.outputs.openclaw == 'true' }}
+      run_pi: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.node == 'true' || steps.filter.outputs.pi == 'true' }}
+      run_python: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.python == 'true' }}
+      run_python_integration_langchain: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.python_integration_langchain == 'true' }}
+      run_python_package: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.python_package == 'true' }}
+      run_rust: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.shared == 'true' || steps.filter.outputs.rust == 'true' || steps.filter.outputs.pi == 'true' }}
+      run_rust_package: ${{ inputs.full_ci || steps.filter.outputs.ci == 'true' || steps.filter.outputs.rust_package == 'true' }}
+
+    steps:
+      - name: Checkout
+        if: ${{ ! inputs.full_ci }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve comparison base
+        id: comparison-base
+        if: ${{ ! inputs.full_ci }}
+        env:
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_INFO: ${{ inputs.pr_info }}
+          REF_NAME: ${{ inputs.ref_name }}
+        run: |
+          set -euo pipefail
+          base=""
+          if [[ "$REF_NAME" == pull-request/* ]]; then
+            if [[ -n "$PR_INFO" ]]; then
+              base="$(jq -r '.base.ref // empty' <<< "$PR_INFO")"
+            fi
+            if [[ -z "$base" ]]; then
+              base="${DEFAULT_BRANCH}"
+            fi
+          elif [[ -n "$EVENT_BEFORE" && "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            base="$EVENT_BEFORE"
+          else
+            base="${DEFAULT_BRANCH}"
+          fi
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
+      - name: Detect changed paths
+        id: filter
+        if: ${{ ! inputs.full_ci }}
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          base: ${{ steps.comparison-base.outputs.base }}
+          filters: .github/ci-path-filters.yml

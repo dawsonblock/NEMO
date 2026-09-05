@@ -1,0 +1,85 @@
+{
+  "name": "nemo-relay-node",
+  "version": "0.9.1-rc.1",
+  "description": "Node.js bindings for the NeMo Relay agent runtime.",
+  "keywords": [
+    "agents",
+    "ai",
+    "llm",
+    "middleware",
+    "nemo-relay",
+    "observability",
+    "runtime",
+    "tools"
+  ],
+  "homepage": "https://github.com/NVIDIA/NeMo-Relay#readme",
+  "bugs": {
+    "url": "https://github.com/NVIDIA/NeMo-Relay/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NVIDIA/NeMo-Relay.git",
+    "directory": "crates/node"
+  },
+  "author": "NVIDIA Corporation & Affiliates",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./typed": {
+      "types": "./typed.d.ts",
+      "default": "./typed.js"
+    },
+    "./plugin": {
+      "types": "./plugin.d.ts",
+      "default": "./plugin.js"
+    },
+    "./adaptive": {
+      "types": "./adaptive.d.ts",
+      "default": "./adaptive.js"
+    },
+    "./observability": {
+      "types": "./observability.d.ts",
+      "default": "./observability.js"
+    },
+    "./pii_redaction": {
+      "types": "./pii_redaction.d.ts",
+      "default": "./pii_redaction.js"
+    },
+    "./model_pricing": {
+      "types": "./model_pricing.d.ts",
+      "default": "./model_pricing.js"
+    }
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "napi": {
+    "name": "nemo-relay",
+    "triples": {}
+  },
+  "scripts": {
+    "build": "napi build --platform --release --dts index.d.ts",
+    "build-debug": "napi build --platform --dts index.d.ts",
+    "check:docstrings": "node ../../scripts/lint/check_public_docstrings.mjs node",
+    "check:docstrings:all": "node ../../scripts/lint/check_public_docstrings.mjs all",
+    "format": "prettier --write \"*.{js,ts,d.ts}\" \"tests/**/*.{mjs,cjs,js,mts,cts,ts,tsx}\"",
+    "format:check": "prettier --check \"*.{js,ts,d.ts}\" \"tests/**/*.{mjs,cjs,js,mts,cts,ts,tsx}\"",
+    "precommit:format": "node ../../scripts/lint/prettier-precommit.mjs",
+    "precoverage": "npm run build-debug",
+    "pretest": "npm run build-debug",
+    "test": "node --test --test-force-exit tests/*.mjs",
+    "coverage": "c8 --reporter=text --reporter=json-summary --reporter=cobertura --reports-dir coverage node --test --test-force-exit --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=junit.xml tests/*.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2",
+    "c8": "^11.0.0",
+    "prettier": "^3.8.2",
+    "typedoc": "^0.28.0",
+    "typescript": "^5.9.3"
+  },
+  "license": "Apache-2.0"
+}

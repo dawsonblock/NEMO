@@ -1,0 +1,3509 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! End-to-end coverage for the Rust gRPC worker SDK service.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::net::{SocketAddr, TcpListener};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use futures_util::{Stream, StreamExt};
+#[cfg(unix)]
+use hyper_util::rt::TokioIo;
+use nemo_relay_types::api::event::{BaseEvent, Event, MarkEvent, PendingMarkSpec};
+use nemo_relay_worker::{
+    ANNOTATED_LLM_REQUEST_SCHEMA, DataSchema, EmitMarkOptions, EventCategory, Json, JsonStream,
+    LlmNext, LlmRequest, LlmStreamNext, LogSeverity, MetricKind, MetricMeasurement,
+    MetricValueType, PluginContext, PluginRuntime, Result, RuntimeRegistrationKind, ScopeType,
+    ToolExecutionInterceptOutcome, ToolNext, WorkerPlugin, WorkerSdkError, WorkerServerConfig,
+    serve_plugin, serve_plugin_arc, serve_plugin_arc_with_config,
+};
+use nemo_relay_worker_proto::v1::plugin_worker_client::PluginWorkerClient;
+use nemo_relay_worker_proto::v1::relay_host_runtime_server::{
+    RelayHostRuntime, RelayHostRuntimeServer,
+};
+use nemo_relay_worker_proto::v1::{
+    CancelInvocationRequest, CreateScopeStackRequest, CreateScopeStackResponse,
+    DeregisterConditionalMiddlewareGuardrailRequest,
+    DeregisterConditionalMiddlewareGuardrailResponse, DropScopeStackRequest, EmitMarkRequest,
+    GetRuntimeDiagnosticsRequest, GetRuntimeDiagnosticsResponse, HandshakeRequest, HealthRequest,
+    HostAck, InvokeRequest, InvokeResponse, JsonEnvelope, JsonResult,
+    ListRuntimeRegistrationsRequest, ListRuntimeRegistrationsResponse, LlmInvocation,
+    LlmNextRequest, LlmStreamNextRequest, PopScopeRequest, PushScopeRequest, PushScopeResponse,
+    RegisterConditionalMiddlewareGuardrailRequest, RegisterConditionalMiddlewareGuardrailResponse,
+    RegisterRequest, RegistrationSurface, RuntimeDiagnostic as ProtoRuntimeDiagnostic,
+    ScopeContext, ShutdownRequest, StreamChunk,
+    ToolExecutionInterceptOutcome as ProtoToolExecutionInterceptOutcome,
+    ToolExecutionResult as ProtoToolExecutionResult, ToolExecutionResultResponse, ToolInvocation,
+    ToolNextRequest, ValidateRequest, WorkerError,
+};
+use nemo_relay_worker_proto::{
+    WORKER_PROTOCOL_GRPC_V1, decode_json_envelope, decode_json_value, json_envelope, json_value,
+};
+use serde_json::json;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinHandle;
+#[cfg(unix)]
+use tokio_stream::wrappers::UnixListenerStream;
+#[cfg(unix)]
+use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Server};
+use tonic::{Request, Response, Status};
+#[cfg(unix)]
+use tower::service_fn;
+
+const ACTIVATION_ID: &str = "activation-1";
+const AUTH_TOKEN: &str = "secret-token";
+const PLUGIN_ID: &str = "acme.worker";
+const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUIRED_WORKER_ENVS: &[&str] = &[
+    "NEMO_RELAY_WORKER_SOCKET",
+    "NEMO_RELAY_HOST_SOCKET",
+    "NEMO_RELAY_WORKER_ID",
+    "NEMO_RELAY_WORKER_TOKEN",
+];
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[test]
+fn runtime_registration_dtos_reexport_shared_types() {
+    let identity = nemo_relay_worker::RuntimeRegistrationIdentity {
+        kind: nemo_relay_worker::RuntimeRegistrationKind::Subscriber,
+        local_name: "subscriber".into(),
+        effective_name: "subscriber".into(),
+        owner: nemo_relay_worker::RuntimeRegistrationOwner {
+            kind: nemo_relay_worker::RuntimeRegistrationOwnerKind::GlobalApi,
+            plugin_kind: None,
+            component_ordinal: None,
+        },
+    };
+    let _: nemo_relay_types::api::registry::RuntimeRegistrationIdentity = identity;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_enforces_auth_and_reports_registrations() {
+    let (handle, mut client) = spawn_worker(
+        Arc::new(SurfacePlugin::default()),
+        "http://127.0.0.1:9".into(),
+    )
+    .await;
+
+    let bad_handshake = client
+        .handshake(Request::new(HandshakeRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            relay_version: "0.8.0".into(),
+            worker_protocol: WORKER_PROTOCOL_GRPC_V1.into(),
+            auth_token: "bad-token".into(),
+            host_endpoint: "http://127.0.0.1:9".into(),
+        }))
+        .await
+        .expect_err("invalid token should fail");
+    assert_eq!(bad_handshake.code(), tonic::Code::PermissionDenied);
+
+    let bad_activation = client
+        .handshake(Request::new(HandshakeRequest {
+            activation_id: "wrong-activation".into(),
+            plugin_id: PLUGIN_ID.into(),
+            relay_version: "0.8.0".into(),
+            worker_protocol: WORKER_PROTOCOL_GRPC_V1.into(),
+            auth_token: AUTH_TOKEN.into(),
+            host_endpoint: "http://127.0.0.1:9".into(),
+        }))
+        .await
+        .expect_err("invalid activation should fail");
+    assert_eq!(bad_activation.code(), tonic::Code::PermissionDenied);
+
+    let handshake = client
+        .handshake(Request::new(HandshakeRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            relay_version: "0.8.0".into(),
+            worker_protocol: WORKER_PROTOCOL_GRPC_V1.into(),
+            auth_token: AUTH_TOKEN.into(),
+            host_endpoint: "http://127.0.0.1:9".into(),
+        }))
+        .await
+        .expect("handshake succeeds")
+        .into_inner();
+    assert_eq!(handshake.plugin_id, PLUGIN_ID);
+    assert_eq!(handshake.worker_protocol, WORKER_PROTOCOL_GRPC_V1);
+    assert!(
+        handshake
+            .supported_surfaces
+            .contains(&(RegistrationSurface::LlmStreamExecutionIntercept as i32))
+    );
+    assert!(
+        handshake
+            .supported_surfaces
+            .contains(&(RegistrationSurface::EventMetadataInjector as i32))
+    );
+
+    let bad_health = client
+        .health(Request::new(HealthRequest {
+            activation_id: ACTIVATION_ID.into(),
+            auth_token: "bad-token".into(),
+        }))
+        .await
+        .expect_err("health auth should fail");
+    assert_eq!(bad_health.code(), tonic::Code::PermissionDenied);
+
+    let health = client
+        .health(Request::new(HealthRequest {
+            activation_id: ACTIVATION_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+        }))
+        .await
+        .expect("health succeeds")
+        .into_inner();
+    assert!(health.ok);
+    assert_eq!(health.message, "ready");
+    assert_eq!(health.plugin_id, PLUGIN_ID);
+    assert_eq!(health.worker_protocol, WORKER_PROTOCOL_GRPC_V1);
+    assert_eq!(health.sdk_name, "nemo-relay-worker");
+    assert_eq!(health.runtime_name, "rust");
+
+    let validate_err = client
+        .validate(Request::new(ValidateRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: "bad-token".into(),
+            config: Some(json_env(json!({"diagnostic": true}))),
+        }))
+        .await
+        .expect_err("validate auth should fail");
+    assert_eq!(validate_err.code(), tonic::Code::PermissionDenied);
+
+    let invalid_validate_config = client
+        .validate(Request::new(ValidateRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+            config: Some(invalid_json_env("nemo.relay.Json@1")),
+        }))
+        .await
+        .expect_err("invalid validate config should fail");
+    assert_eq!(invalid_validate_config.code(), tonic::Code::InvalidArgument);
+
+    let diagnostics = client
+        .validate(Request::new(ValidateRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+            config: Some(json_env(json!({"diagnostic": true}))),
+        }))
+        .await
+        .expect("validate succeeds")
+        .into_inner()
+        .diagnostics
+        .expect("diagnostics envelope");
+    let diagnostics: Vec<nemo_relay_worker::ConfigDiagnostic> =
+        decode_json_envelope(&diagnostics).expect("decode diagnostics");
+    assert_eq!(diagnostics.len(), 1);
+
+    let register_err = client
+        .register(Request::new(RegisterRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: "bad-token".into(),
+            config: Some(json_env(json!({}))),
+        }))
+        .await
+        .expect_err("register auth should fail");
+    assert_eq!(register_err.code(), tonic::Code::PermissionDenied);
+
+    let invalid_register_config = client
+        .register(Request::new(RegisterRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+            config: Some(invalid_json_env("nemo.relay.Json@1")),
+        }))
+        .await
+        .expect_err("invalid register config should fail");
+    assert_eq!(invalid_register_config.code(), tonic::Code::InvalidArgument);
+
+    let registrations = register_plugin(&mut client).await;
+    assert_eq!(registrations.len(), 22);
+    for local_name in [
+        "llm-sanitize-request",
+        "llm-sanitize-response",
+        "llm-sanitize-omit-request",
+        "llm-sanitize-omit-response",
+    ] {
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|registration| registration.local_name == local_name)
+                .count(),
+            1,
+            "expected exactly one {local_name} registration"
+        );
+    }
+    assert_eq!(
+        registrations
+            .iter()
+            .filter(|registration| registration.local_name == "tool-sanitize")
+            .count(),
+        2
+    );
+    assert_eq!(
+        registrations
+            .iter()
+            .filter(|registration| registration.local_name == "event-sanitize")
+            .count(),
+        3
+    );
+
+    let invoke_err = client
+        .invoke(Request::new(InvokeRequest {
+            auth_token: "bad-token".into(),
+            ..tool_invoke(
+                "tool-request",
+                RegistrationSurface::ToolRequestIntercept,
+                json!({}),
+            )
+        }))
+        .await
+        .expect_err("invoke auth should fail");
+    assert_eq!(invoke_err.code(), tonic::Code::PermissionDenied);
+
+    let cancel = client
+        .cancel_invocation(Request::new(CancelInvocationRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "invoke-1".into(),
+            auth_token: AUTH_TOKEN.into(),
+            reason: "test".into(),
+        }))
+        .await
+        .expect("cancel returns ack")
+        .into_inner();
+    assert!(!cancel.accepted);
+    assert!(cancel.message.contains("not active"));
+
+    let shutdown = client
+        .shutdown(Request::new(ShutdownRequest {
+            activation_id: ACTIVATION_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+            reason: "test".into(),
+        }))
+        .await
+        .expect("shutdown returns ack")
+        .into_inner();
+    assert!(!shutdown.accepted);
+    assert!(shutdown.message.contains("not implemented"));
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_rejects_duplicate_registration_names_on_one_surface() {
+    let (handle, mut client) = spawn_worker(
+        Arc::new(DuplicateEventSanitizerPlugin),
+        "http://127.0.0.1:9".into(),
+    )
+    .await;
+
+    let response = client
+        .register(Request::new(RegisterRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+            config: Some(json_env(json!({}))),
+        }))
+        .await
+        .expect("duplicate registration should return protocol data")
+        .into_inner();
+    assert!(response.registrations.is_empty());
+    let error = response
+        .error
+        .expect("duplicate registration should return an error");
+    assert_eq!(error.code, "worker.error");
+    assert_eq!(
+        error.message,
+        "invalid input: duplicate registration 'duplicate' for surface MARK_SANITIZE_GUARDRAIL"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_validates_initial_conditional_middleware_guardrails() {
+    for (mode, expected) in [
+        (InvalidInitialGate::EmptyKinds, "has no registration kinds"),
+        (InvalidInitialGate::EmptyTarget, "names must not be empty"),
+        (
+            InvalidInitialGate::Duplicate,
+            "duplicate conditional middleware guardrail",
+        ),
+    ] {
+        let (handle, mut client) = spawn_worker(
+            Arc::new(InvalidInitialGatePlugin(mode)),
+            "http://127.0.0.1:9".into(),
+        )
+        .await;
+        let response = client
+            .register(Request::new(RegisterRequest {
+                activation_id: ACTIVATION_ID.into(),
+                plugin_id: PLUGIN_ID.into(),
+                auth_token: AUTH_TOKEN.into(),
+                config: Some(json_env(json!({}))),
+            }))
+            .await
+            .expect("invalid initial gate should return protocol data")
+            .into_inner();
+        assert!(response.registrations.is_empty());
+        assert!(response.conditional_middleware_guardrails.is_empty());
+        assert!(response.error.unwrap().message.contains(expected));
+        let invoke = client
+            .invoke(Request::new(InvokeRequest {
+                activation_id: ACTIVATION_ID.into(),
+                invocation_id: "invalid-initial-gate".into(),
+                registration_name: "initial-gate".into(),
+                surface: RegistrationSurface::ConditionalMiddlewareGuardrail as i32,
+                continuation_id: String::new(),
+                scope: None,
+                auth_token: AUTH_TOKEN.into(),
+                payload: Some(
+                    nemo_relay_worker_proto::v1::invoke_request::Payload::ConditionalMiddleware(
+                        nemo_relay_worker_proto::v1::ConditionalMiddlewareInvocation {
+                            kinds: vec![RegistrationSurface::Subscriber as i32],
+                            registration_name: "target-subscriber".into(),
+                        },
+                    ),
+                ),
+            }))
+            .await
+            .expect("failed registration callback lookup should return protocol data")
+            .into_inner();
+        let message = match invoke.result.expect("invoke result") {
+            nemo_relay_worker_proto::v1::invoke_response::Result::Error(error) => error.message,
+            other => panic!("unexpected invoke result after failed registration: {other:?}"),
+        };
+        assert!(message.contains("is not registered"), "{message}");
+        handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_cancels_unary_and_stream_invocations_by_id() {
+    let timeout = WORKER_TEST_TIMEOUT;
+    let plugin = Arc::new(CancellationPlugin::default());
+    let (handle, mut client) = spawn_worker(plugin.clone(), "http://127.0.0.1:9".into()).await;
+    tokio::time::timeout(timeout, register_plugin(&mut client))
+        .await
+        .expect("worker registration should complete");
+
+    let mut unary_client = client.clone();
+    let unary_task = tokio::spawn(async move {
+        unary_client
+            .invoke(Request::new(InvokeRequest {
+                invocation_id: "cancel-unary".into(),
+                ..tool_invoke(
+                    "cancel-unary",
+                    RegistrationSurface::ToolExecutionIntercept,
+                    json!({}),
+                )
+            }))
+            .await
+            .expect("cancelled unary invocation should return a response")
+            .into_inner()
+    });
+    tokio::time::timeout(timeout, plugin.unary_started.notified())
+        .await
+        .expect("unary invocation should start");
+    let unary_ack = tokio::time::timeout(
+        timeout,
+        client.cancel_invocation(Request::new(CancelInvocationRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "cancel-unary".into(),
+            auth_token: AUTH_TOKEN.into(),
+            reason: "test timeout".into(),
+        })),
+    )
+    .await
+    .expect("unary cancellation should complete")
+    .expect("active unary cancellation should return an ack")
+    .into_inner();
+    let unary_response = tokio::time::timeout(timeout, unary_task)
+        .await
+        .expect("unary invocation should finish after cancellation")
+        .expect("unary client task should join");
+    let unary_error = match unary_response.result {
+        Some(nemo_relay_worker_proto::v1::invoke_response::Result::Error(error)) => error,
+        other => panic!("expected cancellation error, got {other:?}"),
+    };
+    assert!(unary_ack.accepted);
+    assert_eq!(unary_error.code, "worker.cancelled");
+    assert!(plugin.unary_cancelled.load(Ordering::SeqCst));
+
+    let repeated = tokio::time::timeout(
+        timeout,
+        client.cancel_invocation(Request::new(CancelInvocationRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "cancel-unary".into(),
+            auth_token: AUTH_TOKEN.into(),
+            reason: "repeat".into(),
+        })),
+    )
+    .await
+    .expect("repeated cancellation should complete")
+    .expect("repeated cancellation should return an ack")
+    .into_inner();
+    assert!(!repeated.accepted);
+    assert!(repeated.message.contains("not active"));
+
+    let mut stream = tokio::time::timeout(
+        timeout,
+        client.invoke_stream(Request::new(InvokeRequest {
+            invocation_id: "cancel-stream".into(),
+            ..llm_invoke(
+                "cancel-stream",
+                RegistrationSurface::LlmStreamExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            )
+        })),
+    )
+    .await
+    .expect("stream invocation setup should complete")
+    .expect("stream invocation should start")
+    .into_inner();
+    tokio::time::timeout(timeout, plugin.stream_started.notified())
+        .await
+        .expect("stream invocation should become active");
+    let stream_ack = tokio::time::timeout(
+        timeout,
+        client.cancel_invocation(Request::new(CancelInvocationRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "cancel-stream".into(),
+            auth_token: AUTH_TOKEN.into(),
+            reason: "stream abandoned".into(),
+        })),
+    )
+    .await
+    .expect("stream cancellation should complete")
+    .expect("active stream cancellation should return an ack")
+    .into_inner();
+    let stream_error = tokio::time::timeout(timeout, async {
+        loop {
+            let chunk = stream
+                .next()
+                .await
+                .expect("cancelled stream should yield a terminal error")
+                .expect("cancelled stream chunk should be protocol data");
+            if let Some(nemo_relay_worker_proto::v1::stream_chunk::Item::Error(error)) = chunk.item
+            {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("cancelled stream should terminate");
+    assert!(stream_ack.accepted);
+    assert_eq!(stream_error.code, "worker.cancelled");
+    tokio::time::timeout(timeout, plugin.stream_cancelled_notified.notified())
+        .await
+        .expect("cancelled stream should be dropped");
+    assert!(plugin.stream_cancelled.load(Ordering::SeqCst));
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_cancels_stream_during_async_setup() {
+    let timeout = WORKER_TEST_TIMEOUT;
+    let plugin = Arc::new(CancellationPlugin::default());
+    let (handle, mut client) = spawn_worker(plugin.clone(), "http://127.0.0.1:9".into()).await;
+    tokio::time::timeout(timeout, register_plugin(&mut client))
+        .await
+        .expect("worker registration should complete");
+
+    let mut stream_client = client.clone();
+    let stream_task = tokio::spawn(async move {
+        stream_client
+            .invoke_stream(Request::new(InvokeRequest {
+                invocation_id: "cancel-stream-setup".into(),
+                ..llm_invoke(
+                    "cancel-stream-setup",
+                    RegistrationSurface::LlmStreamExecutionIntercept,
+                    llm_request(),
+                    None,
+                    None,
+                )
+            }))
+            .await
+    });
+    tokio::time::timeout(timeout, plugin.stream_setup_started.notified())
+        .await
+        .expect("stream setup should start");
+    let ack = tokio::time::timeout(
+        timeout,
+        client.cancel_invocation(Request::new(CancelInvocationRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "cancel-stream-setup".into(),
+            auth_token: AUTH_TOKEN.into(),
+            reason: "cancel setup".into(),
+        })),
+    )
+    .await
+    .expect("stream setup cancellation should complete")
+    .expect("stream setup cancellation should return an ack")
+    .into_inner();
+    let mut stream = tokio::time::timeout(timeout, stream_task)
+        .await
+        .expect("cancelled stream setup should finish")
+        .expect("stream setup client task should join")
+        .expect("cancelled stream setup should return protocol data")
+        .into_inner();
+    let chunk = tokio::time::timeout(timeout, stream.next())
+        .await
+        .expect("cancelled setup stream should terminate")
+        .expect("cancelled setup stream should yield a terminal error")
+        .expect("cancelled setup stream chunk should be protocol data");
+    let error = match chunk.item {
+        Some(nemo_relay_worker_proto::v1::stream_chunk::Item::Error(error)) => error,
+        other => panic!("expected stream setup cancellation error, got {other:?}"),
+    };
+
+    assert!(ack.accepted);
+    assert_eq!(error.code, "worker.cancelled");
+    assert!(plugin.stream_setup_cancelled.load(Ordering::SeqCst));
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_invokes_every_registration_surface() {
+    let host = MockHost::default();
+    let (host_handle, host_endpoint) = spawn_host(host.clone()).await;
+    let plugin = Arc::new(SurfacePlugin::default());
+    let events = plugin.events.clone();
+    let (worker_handle, mut client) = spawn_worker(plugin, tcp_endpoint(&host_endpoint)).await;
+    let registrations = register_plugin(&mut client).await;
+    for name in [
+        "llm-sanitize-request",
+        "llm-sanitize-response",
+        "llm-sanitize-omit-request",
+        "llm-sanitize-omit-response",
+    ] {
+        assert!(
+            registrations
+                .iter()
+                .any(|registration| registration.local_name == name),
+            "{name} must be registered"
+        );
+    }
+
+    let subscriber_response = client
+        .invoke(Request::new(event_invoke("subscriber")))
+        .await
+        .expect("subscriber invoke")
+        .into_inner();
+    assert_empty_response(subscriber_response);
+    assert_eq!(
+        events.lock().expect("events lock").as_slice(),
+        ["subscriber-event"]
+    );
+
+    let metadata = invoke_json(
+        &mut client,
+        event_invoke_surface("event-metadata", RegistrationSurface::EventMetadataInjector),
+    )
+    .await;
+    assert_eq!(metadata, json!({"worker.event_name": "subscriber-event"}));
+
+    let mark_fields = invoke_json(
+        &mut client,
+        event_invoke_surface("event-sanitize", RegistrationSurface::MarkSanitizeGuardrail),
+    )
+    .await;
+    assert_eq!(mark_fields["data"]["phase"], "mark");
+    let start_fields = invoke_json(
+        &mut client,
+        event_invoke_surface(
+            "event-sanitize",
+            RegistrationSurface::ScopeSanitizeStartGuardrail,
+        ),
+    )
+    .await;
+    assert_eq!(start_fields["metadata"]["phase"], "scope_start");
+    let end_fields = invoke_json(
+        &mut client,
+        event_invoke_surface(
+            "event-sanitize",
+            RegistrationSurface::ScopeSanitizeEndGuardrail,
+        ),
+    )
+    .await;
+    assert_eq!(end_fields["metadata"]["phase"], "scope_end");
+
+    assert_json_field(
+        invoke_json(
+            &mut client,
+            tool_invoke(
+                "tool-sanitize",
+                RegistrationSurface::ToolSanitizeRequestGuardrail,
+                json!({}),
+            ),
+        )
+        .await,
+        "phase",
+        "tool_sanitize_request",
+    );
+    assert_json_field(
+        invoke_json(
+            &mut client,
+            tool_invoke(
+                "tool-sanitize",
+                RegistrationSurface::ToolSanitizeResponseGuardrail,
+                json!({}),
+            ),
+        )
+        .await,
+        "phase",
+        "tool_sanitize_response",
+    );
+    assert_eq!(
+        invoke_guardrail(
+            &mut client,
+            tool_invoke(
+                "tool-conditional",
+                RegistrationSurface::ToolConditionalExecutionGuardrail,
+                json!({"block": true}),
+            ),
+        )
+        .await,
+        "blocked-tool"
+    );
+    assert_json_field(
+        invoke_json(
+            &mut client,
+            tool_invoke(
+                "tool-request",
+                RegistrationSurface::ToolRequestIntercept,
+                json!({}),
+            ),
+        )
+        .await,
+        "phase",
+        "tool_request",
+    );
+    let tool_outcome = invoke_tool_execution(
+        &mut client,
+        tool_invoke(
+            "tool-exec",
+            RegistrationSurface::ToolExecutionIntercept,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(tool_outcome.pending_marks.len(), 1);
+    assert_eq!(
+        tool_outcome.pending_marks[0],
+        PendingMarkSpec::builder()
+            .name("worker.tool.execution")
+            .data(json!({"checkpoint": true}))
+            .build()
+    );
+    assert_eq!(tool_outcome.annotation, Some(json!({"source": "host"})));
+    let tool_exec = tool_outcome.result;
+    assert_json_field(tool_exec.clone(), "next", "tool");
+    assert_json_field(tool_exec, "phase", "tool_exec");
+    let conditional_middleware = client
+        .invoke(Request::new(InvokeRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "conditional-middleware".into(),
+            registration_name: "initial-gate".into(),
+            surface: RegistrationSurface::ConditionalMiddlewareGuardrail as i32,
+            continuation_id: String::new(),
+            scope: None,
+            auth_token: AUTH_TOKEN.into(),
+            payload: Some(
+                nemo_relay_worker_proto::v1::invoke_request::Payload::ConditionalMiddleware(
+                    nemo_relay_worker_proto::v1::ConditionalMiddlewareInvocation {
+                        kinds: vec![RegistrationSurface::Subscriber as i32],
+                        registration_name: "missing-target".into(),
+                    },
+                ),
+            ),
+        }))
+        .await
+        .expect("conditional middleware invoke")
+        .into_inner();
+    assert_eq!(guardrail_reason(conditional_middleware), "initial gate");
+    let allowed_conditional_middleware = client
+        .invoke(Request::new(InvokeRequest {
+            activation_id: ACTIVATION_ID.into(),
+            invocation_id: "conditional-middleware-allowed".into(),
+            registration_name: "initial-gate".into(),
+            surface: RegistrationSurface::ConditionalMiddlewareGuardrail as i32,
+            continuation_id: String::new(),
+            scope: None,
+            auth_token: AUTH_TOKEN.into(),
+            payload: Some(
+                nemo_relay_worker_proto::v1::invoke_request::Payload::ConditionalMiddleware(
+                    nemo_relay_worker_proto::v1::ConditionalMiddlewareInvocation {
+                        kinds: vec![RegistrationSurface::Subscriber as i32],
+                        registration_name: "allowed-target".into(),
+                    },
+                ),
+            ),
+        }))
+        .await
+        .expect("allowed conditional middleware invoke")
+        .into_inner();
+    assert_eq!(guardrail_reason(allowed_conditional_middleware), "");
+    assert!(
+        invoke_json(
+            &mut client,
+            tool_invoke(
+                "tool-scope-types",
+                RegistrationSurface::ToolExecutionIntercept,
+                json!({}),
+            ),
+        )
+        .await
+        .is_null()
+    );
+
+    let llm_sanitize = invoke_json(
+        &mut client,
+        llm_invoke(
+            "llm-sanitize-request",
+            RegistrationSurface::LlmSanitizeRequestGuardrail,
+            llm_request(),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        llm_sanitize
+            .get("content")
+            .and_then(|value| value.get("phase")),
+        Some(&json!("llm_sanitize_request"))
+    );
+    assert_json_field(
+        invoke_json(
+            &mut client,
+            llm_invoke(
+                "llm-sanitize-response",
+                RegistrationSurface::LlmSanitizeResponseGuardrail,
+                llm_request(),
+                None,
+                Some(json!({})),
+            ),
+        )
+        .await,
+        "phase",
+        "llm_sanitize_response",
+    );
+    let omitted_request = client
+        .invoke(Request::new(llm_invoke(
+            "llm-sanitize-omit-request",
+            RegistrationSurface::LlmSanitizeRequestGuardrail,
+            llm_request(),
+            None,
+            None,
+        )))
+        .await
+        .expect("request omission invoke")
+        .into_inner();
+    assert_empty_response(omitted_request);
+    let omitted_response = client
+        .invoke(Request::new(llm_invoke(
+            "llm-sanitize-omit-response",
+            RegistrationSurface::LlmSanitizeResponseGuardrail,
+            llm_request(),
+            None,
+            Some(json!({})),
+        )))
+        .await
+        .expect("response omission invoke")
+        .into_inner();
+    assert_empty_response(omitted_response);
+    let codec_request_result = invoke_json(&mut client, llm_request_codec_invoke()).await;
+    assert_eq!(
+        codec_request_result,
+        json!({
+            "headers": {},
+            "content": {"phase": "llm_sanitize_request"},
+        })
+    );
+
+    let codec_response_result = invoke_json(&mut client, llm_response_codec_invoke()).await;
+    assert_eq!(
+        codec_response_result,
+        json!({
+            "value": "secret",
+            "phase": "llm_sanitize_response",
+        })
+    );
+    assert_eq!(
+        invoke_guardrail(
+            &mut client,
+            llm_invoke(
+                "llm-conditional",
+                RegistrationSurface::LlmConditionalExecutionGuardrail,
+                llm_request_with_block(),
+                None,
+                None,
+            ),
+        )
+        .await,
+        "blocked-llm"
+    );
+    let intercepted = invoke_llm_request(
+        &mut client,
+        llm_invoke(
+            "llm-request",
+            RegistrationSurface::LlmRequestIntercept,
+            llm_request(),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        intercepted.content.get("phase"),
+        Some(&json!("llm_request"))
+    );
+    let llm_exec = invoke_json(
+        &mut client,
+        llm_invoke(
+            "llm-exec",
+            RegistrationSurface::LlmExecutionIntercept,
+            llm_request(),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_json_field(llm_exec.clone(), "next", "llm");
+    assert_json_field(llm_exec, "phase", "llm_exec");
+
+    let mut stream = client
+        .invoke_stream(Request::new(llm_invoke(
+            "llm-stream",
+            RegistrationSurface::LlmStreamExecutionIntercept,
+            llm_request(),
+            None,
+            None,
+        )))
+        .await
+        .expect("stream invoke")
+        .into_inner();
+    let first = stream_json(stream.next().await.expect("first stream item").unwrap());
+    assert_json_field(first, "phase", "stream_poll");
+    let second = stream_json(stream.next().await.expect("second stream item").unwrap());
+    assert_json_field(second, "next", "llm_stream");
+    assert!(stream.next().await.is_none());
+
+    let stream_auth = client
+        .invoke_stream(Request::new(InvokeRequest {
+            auth_token: "bad-token".into(),
+            ..llm_invoke(
+                "llm-stream",
+                RegistrationSurface::LlmStreamExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            )
+        }))
+        .await
+        .expect_err("stream auth should fail");
+    assert_eq!(stream_auth.code(), tonic::Code::PermissionDenied);
+
+    let calls = host.calls();
+    let runtime_registration_requests = host.runtime_registration_requests();
+    assert_eq!(runtime_registration_requests.list.len(), 1);
+    assert_eq!(
+        runtime_registration_requests.list[0].activation_id,
+        ACTIVATION_ID
+    );
+    assert_eq!(runtime_registration_requests.list[0].auth_token, AUTH_TOKEN);
+    assert_eq!(
+        runtime_registration_requests.list[0].kinds,
+        vec![RegistrationSurface::Subscriber as i32]
+    );
+    assert_eq!(runtime_registration_requests.register.len(), 1);
+    assert_eq!(
+        runtime_registration_requests.register[0].activation_id,
+        ACTIVATION_ID
+    );
+    assert_eq!(
+        runtime_registration_requests.register[0].auth_token,
+        AUTH_TOKEN
+    );
+    assert_eq!(runtime_registration_requests.register[0].name, "timer-gate");
+    assert_eq!(
+        runtime_registration_requests.register[0].kinds,
+        vec![RegistrationSurface::Subscriber as i32]
+    );
+    assert_eq!(
+        runtime_registration_requests.register[0].registration_name,
+        "target-subscriber"
+    );
+    assert!(runtime_registration_requests.register[0].callback);
+    assert_eq!(runtime_registration_requests.deregister.len(), 1);
+    assert_eq!(
+        runtime_registration_requests.deregister[0].activation_id,
+        ACTIVATION_ID
+    );
+    assert_eq!(
+        runtime_registration_requests.deregister[0].auth_token,
+        AUTH_TOKEN
+    );
+    assert_eq!(
+        runtime_registration_requests.deregister[0].handle,
+        "gate-handle"
+    );
+    assert!(calls.contains(&"runtime_diagnostics".into()));
+    assert!(calls.contains(&"mark:tool-exec:stack-1:parent-1".into()));
+    assert!(calls.contains(&"create_scope_stack".into()));
+    assert!(calls.contains(&"mark:tool-exec-isolated:isolated-stack:".into()));
+    assert!(calls.contains(&"mark:tool-exec-restored:stack-1:parent-1".into()));
+    assert!(calls.contains(&"push:worker-scope:stack-1:parent-1".into()));
+    assert!(calls.contains(&"pop:scope-handle-1".into()));
+    assert!(calls.contains(&"drop:isolated-stack".into()));
+    assert!(calls.contains(&"tool_next:next-1".into()));
+    assert!(calls.contains(&"llm_next:next-1".into()));
+    assert!(calls.contains(&"llm_stream_next:next-1".into()));
+    assert!(calls.contains(&"codec_request_decode:request-capability".into()));
+    assert!(calls.contains(&"codec_request_encode:request-capability".into()));
+    assert!(calls.contains(&"codec_response_decode:response-capability".into()));
+    assert!(calls.contains(&"mark:stream-poll:stack-1:parent-1".into()));
+    assert!(calls.contains(&"push:scope-agent:explicit-stack:".into()));
+    assert!(calls.contains(&"push:scope-unknown:explicit-stack:".into()));
+    let telemetry_mark = host
+        .marks()
+        .into_iter()
+        .find(|request| request.name == "tool-exec-telemetry")
+        .expect("extended mark request");
+    assert_eq!(telemetry_mark.severity, "warn");
+    assert_eq!(telemetry_mark.category, "custom");
+    let data_schema = telemetry_mark.data_schema.expect("mark data schema");
+    assert_eq!(data_schema.schema, "nemo.relay.DataSchema@1");
+    assert_eq!(
+        decode_json_envelope::<DataSchema>(&data_schema).unwrap(),
+        DataSchema::builder()
+            .name("nemo.relay.metric_measurements")
+            .version("1")
+            .build()
+    );
+    let metric_mark = host
+        .marks()
+        .into_iter()
+        .find(|request| request.name == "tool-exec-metric")
+        .expect("metric mark request");
+    assert_eq!(metric_mark.category, "custom");
+    let metric_schema = metric_mark.data_schema.expect("metric data schema");
+    assert_eq!(
+        decode_json_envelope::<DataSchema>(&metric_schema).unwrap(),
+        DataSchema::builder()
+            .name("nemo.relay.metric_measurements")
+            .version("1")
+            .build()
+    );
+    assert_eq!(
+        decode_json_envelope::<Json>(&metric_mark.data.expect("metric data")).unwrap(),
+        json!({
+            "measurements": [{
+                "name": "worker.requests",
+                "kind": "counter",
+                "value_type": "u64",
+                "value": 1,
+                "unit": null,
+                "description": null,
+                "attributes": null,
+                "boundaries": null
+            }]
+        })
+    );
+
+    worker_handle.abort();
+    host_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_reports_structured_callback_and_payload_errors() {
+    let (handle, mut client) = spawn_worker(
+        Arc::new(SurfacePlugin::default()),
+        "http://127.0.0.1:9".into(),
+    )
+    .await;
+    register_plugin(&mut client).await;
+
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                surface: 999,
+                ..tool_invoke(
+                    "tool-request",
+                    RegistrationSurface::ToolRequestIntercept,
+                    json!({}),
+                )
+            }))
+            .await
+            .expect("unknown surface returns structured error")
+            .into_inner(),
+        "unknown registration surface",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(tool_invoke(
+                "missing",
+                RegistrationSurface::ToolRequestIntercept,
+                json!({}),
+            )))
+            .await
+            .expect("unknown registration returns structured error")
+            .into_inner(),
+        "not registered",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                payload: None,
+                ..tool_invoke(
+                    "tool-request",
+                    RegistrationSurface::ToolRequestIntercept,
+                    json!({}),
+                )
+            }))
+            .await
+            .expect("invalid payload returns structured error")
+            .into_inner(),
+        "expected tool payload",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                payload: Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Tool(
+                    ToolInvocation {
+                        tool_name: "tool".into(),
+                        value: Some(JsonEnvelope {
+                            schema: "nemo.relay.Json@1".into(),
+                            json: b"{".to_vec(),
+                        }),
+                    },
+                )),
+                ..tool_invoke(
+                    "tool-request",
+                    RegistrationSurface::ToolRequestIntercept,
+                    json!({}),
+                )
+            }))
+            .await
+            .expect("invalid JSON returns structured error")
+            .into_inner(),
+        "EOF while parsing",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(tool_invoke(
+                "tool-error",
+                RegistrationSurface::ToolRequestIntercept,
+                json!({}),
+            )))
+            .await
+            .expect("callback error returns structured error")
+            .into_inner(),
+        "boom",
+    );
+
+    let stream_err = client
+        .invoke_stream(Request::new(llm_invoke(
+            "llm-stream-error",
+            RegistrationSurface::LlmStreamExecutionIntercept,
+            llm_request(),
+            None,
+            None,
+        )))
+        .await
+        .expect("stream error invoke")
+        .into_inner()
+        .next()
+        .await
+        .expect("stream item")
+        .expect("stream chunk");
+    match stream_err.item.expect("stream item") {
+        nemo_relay_worker_proto::v1::stream_chunk::Item::Error(error) => {
+            assert!(error.message.contains("stream boom"));
+        }
+        other => panic!("unexpected stream item: {other:?}"),
+    }
+
+    let stream_surface_err = client
+        .invoke_stream(Request::new(tool_invoke(
+            "tool-request",
+            RegistrationSurface::ToolRequestIntercept,
+            json!({}),
+        )))
+        .await
+        .expect_err("wrong stream surface should fail transport call");
+    assert_eq!(stream_surface_err.code(), tonic::Code::InvalidArgument);
+
+    handle.abort();
+}
+
+#[test]
+fn worker_plugin_defaults_and_context_construction_are_covered() {
+    let plugin = MinimalPlugin;
+    assert_eq!(plugin.plugin_id(), "minimal");
+    assert!(!plugin.allows_multiple_components());
+    assert!(plugin.validate(&Json::Null).is_empty());
+
+    assert!(PluginContext::new().runtime().is_none());
+    assert!(PluginContext::default().runtime().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_service_validates_env_and_endpoints() {
+    let _env_guard = ENV_LOCK.lock().await;
+    let snapshot = EnvSnapshot::capture(REQUIRED_WORKER_ENVS);
+
+    clear_required_envs();
+    let err = serve_plugin(MinimalPlugin)
+        .await
+        .expect_err("missing worker socket env fails");
+    assert_error_contains(err, "NEMO_RELAY_WORKER_SOCKET");
+
+    for missing in REQUIRED_WORKER_ENVS {
+        set_required_envs();
+        remove_env(missing);
+        let err = serve_plugin_arc(Arc::new(MinimalPlugin))
+            .await
+            .expect_err("missing env fails");
+        assert_error_contains(err, missing);
+    }
+
+    set_required_envs();
+    set_env("NEMO_RELAY_WORKER_SOCKET", "ftp://127.0.0.1:1");
+    let err = serve_plugin_arc(Arc::new(MinimalPlugin))
+        .await
+        .expect_err("valid env values reach endpoint validation");
+    assert_error_contains(err, "unsupported endpoint");
+
+    snapshot.restore();
+
+    let unsupported =
+        serve_plugin_arc_with_config(Arc::new(MinimalPlugin), server_config("ftp://127.0.0.1:1"))
+            .await
+            .expect_err("unsupported worker endpoint fails");
+    assert_error_contains(unsupported, "unsupported endpoint");
+
+    let empty_tcp = serve_plugin_arc_with_config(Arc::new(MinimalPlugin), server_config("tcp://"))
+        .await
+        .expect_err("empty tcp endpoint fails");
+    assert_error_contains(empty_tcp, "unsupported endpoint");
+
+    let path_tcp = serve_plugin_arc_with_config(
+        Arc::new(MinimalPlugin),
+        server_config("http://127.0.0.1:1/path"),
+    )
+    .await
+    .expect_err("tcp endpoint with path fails");
+    assert_error_contains(path_tcp, "unsupported TCP endpoint");
+
+    let invalid_host =
+        serve_plugin_arc_with_config(Arc::new(MinimalPlugin), server_config("http://bad host"))
+            .await
+            .expect_err("invalid tcp host fails");
+    assert_error_contains(invalid_host, "invalid TCP endpoint");
+
+    let busy_listener = TcpListener::bind("127.0.0.1:0").expect("bind busy listener");
+    let busy_endpoint = format!(
+        "tcp://{}",
+        busy_listener.local_addr().expect("busy listener addr")
+    );
+    let busy = serve_plugin_arc_with_config(Arc::new(MinimalPlugin), server_config(&busy_endpoint))
+        .await
+        .expect_err("busy tcp endpoint fails");
+    assert_error_contains(busy, "transport failed");
+    drop(busy_listener);
+
+    #[cfg(unix)]
+    {
+        let path = unique_temp_path("nrw-file");
+        std::fs::write(&path, b"not a socket").expect("write regular file");
+        let endpoint = format!("unix://{}", path.display());
+        let err = serve_plugin_arc_with_config(Arc::new(MinimalPlugin), server_config(&endpoint))
+            .await
+            .expect_err("regular file must not be removed as socket");
+        assert_error_contains(err, "not a socket");
+        assert!(path.exists());
+        std::fs::remove_file(path).expect("remove regular file");
+
+        let missing_parent = unique_temp_path("nrw-missing-parent").join("worker.sock");
+        let missing_parent_endpoint = format!("unix://{}", missing_parent.display());
+        let bind_err = serve_plugin_arc_with_config(
+            Arc::new(MinimalPlugin),
+            server_config(&missing_parent_endpoint),
+        )
+        .await
+        .expect_err("unix endpoint with missing parent fails during bind");
+        assert_error_contains(bind_err, "failed to bind worker socket");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_announces_ephemeral_tcp_endpoint_file() {
+    const ENVS: &[&str] = &[
+        "NEMO_RELAY_WORKER_SOCKET",
+        "NEMO_RELAY_HOST_SOCKET",
+        "NEMO_RELAY_WORKER_ID",
+        "NEMO_RELAY_WORKER_TOKEN",
+        "NEMO_RELAY_WORKER_ENDPOINT_FILE",
+    ];
+    let _env_guard = ENV_LOCK.lock().await;
+    let snapshot = EnvSnapshot::capture(ENVS);
+    let endpoint_file = unique_temp_file("nrw-endpoint");
+    let _ = std::fs::remove_file(&endpoint_file);
+
+    set_required_envs();
+    set_env("NEMO_RELAY_WORKER_SOCKET", "tcp://127.0.0.1:0");
+    set_env(
+        "NEMO_RELAY_WORKER_ENDPOINT_FILE",
+        endpoint_file.to_str().expect("endpoint path utf-8"),
+    );
+    let handle = tokio::spawn(serve_plugin_arc(Arc::new(MinimalPlugin)));
+    let endpoint = wait_for_endpoint_file(&endpoint_file).await;
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+
+    let mut client = connect_worker(&endpoint).await;
+    let health = client
+        .health(Request::new(HealthRequest {
+            activation_id: ACTIVATION_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+        }))
+        .await
+        .expect("announced endpoint should accept connections")
+        .into_inner();
+    assert!(health.ok);
+
+    handle.abort();
+    let _ = std::fs::remove_file(endpoint_file);
+    snapshot.restore();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_supports_unix_socket_worker_and_host_endpoints() {
+    let host = MockHost::default();
+    let host_path = unique_temp_path("nrw-host");
+    let worker_path = unique_temp_path("nrw-worker");
+    let stale_worker_socket =
+        UnixListener::bind(&worker_path).expect("bind stale worker socket before test");
+    drop(stale_worker_socket);
+
+    let host_handle = spawn_unix_host(host.clone(), host_path.clone()).await;
+    let host_endpoint = format!("unix://{}", host_path.display());
+    let worker_endpoint = format!("unix://{}", worker_path.display());
+    let worker_handle = tokio::spawn(serve_plugin_arc_with_config(
+        Arc::new(SurfacePlugin::default()),
+        WorkerServerConfig {
+            worker_endpoint: worker_endpoint.clone(),
+            host_endpoint,
+            activation_id: ACTIVATION_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+        },
+    ));
+    wait_for_unix_socket(&worker_path).await;
+
+    let mut client = connect_worker_uds(&worker_endpoint).await;
+    register_plugin(&mut client).await;
+    let tool_exec = invoke_json(
+        &mut client,
+        tool_invoke(
+            "tool-exec",
+            RegistrationSurface::ToolExecutionIntercept,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_json_field(tool_exec, "phase", "tool_exec");
+    assert!(host.calls().contains(&"tool_next:next-1".into()));
+
+    worker_handle.abort();
+    host_handle.abort();
+    let _ = std::fs::remove_file(host_path);
+    let _ = std::fs::remove_file(worker_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_reports_missing_handlers_and_malformed_payloads() {
+    let (handle, mut client) = spawn_worker(
+        Arc::new(SurfacePlugin::default()),
+        "http://127.0.0.1:9".into(),
+    )
+    .await;
+    register_plugin(&mut client).await;
+
+    for (request, expected) in [
+        (event_invoke("missing-subscriber"), "subscriber"),
+        (
+            event_invoke_surface(
+                "missing-mark-sanitize",
+                RegistrationSurface::MarkSanitizeGuardrail,
+            ),
+            "event sanitizer",
+        ),
+        (
+            event_invoke_surface(
+                "missing-scope-start-sanitize",
+                RegistrationSurface::ScopeSanitizeStartGuardrail,
+            ),
+            "event sanitizer",
+        ),
+        (
+            event_invoke_surface(
+                "missing-scope-end-sanitize",
+                RegistrationSurface::ScopeSanitizeEndGuardrail,
+            ),
+            "event sanitizer",
+        ),
+        (
+            tool_invoke(
+                "missing-tool-sanitize-request",
+                RegistrationSurface::ToolSanitizeRequestGuardrail,
+                json!({}),
+            ),
+            "tool request sanitizer",
+        ),
+        (
+            tool_invoke(
+                "missing-tool-sanitize-response",
+                RegistrationSurface::ToolSanitizeResponseGuardrail,
+                json!({}),
+            ),
+            "tool response sanitizer",
+        ),
+        (
+            tool_invoke(
+                "missing-tool-conditional",
+                RegistrationSurface::ToolConditionalExecutionGuardrail,
+                json!({}),
+            ),
+            "tool conditional",
+        ),
+        (
+            tool_invoke(
+                "missing-tool-request",
+                RegistrationSurface::ToolRequestIntercept,
+                json!({}),
+            ),
+            "tool request",
+        ),
+        (
+            tool_invoke(
+                "missing-tool-execution",
+                RegistrationSurface::ToolExecutionIntercept,
+                json!({}),
+            ),
+            "tool execution",
+        ),
+        (
+            llm_invoke(
+                "missing-llm-sanitize-request",
+                RegistrationSurface::LlmSanitizeRequestGuardrail,
+                llm_request(),
+                None,
+                None,
+            ),
+            "llm request sanitizer",
+        ),
+        (
+            llm_invoke(
+                "missing-llm-sanitize-response",
+                RegistrationSurface::LlmSanitizeResponseGuardrail,
+                llm_request(),
+                None,
+                Some(json!({})),
+            ),
+            "llm response sanitizer",
+        ),
+        (
+            llm_invoke(
+                "missing-llm-conditional",
+                RegistrationSurface::LlmConditionalExecutionGuardrail,
+                llm_request(),
+                None,
+                None,
+            ),
+            "llm conditional",
+        ),
+        (
+            llm_invoke(
+                "missing-llm-request",
+                RegistrationSurface::LlmRequestIntercept,
+                llm_request(),
+                None,
+                None,
+            ),
+            "llm request",
+        ),
+        (
+            llm_invoke(
+                "missing-llm-execution",
+                RegistrationSurface::LlmExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            ),
+            "llm execution",
+        ),
+    ] {
+        assert_worker_error(
+            client
+                .invoke(Request::new(request))
+                .await
+                .expect("missing handler returns structured error")
+                .into_inner(),
+            expected,
+        );
+    }
+
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                payload: None,
+                ..event_invoke("subscriber")
+            }))
+            .await
+            .expect("missing event payload returns structured error")
+            .into_inner(),
+        "expected event payload",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                payload: None,
+                ..event_invoke_surface("mark-sanitize", RegistrationSurface::MarkSanitizeGuardrail)
+            }))
+            .await
+            .expect("missing sanitizer event payload returns structured error")
+            .into_inner(),
+        "expected event payload",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                payload: None,
+                ..llm_invoke(
+                    "llm-exec",
+                    RegistrationSurface::LlmExecutionIntercept,
+                    llm_request(),
+                    None,
+                    None,
+                )
+            }))
+            .await
+            .expect("missing llm payload returns structured error")
+            .into_inner(),
+        "expected llm payload",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(llm_invoke_without_request(
+                "llm-sanitize-request",
+                RegistrationSurface::LlmSanitizeRequestGuardrail,
+            )))
+            .await
+            .expect("missing llm request returns structured error")
+            .into_inner(),
+        "llm request is missing",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(llm_invoke(
+                "llm-sanitize-response",
+                RegistrationSurface::LlmSanitizeResponseGuardrail,
+                llm_request(),
+                None,
+                None,
+            )))
+            .await
+            .expect("missing llm response returns structured error")
+            .into_inner(),
+        "llm response is missing",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(InvokeRequest {
+                surface: RegistrationSurface::Unspecified as i32,
+                ..tool_invoke(
+                    "tool-request",
+                    RegistrationSurface::ToolRequestIntercept,
+                    json!({}),
+                )
+            }))
+            .await
+            .expect("unspecified surface returns structured error")
+            .into_inner(),
+        "unspecified",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(llm_invoke(
+                "llm-stream",
+                RegistrationSurface::LlmStreamExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            )))
+            .await
+            .expect("stream surface on unary invoke returns structured error")
+            .into_inner(),
+        "InvokeStream",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(llm_invoke_with_bad_annotation("llm-request")))
+            .await
+            .expect("bad annotation returns structured error")
+            .into_inner(),
+        "EOF while parsing",
+    );
+    assert_worker_error(
+        client
+            .invoke(Request::new(llm_invoke_with_legacy_annotation(
+                "llm-request",
+            )))
+            .await
+            .expect("legacy annotation schema returns structured error")
+            .into_inner(),
+        "expected \"nemo.relay.AnnotatedLlmRequest@2\"",
+    );
+
+    let unknown_stream_surface = client
+        .invoke_stream(Request::new(InvokeRequest {
+            surface: 999,
+            ..llm_invoke(
+                "llm-stream",
+                RegistrationSurface::LlmStreamExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            )
+        }))
+        .await
+        .expect_err("unknown stream surface fails transport call");
+    assert_eq!(unknown_stream_surface.code(), tonic::Code::InvalidArgument);
+
+    let missing_stream = client
+        .invoke_stream(Request::new(llm_invoke(
+            "missing-llm-stream",
+            RegistrationSurface::LlmStreamExecutionIntercept,
+            llm_request(),
+            None,
+            None,
+        )))
+        .await
+        .expect_err("missing stream handler fails transport call");
+    assert_eq!(missing_stream.code(), tonic::Code::NotFound);
+
+    let missing_stream_payload = client
+        .invoke_stream(Request::new(InvokeRequest {
+            payload: None,
+            ..llm_invoke(
+                "llm-stream",
+                RegistrationSurface::LlmStreamExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            )
+        }))
+        .await
+        .expect_err("missing stream payload fails transport call");
+    assert_status_message(missing_stream_payload, "expected llm payload");
+
+    let missing_stream_request = client
+        .invoke_stream(Request::new(llm_invoke_without_request(
+            "llm-stream",
+            RegistrationSurface::LlmStreamExecutionIntercept,
+        )))
+        .await
+        .expect_err("missing stream request fails transport call");
+    assert_status_message(missing_stream_request, "llm request is missing");
+
+    let open_error = client
+        .invoke_stream(Request::new(llm_invoke(
+            "llm-stream-open-error",
+            RegistrationSurface::LlmStreamExecutionIntercept,
+            llm_request(),
+            None,
+            None,
+        )))
+        .await
+        .expect_err("stream open callback error fails transport call");
+    assert_status_message(open_error, "stream open boom");
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_service_propagates_host_runtime_errors() {
+    let host = MockHost::default();
+    let (host_handle, host_endpoint) = spawn_host(host.clone()).await;
+    let (worker_handle, mut client) = spawn_worker(
+        Arc::new(SurfacePlugin::default()),
+        tcp_endpoint(&host_endpoint),
+    )
+    .await;
+    register_plugin(&mut client).await;
+
+    for (failures, expected) in [
+        (
+            MockHostFailures {
+                runtime_diagnostics_unimplemented: true,
+                ..Default::default()
+            },
+            "runtime diagnostics require a Relay host with the grpc-v1 diagnostics extension",
+        ),
+        (
+            MockHostFailures {
+                emit_mark: HostFailure::WorkerError,
+                ..Default::default()
+            },
+            "emit mark failed",
+        ),
+        (
+            MockHostFailures {
+                emit_mark: HostFailure::EmptyAck,
+                ..Default::default()
+            },
+            "host call failed",
+        ),
+        (
+            MockHostFailures {
+                create_scope_stack: true,
+                ..Default::default()
+            },
+            "create scope stack failed",
+        ),
+        (
+            MockHostFailures {
+                push_scope: true,
+                ..Default::default()
+            },
+            "push scope failed",
+        ),
+        (
+            MockHostFailures {
+                pop_scope: HostFailure::WorkerError,
+                ..Default::default()
+            },
+            "pop scope failed",
+        ),
+        (
+            MockHostFailures {
+                drop_scope_stack: HostFailure::WorkerError,
+                ..Default::default()
+            },
+            "drop scope stack failed",
+        ),
+        (
+            MockHostFailures {
+                tool_next: true,
+                ..Default::default()
+            },
+            "tool next failed",
+        ),
+        (
+            MockHostFailures {
+                tool_next_missing_result: true,
+                ..Default::default()
+            },
+            "tool execution result.result is missing",
+        ),
+    ] {
+        host.set_failures(failures);
+        assert_worker_error(
+            client
+                .invoke(Request::new(tool_invoke(
+                    "tool-exec",
+                    RegistrationSurface::ToolExecutionIntercept,
+                    json!({}),
+                )))
+                .await
+                .expect("host failure returns structured error")
+                .into_inner(),
+            expected,
+        );
+    }
+
+    host.set_failures(MockHostFailures {
+        llm_next: true,
+        ..Default::default()
+    });
+    assert_worker_error(
+        client
+            .invoke(Request::new(llm_invoke(
+                "llm-exec",
+                RegistrationSurface::LlmExecutionIntercept,
+                llm_request(),
+                None,
+                None,
+            )))
+            .await
+            .expect("llm next failure returns structured error")
+            .into_inner(),
+        "llm next failed",
+    );
+
+    for (failures, request, expected) in [
+        (
+            MockHostFailures {
+                codec_request_decode: true,
+                ..Default::default()
+            },
+            llm_request_codec_invoke(),
+            "codec request decode failed",
+        ),
+        (
+            MockHostFailures {
+                codec_request_encode: true,
+                ..Default::default()
+            },
+            llm_request_codec_invoke(),
+            "codec request encode failed",
+        ),
+        (
+            MockHostFailures {
+                codec_response_decode: true,
+                ..Default::default()
+            },
+            llm_response_codec_invoke(),
+            "codec response decode failed",
+        ),
+    ] {
+        host.set_failures(failures);
+        assert_worker_error(
+            client
+                .invoke(Request::new(request))
+                .await
+                .expect("codec failure returns structured error")
+                .into_inner(),
+            expected,
+        );
+    }
+
+    for (index, (mode, expected)) in [
+        (MockStreamMode::WorkerError, "stream worker failed"),
+        (MockStreamMode::EmptyChunk, "empty stream chunk"),
+        (MockStreamMode::TransportError, "stream status failed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        host.set_failures(MockHostFailures {
+            llm_stream_mode: mode,
+            ..Default::default()
+        });
+        let mut request = llm_invoke(
+            "llm-stream",
+            RegistrationSurface::LlmStreamExecutionIntercept,
+            llm_request(),
+            None,
+            None,
+        );
+        request.invocation_id = format!("llm-stream-{index}");
+        let mut stream = client
+            .invoke_stream(Request::new(request))
+            .await
+            .expect("stream invoke")
+            .into_inner();
+        let first = stream_json(stream.next().await.expect("stream poll item").unwrap());
+        assert_json_field(first, "phase", "stream_poll");
+        let second = stream.next().await.expect("host stream item").unwrap();
+        assert_stream_error(second, expected);
+    }
+
+    worker_handle.abort();
+    host_handle.abort();
+}
+
+struct MinimalPlugin;
+
+impl WorkerPlugin for MinimalPlugin {
+    fn plugin_id(&self) -> &str {
+        "minimal"
+    }
+
+    fn register(&self, _ctx: &mut PluginContext, _config: &Json) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct DuplicateEventSanitizerPlugin;
+
+impl WorkerPlugin for DuplicateEventSanitizerPlugin {
+    fn plugin_id(&self) -> &str {
+        PLUGIN_ID
+    }
+
+    fn register(&self, ctx: &mut PluginContext, _config: &Json) -> Result<()> {
+        ctx.register_mark_sanitize_guardrail("duplicate", 0, |_, fields| async move { Ok(fields) });
+        ctx.register_mark_sanitize_guardrail("duplicate", 1, |_, fields| async move { Ok(fields) });
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InvalidInitialGate {
+    EmptyKinds,
+    EmptyTarget,
+    Duplicate,
+}
+
+struct InvalidInitialGatePlugin(InvalidInitialGate);
+
+impl WorkerPlugin for InvalidInitialGatePlugin {
+    fn plugin_id(&self) -> &str {
+        PLUGIN_ID
+    }
+
+    fn register(&self, ctx: &mut PluginContext, _config: &Json) -> Result<()> {
+        let kinds = match self.0 {
+            InvalidInitialGate::EmptyKinds => BTreeSet::new(),
+            InvalidInitialGate::EmptyTarget | InvalidInitialGate::Duplicate => {
+                BTreeSet::from([RuntimeRegistrationKind::Subscriber])
+            }
+        };
+        let target = if matches!(self.0, InvalidInitialGate::EmptyTarget) {
+            ""
+        } else {
+            "target-subscriber"
+        };
+        ctx.register_conditional_middleware_guardrail(
+            "initial-gate",
+            kinds.clone(),
+            target,
+            |_, _| async { Ok(Some("disabled".into())) },
+        );
+        if matches!(self.0, InvalidInitialGate::Duplicate) {
+            ctx.register_conditional_middleware_guardrail(
+                "initial-gate",
+                kinds,
+                target,
+                |_, _| async { Ok(Some("also disabled".into())) },
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CancellationPlugin {
+    unary_started: Arc<tokio::sync::Notify>,
+    unary_cancelled: Arc<AtomicBool>,
+    stream_started: Arc<tokio::sync::Notify>,
+    stream_cancelled: Arc<AtomicBool>,
+    stream_cancelled_notified: Arc<tokio::sync::Notify>,
+    stream_setup_started: Arc<tokio::sync::Notify>,
+    stream_setup_cancelled: Arc<AtomicBool>,
+}
+
+struct CancelledOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelledOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl WorkerPlugin for CancellationPlugin {
+    fn plugin_id(&self) -> &str {
+        "cancellation"
+    }
+
+    fn register(&self, ctx: &mut PluginContext, _config: &Json) -> Result<()> {
+        let unary_started = self.unary_started.clone();
+        let unary_cancelled = self.unary_cancelled.clone();
+        ctx.register_tool_execution_intercept("cancel-unary", 0, move |_, _, _| {
+            let unary_started = unary_started.clone();
+            let unary_cancelled = unary_cancelled.clone();
+            async move {
+                let _cancelled = CancelledOnDrop(unary_cancelled);
+                unary_started.notify_one();
+                std::future::pending::<Result<ToolExecutionInterceptOutcome>>().await
+            }
+        });
+
+        let stream_started = self.stream_started.clone();
+        let stream_cancelled = self.stream_cancelled.clone();
+        let stream_cancelled_notified = self.stream_cancelled_notified.clone();
+        ctx.register_llm_stream_execution_intercept("cancel-stream", 0, move |_, _, _| {
+            let stream_started = stream_started.clone();
+            let stream_cancelled = stream_cancelled.clone();
+            let stream_cancelled_notified = stream_cancelled_notified.clone();
+            async move {
+                Ok(Box::pin(FillThenPendingStream {
+                    started: stream_started,
+                    cancelled: stream_cancelled,
+                    cancelled_notified: stream_cancelled_notified,
+                    yielded: 0,
+                }) as JsonStream)
+            }
+        });
+
+        let stream_setup_started = self.stream_setup_started.clone();
+        let stream_setup_cancelled = self.stream_setup_cancelled.clone();
+        ctx.register_llm_stream_execution_intercept("cancel-stream-setup", 0, move |_, _, _| {
+            let stream_setup_started = stream_setup_started.clone();
+            let stream_setup_cancelled = stream_setup_cancelled.clone();
+            async move {
+                let _cancelled = CancelledOnDrop(stream_setup_cancelled);
+                stream_setup_started.notify_one();
+                std::future::pending::<Result<JsonStream>>().await
+            }
+        });
+        Ok(())
+    }
+}
+
+struct FillThenPendingStream {
+    started: Arc<tokio::sync::Notify>,
+    cancelled: Arc<AtomicBool>,
+    cancelled_notified: Arc<tokio::sync::Notify>,
+    yielded: usize,
+}
+
+impl Stream for FillThenPendingStream {
+    type Item = Result<Json>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.yielded < 17 {
+            self.yielded += 1;
+            if self.yielded == 17 {
+                self.started.notify_one();
+            }
+            return Poll::Ready(Some(Ok(json!({ "chunk": self.yielded }))));
+        }
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for FillThenPendingStream {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancelled_notified.notify_one();
+    }
+}
+
+#[derive(Default)]
+struct SurfacePlugin {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl WorkerPlugin for SurfacePlugin {
+    fn plugin_id(&self) -> &str {
+        PLUGIN_ID
+    }
+
+    fn validate(&self, config: &Json) -> Vec<nemo_relay_worker::ConfigDiagnostic> {
+        if config
+            .get("diagnostic")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            vec![nemo_relay_worker::ConfigDiagnostic {
+                level: nemo_relay_worker::DiagnosticLevel::Warning,
+                code: "diagnostic.requested".into(),
+                component: Some(PLUGIN_ID.into()),
+                field: Some("diagnostic".into()),
+                message: "diagnostic requested".into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn register(&self, ctx: &mut PluginContext, _config: &Json) -> Result<()> {
+        let runtime = ctx.runtime().expect("worker service provides runtime");
+        ctx.register_conditional_middleware_guardrail(
+            "initial-gate",
+            BTreeSet::from([RuntimeRegistrationKind::Subscriber]),
+            "missing-target",
+            |_, registration_name| {
+                let decision =
+                    (registration_name == "missing-target").then(|| "initial gate".to_string());
+                async move { Ok(decision) }
+            },
+        );
+        let events = self.events.clone();
+        ctx.register_subscriber("subscriber", move |event| {
+            events
+                .lock()
+                .expect("events lock")
+                .push(event.name().into());
+        });
+        ctx.register_event_metadata_injector("event-metadata", 1, |event| async move {
+            Ok(BTreeMap::from([(
+                "worker.event_name".into(),
+                json!(event.name()),
+            )]))
+        });
+        ctx.register_mark_sanitize_guardrail("event-sanitize", 1, |event, mut fields| {
+            let event_name = event.name().to_owned();
+            async move {
+                fields.data = Some(json!({"name": event_name, "phase": "mark"}));
+                Ok(fields)
+            }
+        });
+        ctx.register_scope_sanitize_start_guardrail(
+            "event-sanitize",
+            1,
+            |_, mut fields| async move {
+                fields.metadata = Some(json!({"phase": "scope_start"}));
+                Ok(fields)
+            },
+        );
+        ctx.register_scope_sanitize_end_guardrail(
+            "event-sanitize",
+            1,
+            |_, mut fields| async move {
+                fields.metadata = Some(json!({"phase": "scope_end"}));
+                Ok(fields)
+            },
+        );
+        ctx.register_tool_sanitize_request_guardrail("tool-sanitize", 1, |_, value| async move {
+            Ok(set_json_field(value, "phase", "tool_sanitize_request"))
+        });
+        ctx.register_tool_sanitize_response_guardrail("tool-sanitize", 1, |_, value| async move {
+            Ok(set_json_field(value, "phase", "tool_sanitize_response"))
+        });
+        ctx.register_tool_conditional_execution_guardrail(
+            "tool-conditional",
+            1,
+            |_, value| async move {
+                tokio::task::yield_now().await;
+                Ok(value
+                    .get("block")
+                    .and_then(serde_json::Value::as_bool)
+                    .and_then(|blocked| blocked.then(|| "blocked-tool".into())))
+            },
+        );
+        ctx.register_tool_request_intercept("tool-request", 1, false, |_, value| async move {
+            tokio::task::yield_now().await;
+            Ok(set_json_field(value, "phase", "tool_request"))
+        });
+        ctx.register_tool_request_intercept("tool-error", 1, false, |_, _| async {
+            Err(WorkerSdkError::Callback("boom".into()))
+        });
+
+        let tool_runtime = runtime.clone();
+        ctx.register_tool_execution_intercept("tool-exec", 1, move |_, value, next: ToolNext| {
+            let runtime = tool_runtime.clone();
+            async move {
+                let registrations = runtime
+                    .list_runtime_registrations(Some(BTreeSet::from([
+                        RuntimeRegistrationKind::Subscriber,
+                    ])))
+                    .await?;
+                if !registrations.is_empty() {
+                    return Err(WorkerSdkError::Callback(
+                        "mock runtime registration discovery was not empty".into(),
+                    ));
+                }
+                let duplicate_error = runtime
+                    .register_conditional_middleware_guardrail(
+                        "initial-gate",
+                        BTreeSet::from([RuntimeRegistrationKind::Subscriber]),
+                        "target-subscriber",
+                        |_, _| async { Ok(None) },
+                    )
+                    .await
+                    .expect_err("activation callback names must remain reserved");
+                if !matches!(duplicate_error, WorkerSdkError::InvalidInput(_)) {
+                    return Err(WorkerSdkError::Callback(format!(
+                        "unexpected duplicate callback error: {duplicate_error}"
+                    )));
+                }
+                let gate = runtime
+                    .register_conditional_middleware_guardrail(
+                        "timer-gate",
+                        BTreeSet::from([RuntimeRegistrationKind::Subscriber]),
+                        "target-subscriber",
+                        |_, _| async { Ok(Some("timer active".into())) },
+                    )
+                    .await?;
+                if !runtime
+                    .deregister_conditional_middleware_guardrail(&gate)
+                    .await?
+                {
+                    return Err(WorkerSdkError::Callback(
+                        "mock runtime did not remove the owned gate".into(),
+                    ));
+                }
+                let diagnostics = runtime.runtime_diagnostics().await?;
+                if diagnostics
+                    .get("otel.metric_mark_invalid")
+                    .map(|diagnostic| diagnostic.count)
+                    != Some(3)
+                {
+                    return Err(WorkerSdkError::Callback(
+                        "runtime diagnostics response did not contain the expected entry".into(),
+                    ));
+                }
+                runtime.emit_mark("tool-exec", None, None).await?;
+                runtime
+                    .emit_mark_with_options_and_category(
+                        "tool-exec-telemetry",
+                        Some(json!({"measurements": []})),
+                        None,
+                        EmitMarkOptions {
+                            data_schema: Some(
+                                DataSchema::builder()
+                                    .name("nemo.relay.metric_measurements")
+                                    .version("1")
+                                    .build(),
+                            ),
+                            severity: Some(LogSeverity::Warn),
+                        },
+                        EventCategory::custom(),
+                    )
+                    .await?;
+                runtime
+                    .emit_metric_with_category(
+                        "tool-exec-metric",
+                        vec![MetricMeasurement {
+                            name: "worker.requests".into(),
+                            kind: MetricKind::Counter,
+                            value_type: MetricValueType::U64,
+                            value: json!(1),
+                            unit: None,
+                            description: None,
+                            attributes: None,
+                            boundaries: None,
+                        }],
+                        None,
+                        EventCategory::custom(),
+                    )
+                    .await?;
+                let stack_id = runtime.create_scope_stack().await?;
+                let isolated_runtime = runtime.clone();
+                runtime
+                    .with_scope_stack(&stack_id, || async move {
+                        isolated_runtime
+                            .emit_mark("tool-exec-isolated", None, None)
+                            .await
+                    })
+                    .await?;
+                runtime.emit_mark("tool-exec-restored", None, None).await?;
+                let handle = runtime
+                    .push_scope(None, "worker-scope", ScopeType::Function, None, None, None)
+                    .await?;
+                runtime.pop_scope(&handle, None, None).await?;
+                runtime.drop_scope_stack(&stack_id).await?;
+                let mut next_value = next.call(value).await?;
+                next_value.result = set_json_field(next_value.result, "phase", "tool_exec");
+                Ok(
+                    ToolExecutionInterceptOutcome::from(next_value).with_pending_mark(
+                        PendingMarkSpec::builder()
+                            .name("worker.tool.execution")
+                            .data(json!({"checkpoint": true}))
+                            .build(),
+                    ),
+                )
+            }
+        });
+        let scope_runtime = runtime.clone();
+        ctx.register_tool_execution_intercept("tool-scope-types", 1, move |_, _, _| {
+            let runtime = scope_runtime.clone();
+            async move {
+                for scope_type in [
+                    ScopeType::Agent,
+                    ScopeType::Function,
+                    ScopeType::Tool,
+                    ScopeType::Llm,
+                    ScopeType::Retriever,
+                    ScopeType::Embedder,
+                    ScopeType::Reranker,
+                    ScopeType::Guardrail,
+                    ScopeType::Evaluator,
+                    ScopeType::Custom,
+                    ScopeType::Unknown,
+                ] {
+                    let handle = runtime
+                        .push_scope(
+                            Some("explicit-stack"),
+                            &format!("scope-{}", scope_type.as_str()),
+                            scope_type,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    runtime.pop_scope(&handle, None, None).await?;
+                }
+                Ok(Json::Null.into())
+            }
+        });
+
+        ctx.register_llm_sanitize_request_guardrail(
+            "llm-sanitize-request",
+            1,
+            |mut request, context| async move {
+                if let Some(codec) = context.resolve_codec() {
+                    let annotated = codec.decode(&request).await?;
+                    request = codec.encode(&annotated, &request).await?;
+                }
+                Ok(Some(set_llm_phase(request, "llm_sanitize_request")))
+            },
+        );
+        ctx.register_llm_sanitize_response_guardrail(
+            "llm-sanitize-response",
+            1,
+            |value, context| async move {
+                if let Some(codec) = context.resolve_codec() {
+                    codec.decode(&value).await?;
+                }
+                Ok(Some(set_json_field(
+                    value,
+                    "phase",
+                    "llm_sanitize_response",
+                )))
+            },
+        );
+        ctx.register_llm_sanitize_request_guardrail(
+            "llm-sanitize-omit-request",
+            1,
+            |_request, _context| async { Ok(None) },
+        );
+        ctx.register_llm_sanitize_response_guardrail(
+            "llm-sanitize-omit-response",
+            1,
+            |_response, _context| async { Ok(None) },
+        );
+        ctx.register_llm_conditional_execution_guardrail(
+            "llm-conditional",
+            1,
+            |request| async move {
+                tokio::task::yield_now().await;
+                Ok(request
+                    .content
+                    .get("block")
+                    .and_then(serde_json::Value::as_bool)
+                    .and_then(|blocked| blocked.then(|| "blocked-llm".into())))
+            },
+        );
+        ctx.register_llm_request_intercept(
+            "llm-request",
+            1,
+            false,
+            |_, request, annotated| async move {
+                tokio::task::yield_now().await;
+                Ok(nemo_relay_worker::LlmRequestInterceptOutcome::new(
+                    set_llm_phase(request, "llm_request"),
+                    annotated,
+                ))
+            },
+        );
+
+        ctx.register_llm_execution_intercept(
+            "llm-exec",
+            1,
+            move |_, request, next: LlmNext| async move {
+                let next_value = next.call(request).await?;
+                Ok(set_json_field(next_value, "phase", "llm_exec"))
+            },
+        );
+
+        let stream_runtime = runtime.clone();
+        ctx.register_llm_stream_execution_intercept(
+            "llm-stream",
+            1,
+            move |_, request, next: LlmStreamNext| {
+                let runtime = stream_runtime.clone();
+                async move {
+                    let next_stream = next.call(request).await?;
+                    Ok(Box::pin(RuntimeMarkThenStream::new(runtime, next_stream)) as JsonStream)
+                }
+            },
+        );
+        ctx.register_llm_stream_execution_intercept("llm-stream-error", 1, |_, _, _| async {
+            let stream: JsonStream = Box::pin(tokio_stream::iter(vec![Err(
+                WorkerSdkError::Callback("stream boom".into()),
+            )]));
+            Ok(stream)
+        });
+        ctx.register_llm_stream_execution_intercept("llm-stream-open-error", 1, |_, _, _| async {
+            Err(WorkerSdkError::Callback("stream open boom".into()))
+        });
+        Ok(())
+    }
+}
+
+struct RuntimeMarkThenStream {
+    runtime: Option<PluginRuntime>,
+    pending: Option<Pin<Box<dyn Future<Output = Result<Json>> + Send>>>,
+    inner: JsonStream,
+}
+
+impl RuntimeMarkThenStream {
+    fn new(runtime: PluginRuntime, inner: JsonStream) -> Self {
+        Self {
+            runtime: Some(runtime),
+            pending: None,
+            inner,
+        }
+    }
+}
+
+impl Unpin for RuntimeMarkThenStream {}
+
+impl Stream for RuntimeMarkThenStream {
+    type Item = Result<Json>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.runtime.is_some() || self.pending.is_some() {
+            if self.pending.is_none() {
+                let runtime = self.runtime.take().expect("runtime present");
+                self.pending = Some(Box::pin(async move {
+                    runtime.emit_mark("stream-poll", None, None).await?;
+                    Ok(json!({"phase": "stream_poll"}))
+                }));
+            }
+            let future = self.pending.as_mut().expect("pending future");
+            return match future.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    self.pending = None;
+                    Poll::Ready(Some(result))
+                }
+                Poll::Pending => Poll::Pending,
+            };
+        }
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum HostFailure {
+    #[default]
+    None,
+    WorkerError,
+    EmptyAck,
+}
+
+#[derive(Clone, Copy, Default)]
+enum MockStreamMode {
+    #[default]
+    Value,
+    WorkerError,
+    TransportError,
+    EmptyChunk,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MockHostFailures {
+    runtime_diagnostics_unimplemented: bool,
+    emit_mark: HostFailure,
+    create_scope_stack: bool,
+    push_scope: bool,
+    pop_scope: HostFailure,
+    drop_scope_stack: HostFailure,
+    tool_next: bool,
+    tool_next_missing_result: bool,
+    llm_next: bool,
+    llm_stream_mode: MockStreamMode,
+    codec_request_decode: bool,
+    codec_request_encode: bool,
+    codec_response_decode: bool,
+}
+
+#[derive(Clone, Default)]
+struct RuntimeRegistrationRequests {
+    list: Vec<ListRuntimeRegistrationsRequest>,
+    register: Vec<RegisterConditionalMiddlewareGuardrailRequest>,
+    deregister: Vec<DeregisterConditionalMiddlewareGuardrailRequest>,
+}
+
+#[derive(Clone, Default)]
+struct MockHost {
+    calls: Arc<Mutex<Vec<String>>>,
+    marks: Arc<Mutex<Vec<EmitMarkRequest>>>,
+    failures: Arc<Mutex<MockHostFailures>>,
+    runtime_registration_requests: Arc<Mutex<RuntimeRegistrationRequests>>,
+}
+
+impl MockHost {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+
+    fn record(&self, call: impl Into<String>) {
+        self.calls.lock().expect("calls lock").push(call.into());
+    }
+
+    fn marks(&self) -> Vec<EmitMarkRequest> {
+        self.marks.lock().expect("marks lock").clone()
+    }
+
+    fn failures(&self) -> MockHostFailures {
+        *self.failures.lock().expect("failures lock")
+    }
+
+    fn set_failures(&self, failures: MockHostFailures) {
+        *self.failures.lock().expect("failures lock") = failures;
+    }
+
+    fn runtime_registration_requests(&self) -> RuntimeRegistrationRequests {
+        self.runtime_registration_requests
+            .lock()
+            .expect("runtime registration requests lock")
+            .clone()
+    }
+}
+
+#[tonic::async_trait]
+impl RelayHostRuntime for MockHost {
+    async fn list_runtime_registrations(
+        &self,
+        request: Request<ListRuntimeRegistrationsRequest>,
+    ) -> std::result::Result<Response<ListRuntimeRegistrationsResponse>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.runtime_registration_requests
+            .lock()
+            .expect("runtime registration requests lock")
+            .list
+            .push(request);
+        Ok(Response::new(ListRuntimeRegistrationsResponse {
+            registrations: Vec::new(),
+            error: None,
+        }))
+    }
+
+    async fn register_conditional_middleware_guardrail(
+        &self,
+        request: Request<RegisterConditionalMiddlewareGuardrailRequest>,
+    ) -> std::result::Result<Response<RegisterConditionalMiddlewareGuardrailResponse>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.runtime_registration_requests
+            .lock()
+            .expect("runtime registration requests lock")
+            .register
+            .push(request);
+        Ok(Response::new(
+            RegisterConditionalMiddlewareGuardrailResponse {
+                handle: "gate-handle".into(),
+                error: None,
+            },
+        ))
+    }
+
+    async fn deregister_conditional_middleware_guardrail(
+        &self,
+        request: Request<DeregisterConditionalMiddlewareGuardrailRequest>,
+    ) -> std::result::Result<Response<DeregisterConditionalMiddlewareGuardrailResponse>, Status>
+    {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.runtime_registration_requests
+            .lock()
+            .expect("runtime registration requests lock")
+            .deregister
+            .push(request);
+        Ok(Response::new(
+            DeregisterConditionalMiddlewareGuardrailResponse {
+                removed: true,
+                error: None,
+            },
+        ))
+    }
+
+    async fn get_runtime_diagnostics(
+        &self,
+        request: Request<GetRuntimeDiagnosticsRequest>,
+    ) -> std::result::Result<Response<GetRuntimeDiagnosticsResponse>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record("runtime_diagnostics");
+        if self.failures().runtime_diagnostics_unimplemented {
+            return Err(Status::unimplemented("runtime diagnostics are unavailable"));
+        }
+        Ok(Response::new(GetRuntimeDiagnosticsResponse {
+            entries: vec![ProtoRuntimeDiagnostic {
+                code: "otel.metric_mark_invalid".into(),
+                message: "metric mark has an unsupported value".into(),
+                count: 3,
+            }],
+        }))
+    }
+
+    async fn emit_mark(
+        &self,
+        request: Request<EmitMarkRequest>,
+    ) -> std::result::Result<Response<HostAck>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.marks.lock().expect("marks lock").push(request.clone());
+        let scope = request.scope.expect("scope context");
+        self.record(format!(
+            "mark:{}:{}:{}",
+            request.name, scope.scope_stack_id, scope.parent_scope_id
+        ));
+        match self.failures().emit_mark {
+            HostFailure::None => {}
+            HostFailure::WorkerError => {
+                return Ok(Response::new(host_ack_error("emit mark failed")));
+            }
+            HostFailure::EmptyAck => {
+                return Ok(Response::new(HostAck {
+                    ok: false,
+                    error: None,
+                }));
+            }
+        }
+        Ok(Response::new(host_ack()))
+    }
+
+    async fn push_scope(
+        &self,
+        request: Request<PushScopeRequest>,
+    ) -> std::result::Result<Response<PushScopeResponse>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        let scope = request.scope.expect("scope context");
+        self.record(format!(
+            "push:{}:{}:{}",
+            request.name, scope.scope_stack_id, scope.parent_scope_id
+        ));
+        if self.failures().push_scope {
+            return Ok(Response::new(PushScopeResponse {
+                scope_handle_id: String::new(),
+                error: Some(worker_error("push scope failed")),
+            }));
+        }
+        Ok(Response::new(PushScopeResponse {
+            scope_handle_id: "scope-handle-1".into(),
+            error: None,
+        }))
+    }
+
+    async fn pop_scope(
+        &self,
+        request: Request<PopScopeRequest>,
+    ) -> std::result::Result<Response<HostAck>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!("pop:{}", request.scope_handle_id));
+        match self.failures().pop_scope {
+            HostFailure::None => {}
+            HostFailure::WorkerError => {
+                return Ok(Response::new(host_ack_error("pop scope failed")));
+            }
+            HostFailure::EmptyAck => {
+                return Ok(Response::new(HostAck {
+                    ok: false,
+                    error: None,
+                }));
+            }
+        }
+        Ok(Response::new(host_ack()))
+    }
+
+    async fn create_scope_stack(
+        &self,
+        request: Request<CreateScopeStackRequest>,
+    ) -> std::result::Result<Response<CreateScopeStackResponse>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record("create_scope_stack");
+        if self.failures().create_scope_stack {
+            return Ok(Response::new(CreateScopeStackResponse {
+                scope_stack_id: String::new(),
+                error: Some(worker_error("create scope stack failed")),
+            }));
+        }
+        Ok(Response::new(CreateScopeStackResponse {
+            scope_stack_id: "isolated-stack".into(),
+            error: None,
+        }))
+    }
+
+    async fn drop_scope_stack(
+        &self,
+        request: Request<DropScopeStackRequest>,
+    ) -> std::result::Result<Response<HostAck>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!("drop:{}", request.scope_stack_id));
+        match self.failures().drop_scope_stack {
+            HostFailure::None => {}
+            HostFailure::WorkerError => {
+                return Ok(Response::new(host_ack_error("drop scope stack failed")));
+            }
+            HostFailure::EmptyAck => {
+                return Ok(Response::new(HostAck {
+                    ok: false,
+                    error: None,
+                }));
+            }
+        }
+        Ok(Response::new(host_ack()))
+    }
+
+    async fn tool_next(
+        &self,
+        request: Request<ToolNextRequest>,
+    ) -> std::result::Result<Response<ToolExecutionResultResponse>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!("tool_next:{}", request.continuation_id));
+        if self.failures().tool_next {
+            return Ok(Response::new(ToolExecutionResultResponse {
+                value: None,
+                error: Some(worker_error("tool next failed")),
+            }));
+        }
+        let value = if self.failures().tool_next_missing_result {
+            ProtoToolExecutionResult {
+                result: None,
+                annotation: None,
+            }
+        } else {
+            ProtoToolExecutionResult {
+                result: Some(json_value(&json!({"next": "tool"})).expect("encode tool result")),
+                annotation: Some(
+                    json_value(&json!({"source": "host"})).expect("encode annotation"),
+                ),
+            }
+        };
+        Ok(Response::new(ToolExecutionResultResponse {
+            value: Some(value),
+            error: None,
+        }))
+    }
+
+    async fn llm_next(
+        &self,
+        request: Request<LlmNextRequest>,
+    ) -> std::result::Result<Response<JsonResult>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!("llm_next:{}", request.continuation_id));
+        if self.failures().llm_next {
+            return Ok(Response::new(JsonResult {
+                value: None,
+                error: Some(worker_error("llm next failed")),
+            }));
+        }
+        Ok(Response::new(JsonResult {
+            value: Some(json_env(json!({"next": "llm"}))),
+            error: None,
+        }))
+    }
+
+    type LlmStreamNextStream =
+        Pin<Box<dyn Stream<Item = std::result::Result<StreamChunk, Status>> + Send>>;
+
+    async fn llm_stream_next(
+        &self,
+        request: Request<LlmStreamNextRequest>,
+    ) -> std::result::Result<Response<Self::LlmStreamNextStream>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!("llm_stream_next:{}", request.continuation_id));
+        let chunks: Vec<std::result::Result<StreamChunk, Status>> =
+            match self.failures().llm_stream_mode {
+                MockStreamMode::Value => vec![Ok(StreamChunk {
+                    item: Some(nemo_relay_worker_proto::v1::stream_chunk::Item::Value(
+                        json_env(json!({"next": "llm_stream"})),
+                    )),
+                })],
+                MockStreamMode::WorkerError => vec![Ok(StreamChunk {
+                    item: Some(nemo_relay_worker_proto::v1::stream_chunk::Item::Error(
+                        worker_error("stream worker failed"),
+                    )),
+                })],
+                MockStreamMode::TransportError => {
+                    vec![Err(Status::unavailable("stream status failed"))]
+                }
+                MockStreamMode::EmptyChunk => vec![Ok(StreamChunk { item: None })],
+            };
+        let stream = tokio_stream::iter(chunks);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn decode_llm_codec_request(
+        &self,
+        request: Request<nemo_relay_worker_proto::v1::LlmCodecDecodeRequest>,
+    ) -> std::result::Result<Response<JsonResult>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!(
+            "codec_request_decode:{}",
+            request.codec_capability_id
+        ));
+        if self.failures().codec_request_decode {
+            return Ok(Response::new(JsonResult {
+                value: None,
+                error: Some(worker_error("codec request decode failed")),
+            }));
+        }
+        Ok(Response::new(JsonResult {
+            value: Some(
+                json_envelope("nemo.relay.AnnotatedLlmRequest@2", &json!({}))
+                    .expect("encode annotated request"),
+            ),
+            error: None,
+        }))
+    }
+
+    async fn encode_llm_codec_request(
+        &self,
+        request: Request<nemo_relay_worker_proto::v1::LlmCodecEncodeRequest>,
+    ) -> std::result::Result<Response<JsonResult>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!(
+            "codec_request_encode:{}",
+            request.codec_capability_id
+        ));
+        if self.failures().codec_request_encode {
+            return Ok(Response::new(JsonResult {
+                value: None,
+                error: Some(worker_error("codec request encode failed")),
+            }));
+        }
+        Ok(Response::new(JsonResult {
+            value: Some(
+                json_envelope(
+                    "nemo.relay.LlmRequest@1",
+                    &json!({"headers": {}, "content": {}}),
+                )
+                .expect("encode LLM request"),
+            ),
+            error: None,
+        }))
+    }
+
+    async fn decode_llm_codec_response(
+        &self,
+        request: Request<nemo_relay_worker_proto::v1::LlmCodecDecodeResponse>,
+    ) -> std::result::Result<Response<JsonResult>, Status> {
+        let request = request.into_inner();
+        authorize_host(&request.activation_id, &request.auth_token)?;
+        self.record(format!(
+            "codec_response_decode:{}",
+            request.codec_capability_id
+        ));
+        if self.failures().codec_response_decode {
+            return Ok(Response::new(JsonResult {
+                value: None,
+                error: Some(worker_error("codec response decode failed")),
+            }));
+        }
+        Ok(Response::new(JsonResult {
+            value: Some(json_env(json!({}))),
+            error: None,
+        }))
+    }
+}
+
+async fn spawn_worker(
+    plugin: Arc<dyn WorkerPlugin>,
+    host_endpoint: String,
+) -> (JoinHandle<Result<()>>, PluginWorkerClient<Channel>) {
+    let (worker_endpoint, connect_endpoint) = unused_worker_endpoints();
+    let handle = tokio::spawn(serve_plugin_arc_with_config(
+        plugin,
+        WorkerServerConfig {
+            worker_endpoint,
+            host_endpoint,
+            activation_id: ACTIVATION_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+        },
+    ));
+    let client = connect_worker(&connect_endpoint).await;
+    (handle, client)
+}
+
+async fn spawn_host(
+    host: MockHost,
+) -> (
+    JoinHandle<std::result::Result<(), tonic::transport::Error>>,
+    String,
+) {
+    let endpoint = unused_http_endpoint();
+    let addr = endpoint
+        .strip_prefix("http://")
+        .expect("http endpoint")
+        .parse::<SocketAddr>()
+        .expect("socket address");
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(RelayHostRuntimeServer::new(host))
+            .serve(addr)
+            .await
+    });
+    wait_for_port(&endpoint).await;
+    (handle, endpoint)
+}
+
+#[cfg(unix)]
+async fn spawn_unix_host(
+    host: MockHost,
+    path: PathBuf,
+) -> JoinHandle<std::result::Result<(), tonic::transport::Error>> {
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind host unix socket");
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(RelayHostRuntimeServer::new(host))
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+    });
+    wait_for_unix_socket(&path).await;
+    handle
+}
+
+async fn connect_worker(endpoint: &str) -> PluginWorkerClient<Channel> {
+    for _ in 0..50 {
+        match PluginWorkerClient::connect(endpoint.to_owned()).await {
+            Ok(client) => return client,
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    panic!("worker did not start at {endpoint}");
+}
+
+#[cfg(unix)]
+async fn connect_worker_uds(endpoint: &str) -> PluginWorkerClient<Channel> {
+    let path = Arc::new(
+        endpoint
+            .strip_prefix("unix://")
+            .map(PathBuf::from)
+            .expect("unix endpoint"),
+    );
+    for _ in 0..50 {
+        let path = path.clone();
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .expect("uds placeholder endpoint")
+            .connect_with_connector(service_fn(move |_| {
+                let path = path.clone();
+                async move {
+                    let stream = UnixStream::connect(&*path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await;
+        if let Ok(channel) = channel {
+            return PluginWorkerClient::new(channel);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("worker did not start at {endpoint}");
+}
+
+async fn wait_for_port(endpoint: &str) {
+    for _ in 0..50 {
+        if Channel::from_shared(endpoint.to_owned())
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("server did not start at {endpoint}");
+}
+
+async fn wait_for_endpoint_file(path: &Path) -> String {
+    for _ in 0..50 {
+        match std::fs::read_to_string(path) {
+            Ok(endpoint) if !endpoint.trim().is_empty() => return endpoint,
+            Ok(_) | Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    panic!("endpoint file was not written at {}", path.display());
+}
+
+#[cfg(unix)]
+async fn wait_for_unix_socket(path: &Path) {
+    for _ in 0..50 {
+        if UnixStream::connect(path).await.is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("server did not start at {}", path.display());
+}
+
+async fn register_plugin(
+    client: &mut PluginWorkerClient<Channel>,
+) -> Vec<nemo_relay_worker_proto::v1::Registration> {
+    client
+        .register(Request::new(RegisterRequest {
+            activation_id: ACTIVATION_ID.into(),
+            plugin_id: PLUGIN_ID.into(),
+            auth_token: AUTH_TOKEN.into(),
+            config: Some(json_env(json!({}))),
+        }))
+        .await
+        .expect("register succeeds")
+        .into_inner()
+        .registrations
+}
+
+fn unused_http_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+fn unused_worker_endpoints() -> (String, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    (format!("tcp://{addr}"), format!("http://{addr}"))
+}
+
+fn tcp_endpoint(http_endpoint: &str) -> String {
+    format!(
+        "tcp://{}",
+        http_endpoint
+            .strip_prefix("http://")
+            .expect("http endpoint")
+    )
+}
+
+fn json_env(value: Json) -> JsonEnvelope {
+    json_envelope("nemo.relay.Json@1", &value).expect("encode JSON envelope")
+}
+
+fn invalid_json_env(schema: &str) -> JsonEnvelope {
+    JsonEnvelope {
+        schema: schema.into(),
+        json: b"{".to_vec(),
+    }
+}
+
+fn event_invoke(registration_name: &str) -> InvokeRequest {
+    event_invoke_surface(registration_name, RegistrationSurface::Subscriber)
+}
+
+fn event_invoke_surface(registration_name: &str, surface: RegistrationSurface) -> InvokeRequest {
+    let event = Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .name("subscriber-event")
+            .data(json!({"raw": true}))
+            .build(),
+        None,
+        None,
+    ));
+    InvokeRequest {
+        activation_id: ACTIVATION_ID.into(),
+        invocation_id: "invoke-1".into(),
+        registration_name: registration_name.into(),
+        surface: surface as i32,
+        continuation_id: "next-1".into(),
+        scope: Some(scope_context()),
+        auth_token: AUTH_TOKEN.into(),
+        payload: Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Event(
+            json_envelope("nemo.relay.Event@1", &event).expect("encode event"),
+        )),
+    }
+}
+
+fn tool_invoke(
+    registration_name: &str,
+    surface: RegistrationSurface,
+    value: Json,
+) -> InvokeRequest {
+    InvokeRequest {
+        activation_id: ACTIVATION_ID.into(),
+        invocation_id: "invoke-1".into(),
+        registration_name: registration_name.into(),
+        surface: surface as i32,
+        continuation_id: "next-1".into(),
+        scope: Some(scope_context()),
+        auth_token: AUTH_TOKEN.into(),
+        payload: Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Tool(
+            ToolInvocation {
+                tool_name: "tool".into(),
+                value: Some(json_env(value)),
+            },
+        )),
+    }
+}
+
+fn llm_invoke(
+    registration_name: &str,
+    surface: RegistrationSurface,
+    request: LlmRequest,
+    annotated_request: Option<Json>,
+    response: Option<Json>,
+) -> InvokeRequest {
+    InvokeRequest {
+        activation_id: ACTIVATION_ID.into(),
+        invocation_id: "invoke-1".into(),
+        registration_name: registration_name.into(),
+        surface: surface as i32,
+        continuation_id: "next-1".into(),
+        scope: Some(scope_context()),
+        auth_token: AUTH_TOKEN.into(),
+        payload: Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Llm(
+            LlmInvocation {
+                model_name: "model".into(),
+                request: Some(
+                    json_envelope("nemo.relay.LlmRequest@1", &request).expect("encode request"),
+                ),
+                annotated_request: annotated_request.map(json_env),
+                response: response.map(json_env),
+                sanitize_context: None,
+            },
+        )),
+    }
+}
+
+fn llm_invoke_without_request(
+    registration_name: &str,
+    surface: RegistrationSurface,
+) -> InvokeRequest {
+    InvokeRequest {
+        activation_id: ACTIVATION_ID.into(),
+        invocation_id: "invoke-1".into(),
+        registration_name: registration_name.into(),
+        surface: surface as i32,
+        continuation_id: "next-1".into(),
+        scope: Some(scope_context()),
+        auth_token: AUTH_TOKEN.into(),
+        payload: Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Llm(
+            LlmInvocation {
+                model_name: "model".into(),
+                request: None,
+                annotated_request: None,
+                response: None,
+                sanitize_context: None,
+            },
+        )),
+    }
+}
+
+fn llm_invoke_with_bad_annotation(registration_name: &str) -> InvokeRequest {
+    let mut request = llm_invoke(
+        registration_name,
+        RegistrationSurface::LlmRequestIntercept,
+        llm_request(),
+        None,
+        None,
+    );
+    if let Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Llm(payload)) =
+        request.payload.as_mut()
+    {
+        payload.annotated_request = Some(JsonEnvelope {
+            schema: ANNOTATED_LLM_REQUEST_SCHEMA.into(),
+            json: b"{".to_vec(),
+        });
+    }
+    request
+}
+
+fn llm_invoke_with_legacy_annotation(registration_name: &str) -> InvokeRequest {
+    let mut request = llm_invoke(
+        registration_name,
+        RegistrationSurface::LlmRequestIntercept,
+        llm_request(),
+        None,
+        None,
+    );
+    if let Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Llm(payload)) =
+        request.payload.as_mut()
+    {
+        payload.annotated_request = Some(JsonEnvelope {
+            schema: "nemo.relay.AnnotatedLlmRequest@1".into(),
+            json: br#"{"messages":[]}"#.to_vec(),
+        });
+    }
+    request
+}
+
+fn scope_context() -> ScopeContext {
+    ScopeContext {
+        scope_stack_id: "stack-1".into(),
+        parent_scope_id: "parent-1".into(),
+    }
+}
+
+fn llm_request() -> LlmRequest {
+    LlmRequest {
+        headers: Default::default(),
+        content: json!({"prompt": "hello"}),
+    }
+}
+
+fn llm_request_with_block() -> LlmRequest {
+    LlmRequest {
+        headers: Default::default(),
+        content: json!({"block": true}),
+    }
+}
+
+fn llm_request_codec_invoke() -> InvokeRequest {
+    let mut request = llm_invoke(
+        "llm-sanitize-request",
+        RegistrationSurface::LlmSanitizeRequestGuardrail,
+        llm_request(),
+        None,
+        None,
+    );
+    if let Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Llm(invocation)) =
+        request.payload.as_mut()
+    {
+        invocation.sanitize_context = Some(
+            nemo_relay_worker_proto::v1::llm_invocation::SanitizeContext::RequestSanitizeContext(
+                nemo_relay_worker_proto::v1::LlmSanitizeRequestContext {
+                    codec: Some(nemo_relay_worker_proto::v1::LlmCodecIdentity {
+                        kind: nemo_relay_worker_proto::v1::LlmCodecKind::Builtin as i32,
+                        id: Some("openai_chat".into()),
+                    }),
+                    codec_capability_id: Some("request-capability".into()),
+                },
+            ),
+        );
+    }
+    request
+}
+
+fn llm_response_codec_invoke() -> InvokeRequest {
+    let mut request = llm_invoke(
+        "llm-sanitize-response",
+        RegistrationSurface::LlmSanitizeResponseGuardrail,
+        llm_request(),
+        None,
+        Some(json!({"value": "secret"})),
+    );
+    if let Some(nemo_relay_worker_proto::v1::invoke_request::Payload::Llm(invocation)) =
+        request.payload.as_mut()
+    {
+        invocation.sanitize_context = Some(
+            nemo_relay_worker_proto::v1::llm_invocation::SanitizeContext::ResponseSanitizeContext(
+                nemo_relay_worker_proto::v1::LlmSanitizeResponseContext {
+                    codec: Some(nemo_relay_worker_proto::v1::LlmCodecIdentity {
+                        kind: nemo_relay_worker_proto::v1::LlmCodecKind::Opaque as i32,
+                        id: None,
+                    }),
+                    codec_capability_id: Some("response-capability".into()),
+                },
+            ),
+        );
+    }
+    request
+}
+
+fn set_json_field(mut value: Json, key: &str, field_value: &str) -> Json {
+    value
+        .as_object_mut()
+        .expect("JSON object")
+        .insert(key.into(), json!(field_value));
+    value
+}
+
+fn set_llm_phase(mut request: LlmRequest, phase: &str) -> LlmRequest {
+    request
+        .content
+        .as_object_mut()
+        .expect("request content object")
+        .insert("phase".into(), json!(phase));
+    request
+}
+
+async fn invoke_json(client: &mut PluginWorkerClient<Channel>, request: InvokeRequest) -> Json {
+    let response = client
+        .invoke(Request::new(request))
+        .await
+        .expect("invoke succeeds")
+        .into_inner();
+    match response.result.expect("invoke result") {
+        nemo_relay_worker_proto::v1::invoke_response::Result::Json(result) => {
+            decode_json_envelope(&result.value.expect("json value")).expect("decode JSON result")
+        }
+        nemo_relay_worker_proto::v1::invoke_response::Result::ToolExecution(result) => {
+            decode_tool_execution_outcome(result.outcome.expect("tool execution outcome")).result
+        }
+        other => panic!("unexpected invoke result: {other:?}"),
+    }
+}
+
+async fn invoke_tool_execution(
+    client: &mut PluginWorkerClient<Channel>,
+    request: InvokeRequest,
+) -> ToolExecutionInterceptOutcome {
+    let response = client
+        .invoke(Request::new(request))
+        .await
+        .expect("invoke succeeds")
+        .into_inner();
+    match response.result.expect("invoke result") {
+        nemo_relay_worker_proto::v1::invoke_response::Result::ToolExecution(result) => {
+            let outcome = result.outcome.expect("tool execution outcome");
+            decode_tool_execution_outcome(outcome)
+        }
+        other => panic!("unexpected invoke result: {other:?}"),
+    }
+}
+
+fn decode_tool_execution_outcome(
+    outcome: ProtoToolExecutionInterceptOutcome,
+) -> ToolExecutionInterceptOutcome {
+    ToolExecutionInterceptOutcome {
+        result: decode_json_value(outcome.result.as_ref().expect("tool execution result"))
+            .expect("decode tool execution result"),
+        annotation: outcome
+            .annotation
+            .as_ref()
+            .map(decode_json_value)
+            .transpose()
+            .expect("decode tool execution annotation")
+            .filter(|value: &Json| !value.is_null()),
+        pending_marks: outcome
+            .pending_marks
+            .as_ref()
+            .map(decode_json_value)
+            .transpose()
+            .expect("decode pending marks")
+            .unwrap_or_default(),
+    }
+}
+
+async fn invoke_guardrail(
+    client: &mut PluginWorkerClient<Channel>,
+    request: InvokeRequest,
+) -> String {
+    let response = client
+        .invoke(Request::new(request))
+        .await
+        .expect("invoke succeeds")
+        .into_inner();
+    match response.result.expect("invoke result") {
+        nemo_relay_worker_proto::v1::invoke_response::Result::Guardrail(result) => {
+            result.block_reason
+        }
+        other => panic!("unexpected invoke result: {other:?}"),
+    }
+}
+
+fn guardrail_reason(response: InvokeResponse) -> String {
+    match response.result.expect("invoke result") {
+        nemo_relay_worker_proto::v1::invoke_response::Result::Guardrail(result) => {
+            result.block_reason
+        }
+        other => panic!("unexpected invoke result: {other:?}"),
+    }
+}
+
+async fn invoke_llm_request(
+    client: &mut PluginWorkerClient<Channel>,
+    request: InvokeRequest,
+) -> LlmRequest {
+    let response = client
+        .invoke(Request::new(request))
+        .await
+        .expect("invoke succeeds")
+        .into_inner();
+    match response.result.expect("invoke result") {
+        nemo_relay_worker_proto::v1::invoke_response::Result::LlmRequest(result) => {
+            decode_json_envelope::<nemo_relay_worker::LlmRequestInterceptOutcome>(
+                &result.outcome.expect("llm request outcome"),
+            )
+            .expect("decode LLM request outcome")
+            .request
+        }
+        other => panic!("unexpected invoke result: {other:?}"),
+    }
+}
+
+fn stream_json(chunk: StreamChunk) -> Json {
+    match chunk.item.expect("stream chunk item") {
+        nemo_relay_worker_proto::v1::stream_chunk::Item::Value(value) => {
+            decode_json_envelope(&value).expect("decode stream value")
+        }
+        other => panic!("unexpected stream chunk: {other:?}"),
+    }
+}
+
+fn assert_empty_response(response: InvokeResponse) {
+    assert!(matches!(
+        response.result.expect("invoke result"),
+        nemo_relay_worker_proto::v1::invoke_response::Result::Empty(_)
+    ));
+}
+
+fn assert_json_field(value: Json, key: &str, expected: &str) {
+    assert_eq!(value.get(key), Some(&json!(expected)));
+}
+
+fn assert_worker_error(response: InvokeResponse, expected: &str) {
+    match response.result.expect("invoke result") {
+        nemo_relay_worker_proto::v1::invoke_response::Result::Error(error) => {
+            assert!(
+                error.message.contains(expected),
+                "expected '{expected}' in '{}'",
+                error.message
+            );
+        }
+        other => panic!("unexpected invoke result: {other:?}"),
+    }
+}
+
+fn assert_stream_error(chunk: StreamChunk, expected: &str) {
+    match chunk.item.expect("stream item") {
+        nemo_relay_worker_proto::v1::stream_chunk::Item::Error(error) => {
+            assert!(
+                error.message.contains(expected),
+                "expected '{expected}' in '{}'",
+                error.message
+            );
+        }
+        other => panic!("unexpected stream item: {other:?}"),
+    }
+}
+
+fn assert_status_message(status: Status, expected: &str) {
+    assert!(
+        status.message().contains(expected),
+        "expected '{expected}' in '{}'",
+        status.message()
+    );
+}
+
+fn assert_error_contains(error: WorkerSdkError, expected: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains(expected),
+        "expected '{expected}' in '{message}'"
+    );
+}
+
+fn server_config(worker_endpoint: &str) -> WorkerServerConfig {
+    WorkerServerConfig {
+        worker_endpoint: worker_endpoint.into(),
+        host_endpoint: "http://127.0.0.1:9".into(),
+        activation_id: ACTIVATION_ID.into(),
+        auth_token: AUTH_TOKEN.into(),
+    }
+}
+
+struct EnvSnapshot {
+    values: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvSnapshot {
+    fn capture(names: &'static [&'static str]) -> Self {
+        Self {
+            values: names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect(),
+        }
+    }
+
+    fn restore(&self) {
+        for (name, value) in &self.values {
+            match value {
+                Some(value) => set_env(name, value),
+                None => remove_env(name),
+            }
+        }
+    }
+}
+
+impl Drop for EnvSnapshot {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn set_required_envs() {
+    set_env("NEMO_RELAY_WORKER_SOCKET", "tcp://127.0.0.1:1");
+    set_env("NEMO_RELAY_HOST_SOCKET", "http://127.0.0.1:9");
+    set_env("NEMO_RELAY_WORKER_ID", ACTIVATION_ID);
+    set_env("NEMO_RELAY_WORKER_TOKEN", AUTH_TOKEN);
+}
+
+fn clear_required_envs() {
+    for name in REQUIRED_WORKER_ENVS {
+        remove_env(name);
+    }
+}
+
+fn set_env(name: &str, value: &str) {
+    // Process environment mutation is guarded by ENV_LOCK in these tests.
+    unsafe {
+        std::env::set_var(name, value);
+    }
+}
+
+fn remove_env(name: &str) {
+    // Process environment mutation is guarded by ENV_LOCK in these tests.
+    unsafe {
+        std::env::remove_var(name);
+    }
+}
+
+fn unique_temp_file(prefix: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+#[cfg(unix)]
+fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    PathBuf::from(format!("/tmp/{prefix}-{}-{nanos}.sock", std::process::id()))
+}
+
+fn host_ack() -> HostAck {
+    HostAck {
+        ok: true,
+        error: None,
+    }
+}
+
+fn host_ack_error(message: &str) -> HostAck {
+    HostAck {
+        ok: false,
+        error: Some(worker_error(message)),
+    }
+}
+
+fn worker_error(message: &str) -> WorkerError {
+    WorkerError {
+        code: "mock.error".into(),
+        message: message.into(),
+        retryable: false,
+    }
+}
+
+fn authorize_host(activation_id: &str, auth_token: &str) -> std::result::Result<(), Status> {
+    if activation_id != ACTIVATION_ID || auth_token != AUTH_TOKEN {
+        return Err(Status::permission_denied("invalid host auth"));
+    }
+    Ok(())
+}

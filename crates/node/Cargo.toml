@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node.js native bindings for NeMo Relay built with napi-rs."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
+[features]
+__skip-implicit-config = ["nemo-relay/__skip-implicit-config"]
+
+[dependencies]
+nemo-relay = { workspace = true, features = ["atof-streaming", "guardrails-remote", "object-store", "worker-grpc"] }
+nemo-relay-adaptive = { workspace = true, features = ["redis-backend"] }
+nemo-relay-pii-redaction.workspace = true
+chrono = "0.4"
+napi = { version = "2", features = ["napi6", "async", "serde-json", "tokio_rt"] }
+napi-derive = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { workspace = true, features = ["v7"] }
+
+[build-dependencies]
+napi-build = "2"

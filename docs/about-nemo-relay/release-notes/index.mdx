@@ -1,0 +1,110 @@
+---
+title: "Release Notes for NVIDIA NeMo Relay"
+sidebar-title: "Release Notes"
+description: "Review highlights, compatibility updates, fixed known issues, and current known issues for NVIDIA NeMo Relay 0.9."
+template-library-version: "1.0.0"
+position: 6
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+{/* @tpl:naming
+Use title casing: Start with "Release Notes for" followed by the product name. Fern resolves the page title from frontmatter; do not add an H1 heading.
+*/}
+
+{/* @tpl:formatting
+This is the Release Notes template. Document one release version per page and use the documentation version selector or previous-release links for earlier versions. Include patch releases on the same page in reverse chronological order.
+*/}
+
+{/* @tpl:formatting
+- Release notes summarize what changed in a version. Link to guides and reference pages instead of duplicating full procedures.
+- Use tables for support matrices, compatibility lists, and fixed or known issue summaries when they improve scanability.
+- Use callouts for upgrade blockers, breaking changes, and security advisories.
+*/}
+
+This page contains the release notes for [NVIDIA NeMo
+Relay](/about-nemo-relay/overview).
+
+## Release 0.9
+
+NeMo Relay 0.9 is under development. This page will track its user-visible
+changes, compatibility updates, and fixed known issues.
+
+### 0.9.1-hardened development line
+
+The hardened line adds a reproducible qualification harness, fallible Node
+stream finalization, effective plugin-policy validation, bounded subscriber
+delivery with queue telemetry, cache identity partitions, single-flight cache
+miss coalescing, and explicit cache-write drain helpers. See
+[Hardened runtime qualification](/reference/hardening) for the evidence
+boundary and disabled hardening crate contracts.
+
+## Known Issues in 0.9
+
+- OTLP collectors can return a successful response while rejecting individual
+  spans, log records, or metric data points. Relay does not report these partial
+  successes in runtime diagnostics, and flush or shutdown can still succeed.
+  Monitor collector-side rejection metrics and logs; see
+  [OpenTelemetry](/configure-plugins/observability/opentelemetry#trace-batch-processor-configuration).
+- Go and the raw C FFI remain experimental and source-first. Generated API
+  pages focus on Rust, Python, and Node.js.
+- Local coding-agent observability depends on host hooks and provider traffic
+  reaching the local gateway. Relay cannot fully capture remote or cloud
+  execution that bypasses the local host.
+- Persistent Codex and Claude Code integrations use user-scoped
+  configuration and a shared loopback gateway. Use `nemo-relay run` when a
+  launch must retain project-specific configuration.
+- On Windows, a restrictive host Job Object can limit gateway reuse or prevent
+  persistent bootstrap. Codex can also make a cold-start `/models` request
+  before required MCP servers start; Relay retries the request.
+- Codex 0.143 does not expose `SessionEnd`, and Codex multi-agent v2 encrypts
+  delegated-task payloads that Relay cannot decrypt or reliably link.
+- The Node.js binding and package workflows require Node.js 24 or later.
+- OpenClaw has public hook-backed telemetry. Its security and optimization
+  coverage is partial because it does not own a managed execution path.
+- The built-in `nemo_guardrails` plugin is formally deprecated for compatibility
+  and deferred to the next breaking release. New deployments should use current
+  guardrail and intercept APIs. Until removal, the remote backend inherits its
+  configured service's availability, latency, and policy behavior, and the
+  local backend requires Python 3.11 or later and `nemoguardrails==0.22.0`.
+- The PII redaction plugin currently supports its deterministic local backend;
+  local-model backend configuration is reserved for future work.
+- Pricing and optimization estimates depend on model names, token data, pricing
+  sources, and freshness evidence. Missing or inconsistent evidence produces
+  partial or absent cost fields rather than zero values.
+- ATOF stream sinks and remote ATIF storage require reachable, correctly
+  configured destinations. A failed stream sink does not stop file output or
+  other active sinks.
+- ATIF omits point-in-time marks. Use ATOF for the canonical mark stream;
+  the `gen_ai` OpenTelemetry projection also omits marks. The `full` and
+  `openinference` projections retain their fixed native mark handling.
+- Native dynamic plugins run in the Relay process and are not sandboxed. A
+  `grpc-v1` worker runs in a separate process, but that process is not a
+  security sandbox.
+- Treat Python `LLMRequest` objects as immutable. Request middleware that
+  changes content must return a new request object.
+- Native subscriber callbacks arrive asynchronously. Flush subscribers before
+  depending on their side effects, captured events, files, or exporter output.
+- OpenTelemetry endpoints use finite batch queues. A burst that fills an
+  endpoint queue drops completed spans without applying backpressure and can
+  leave an incomplete trace, including a missing root span. The SDK warns on
+  the first drop and reports the exact dropped-span count during graceful
+  shutdown. Configure `max_queue_size`, `max_export_batch_size`, and
+  `scheduled_delay_millis` independently on each endpoint, or use the standard
+  `OTEL_BSP_*` environment variables as process-wide fallbacks. A larger finite
+  queue does not guarantee lossless telemetry.
+- Operational logging configuration and sink lifecycle are available, but broad
+  operational log coverage across commands is not yet available.
+
+## Previous Releases
+
+For previous release notes, release artifacts, and the complete PR-by-PR
+history, refer to [GitHub Releases](https://github.com/NVIDIA/NeMo-Relay/releases).
+
+## Related Topics
+
+- [Support Matrix](/reference/support-matrix)
+- [Migration Guides](/reference/migration-guides)
+- [Installation](/getting-started/installation)
+- [NVIDIA NeMo Relay CLI](/nemo-relay-cli/about)
+- [Known Issues and Troubleshooting](/resources/support-and-faqs)

@@ -1,0 +1,361 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Logger and sink assembly, including sink path resolution.
+
+use std::io::{self, Write};
+use std::num::NonZeroUsize;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use spdlog::sink::{AsyncPoolSink, FileSink, OverflowPolicy, StdStreamSink, WriteSink};
+use spdlog::terminal_style::StyleMode;
+use spdlog::{Level, LevelFilter, Logger, ThreadPool};
+
+use super::config::{LogLevel, LogSinkConfig, LoggingConfig, MAX_FILE_SINK_QUEUE_ENTRIES};
+use super::format::RelayFormatter;
+use super::rotation::{SizeRotatingFileWriter, rotated_log_path};
+use crate::error::{FlowError, Result};
+
+pub(crate) fn build_logger(
+    config: &LoggingConfig,
+    root_relay_id: String,
+) -> Result<(Arc<Logger>, Vec<Arc<ThreadPool>>)> {
+    let mut sinks: Vec<Arc<dyn spdlog::sink::Sink>> = Vec::new();
+    let mut thread_pools = Vec::new();
+    let mut active_paths: Vec<PathBuf> = Vec::new();
+    let mut reserved_paths: Vec<PathBuf> = Vec::new();
+
+    if config.stderr_enabled {
+        let stderr_sink = StdStreamSink::builder()
+            .stderr()
+            .style_mode(StyleMode::Never)
+            .formatter(RelayFormatter {
+                format: config.stderr_format,
+                root_relay_id: root_relay_id.clone(),
+            })
+            .level_filter(spdlog_level_filter(config.level))
+            .error_handler(stderr_error_handler("stderr"))
+            .build_arc()
+            .map_err(|error| {
+                FlowError::InvalidArgument(format!("failed to create stderr logging sink: {error}"))
+            })?;
+        sinks.push(stderr_sink);
+    }
+
+    for sink in &config.sinks {
+        let LogSinkConfig::File(file_sink) = sink;
+        let resolved_path = resolve_log_path(&file_sink.path)?;
+        if active_paths.contains(&resolved_path) {
+            return Err(FlowError::InvalidArgument(format!(
+                "duplicate logging sink path {}",
+                resolved_path.display()
+            )));
+        }
+        let candidate_paths = reserved_sink_paths(&resolved_path, file_sink.rotation);
+        if let Some(collision) = candidate_paths
+            .iter()
+            .find(|candidate| reserved_paths.contains(candidate))
+        {
+            return Err(FlowError::InvalidArgument(format!(
+                "logging sink path conflicts with another active or rotated file: {}",
+                collision.display()
+            )));
+        }
+        active_paths.push(resolved_path.clone());
+        reserved_paths.extend(candidate_paths);
+
+        let file: Arc<dyn spdlog::sink::Sink> = match file_sink.rotation {
+            None => FileSink::builder()
+                .path(&resolved_path)
+                .truncate(false)
+                .formatter(RelayFormatter {
+                    format: file_sink.format,
+                    root_relay_id: root_relay_id.clone(),
+                })
+                .level_filter(spdlog_level_filter(file_sink.level))
+                .error_handler(stderr_error_handler(&resolved_path.display().to_string()))
+                .build_arc()
+                .map_err(|error| {
+                    FlowError::InvalidArgument(format!(
+                        "failed to open logging sink {}: {error}",
+                        resolved_path.display()
+                    ))
+                })?,
+            Some(rotation) => WriteSink::builder()
+                .target(
+                    SizeRotatingFileWriter::new(
+                        resolved_path.clone(),
+                        rotation.max_file_size_bytes(),
+                        rotation.retained_files(),
+                    )
+                    .map_err(|error| {
+                        FlowError::InvalidArgument(format!(
+                            "failed to open rotating logging sink {}: {error}",
+                            resolved_path.display()
+                        ))
+                    })?,
+                )
+                .formatter(RelayFormatter {
+                    format: file_sink.format,
+                    root_relay_id: root_relay_id.clone(),
+                })
+                .level_filter(spdlog_level_filter(file_sink.level))
+                .error_handler(stderr_error_handler(&resolved_path.display().to_string()))
+                .build_arc()
+                .map_err(|error| {
+                    FlowError::InvalidArgument(format!(
+                        "failed to open rotating logging sink {}: {error}",
+                        resolved_path.display()
+                    ))
+                })?,
+        };
+
+        if file_sink.queue_capacity > MAX_FILE_SINK_QUEUE_ENTRIES {
+            return Err(FlowError::InvalidArgument(format!(
+                "logging sink queue_capacity {} exceeds maximum \
+                 {MAX_FILE_SINK_QUEUE_ENTRIES} entries per file sink",
+                file_sink.queue_capacity
+            )));
+        }
+        let capacity = NonZeroUsize::new(file_sink.queue_capacity).ok_or_else(|| {
+            FlowError::InvalidArgument("logging sink queue_capacity must be greater than 0".into())
+        })?;
+        let mut pool_builder = ThreadPool::builder();
+        let pool = pool_builder
+            .capacity(capacity)
+            .build_arc()
+            .map_err(|error| {
+                FlowError::InvalidArgument(format!(
+                    "failed to create logging thread pool for {}: {error}",
+                    resolved_path.display()
+                ))
+            })?;
+
+        let async_sink = AsyncPoolSink::builder()
+            .sink(file)
+            .thread_pool(Arc::clone(&pool))
+            .overflow_policy(OverflowPolicy::DropIncoming)
+            .level_filter(spdlog_level_filter(file_sink.level))
+            .error_handler(dropped_record_error_handler(
+                &resolved_path.display().to_string(),
+            ))
+            .build_arc()
+            .map_err(|error| {
+                FlowError::InvalidArgument(format!(
+                    "failed to create async logging sink for {}: {error}",
+                    resolved_path.display()
+                ))
+            })?;
+
+        thread_pools.push(pool);
+        sinks.push(async_sink);
+    }
+
+    // Leave the logger unnamed so LogCrateProxy maps log::target into record.logger_name().
+    let logger = Logger::builder()
+        .level_filter(spdlog_level_filter(config.level))
+        .sinks(sinks)
+        .build_arc()
+        .map_err(|error| {
+            FlowError::InvalidArgument(format!("failed to build logging runtime: {error}"))
+        })?;
+
+    if !thread_pools.is_empty() && config.flush_interval_millis > 0 {
+        logger.set_flush_period(Some(Duration::from_millis(config.flush_interval_millis)));
+    }
+
+    Ok((logger, thread_pools))
+}
+
+fn reserved_sink_paths(
+    resolved_path: &Path,
+    rotation: Option<super::config::FileLogRotationConfig>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![resolved_path.to_path_buf()];
+    if let Some(rotation) = rotation {
+        paths.reserve(rotation.retained_files());
+        for index in 1..=rotation.retained_files() {
+            paths.push(logging_path_identity(&rotated_log_path(
+                resolved_path,
+                index,
+            )));
+        }
+    }
+    paths
+}
+
+fn resolve_log_path(path: &Path) -> Result<PathBuf> {
+    // Relative paths resolve against process CWD. Absolute paths are unchanged. No `~` or env
+    // expansion.
+    if path.as_os_str().is_empty() {
+        return Err(FlowError::InvalidArgument(
+            "logging sink path must not be empty".into(),
+        ));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir().map_err(|error| {
+            FlowError::InvalidArgument(format!(
+                "failed to resolve relative logging path {}: {error}",
+                path.display()
+            ))
+        })?;
+        cwd.join(path)
+    };
+    Ok(logging_path_identity(&absolute))
+}
+
+/// Builds a stable path identity for duplicate-sink detection.
+///
+/// Prefer filesystem canonicalization when the path (or its parent) exists so `./a` and `a`
+/// collapse, and symlink parents resolve. When nothing on disk exists yet, normalize `.` / `..`
+/// components only. Distinct basenames that are symlink aliases remain distinct until the
+/// destination exists and can be canonicalized.
+fn logging_path_identity(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            let file_name = path.file_name().unwrap_or_default();
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                return canonical_parent.join(file_name);
+            }
+            normalize_path_components(parent).join(file_name)
+        }
+        _ => normalize_path_components(path),
+    }
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn stderr_error_handler(sink_label: &str) -> impl Fn(spdlog::Error) + Send + Sync + 'static {
+    let sink_label = sink_label.to_owned();
+    move |error| {
+        let _ = writeln!(
+            io::stderr(),
+            "nemo-relay: logging sink error ({sink_label}): {error}"
+        );
+    }
+}
+
+/// Minimum spacing between queue-full notices written to stderr.
+const DROP_REPORT_INTERVAL_MILLIS: u64 = 1000;
+
+/// Rate-limits async-sink queue-full notices so a full queue cannot flood or block stderr.
+///
+/// `DropIncoming` reports a queue-full error per dropped record on the enqueue (caller) thread.
+/// Writing each one synchronously would defeat the non-blocking queue during a burst, so Relay
+/// reports at most one notice per [`DROP_REPORT_INTERVAL_MILLIS`].
+struct DropNoticeRateLimiter {
+    last_report_millis: AtomicU64,
+}
+
+impl DropNoticeRateLimiter {
+    fn new() -> Self {
+        Self {
+            last_report_millis: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns `true` when a notice may be emitted at `now_millis`.
+    fn should_report(&self, now_millis: u64) -> bool {
+        loop {
+            let last = self.last_report_millis.load(Ordering::Relaxed);
+            if now_millis.saturating_sub(last) < DROP_REPORT_INTERVAL_MILLIS {
+                return false;
+            }
+            if self
+                .last_report_millis
+                .compare_exchange_weak(last, now_millis, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn dropped_record_error_handler(
+    sink_label: &str,
+) -> impl Fn(spdlog::Error) + Send + Sync + 'static {
+    let sink_label = sink_label.to_owned();
+    let rate_limiter = DropNoticeRateLimiter::new();
+    move |error| {
+        // Only a full queue dropping a record is the high-volume "records lost" case that needs
+        // rate-limiting. Other errors (disconnected channel, dropped flush, write failures) are
+        // rare and reported immediately and accurately.
+        match &error {
+            spdlog::Error::SendToChannel(
+                spdlog::error::SendToChannelError::Full,
+                spdlog::error::SendToChannelErrorDropped::Record(_),
+            ) => {
+                if rate_limiter.should_report(now_millis()) {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "nemo-relay: logging sink ({sink_label}): records are being dropped \
+                         because the queue is full; repeated notices are limited to once per \
+                         {DROP_REPORT_INTERVAL_MILLIS}ms"
+                    );
+                }
+            }
+            other => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "nemo-relay: logging sink error ({sink_label}): {other}"
+                );
+            }
+        }
+    }
+}
+
+fn spdlog_level_filter(level: LogLevel) -> LevelFilter {
+    LevelFilter::MoreSevereEqual(spdlog_level(level))
+}
+
+fn spdlog_level(level: LogLevel) -> Level {
+    match level {
+        LogLevel::Error => Level::Error,
+        LogLevel::Warn => Level::Warn,
+        LogLevel::Info => Level::Info,
+        LogLevel::Debug => Level::Debug,
+        LogLevel::Trace => Level::Trace,
+    }
+}
+
+pub(super) fn log_level_filter(level: LogLevel) -> log::LevelFilter {
+    match level {
+        LogLevel::Error => log::LevelFilter::Error,
+        LogLevel::Warn => log::LevelFilter::Warn,
+        LogLevel::Info => log::LevelFilter::Info,
+        LogLevel::Debug => log::LevelFilter::Debug,
+        LogLevel::Trace => log::LevelFilter::Trace,
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/coverage/logging_sink_tests.rs"]
+mod tests;

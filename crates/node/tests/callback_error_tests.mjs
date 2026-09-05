@@ -1,0 +1,161 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const lib = require('../index.js');
+
+const {
+  __testClosedCollectorCallback,
+  __testClosedFinalizerCallback,
+  __testClosedLlmResponseCallback,
+  __testClosedLlmSanitizeRequestCallback,
+  __testClosedPromiseAwareCall,
+  __testClosedToolCallback,
+  clearLastCallbackError,
+  deregisterLlmSanitizeRequestGuardrail,
+  flushSubscribers,
+  getLastCallbackError,
+  llmCallExecute,
+  registerLlmSanitizeRequestGuardrail,
+} = lib;
+
+function makeNative() {
+  return {
+    headers: {},
+    content: {
+      messages: [],
+      model: 'test-model',
+    },
+  };
+}
+
+describe('callback error helpers', () => {
+  it('getLastCallbackError and clearLastCallbackError expose malformed sanitize-request failures', async () => {
+    clearLastCallbackError();
+    registerLlmSanitizeRequestGuardrail('node_llm_san_req_public_error', 10, () => ({ broken: true }));
+    try {
+      const result = await llmCallExecute(
+        'san_req_public_error_llm',
+        makeNative(),
+        (request) => ({
+          model: request.content.model,
+          headers: request.headers,
+        }),
+        null,
+        null,
+        null,
+        null,
+        null,
+      );
+
+      const { traceparent, ...headers } = result.headers;
+      assert.deepEqual({ ...result, headers }, { model: 'test-model', headers: {} });
+      assert.match(traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      await flushSubscribers();
+      assert.match(
+        getLastCallbackError() ?? '',
+        /JS LLM sanitize request callback failed: failed to deserialize LlmRequest/i,
+      );
+      clearLastCallbackError();
+      assert.equal(getLastCallbackError(), null);
+    } finally {
+      deregisterLlmSanitizeRequestGuardrail('node_llm_san_req_public_error');
+      clearLastCallbackError();
+    }
+  });
+
+  it('closed tool sanitize callbacks preserve the original payload and record the queue failure', async () => {
+    const args = {
+      value: 1,
+    };
+    const result = await __testClosedToolCallback(
+      () => ({
+        ok: true,
+      }),
+      'closed_tool',
+      args,
+    );
+    assert.deepEqual(result, args);
+    assert.match(getLastCallbackError() ?? '', /failed to queue JS tool callback/i);
+    clearLastCallbackError();
+  });
+
+  it('closed llm sanitize-request callbacks omit the payload and record the queue failure', () => {
+    const request = makeNative();
+    const result = __testClosedLlmSanitizeRequestCallback(
+      () => ({
+        broken: true,
+      }),
+      request,
+    );
+    assert.equal(result, null);
+    assert.match(getLastCallbackError() ?? '', /failed to queue JS LLM sanitize request callback/i);
+    clearLastCallbackError();
+  });
+
+  it('closed llm sanitize-response callbacks omit the payload and record the queue failure', () => {
+    const response = {
+      ok: true,
+    };
+    const result = __testClosedLlmResponseCallback(
+      () => ({
+        rewritten: true,
+      }),
+      response,
+    );
+    assert.equal(result, null);
+    assert.match(getLastCallbackError() ?? '', /failed to queue JS LLM sanitize response callback/i);
+    clearLastCallbackError();
+  });
+
+  it('closed collector callbacks surface the queue failure and record it', async () => {
+    assert.throws(
+      () =>
+        __testClosedCollectorCallback(() => undefined, {
+          token: 'x',
+        }),
+      /failed to queue JS collector callback/i,
+    );
+    assert.match(getLastCallbackError() ?? '', /failed to queue JS collector callback/i);
+    clearLastCallbackError();
+  });
+
+  it('closed finalizer callbacks throw and record the queue failure', () => {
+    assert.throws(
+      () =>
+        __testClosedFinalizerCallback(() => ({
+          done: true,
+        })),
+      /failed to queue JS finalizer callback/i,
+    );
+    assert.match(getLastCallbackError() ?? '', /failed to queue JS finalizer callback/i);
+    clearLastCallbackError();
+  });
+
+  it('closed PromiseAwareFn calls reject with the closed threadsafe-function error', async () => {
+    await assert.rejects(
+      () =>
+        __testClosedPromiseAwareCall(() => ({
+          ok: true,
+        })),
+      /PromiseAwareFn threadsafe function closed/i,
+    );
+  });
+
+  it('PromiseAwareFn argument conversion failures reject without invoking the callback', async () => {
+    let invoked = false;
+    await assert.rejects(
+      () =>
+        __testClosedPromiseAwareCall(() => {
+          invoked = true;
+          return null;
+        }, true),
+      /forced PromiseAwareFn conversion failure/i,
+    );
+    assert.equal(invoked, false);
+  });
+});

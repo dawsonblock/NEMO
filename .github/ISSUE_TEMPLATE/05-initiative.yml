@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Initiative
+description: Propose or track a strategic program that may contain multiple epics.
+title: "[Initiative]: "
+type: Initiative
+body:
+  - type: textarea
+    id: strategic_objective
+    attributes:
+      label: Strategic objective
+      description: Describe the broader objective this initiative advances.
+      placeholder: This initiative aims to...
+    validations: {required: true}
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Explain the business, product, ecosystem, or maintainer reason for the initiative.
+      placeholder: This matters because...
+    validations: {required: true}
+  - type: textarea
+    id: success_metrics
+    attributes:
+      label: Success metrics
+      description: Define measurable outcomes or clear signals of success.
+      placeholder: |
+        - ...
+    validations: {required: true}
+  - type: textarea
+    id: scope_boundaries
+    attributes:
+      label: Scope boundaries
+      description: Describe what is in scope and what is out of scope.
+      placeholder: |
+        In scope:
+        - ...
+
+        Out of scope:
+        - ...
+    validations: {required: true}
+  - type: textarea
+    id: milestones
+    attributes:
+      label: Milestones or phases
+      description: Describe the expected phases, epics, or delivery sequence. Enter N/A if unknown.
+      placeholder: |
+        1. ...
+        2. ...
+    validations: {required: true}
+  - type: textarea
+    id: risks_dependencies
+    attributes:
+      label: Risks and dependencies
+      description: List important risks, open questions, and dependencies. Enter N/A if none.
+      placeholder: |
+        - ...
+    validations: {required: true}

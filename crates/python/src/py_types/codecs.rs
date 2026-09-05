@@ -1,0 +1,1151 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use pyo3::prelude::*;
+use serde::de::DeserializeOwned;
+
+use super::core::PyLLMRequest;
+use super::{
+    AnnotatedLLMRequest, AnnotatedLLMResponse, ApiSpecificRequest, Arc, Bound, GenerationParams,
+    LlmCodec, LlmResponseCodec, Message, MessageContent, PyAny, PyResult, Python, ToolChoice,
+    ToolDefinition, json_to_py, py_to_json, to_python_json_value,
+};
+#[cfg(test)]
+use super::{
+    FORCE_ANNOTATED_REQUEST_API_SPECIFIC_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_REQUEST_INSTRUCTIONS_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_REQUEST_MESSAGES_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_REQUEST_PARAMS_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_REQUEST_TOOL_CHOICE_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_REQUEST_TOOLS_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_RESPONSE_API_SPECIFIC_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_RESPONSE_MESSAGE_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_RESPONSE_OPTIMIZATION_SUMMARY_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_RESPONSE_TOOL_CALLS_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_RESPONSE_USAGE_SERIALIZATION_ERROR,
+};
+use nemo_relay::codec::response::FinishReason;
+
+/// A resolved request codec available while an LLM request sanitizer runs.
+#[pyclass(name = "LlmSanitizeRequestCodec")]
+pub struct PyLlmSanitizeRequestCodec {
+    pub(crate) inner: Arc<dyn LlmCodec>,
+}
+
+#[pymethods]
+impl PyLlmSanitizeRequestCodec {
+    /// Parse an opaque request into its normalized representation.
+    fn decode(&self, request: &PyLLMRequest) -> PyResult<PyAnnotatedLLMRequest> {
+        self.inner
+            .decode(&request.inner)
+            .map(|inner| PyAnnotatedLLMRequest { inner })
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
+    }
+
+    /// Merge a normalized request back into its provider representation.
+    fn encode(
+        &self,
+        annotated: &PyAnnotatedLLMRequest,
+        original: &PyLLMRequest,
+    ) -> PyResult<PyLLMRequest> {
+        self.inner
+            .encode(&annotated.inner, &original.inner)
+            .map(|inner| PyLLMRequest { inner })
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
+    }
+}
+
+/// A resolved response codec available while an LLM response sanitizer runs.
+#[pyclass(name = "LlmSanitizeResponseCodec")]
+pub struct PyLlmSanitizeResponseCodec {
+    pub(crate) inner: Arc<dyn LlmResponseCodec>,
+}
+
+#[pymethods]
+impl PyLlmSanitizeResponseCodec {
+    /// Parse an opaque response into its normalized representation.
+    fn decode_response(&self, response: &Bound<'_, PyAny>) -> PyResult<PyAnnotatedLLMResponse> {
+        let response = py_to_json(response)?;
+        self.inner
+            .decode_response(&response)
+            .map(|inner| PyAnnotatedLLMResponse { inner })
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AnnotatedLLMRequest
+// ---------------------------------------------------------------------------
+
+/// A structured view of an LLM request produced by a Codec.
+///
+/// Provides typed access to conversation messages, model name, generation
+/// parameters, tool definitions, tool choice, tagged provider-specific fields,
+/// and extensible unknown top-level fields.
+///
+/// Properties:
+///     messages (list): Parsed conversation messages (list of dicts with a ``role`` key).
+///     instructions (str | list | None): Provider-level system instructions.
+///     model (str | None): Model identifier (e.g., ``"gpt-4"``).
+///     params (dict | None): Normalized generation parameters.
+///     tools (list | None): Tool definitions (function schemas).
+///     tool_choice (Any | None): Tool choice control.
+///     api_specific (dict | None): Tagged provider-specific request fields.
+///     extra (dict): Unknown future top-level fields.
+///
+/// Helper methods:
+///     system_prompt() -> str | None: Text of the first system message.
+///     last_user_message() -> str | None: Text of the last user message.
+///     has_tool_calls() -> bool: Whether any assistant message has tool calls.
+#[pyclass(name = "AnnotatedLLMRequest", from_py_object)]
+#[derive(Clone)]
+pub struct PyAnnotatedLLMRequest {
+    pub inner: AnnotatedLLMRequest,
+}
+
+fn optional_json_getter(py: Python<'_>, value: &Option<serde_json::Value>) -> PyResult<Py<PyAny>> {
+    match value {
+        Some(value) => json_to_py(py, value),
+        None => Ok(py.None()),
+    }
+}
+
+fn optional_json_setter(
+    target: &mut Option<serde_json::Value>,
+    value: &Bound<'_, PyAny>,
+    field: &str,
+) -> PyResult<()> {
+    if value.is_none() {
+        *target = None;
+    } else {
+        *target = Some(pythonize::depythonize(value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid {field}: {e}"))
+        })?);
+    }
+    Ok(())
+}
+
+#[pymethods]
+impl PyAnnotatedLLMRequest {
+    /// Create a new AnnotatedLLMRequest.
+    ///
+    /// Args:
+    ///     messages: A list of message dicts, each with a ``role`` key.
+    ///     instructions: Optional provider-level instructions.
+    ///     model: Optional model identifier.
+    ///     params: Optional generation parameters dict.
+    ///     tools: Optional list of tool definition dicts.
+    ///     tool_choice: Optional tool choice control.
+    ///     api_specific: Optional tagged provider-specific request fields.
+    ///     extra: Optional dict of unknown future top-level fields.
+    #[new]
+    #[pyo3(signature = (messages, *, instructions=None, model=None, params=None, tools=None, tool_choice=None, api_specific=None, extra=None))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the Python constructor mirrors the public annotation fields as keywords"
+    )]
+    pub(crate) fn new(
+        messages: &Bound<'_, PyAny>,
+        instructions: Option<&Bound<'_, PyAny>>,
+        model: Option<String>,
+        params: Option<&Bound<'_, PyAny>>,
+        tools: Option<&Bound<'_, PyAny>>,
+        tool_choice: Option<&Bound<'_, PyAny>>,
+        api_specific: Option<&Bound<'_, PyAny>>,
+        extra: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let msgs: Vec<Message> = pythonize::depythonize(messages).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid messages: each dict must include a 'role' key (user/system/assistant/tool): {e}"
+            ))
+        })?;
+        let gen_params: Option<GenerationParams> = match params {
+            Some(p) if !p.is_none() => Some(pythonize::depythonize(p).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid params: {e}"))
+            })?),
+            _ => None,
+        };
+        let request_instructions: Option<MessageContent> = match instructions {
+            Some(value) if !value.is_none() => {
+                Some(pythonize::depythonize(value).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid instructions: expected a string or content-part list: {e}"
+                    ))
+                })?)
+            }
+            _ => None,
+        };
+        let tool_defs: Option<Vec<ToolDefinition>> = match tools {
+            Some(t) if !t.is_none() => Some(pythonize::depythonize(t).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid tools: {e}"))
+            })?),
+            _ => None,
+        };
+        let tc: Option<ToolChoice> = match tool_choice {
+            Some(tc_val) if !tc_val.is_none() => {
+                Some(pythonize::depythonize(tc_val).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("invalid tool_choice: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+        let provider_fields: Option<ApiSpecificRequest> = match api_specific {
+            Some(value) if !value.is_none() => {
+                Some(pythonize::depythonize(value).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid api_specific: expected a tagged request object: {e}"
+                    ))
+                })?)
+            }
+            _ => None,
+        };
+        let extra_map: serde_json::Map<String, serde_json::Value> = match extra {
+            Some(e) if !e.is_none() => pythonize::depythonize(e).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid extra: {e}"))
+            })?,
+            _ => serde_json::Map::new(),
+        };
+        Ok(Self {
+            inner: AnnotatedLLMRequest {
+                messages: msgs,
+                instructions: request_instructions,
+                model,
+                params: gen_params,
+                tools: tool_defs,
+                tool_choice: tc,
+                store: None,
+                previous_response_id: None,
+                truncation: None,
+                reasoning: None,
+                include: None,
+                user: None,
+                metadata: None,
+                service_tier: None,
+                parallel_tool_calls: None,
+                max_output_tokens: None,
+                max_tool_calls: None,
+                top_logprobs: None,
+                stream: None,
+                api_specific: provider_fields,
+                extra: extra_map,
+            },
+        })
+    }
+
+    #[getter]
+    pub(crate) fn messages(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = to_python_json_value(
+            &self.inner.messages,
+            "serialization error",
+            #[cfg(test)]
+            FORCE_ANNOTATED_REQUEST_MESSAGES_SERIALIZATION_ERROR,
+        )?;
+        json_to_py(py, &value)
+    }
+
+    #[setter]
+    pub(crate) fn set_messages(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner.messages = pythonize::depythonize(value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid messages: each dict must include a 'role' key (user/system/assistant/tool): {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn instructions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.instructions {
+            Some(value) => {
+                let value = to_python_json_value(
+                    value,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_REQUEST_INSTRUCTIONS_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[setter]
+    pub(crate) fn set_instructions(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.instructions = None;
+        } else {
+            self.inner.instructions = Some(pythonize::depythonize(value).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid instructions: expected a string or content-part list: {e}"
+                ))
+            })?);
+        }
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn model(&self) -> Option<String> {
+        self.inner.model.clone()
+    }
+
+    #[setter]
+    pub(crate) fn set_model(&mut self, value: Option<String>) {
+        self.inner.model = value;
+    }
+
+    #[getter]
+    pub(crate) fn params(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.params {
+            Some(p) => {
+                let value = to_python_json_value(
+                    p,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_REQUEST_PARAMS_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[setter]
+    pub(crate) fn set_params(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.params = None;
+        } else {
+            self.inner.params = Some(pythonize::depythonize(value).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid params: {e}"))
+            })?);
+        }
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn tools(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.tools {
+            Some(t) => {
+                let value = to_python_json_value(
+                    t,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_REQUEST_TOOLS_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[setter]
+    pub(crate) fn set_tools(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.tools = None;
+        } else {
+            self.inner.tools = Some(pythonize::depythonize(value).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid tools: {e}"))
+            })?);
+        }
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn tool_choice(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.tool_choice {
+            Some(tc) => {
+                let value = to_python_json_value(
+                    tc,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_REQUEST_TOOL_CHOICE_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[setter]
+    pub(crate) fn set_tool_choice(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.tool_choice = None;
+        } else {
+            self.inner.tool_choice = Some(pythonize::depythonize(value).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid tool_choice: {e}"))
+            })?);
+        }
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn store(&self) -> Option<bool> {
+        self.inner.store
+    }
+
+    #[setter]
+    pub(crate) fn set_store(&mut self, value: Option<bool>) {
+        self.inner.store = value;
+    }
+
+    #[getter]
+    pub(crate) fn previous_response_id(&self) -> Option<String> {
+        self.inner.previous_response_id.clone()
+    }
+
+    #[setter]
+    pub(crate) fn set_previous_response_id(&mut self, value: Option<String>) {
+        self.inner.previous_response_id = value;
+    }
+
+    #[getter]
+    pub(crate) fn truncation(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        optional_json_getter(py, &self.inner.truncation)
+    }
+
+    #[setter]
+    pub(crate) fn set_truncation(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        optional_json_setter(&mut self.inner.truncation, value, "truncation")
+    }
+
+    #[getter]
+    pub(crate) fn reasoning(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        optional_json_getter(py, &self.inner.reasoning)
+    }
+
+    #[setter]
+    pub(crate) fn set_reasoning(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        optional_json_setter(&mut self.inner.reasoning, value, "reasoning")
+    }
+
+    #[getter]
+    pub(crate) fn include(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        optional_json_getter(py, &self.inner.include)
+    }
+
+    #[setter]
+    pub(crate) fn set_include(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        optional_json_setter(&mut self.inner.include, value, "include")
+    }
+
+    #[getter]
+    pub(crate) fn user(&self) -> Option<String> {
+        self.inner.user.clone()
+    }
+
+    #[setter]
+    pub(crate) fn set_user(&mut self, value: Option<String>) {
+        self.inner.user = value;
+    }
+
+    #[getter]
+    pub(crate) fn metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        optional_json_getter(py, &self.inner.metadata)
+    }
+
+    #[setter]
+    pub(crate) fn set_metadata(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        optional_json_setter(&mut self.inner.metadata, value, "metadata")
+    }
+
+    #[getter]
+    pub(crate) fn service_tier(&self) -> Option<String> {
+        self.inner.service_tier.clone()
+    }
+
+    #[setter]
+    pub(crate) fn set_service_tier(&mut self, value: Option<String>) {
+        self.inner.service_tier = value;
+    }
+
+    #[getter]
+    pub(crate) fn parallel_tool_calls(&self) -> Option<bool> {
+        self.inner.parallel_tool_calls
+    }
+
+    #[setter]
+    pub(crate) fn set_parallel_tool_calls(&mut self, value: Option<bool>) {
+        self.inner.parallel_tool_calls = value;
+    }
+
+    #[getter]
+    pub(crate) fn max_output_tokens(&self) -> Option<u64> {
+        self.inner.max_output_tokens
+    }
+
+    #[setter]
+    pub(crate) fn set_max_output_tokens(&mut self, value: Option<u64>) {
+        self.inner.max_output_tokens = value;
+    }
+
+    #[getter]
+    pub(crate) fn max_tool_calls(&self) -> Option<u64> {
+        self.inner.max_tool_calls
+    }
+
+    #[setter]
+    pub(crate) fn set_max_tool_calls(&mut self, value: Option<u64>) {
+        self.inner.max_tool_calls = value;
+    }
+
+    #[getter]
+    pub(crate) fn top_logprobs(&self) -> Option<u64> {
+        self.inner.top_logprobs
+    }
+
+    #[setter]
+    pub(crate) fn set_top_logprobs(&mut self, value: Option<u64>) {
+        self.inner.top_logprobs = value;
+    }
+
+    #[getter]
+    pub(crate) fn stream(&self) -> Option<bool> {
+        self.inner.stream
+    }
+
+    #[setter]
+    pub(crate) fn set_stream(&mut self, value: Option<bool>) {
+        self.inner.stream = value;
+    }
+
+    #[getter]
+    pub(crate) fn api_specific(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.api_specific {
+            Some(value) => {
+                let value = to_python_json_value(
+                    value,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_REQUEST_API_SPECIFIC_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[setter]
+    pub(crate) fn set_api_specific(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.api_specific = None;
+        } else {
+            self.inner.api_specific = Some(pythonize::depythonize(value).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid api_specific: {e}"))
+            })?);
+        }
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn extra(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::Value::Object(self.inner.extra.clone());
+        json_to_py(py, &value)
+    }
+
+    #[setter]
+    pub(crate) fn set_extra(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner.extra = pythonize::depythonize(value)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid extra: {e}")))?;
+        Ok(())
+    }
+
+    /// Extract the text content of the first system message, if any.
+    pub(crate) fn system_prompt(&self) -> Option<String> {
+        self.inner.system_prompt().map(|s| s.to_string())
+    }
+
+    /// Get the text content of the last user message, if any.
+    pub(crate) fn last_user_message(&self) -> Option<String> {
+        self.inner.last_user_message().map(|s| s.to_string())
+    }
+
+    /// Check if any assistant message contains tool calls.
+    pub(crate) fn has_tool_calls(&self) -> bool {
+        self.inner.has_tool_calls()
+    }
+
+    pub(crate) fn __repr__(&self) -> String {
+        format!(
+            "<AnnotatedLLMRequest messages={} model={:?}>",
+            self.inner.messages.len(),
+            self.inner.model
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AnnotatedLLMResponse (read-only wrapper)
+// ---------------------------------------------------------------------------
+
+/// Structured view of an LLM response produced by a response codec.
+///
+/// Read-only: fields are accessed via properties. Complex fields
+/// (message, tool_calls, usage, api_specific) return Python dicts/lists.
+///
+/// Properties:
+///     id -> str | None: Response ID from the API.
+///     model -> str | None: The model that served the request.
+///     message -> Any | None: The assistant's response content.
+///     tool_calls -> list | None: Tool calls requested by the model.
+///     finish_reason -> str | None: Why generation stopped.
+///     usage -> dict | None: Token usage statistics.
+///     api_specific -> dict | None: API-specific response data.
+///     extra -> dict: Unmodeled top-level fields (catch-all).
+///
+/// Helper methods:
+///     response_text() -> str | None: Text content of the response message.
+///     has_tool_calls() -> bool: Whether the response contains tool calls.
+#[pyclass(name = "AnnotatedLLMResponse", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyAnnotatedLLMResponse {
+    pub inner: AnnotatedLLMResponse,
+}
+
+fn optional_py_json<T>(
+    value: Option<&Bound<'_, PyAny>>,
+    field_name: &'static str,
+) -> PyResult<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    let json = py_to_json(value).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid {field_name}: {e}"))
+    })?;
+    serde_json::from_value(json)
+        .map(Some)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid {field_name}: {e}")))
+}
+
+fn optional_finish_reason(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<FinishReason>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    let json = py_to_json(value).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid finish_reason: {e}"))
+    })?;
+    if let serde_json::Value::String(reason) = &json {
+        return Ok(Some(match reason.as_str() {
+            "complete" => FinishReason::Complete,
+            "length" => FinishReason::Length,
+            "tool_use" => FinishReason::ToolUse,
+            "content_filter" => FinishReason::ContentFilter,
+            other => FinishReason::Unknown(other.to_string()),
+        }));
+    }
+
+    serde_json::from_value(json)
+        .map(Some)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid finish_reason: {e}")))
+}
+
+#[pymethods]
+impl PyAnnotatedLLMResponse {
+    #[new]
+    #[pyo3(signature = (
+        id = None,
+        model = None,
+        message = None,
+        tool_calls = None,
+        finish_reason = None,
+        usage = None,
+        api_specific = None,
+        extra = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        id: Option<String>,
+        model: Option<String>,
+        message: Option<&Bound<'_, PyAny>>,
+        tool_calls: Option<&Bound<'_, PyAny>>,
+        finish_reason: Option<&Bound<'_, PyAny>>,
+        usage: Option<&Bound<'_, PyAny>>,
+        api_specific: Option<&Bound<'_, PyAny>>,
+        extra: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: AnnotatedLLMResponse {
+                id,
+                model,
+                message: optional_py_json(message, "message")?,
+                tool_calls: optional_py_json(tool_calls, "tool_calls")?,
+                finish_reason: optional_finish_reason(finish_reason)?,
+                usage: optional_py_json(usage, "usage")?,
+                optimization_summary: None,
+                api_specific: optional_py_json(api_specific, "api_specific")?,
+                extra: optional_py_json(extra, "extra")?.unwrap_or_default(),
+            },
+        })
+    }
+
+    #[getter]
+    pub(crate) fn id(&self) -> Option<String> {
+        self.inner.id.clone()
+    }
+
+    #[getter]
+    pub(crate) fn model(&self) -> Option<String> {
+        self.inner.model.clone()
+    }
+
+    #[getter]
+    pub(crate) fn message(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.message {
+            Some(m) => {
+                let value = to_python_json_value(
+                    m,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_RESPONSE_MESSAGE_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[getter]
+    pub(crate) fn tool_calls(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.tool_calls {
+            Some(tc) => {
+                let value = to_python_json_value(
+                    tc,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_RESPONSE_TOOL_CALLS_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[getter]
+    pub(crate) fn finish_reason(&self) -> Option<String> {
+        self.inner
+            .finish_reason
+            .as_ref()
+            .map(|reason| match reason {
+                FinishReason::Complete => "complete".to_string(),
+                FinishReason::Length => "length".to_string(),
+                FinishReason::ToolUse => "tool_use".to_string(),
+                FinishReason::ContentFilter => "content_filter".to_string(),
+                FinishReason::Unknown(value) => value.clone(),
+            })
+    }
+
+    #[getter]
+    pub(crate) fn usage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.usage {
+            Some(u) => {
+                let value = to_python_json_value(
+                    u,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_RESPONSE_USAGE_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    /// Return Relay's plugin-neutral optimization accounting, if present.
+    #[getter]
+    pub(crate) fn optimization_summary(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.optimization_summary {
+            Some(summary) => {
+                let value = to_python_json_value(
+                    summary,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_RESPONSE_OPTIMIZATION_SUMMARY_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[getter]
+    pub(crate) fn api_specific(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.api_specific {
+            Some(a) => {
+                let value = to_python_json_value(
+                    a,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_RESPONSE_API_SPECIFIC_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[getter]
+    pub(crate) fn extra(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_to_py(py, &serde_json::Value::Object(self.inner.extra.clone()))
+    }
+
+    /// Extract the text content of the response message.
+    pub(crate) fn response_text(&self) -> Option<String> {
+        self.inner.response_text().map(|s| s.to_string())
+    }
+
+    /// Check if the response contains any tool calls.
+    pub(crate) fn has_tool_calls(&self) -> bool {
+        self.inner.has_tool_calls()
+    }
+
+    pub(crate) fn __repr__(&self) -> String {
+        format!(
+            "<AnnotatedLLMResponse id={:?} model={:?}>",
+            self.inner.id, self.inner.model
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in LLM Codec pyclasses
+// ---------------------------------------------------------------------------
+
+/// Built-in codec for the OpenAI Chat Completions API.
+///
+/// Implements both ``LlmCodec`` (decode/encode for requests) and
+/// ``LlmResponseCodec`` (decode_response for responses).
+///
+/// Example:
+/// ```python
+/// from nemo_relay.codecs import OpenAIChatCodec
+/// codec = OpenAIChatCodec()
+/// annotated_req = codec.decode(request)
+/// annotated_resp = codec.decode_response(response)
+/// ```
+#[pyclass(name = "OpenAIChatCodec")]
+pub struct PyOpenAIChatCodec {
+    pub(crate) inner_codec: Arc<dyn LlmCodec>,
+    pub(crate) inner_response_codec: Arc<dyn LlmResponseCodec>,
+}
+
+#[pymethods]
+impl PyOpenAIChatCodec {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner_codec: Arc::new(nemo_relay::codec::openai_chat::OpenAIChatCodec),
+            inner_response_codec: Arc::new(nemo_relay::codec::openai_chat::OpenAIChatCodec),
+        }
+    }
+
+    /// Parse an opaque ``LlmRequest`` into a structured ``AnnotatedLLMRequest``.
+    pub(crate) fn decode(&self, request: &PyLLMRequest) -> PyResult<PyAnnotatedLLMRequest> {
+        self.inner_codec
+            .decode(&request.inner)
+            .map(|r| PyAnnotatedLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Merge structured changes back into the opaque request.
+    pub(crate) fn encode(
+        &self,
+        annotated: &PyAnnotatedLLMRequest,
+        original: &PyLLMRequest,
+    ) -> PyResult<PyLLMRequest> {
+        self.inner_codec
+            .encode(&annotated.inner, &original.inner)
+            .map(|r| PyLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Parse a raw JSON response into a structured ``AnnotatedLLMResponse``.
+    pub(crate) fn decode_response(
+        &self,
+        response: &Bound<'_, PyAny>,
+    ) -> PyResult<PyAnnotatedLLMResponse> {
+        let json = py_to_json(response)?;
+        self.inner_response_codec
+            .decode_response(&json)
+            .map(|r| PyAnnotatedLLMResponse { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub(crate) fn __repr__(&self) -> &'static str {
+        "<OpenAIChatCodec>"
+    }
+}
+
+/// Built-in codec for the OpenAI Responses API.
+///
+/// Implements both ``LlmCodec`` (decode/encode for requests) and
+/// ``LlmResponseCodec`` (decode_response for responses).
+///
+/// Example:
+/// ```python
+/// from nemo_relay.codecs import OpenAIResponsesCodec
+/// codec = OpenAIResponsesCodec()
+/// annotated_req = codec.decode(request)
+/// annotated_resp = codec.decode_response(response)
+/// ```
+#[pyclass(name = "OpenAIResponsesCodec")]
+pub struct PyOpenAIResponsesCodec {
+    pub(crate) inner_codec: Arc<dyn LlmCodec>,
+    pub(crate) inner_response_codec: Arc<dyn LlmResponseCodec>,
+}
+
+#[pymethods]
+impl PyOpenAIResponsesCodec {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner_codec: Arc::new(nemo_relay::codec::openai_responses::OpenAIResponsesCodec),
+            inner_response_codec: Arc::new(
+                nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
+            ),
+        }
+    }
+
+    /// Parse an opaque ``LlmRequest`` into a structured ``AnnotatedLLMRequest``.
+    pub(crate) fn decode(&self, request: &PyLLMRequest) -> PyResult<PyAnnotatedLLMRequest> {
+        self.inner_codec
+            .decode(&request.inner)
+            .map(|r| PyAnnotatedLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Merge structured changes back into the opaque request.
+    pub(crate) fn encode(
+        &self,
+        annotated: &PyAnnotatedLLMRequest,
+        original: &PyLLMRequest,
+    ) -> PyResult<PyLLMRequest> {
+        self.inner_codec
+            .encode(&annotated.inner, &original.inner)
+            .map(|r| PyLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Parse a raw JSON response into a structured ``AnnotatedLLMResponse``.
+    pub(crate) fn decode_response(
+        &self,
+        response: &Bound<'_, PyAny>,
+    ) -> PyResult<PyAnnotatedLLMResponse> {
+        let json = py_to_json(response)?;
+        self.inner_response_codec
+            .decode_response(&json)
+            .map(|r| PyAnnotatedLLMResponse { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub(crate) fn __repr__(&self) -> &'static str {
+        "<OpenAIResponsesCodec>"
+    }
+}
+
+/// Built-in codec for the Anthropic Messages API.
+///
+/// Implements both ``LlmCodec`` (decode/encode for requests) and
+/// ``LlmResponseCodec`` (decode_response for responses).
+///
+/// Example:
+/// ```python
+/// from nemo_relay.codecs import AnthropicMessagesCodec
+/// codec = AnthropicMessagesCodec()
+/// annotated_req = codec.decode(request)
+/// annotated_resp = codec.decode_response(response)
+/// ```
+#[pyclass(name = "AnthropicMessagesCodec")]
+pub struct PyAnthropicMessagesCodec {
+    pub(crate) inner_codec: Arc<dyn LlmCodec>,
+    pub(crate) inner_response_codec: Arc<dyn LlmResponseCodec>,
+}
+
+#[pymethods]
+impl PyAnthropicMessagesCodec {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner_codec: Arc::new(nemo_relay::codec::anthropic::AnthropicMessagesCodec),
+            inner_response_codec: Arc::new(nemo_relay::codec::anthropic::AnthropicMessagesCodec),
+        }
+    }
+
+    /// Parse an opaque ``LlmRequest`` into a structured ``AnnotatedLLMRequest``.
+    pub(crate) fn decode(&self, request: &PyLLMRequest) -> PyResult<PyAnnotatedLLMRequest> {
+        self.inner_codec
+            .decode(&request.inner)
+            .map(|r| PyAnnotatedLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Merge structured changes back into the opaque request.
+    pub(crate) fn encode(
+        &self,
+        annotated: &PyAnnotatedLLMRequest,
+        original: &PyLLMRequest,
+    ) -> PyResult<PyLLMRequest> {
+        self.inner_codec
+            .encode(&annotated.inner, &original.inner)
+            .map(|r| PyLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Parse a raw JSON response into a structured ``AnnotatedLLMResponse``.
+    pub(crate) fn decode_response(
+        &self,
+        response: &Bound<'_, PyAny>,
+    ) -> PyResult<PyAnnotatedLLMResponse> {
+        let json = py_to_json(response)?;
+        self.inner_response_codec
+            .decode_response(&json)
+            .map(|r| PyAnnotatedLLMResponse { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub(crate) fn __repr__(&self) -> &'static str {
+        "<AnthropicMessagesCodec>"
+    }
+}
+
+/// Built-in codec for the OCI Generative AI chat API.
+///
+/// Implements both ``LlmCodec`` (decode/encode for requests) and
+/// ``LlmResponseCodec`` (decode_response for responses).
+///
+/// Example:
+/// ```python
+/// from nemo_relay.codecs import OCIGenAIChatCodec
+/// codec = OCIGenAIChatCodec()
+/// annotated_req = codec.decode(request)
+/// annotated_resp = codec.decode_response(response)
+/// ```
+#[pyclass(name = "OCIGenAIChatCodec")]
+pub struct PyOCIGenAIChatCodec {
+    pub(crate) inner_codec: Arc<dyn LlmCodec>,
+    pub(crate) inner_response_codec: Arc<dyn LlmResponseCodec>,
+}
+
+#[pymethods]
+impl PyOCIGenAIChatCodec {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner_codec: Arc::new(nemo_relay::codec::oci_genai::OCIGenAIChatCodec),
+            inner_response_codec: Arc::new(nemo_relay::codec::oci_genai::OCIGenAIChatCodec),
+        }
+    }
+
+    /// Parse an opaque ``LlmRequest`` into a structured ``AnnotatedLLMRequest``.
+    pub(crate) fn decode(&self, request: &PyLLMRequest) -> PyResult<PyAnnotatedLLMRequest> {
+        self.inner_codec
+            .decode(&request.inner)
+            .map(|r| PyAnnotatedLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Merge structured changes back into the opaque request.
+    pub(crate) fn encode(
+        &self,
+        annotated: &PyAnnotatedLLMRequest,
+        original: &PyLLMRequest,
+    ) -> PyResult<PyLLMRequest> {
+        self.inner_codec
+            .encode(&annotated.inner, &original.inner)
+            .map(|r| PyLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Parse a raw JSON response into a structured ``AnnotatedLLMResponse``.
+    pub(crate) fn decode_response(
+        &self,
+        response: &Bound<'_, PyAny>,
+    ) -> PyResult<PyAnnotatedLLMResponse> {
+        let json = py_to_json(response)?;
+        self.inner_response_codec
+            .decode_response(&json)
+            .map(|r| PyAnnotatedLLMResponse { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub(crate) fn __repr__(&self) -> &'static str {
+        "<OCIGenAIChatCodec>"
+    }
+}
+
+/// Built-in codec for the Gemini generateContent API.
+///
+/// Implements both ``LlmCodec`` (decode/encode for requests) and
+/// ``LlmResponseCodec`` (decode_response for responses).
+///
+/// Example:
+/// ```python
+/// from nemo_relay.codecs import GeminiGenerateContentCodec
+/// codec = GeminiGenerateContentCodec()
+/// annotated_req = codec.decode(request)
+/// annotated_resp = codec.decode_response(response)
+/// ```
+#[pyclass(name = "GeminiGenerateContentCodec")]
+pub struct PyGeminiGenerateContentCodec {
+    pub(crate) inner_codec: Arc<dyn LlmCodec>,
+    pub(crate) inner_response_codec: Arc<dyn LlmResponseCodec>,
+}
+
+#[pymethods]
+impl PyGeminiGenerateContentCodec {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner_codec: Arc::new(
+                nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
+            ),
+            inner_response_codec: Arc::new(
+                nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
+            ),
+        }
+    }
+
+    /// Parse an opaque ``LlmRequest`` into a structured ``AnnotatedLLMRequest``.
+    pub(crate) fn decode(&self, request: &PyLLMRequest) -> PyResult<PyAnnotatedLLMRequest> {
+        self.inner_codec
+            .decode(&request.inner)
+            .map(|r| PyAnnotatedLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Merge structured changes back into the opaque request.
+    pub(crate) fn encode(
+        &self,
+        annotated: &PyAnnotatedLLMRequest,
+        original: &PyLLMRequest,
+    ) -> PyResult<PyLLMRequest> {
+        self.inner_codec
+            .encode(&annotated.inner, &original.inner)
+            .map(|r| PyLLMRequest { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Parse a raw JSON response into a structured ``AnnotatedLLMResponse``.
+    pub(crate) fn decode_response(
+        &self,
+        response: &Bound<'_, PyAny>,
+    ) -> PyResult<PyAnnotatedLLMResponse> {
+        let json = py_to_json(response)?;
+        self.inner_response_codec
+            .decode_response(&json)
+            .map(|r| PyAnnotatedLLMResponse { inner: r })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub(crate) fn __repr__(&self) -> &'static str {
+        "<GeminiGenerateContentCodec>"
+    }
+}

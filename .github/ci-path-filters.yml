@@ -1,0 +1,221 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ci:
+  - '.github/actionlint.yaml'
+  - '.github/ci-path-filters.yml'
+  - '.github/workflows/**'
+  - 'codecov.yml'
+
+installer:
+  - '.github/ci-path-filters.yml'
+  - '.github/workflows/ci.yaml'
+  - '.github/workflows/ci_changes.yml'
+  - '.github/workflows/ci_check.yml'
+  - 'install.sh'
+  - 'install.ps1'
+  - 'scripts/test-install.sh'
+  - 'scripts/test-install-mocks.sh'
+  - 'scripts/test-install.ps1'
+
+shared:
+  - 'crates/adaptive/Cargo.toml'
+  - 'crates/adaptive/src/**'
+  - 'crates/core/Cargo.toml'
+  - 'crates/core/src/**'
+  - 'crates/types/Cargo.toml'
+  - 'crates/types/src/**'
+  - 'crates/worker-proto/Cargo.toml'
+  - 'crates/worker-proto/build.rs'
+  - 'crates/worker-proto/proto/**'
+  - 'crates/worker-proto/src/**'
+  - 'crates/worker/Cargo.toml'
+  - 'crates/worker/src/**'
+  - 'justfile'
+  - 'rust-toolchain.toml'
+
+rust_package:
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'crates/adaptive/Cargo.toml'
+  - 'crates/adaptive/src/**'
+  - 'crates/cli/Cargo.toml'
+  - 'crates/cli/src/**'
+  - 'crates/core/Cargo.toml'
+  - 'crates/core/src/**'
+  - 'crates/plugin/Cargo.toml'
+  - 'crates/plugin/src/**'
+  - 'crates/types/Cargo.toml'
+  - 'crates/types/src/**'
+  - 'crates/worker-proto/Cargo.toml'
+  - 'crates/worker-proto/build.rs'
+  - 'crates/worker-proto/proto/**'
+  - 'crates/worker-proto/src/**'
+  - 'crates/worker/Cargo.toml'
+  - 'crates/worker/src/**'
+  - 'crates/ffi/Cargo.toml'
+  - 'crates/ffi/build.rs'
+  - 'crates/ffi/cbindgen.toml'
+  - 'crates/ffi/nemo_relay.h'
+  - 'crates/ffi/src/**'
+  - 'justfile'
+  - 'python/cli-bin/**'
+  - 'rust-toolchain.toml'
+  - 'scripts/package-cli-bin.py'
+
+node_package:
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'crates/adaptive/Cargo.toml'
+  - 'crates/adaptive/src/**'
+  - 'crates/core/Cargo.toml'
+  - 'crates/core/src/**'
+  - 'crates/types/Cargo.toml'
+  - 'crates/types/src/**'
+  - 'crates/node/Cargo.toml'
+  - 'crates/node/build.rs'
+  - 'crates/node/package.json'
+  - 'crates/node/*.d.ts'
+  - 'crates/node/*.js'
+  - 'crates/node/src/**'
+  - 'justfile'
+  - 'package.json'
+  - 'package-lock.json'
+  - 'pyproject.toml'
+  - 'rust-toolchain.toml'
+  - 'scripts/package-node-bin.py'
+  - 'uv.lock'
+
+python_package:
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'crates/adaptive/Cargo.toml'
+  - 'crates/adaptive/src/**'
+  - 'crates/core/Cargo.toml'
+  - 'crates/core/src/**'
+  - 'crates/types/Cargo.toml'
+  - 'crates/types/src/**'
+  - 'crates/python/Cargo.toml'
+  - 'crates/python/src/**'
+  - 'justfile'
+  - 'pyproject.toml'
+  - 'python/cli-bin/**'
+  - 'python/nemo_relay/**'
+  - 'rust-toolchain.toml'
+  - 'scripts/package-cli-bin.py'
+  - 'uv.lock'
+
+python_integration_langchain:
+  # Includes LangGraph and DeepAgents integrations as well
+  - 'justfile'
+  - 'pyproject.toml'
+  - 'python/nemo_relay/integrations/deepagents/**'
+  - 'python/nemo_relay/integrations/langchain/**'
+  - 'python/nemo_relay/integrations/langgraph/**'
+  - 'python/tests/integrations/conftest.py'
+  - 'python/tests/integrations/deepagents_tests/**'
+  - 'python/tests/integrations/langchain_tests/**'
+  - 'python/tests/integrations/langgraph_tests/**'
+  - 'rust-toolchain.toml'
+  - 'uv.lock'
+
+dependencies:
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'about.toml'
+  - 'crates/**/Cargo.toml'
+  - 'crates/worker-proto/proto/**'
+  - 'crates/**/package.json'
+  - 'integrations/**/package.json'
+  - 'package.json'
+  - 'package-lock.json'
+  - 'pyproject.toml'
+  - 'python/cli-bin/**'
+  - 'scripts/licensing/**'
+  - 'uv.lock'
+
+docs:
+  - '.agents/plugins/marketplace.json'
+  - '.claude-plugin/marketplace.json'
+  - 'CONTRIBUTING.md'
+  - 'README.md'
+  - 'docs/**'
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'crates/adaptive/src/**'
+  - 'crates/core/src/**'
+  - 'crates/ffi/src/**'
+  - 'crates/node/*.d.ts'
+  - 'crates/node/*.js'
+  - 'crates/node/package.json'
+  - 'crates/*/Cargo.toml'
+  - 'crates/**/*.md'
+  - 'fern/**'
+  - 'integrations/coding-agents/**'
+  - 'python/nemo_relay/**'
+  - 'scripts/build-docs.sh'
+  - 'scripts/docs/**'
+
+rust:
+  - '.agents/plugins/marketplace.json'
+  - '.claude-plugin/marketplace.json'
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'crates/**/Cargo.toml'
+  - 'crates/**/*.rs'
+  # The embedded pi extension is `.ts`/`.json` under the CLI crate. Changes must run
+  # the Rust tests that verify the embedded asset inventory and package contents.
+  - 'crates/cli/assets/**'
+  - 'crates/worker-proto/proto/**'
+  - 'crates/ffi/cbindgen.toml'
+  - 'integrations/coding-agents/**'
+
+go:
+  - 'crates/ffi/Cargo.toml'
+  - 'crates/ffi/build.rs'
+  - 'crates/ffi/cbindgen.toml'
+  - 'crates/ffi/nemo_relay.h'
+  - 'crates/ffi/src/**'
+  - 'go/**/!(*.md)'
+
+node:
+  - 'package.json'
+  - 'package-lock.json'
+  - 'crates/node/Cargo.toml'
+  - 'crates/node/build.rs'
+  - 'crates/node/package.json'
+  - 'crates/node/*.d.ts'
+  - 'crates/node/*.js'
+  - 'crates/node/src/**'
+  - 'crates/node/tests/**/*.mjs'
+  - 'scripts/test-support/**'
+
+openclaw:
+  - 'integrations/openclaw/**'
+
+# The pi extension is a hook client for the CLI gateway, so a change to the
+# adapter it posts against should re-run the extension's own suite.
+#
+# Only the adapter paths are listed, deliberately. `test-pi` is a TypeScript
+# typecheck plus Node tests against a *stub* gateway, so it cannot observe the
+# `/hooks/pi` route, the event classifier, or the session manager no matter what
+# changes there -- and `crates/cli/src/sessions/**` alone would put a full Node
+# matrix on nearly every CLI change. Those files are covered by the `rust`
+# filter, which matches every `crates/**/*.rs` file and runs the workspace tests
+# that exercise the route for real.
+pi:
+  - 'crates/cli/src/agents/pi/**'
+  - 'crates/cli/src/agents/shared/adapters.rs'
+  # The extension's source lives under the CLI crate, because the published crate can only
+  # embed files below its own root. `integrations/pi` holds its README, tsconfig and test
+  # suite and symlinks the rest, so an edit to the extension itself lands here and would
+  # otherwise never reach the suite that tests it.
+  - 'crates/cli/assets/pi-extension/**'
+  - 'integrations/pi/**'
+
+python:
+  - 'crates/python/Cargo.toml'
+  - 'crates/python/src/**'
+  - 'pyproject.toml'
+  - 'python/**/!(*.md)'
+  - 'uv.lock'

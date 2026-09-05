@@ -1,0 +1,191 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Label pull request
+
+on:
+  pull_request_target:
+    types:
+      - edited
+      - opened
+      - ready_for_review
+      - reopened
+      - synchronize
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.number }}'
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  label:
+    name: Apply PR labels
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Apply size, breaking, type, language, and skills labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          size_labels=("size:XS" "size:S" "size:M" "size:L" "size:XL" "size:XXL")
+          classifier_labels=("build" "chore" "ci" "docs" "feat" "fix" "perf" "refactor" "revert" "style" "test")
+          type_labels=("Automation" "Bug" "Documentation" "Feature" "Improvement" "Maintenance" "Skills" "Test")
+          lang_labels=("lang:go" "lang:js" "lang:python" "lang:rust")
+          controlled_labels=("${size_labels[@]}" "${classifier_labels[@]}" "${type_labels[@]}" "${lang_labels[@]}")
+
+          contains_label() {
+            local needle="$1"
+            shift
+            local label
+            for label in "$@"; do
+              if [[ "$label" == "$needle" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          mapfile -t file_rows < <(
+            gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+              --jq '.[] | [.filename, .additions, .deletions] | @tsv'
+          )
+
+          changed_lines=0
+          has_go=false
+          has_js=false
+          has_python=false
+          has_rust=false
+
+          for row in "${file_rows[@]}"; do
+            IFS=$'\t' read -r path additions deletions <<< "$row"
+            changed_lines=$((changed_lines + additions + deletions))
+
+            case "$path" in
+              *.go)
+                has_go=true
+                ;;
+            esac
+
+            case "$path" in
+              *.cjs|*.cts|*.js|*.jsx|*.mjs|*.mts|*.ts|*.tsx)
+                has_js=true
+                ;;
+            esac
+
+            case "$path" in
+              *.py|*.pyi)
+                has_python=true
+                ;;
+            esac
+
+            case "$path" in
+              *.rs)
+                has_rust=true
+                ;;
+            esac
+          done
+
+          if (( changed_lines <= 25 )); then
+            size_label="size:XS"
+          elif (( changed_lines <= 250 )); then
+            size_label="size:S"
+          elif (( changed_lines <= 500 )); then
+            size_label="size:M"
+          elif (( changed_lines <= 1000 )); then
+            size_label="size:L"
+          elif (( changed_lines <= 5000 )); then
+            size_label="size:XL"
+          else
+            size_label="size:XXL"
+          fi
+
+          desired_labels=("$size_label")
+
+          title_lower="${PR_TITLE,,}"
+          type_label=""
+          title_pattern='^(build|chore|ci|docs|enhancement|feat|fix|perf|refactor|revert|skills|style|test)(\([^)]+\))?(!)?:'
+          breaking_pattern='^(build|chore|ci|docs|enhancement|feat|fix|perf|refactor|revert|skills|style|test)(\([^)]+\))?!:'
+          if [[ "$title_lower" =~ $title_pattern ]]; then
+            case "${BASH_REMATCH[1]}" in
+              feat)
+                type_label="Feature"
+                ;;
+              enhancement|perf|refactor)
+                type_label="Improvement"
+                ;;
+              fix|revert)
+                type_label="Bug"
+                ;;
+              test)
+                type_label="Test"
+                ;;
+              docs)
+                type_label="Documentation"
+                ;;
+              skills)
+                type_label="Skills"
+                ;;
+              build|chore|ci|style)
+                type_label="Maintenance"
+                ;;
+            esac
+            desired_labels+=("$type_label")
+          fi
+          if [[ "$PR_TITLE" =~ $breaking_pattern ]]; then
+            desired_labels+=("breaking")
+          fi
+
+          if [[ "$has_go" == true ]]; then
+            desired_labels+=("lang:go")
+          fi
+          if [[ "$has_js" == true ]]; then
+            desired_labels+=("lang:js")
+          fi
+          if [[ "$has_python" == true ]]; then
+            desired_labels+=("lang:python")
+          fi
+          if [[ "$has_rust" == true ]]; then
+            desired_labels+=("lang:rust")
+          fi
+
+          mapfile -t current_labels < <(
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name'
+          )
+
+          add_labels=()
+          for label in "${desired_labels[@]}"; do
+            if ! contains_label "$label" "${current_labels[@]}"; then
+              add_labels+=("$label")
+            fi
+          done
+
+          remove_labels=()
+          for label in "${controlled_labels[@]}"; do
+            if contains_label "$label" "${current_labels[@]}" && ! contains_label "$label" "${desired_labels[@]}"; then
+              remove_labels+=("$label")
+            fi
+          done
+
+          for label in "${remove_labels[@]}"; do
+            gh api --method DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/${label}" >/dev/null
+          done
+
+          for label in "${add_labels[@]}"; do
+            gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+              --field "labels[]=$label" >/dev/null
+          done
+
+          printf 'Changed lines: %s\n' "$changed_lines"
+          printf 'Desired labels: %s\n' "${desired_labels[*]}"
+          printf 'Added labels: %s\n' "${add_labels[*]:-none}"
+          printf 'Removed labels: %s\n' "${remove_labels[*]:-none}"

@@ -1,0 +1,23 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! NAPI-RS bindings for NeMo Relay, exposing the agent runtime framework to Node.js.
+//!
+//! This crate provides JavaScript/TypeScript access to scope management, tool and LLM
+//! lifecycle operations, guardrails, intercepts, event subscriptions, and ATIF trajectory
+//! export via NAPI-RS. Doc comments on `#[napi]` items are emitted into the generated
+//! `index.d.ts` TypeScript definitions.
+//!
+//! Tool calls accept an optional `toolCallId` and LLM calls accept an optional `modelName`
+//! for ATIF trajectory correlation. The `AtifExporter` class collects lifecycle events
+//! and exports ATIF v1.7 trajectories.
+
+#![allow(dead_code)]
+
+mod api;
+mod callable;
+mod callback_factory;
+mod convert;
+mod promise_call;
+mod stream;
+mod types;

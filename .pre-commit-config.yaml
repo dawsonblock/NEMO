@@ -1,0 +1,221 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Generated agent-skill artifacts are managed independently and must not trigger repository checks.
+exclude: '^skills/[^/]+/(?:BENCHMARK\.md|skill-card\.md|skill\.oms\.sig)$'
+
+repos:
+  # SPDX copyright header check
+  - repo: local
+    hooks:
+      - id: copyright-header
+        name: copyright header
+        entry: python3 scripts/lint/check_copyright.py
+        language: system
+        files: '\.(rs|go|py|pyi|toml|yaml|yml|md|mjs|js|ts|h|sh)$|\.gitignore$'
+        exclude: '(/SKILL\.md|index\.js|index\.d\.ts|nemo_relay\.h|node_modules/|target/|\.venv/|pkg/|^\.github/pull_request_template\.md)$'
+
+  # General file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '^ATTRIBUTIONS-(Rust|Python|Node)\.md$'
+      - id: end-of-file-fixer
+        exclude: '^ATTRIBUTIONS-(Rust|Python|Node)\.md$'
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+        exclude: '^ATTRIBUTIONS-(Rust|Python|Node)\.md$'
+
+  # GitHub Actions — workflow semantics
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        files: '^(\.github/workflows/.*\.ya?ml|\.github/actions/.*/action\.ya?ml|\.github/actionlint\.ya?ml)$'
+        pass_filenames: false
+
+  # Python — ruff lint + format
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.0
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  # Python — type checking
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty (type check)
+        entry: uv run ty check . --extra-search-path python/plugin/src --extra-search-path scripts/docs --extra-search-path scripts/licensing --exclude docs/** --exclude fern/** --exclude ./examples/** --exclude .cache/** --exclude .claude/** --exclude python/plugin/src/nemo_relay_plugin/_proto/**
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: ty-python-plugin-example
+        name: ty (Python plugin example)
+        entry: uv run ty check examples/python-grpc-worker-plugin/nemo_relay_python_grpc_worker_example --extra-search-path python/plugin/src --exclude python/plugin/src/nemo_relay_plugin/_proto/**
+        language: system
+        files: '^(examples/python-grpc-worker-plugin/nemo_relay_python_grpc_worker_example/.*\.py|python/plugin/src/nemo_relay_plugin/.*\.py)$'
+        pass_filenames: false
+
+  # Documentation — external link validation
+  - repo: https://github.com/lycheeverse/lychee.git
+    rev: lychee-v0.23.0
+    hooks:
+      - id: lychee
+        name: docs markdown linkcheck
+        args:
+          - --no-progress
+          - --include-fragments
+          - --root-dir
+          - .
+          - --scheme
+          - http
+          - --scheme
+          - https
+          - --accept
+          - '200..=299,403,429'
+          - --exclude
+          - '^https?://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/.*)?$'
+          - --exclude
+          - '^https://www\.npmjs\.com/package/nemo-relay-node$'
+          - --exclude
+          - '^https://github\.com/NVIDIA/NeMo-Relay(?:/.*)?$'
+          - --exclude
+          - '^https://nvidia-nemo-relay\.docs\.buildwithfern\.com/nemo-relay(?:/.*)?$'
+          - README.md
+          - CONTRIBUTING.md
+          - docs/**/*.mdx
+        always_run: true
+        pass_filenames: false
+
+  # Lockfiles — manifest freshness
+  - repo: local
+    hooks:
+      - id: cargo-lockfile-check
+        name: Cargo.lock is up to date
+        entry: bash -c 'cargo metadata --format-version 1 --no-deps >/dev/null'
+        language: system
+        files: '^(Cargo\.toml|Cargo\.lock|crates/.*/Cargo\.toml)$'
+        pass_filenames: false
+
+      - id: uv-lockfile-check
+        name: uv.lock is up to date
+        entry: uv lock
+        language: system
+        files: '^(pyproject\.toml|python/plugin/pyproject\.toml|uv\.lock)$'
+        pass_filenames: false
+
+      - id: python-worker-proto-check
+        name: Python worker protobuf bindings are compatible
+        entry: just check-python-worker-proto
+        language: system
+        files: '^(crates/worker-proto/proto/nemo/relay/worker/v1/plugin_worker\.proto|python/plugin/(build_backend\.py|pyproject\.toml)|justfile)$'
+        pass_filenames: false
+
+      - id: node-lockfile-check
+        name: package-lock.json is up to date
+        entry: bash -c 'npm install --package-lock-only --ignore-scripts --audit=false --fund=false'
+        language: system
+        files: 'package(?:-lock)?\.json$'
+        pass_filenames: false
+
+  # Rust — fmt + clippy + cargo-deny
+  - repo: local
+    hooks:
+      - id: ffi-header-sync
+        name: ffi header sync
+        entry: cargo check -p nemo-relay-ffi
+        language: system
+        files: '^crates/ffi/(Cargo\.toml|cbindgen\.toml|nemo_relay\.h|src/.*\.rs)$'
+        pass_filenames: false
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --workspace --all-targets
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check
+        language: system
+        files: '(Cargo\.toml|Cargo\.lock|deny\.toml)$'
+        pass_filenames: false
+
+      - id: attributions-rust
+        name: ATTRIBUTIONS-Rust.md (Cargo.lock)
+        entry: bash scripts/generate_attributions.sh rust
+        language: system
+        files: '^(Cargo\.lock|ATTRIBUTIONS-Rust\.md)$'
+        pass_filenames: false
+
+      - id: attributions-python
+        name: ATTRIBUTIONS-Python.md (uv.lock)
+        entry: bash scripts/generate_attributions.sh python
+        language: system
+        files: '^(uv\.lock|ATTRIBUTIONS-Python\.md)$'
+        pass_filenames: false
+
+      - id: attributions-node
+        name: ATTRIBUTIONS-Node.md (package-lock.json)
+        entry: bash scripts/generate_attributions.sh node
+        language: system
+        files: '^(package-lock\.json|ATTRIBUTIONS-Node\.md)$'
+        pass_filenames: false
+
+  # Go — fmt + vet
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: go fmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+
+      - id: go-vet
+        name: go vet
+        entry: bash -c 'cd go/nemo_relay && go vet ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+  # JavaScript / TypeScript — format
+  - repo: local
+    hooks:
+      - id: node-prettier-check
+        name: node prettier check
+        entry: node scripts/lint/prettier-precommit.mjs
+        language: system
+        files: '^crates/node/.*\.(?:[cm]?js|[mc]?ts|tsx)$'
+        pass_filenames: false
+
+      - id: node-docstrings-check
+        name: node docstrings check
+        entry: node scripts/lint/check_public_docstrings.mjs all
+        language: system
+        files: '^crates/node/(?:plugin|adaptive|typed)\.(?:js|d\.ts)$'
+        pass_filenames: false

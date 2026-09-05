@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "platform": "macOS-26.2-arm64-arm-64bit",
+  "machine": "arm64",
+  "tools": {
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "cargo": "cargo 1.96.1 (356927216 2026-06-26)",
+    "node": "v22.22.3",
+    "npm": "10.9.8",
+    "python": "Python 3.12.0",
+    "uv": "uv 0.11.8 (0e961dd9a 2026-04-27 aarch64-apple-darwin)",
+    "go": "go version go1.25.1 darwin/arm64",
+    "protoc": "libprotoc 33.1",
+    "just": "just 1.47.1",
+    "cargo-nextest": "error: no such command: `nextest`",
+    "cargo-deny": "error: no such command: `deny`",
+    "cargo-audit": "cargo-audit-audit 0.22.2"
+  }
+}

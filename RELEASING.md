@@ -1,0 +1,372 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Releasing NeMo Relay
+
+This document is the maintainer playbook for cutting NeMo Relay releases. It
+describes the release contract, the version files that must be updated, the tag
+format that CI accepts, the package surfaces that are published, and the checks
+to run before and after a tag push.
+
+## Source Of Truth
+
+This section defines where release history and release-facing details are maintained.
+
+- There is no `CHANGELOG.md` in this repository.
+- The documentation site has a release-notes landing page for current
+  documentation-visible release status.
+- The source of truth for complete release history and tag-specific release
+  notes is always GitHub Releases for this repository.
+
+Do not copy full GitHub Release notes into `CHANGELOG.md` or the docs site.
+The docs release-notes page can summarize support status and point users to
+GitHub Releases.
+
+## Published Surfaces
+
+The release pipeline publishes these package surfaces from a tag push:
+
+| Ecosystem | Published Surface |
+|---|---|
+| crates.io | `nemo-relay-types`, `nemo-relay-plugin`, `nemo-relay-worker-proto`, `nemo-relay-worker`, `nemo-relay`, `nemo-relay-adaptive`, `nemo-relay-pii-redaction`, `nemo-relay-ffi`, `nemo-relay-cli` |
+| PyPI | `nemo-relay` wheels and source distribution, `nemo-relay-plugin` and `nemo-relay-cli-bin` wheels |
+| npm | `nemo-relay-node` and its seven platform packages, and `nemo-relay-openclaw` |
+| GitHub Releases | CLI binaries, `nemo-relay` and `nemo-relay-cli-bin` wheels, Node npm tarballs, and checksums |
+| Fern | The documentation site |
+
+Go remains source-first. There is no separate Go package-manager publication
+step in the repository release workflow.
+
+The former npm `nemo-relay-cli-bin` metapackage and its seven platform
+packages are retired and must not be republished.
+
+The mirrored GitLab pipeline also publishes the same tag's collected package
+artifacts to NVIDIA Artifactory. It is driven by the tag push, not by a GitLab
+pipeline schedule.
+
+## Version Model
+
+NeMo Relay versions are anchored on the workspace SemVer in the repository root
+`Cargo.toml`.
+
+- The root `Cargo.toml` `workspace.package.version` is the canonical release
+  version for the Rust workspace.
+- The root `Cargo.toml` `workspace.dependencies` entries for
+  `nemo-relay-types`, `nemo-relay-plugin`, `nemo-relay-worker-proto`,
+  `nemo-relay-worker`, `nemo-relay`, `nemo-relay-adaptive`,
+  `nemo-relay-pii-redaction`, `nemo-relay-ffi`, and `nemo-relay-cli` must
+  stay aligned with that same version.
+- `crates/node/package.json` carries the base npm version for the Node.js
+  package. The repository-root `package-lock.json` carries the npm workspace
+  lock entries and must be updated with it.
+- `integrations/openclaw/package.json` carries the base npm version for the
+  OpenClaw plugin package and must stay aligned with the same release version.
+- `python/cli-bin/pyproject.toml` carries the base CLI package version in its
+  PEP 440 spelling. The `nemo-relay[cli]` extra must pin the exact PyPI version.
+- The Python package version is derived at packaging time. `pyproject.toml`
+  stays `dynamic = ["version"]` in the repository, and the packaging recipe
+  writes a concrete version into `pyproject.toml` and `crates/python/Cargo.toml`
+  in the ephemeral packaging workspace.
+
+For non-tag CI builds, packaging recipes append a commit-derived suffix:
+
+- Node.js uses `-<short_sha>`.
+- Python uses `+<short_sha>` and converts prerelease labels into PEP 440 form.
+  For example, `0.2.0-rc.1` becomes `0.2.0rc1` when packaged for PyPI.
+
+## Release Tags
+
+Release tags must use raw Rust-compatible SemVer without a leading `v`.
+
+- Use `0.1.0` for stable releases.
+- Use `0.1.0-rc.1` for prereleases.
+- Do not use tags such as `v0.1.0` or `v0.1.0-rc.1`.
+
+CI rejects tags that do not match the required format.
+
+The tag text must match the version that the packaging jobs publish.
+
+Release tags for a frozen release line should be created from the matching
+`release/*` branch, not from `main`.
+
+## Code Freeze
+
+When code freeze begins for a target release, create a release branch from the
+latest `main` commit. Name the branch from the target release major and minor
+version:
+
+These examples assume `upstream` is the NVIDIA repository remote
+(`NVIDIA/NeMo-Relay`). The `origin` remote is usually a maintainer's personal
+fork.
+
+```bash
+git fetch upstream main
+git checkout -b release/0.2 upstream/main
+git push upstream release/0.2
+```
+
+After creating the release branch, open a PR against `main` that does both of
+the following:
+
+1. Add the new `release/*` branch to
+   [`.github/nightly-alpha-branches.yaml`](.github/nightly-alpha-branches.yaml)
+   so nightly alpha tags continue for the frozen release line.
+2. Bump all package versions on `main` to the next release line:
+
+   ```bash
+   just set-version <next-version>
+   ```
+
+New PRs that must go into the upcoming release must target the new `release/*`
+branch. Changes intended for later releases should continue to target `main`.
+
+When a release branch no longer needs nightly alpha tags, open a PR against
+`main` to remove that branch from
+[`.github/nightly-alpha-branches.yaml`](.github/nightly-alpha-branches.yaml).
+
+## Before You Cut A Release
+
+Before you create a release tag, confirm the following:
+
+1. The intended release commit is already on the release branch you intend to
+   tag. For frozen release lines, tag the matching `release/*` branch.
+2. The release commit contains the final version bump, docs updates, and any
+   public API changes that belong in the release.
+3. The working tree you use for local validation is clean or disposable.
+4. Registry credentials and repository settings are in place:
+   - GitHub Actions `id-token: write` access for the top-level crates.io publish job
+   - crates.io trusted publishers for `nemo-relay-types`,
+     `nemo-relay-plugin`, `nemo-relay-worker-proto`, `nemo-relay-worker`,
+     `nemo-relay`, `nemo-relay-adaptive`, `nemo-relay-pii-redaction`,
+     `nemo-relay-ffi`, and `nemo-relay-cli` are
+     configured for the top-level
+     [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) workflow
+   - GitHub Actions `id-token: write` access is available for the top-level npm publish job
+   - GitHub Actions `id-token: write` access for the top-level PyPI publish job
+   - Pending or existing PyPI trusted publishing is configured for
+     `nemo-relay-cli-bin`
+   - npm trusted publishers are configured for `nemo-relay-node`,
+     `nemo-relay-node-linux-x64-gnu`, `nemo-relay-node-linux-arm64-gnu`,
+     `nemo-relay-node-linux-x64-musl`, `nemo-relay-node-linux-arm64-musl`,
+     `nemo-relay-node-darwin-arm64`, `nemo-relay-node-win32-x64-msvc`, and
+     `nemo-relay-node-win32-arm64-msvc`
+5. The GitHub Release entry is ready to become the only canonical release-notes
+   surface.
+
+## Prepare The Release Commit
+
+Update the versioned source files in the release PR or release-prep commit.
+Prefer the repository helper:
+
+```bash
+just set-version <release-version>
+```
+
+The helper updates:
+
+1. The root [`Cargo.toml`](Cargo.toml) workspace version.
+2. The root [`Cargo.toml`](Cargo.toml) `workspace.dependencies` versions for
+   `nemo-relay-types`, `nemo-relay-plugin`, `nemo-relay-worker-proto`,
+   `nemo-relay-worker`, `nemo-relay`, `nemo-relay-adaptive`,
+   `nemo-relay-pii-redaction`, `nemo-relay-ffi`, and `nemo-relay-cli`.
+3. [`crates/node/package.json`](crates/node/package.json) and the `crates/node`
+   entry in the root [`package-lock.json`](package-lock.json) to the same
+   release version.
+4. [`integrations/openclaw/package.json`](integrations/openclaw/package.json)
+   and the `integrations/openclaw` entry in the root
+   [`package-lock.json`](package-lock.json) to the same release version.
+5. The Python `nemo-relay-cli-bin` metadata, including the exact
+   `nemo-relay[cli]` dependency version.
+Review docs and snippets that mention explicit versions, including:
+
+- [`README.md`](README.md)
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- [`docs/getting-started/installation.mdx`](docs/getting-started/installation.mdx)
+- Any binding README or example that pins a release number
+
+Do not commit a static Python package version into `pyproject.toml` just to cut
+the release. The packaging workflow stamps that file during the build.
+
+## Local Validation
+
+Run the checks that match the surfaces affected by the release. For a normal
+repository release, the safest baseline is:
+
+```bash
+uv run pre-commit run --all-files
+just test-rust
+just test-python
+just test-go
+just test-node
+./scripts/build-docs.sh check
+./scripts/build-docs.sh linkcheck
+```
+
+If you want to validate the packaging recipes before pushing a tag, run:
+
+```bash
+just --set output_dir "$PWD/target/release-artifacts" --set ref_name 0.1.0 package-node
+just --set output_dir "$PWD/target/release-artifacts" --set ref_name 0.1.0 package-openclaw
+just --set output_dir "$PWD/target/release-artifacts" --set ref_name 0.1.0 package-rust
+just --set output_dir "$PWD/target/release-artifacts" --set ref_name 0.1.0 package-python
+just --set output_dir "$PWD/target/release-artifacts" --set ref_name 0.1.0 package-python-sdist
+```
+
+Be aware that the local packaging recipes intentionally rewrite version fields
+in place while they build artifacts. In a disposable CI workspace that is fine.
+In a local checkout, restore those temporary manifest edits before continuing if
+you are not committing them.
+
+## Cut The Tag
+
+After the release commit is merged and validated, create and push the raw
+SemVer tag:
+
+```bash
+git fetch upstream release/0.1
+git checkout release/0.1
+git pull --ff-only upstream release/0.1
+git tag 0.1.0
+git push upstream 0.1.0
+```
+
+Use the prerelease form when needed:
+
+```bash
+git tag 0.1.0-rc.1
+git push upstream 0.1.0-rc.1
+```
+
+## What CI Does On A Tag Push
+
+Pushing a valid tag triggers [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml).
+That workflow then calls the language-specific reusable workflows for validation
+and package artifact creation.
+
+The release pipeline then:
+
+1. Validates the tag format in the `prepare` job.
+2. Runs the required repository checks, language test jobs, and Fern documentation
+   validation.
+3. Builds publishable package artifacts with the exact tag version:
+   - `package-rust` packs the published Rust crates for local validation.
+   - `package-node` packs one native npm Node.js package per supported platform,
+     including GNU and musl Linux packages for x86_64 and ARM64, and creates the
+     JavaScript and TypeScript metapackage once.
+   - `package-openclaw` packs the npm OpenClaw plugin package.
+   - `package-python` builds platform `nemo-relay` wheels, including
+     `musllinux_1_2_x86_64` and `musllinux_1_2_aarch64` wheels.
+   - `package-python-sdist` builds one platform-independent `nemo-relay` source
+     distribution.
+   - `package-python-plugin` builds the `nemo-relay-plugin` wheel.
+   - The Rust CLI matrix builds GNU Linux binaries in manylinux containers and
+     musl Linux binaries natively, validates each in its matching container, and
+     packages each prebuilt binary as a `nemo-relay-cli-bin` wheel.
+   - The distribution release-asset job uploads the CLI binaries, `nemo-relay`
+     API wheels, CLI wheels, and split Node npm packages.
+     `SHA256SUMS` covers every attached distribution artifact, and raw CLI
+     binaries also receive individual `.sha256` files for installer
+     compatibility.
+     GitHub-facing npm artifacts use
+     `nemo-relay-node-npm[-<os>-<cpu>]-<version>.tgz`; their registry package
+     names remain in the tarball manifests.
+4. Publishes packages from the top-level workflow after the reusable packaging
+   jobs complete:
+   - `publish-rust` stamps Cargo workspace versions from the release tag, then
+     runs `cargo publish --package` for `nemo-relay-types`,
+     `nemo-relay-plugin`, `nemo-relay-worker-proto`, `nemo-relay-worker`,
+     `nemo-relay`, `nemo-relay-adaptive`, `nemo-relay-pii-redaction`,
+     `nemo-relay-ffi`, and `nemo-relay-cli` through
+     trusted publishing from
+     the top-level workflow
+   - `publish-python` downloads the `nemo-relay` wheel and source distribution
+     artifacts plus the `nemo-relay-plugin` and `nemo-relay-cli-bin` wheels,
+     then uploads them to PyPI with trusted publishing from the top-level
+     workflow
+   - `publish-npm` publishes the Node.js native packages before their
+     metapackage, then publishes the OpenClaw package, through npm trusted
+     publishing from the top-level workflow
+     - Stable tags publish to the npm `latest` dist-tag
+     - Prerelease tags such as `0.1.0-rc.1` publish to the npm `next`
+       dist-tag so they do not become the default upgrade target
+   - The GitHub Release entry remains a draft until a maintainer publishes it.
+     End-user `nemo-relay install ...` commands require the CLI binary to be
+     installed and available on `PATH`.
+
+The workflow boundary is split intentionally:
+
+- The language-specific reusable workflows produce publishable package artifacts
+  after their tests pass.
+- [`.github/workflows/fern-docs.yml`](.github/workflows/fern-docs.yml) validates
+  and publishes Fern documentation independently from package CI.
+- [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) owns all crates.io,
+  PyPI, and npm publication decisions and credentials.
+- This layout also satisfies the official `pypa/gh-action-pypi-publish`
+  guidance that trusted publishing should not run inside reusable workflows.
+
+The mirrored GitLab pipeline in [`.gitlab-ci.yml`](.gitlab-ci.yml) handles
+NVIDIA Artifactory publication for the same tag:
+
+- GitLab starts the pipeline from a tag push through `CI_COMMIT_TAG`; no GitLab
+  cron or pipeline schedule is required.
+- The collector waits for the mirrored GitHub tag and matching GitHub Actions
+  run, then downloads the Python wheel and source distribution, Cargo, and
+  Node.js package artifacts produced by GitHub Actions.
+- The Artifactory jobs publish those collected artifacts to the configured
+  Python, Cargo, and npm Artifactory registries.
+
+npm trusted publishing has its own registry-side constraints:
+
+- Each npm package can only have one trusted publisher configured at a time.
+- Configure trusted publishers for `nemo-relay-node`, all seven Node platform
+  packages, and `nemo-relay-openclaw` before pushing a release tag.
+- npm trusted publishing currently supports GitHub-hosted runners, not
+  self-hosted runners.
+
+Stable docs versioning is managed through Fern configuration, not the release
+tag workflow. Update the Fern version entries when introducing a stable
+documentation version; prerelease tags do not publish a separate documentation
+artifact from CI.
+
+## Publish The GitHub Release Entry
+
+After the tag pipeline succeeds, publish or finalize the GitHub Release entry
+for that tag.
+
+- Keep complete release notes in GitHub Releases.
+- Publish the draft release before announcing `nemo-relay install` commands for
+  the new version.
+- Do not copy those notes into `CHANGELOG.md` or duplicate the full release
+  history in the docs site.
+- If you use GitHub-generated notes, review them before publishing. The
+  category mapping lives in [`.github/release.yml`](.github/release.yml).
+
+## Post-Release Checks
+
+After the release is live, verify:
+
+1. The `nemo-relay-types`, `nemo-relay-plugin`, `nemo-relay-worker-proto`,
+   `nemo-relay-worker`, `nemo-relay`, `nemo-relay-adaptive`,
+   `nemo-relay-pii-redaction`, `nemo-relay-ffi`, and `nemo-relay-cli` crates
+   are visible on crates.io.
+2. The `nemo-relay` and `nemo-relay-cli-bin` wheels are visible on PyPI, and
+   `pip install "nemo-relay[cli]"` exposes `nemo-relay`.
+3. The `nemo-relay-node`, its seven platform packages, and
+   `nemo-relay-openclaw` are visible on npm.
+4. The Unix and Windows installers resolve the new stable tag and verify
+   matching CLI release asset checksums on their supported platforms.
+5. The Fern documentation site shows the expected version and release notes.
+6. The GitHub Release page is complete and accurate.
+
+## If Something Fails
+
+Use the failure point to decide how to recover:
+
+- If the tag pipeline fails before any registry publish step succeeds, fix the
+  issue and rerun or replace the tag as appropriate.
+- If any package has already been published to a public registry, do not reuse
+  the same version number. Prepare a follow-up patch or prerelease instead.
+- If only the GitHub Release text is wrong, edit the GitHub Release entry
+  directly. Do not create a duplicate notes surface in the repository.

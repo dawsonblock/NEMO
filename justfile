@@ -1,0 +1,1982 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+export REPO_ROOT := justfile_directory()
+export NEMO_RELAY_REPO_ROOT := REPO_ROOT
+
+# Shared knobs used by the CI-oriented build, test, and package targets below.
+ci := "false"
+output_dir := ""
+# When set, package targets use this exact version instead of synthesizing one.
+ref_name := ""
+# Linux package artifacts target this minimum glibc version for compatibility.
+linux_glibc_version := "2.17"
+# Supported Node package platform key. CI sets this from its package matrix.
+node_platform := ""
+node_target := ""
+node_build_strategy := "native"
+
+bash_helpers := '''
+set -euo pipefail
+
+export_uv_python_runtime() {
+    local python_runtime_exports=""
+    local python_executable=""
+    python_executable="$(uv_python_executable)"
+    python_runtime_exports="$(
+        cd "$NEMO_RELAY_REPO_ROOT"
+        "$python_executable" - <<'PY'
+import shlex
+from pathlib import Path
+import os
+import sys
+import sysconfig
+
+def emit(name, value):
+    print(f"export {name}={shlex.quote('' if value is None else str(value))}")
+
+emit("PYO3_PYTHON", sys.executable)
+emit("PYTHON_EXE_DIR", Path(sys.executable).parent)
+emit("PYTHONHOME", sys.base_prefix)
+emit("PYTHON_PATHSEP", os.pathsep)
+emit("PYTHON_STDLIB", sysconfig.get_path("stdlib"))
+emit("PYTHON_PLATSTDLIB", sysconfig.get_path("platstdlib"))
+emit("PYTHON_LIBDIR", sysconfig.get_config_var("LIBDIR"))
+PY
+    )"
+
+    eval "$python_runtime_exports"
+    if command -v cygpath >/dev/null 2>&1; then
+        export PATH="$(cygpath -u "$PYTHON_EXE_DIR"):$PATH"
+    else
+        export PATH="$PYTHON_EXE_DIR:$PATH"
+    fi
+    export PYTHONPATH="${PYTHON_STDLIB}${PYTHON_PATHSEP}${PYTHON_PLATSTDLIB}"
+    export LD_LIBRARY_PATH="${PYTHON_LIBDIR:+${PYTHON_LIBDIR}}${PYTHON_LIBDIR:+${LD_LIBRARY_PATH:+:}}${LD_LIBRARY_PATH:-}"
+    export DYLD_LIBRARY_PATH="${PYTHON_LIBDIR:+${PYTHON_LIBDIR}}${PYTHON_LIBDIR:+${DYLD_LIBRARY_PATH:+:}}${DYLD_LIBRARY_PATH:-}"
+}
+
+uv_python_executable() {
+    (
+        cd "$NEMO_RELAY_REPO_ROOT"
+        if [[ -n "${UV_PYTHON:-}" ]]; then
+            uv python find "$UV_PYTHON"
+        else
+            uv python find
+        fi
+    )
+}
+
+activate_project_venv() {
+    # Ensure PATH-based tool lookups (for example, `zig`) resolve from the
+    # synced project environment without asking uv to resync the project.
+    local venv_dir=""
+    local venv_bin=""
+    if [[ -x "$NEMO_RELAY_REPO_ROOT/.venv/bin/python" ]]; then
+        venv_dir="$NEMO_RELAY_REPO_ROOT/.venv"
+        venv_bin="$venv_dir/bin"
+    elif [[ -x "$NEMO_RELAY_REPO_ROOT/.venv/Scripts/python.exe" ]]; then
+        venv_dir="$NEMO_RELAY_REPO_ROOT/.venv"
+        venv_bin="$venv_dir/Scripts"
+    else
+        echo "ERROR: expected project virtualenv Python executable under .venv" >&2
+        exit 1
+    fi
+    if command -v cygpath >/dev/null 2>&1; then
+        venv_bin="$(cygpath -u "$venv_bin")"
+    fi
+    export VIRTUAL_ENV="$venv_dir"
+    export PATH="$venv_bin:$PATH"
+    unset PYTHONHOME
+}
+
+project_python_executable() {
+    local python_executable=""
+    if [[ -x "$NEMO_RELAY_REPO_ROOT/.venv/bin/python" ]]; then
+        python_executable="$NEMO_RELAY_REPO_ROOT/.venv/bin/python"
+    elif [[ -x "$NEMO_RELAY_REPO_ROOT/.venv/Scripts/python.exe" ]]; then
+        python_executable="$NEMO_RELAY_REPO_ROOT/.venv/Scripts/python.exe"
+    else
+        echo "ERROR: expected project virtualenv Python executable under .venv" >&2
+        exit 1
+    fi
+
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$python_executable"
+    else
+        printf '%s\n' "$python_executable"
+    fi
+}
+
+prepend_ziglang_to_path() {
+    local python_executable="$1"
+    local zig_dir=""
+
+    zig_dir="$("$python_executable" - <<'PY'
+from pathlib import Path
+import importlib.util
+import sys
+
+spec = importlib.util.find_spec("ziglang")
+if spec is None or spec.origin is None:
+    raise SystemExit("ERROR: expected ziglang from the locked uv environment")
+
+zig = Path(spec.origin).resolve().parent / ("zig.exe" if sys.platform == "win32" else "zig")
+if not zig.exists():
+    raise SystemExit(f"ERROR: expected zig binary at {zig}")
+
+print(zig.parent)
+PY
+    )"
+
+    export PATH="$zig_dir:$PATH"
+}
+
+use_project_python_source() {
+    local python_executable="$1"
+    local python_pathsep=""
+    local python_source_path="$NEMO_RELAY_REPO_ROOT/python"
+
+    python_pathsep="$("$python_executable" - <<'PY'
+import os
+print(os.pathsep)
+PY
+    )"
+    if command -v cygpath >/dev/null 2>&1; then
+        python_source_path="$(cygpath -w "$python_source_path")"
+    fi
+    export PYTHONPATH="${python_source_path}${PYTHONPATH:+${python_pathsep}${PYTHONPATH}}"
+}
+
+docs_dependencies_ready() {
+    case "${NEMO_RELAY_DOCS_DEPS_READY:-}" in
+        1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_docs_dependencies() {
+    if docs_dependencies_ready; then
+        return 0
+    fi
+
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv sync --inexact --no-default-groups --group dev --no-install-project
+    npm install --ignore-scripts
+}
+
+ensure_node_docs_declarations() {
+    cd "$NEMO_RELAY_REPO_ROOT"
+    local types_file="crates/node/index.d.ts"
+    local newest_source=""
+
+    if [[ -f "$types_file" ]]; then
+        newest_source="$(
+            find crates/node/src crates/node/Cargo.toml crates/node/build.rs \
+                -type f -newer "$types_file" -print -quit
+        )"
+    fi
+
+    if [[ ! -f "$types_file" || -n "$newest_source" ]]; then
+        npm run build-debug --workspace=nemo-relay-node
+    fi
+}
+
+generate_docs_api_references() {
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv run --no-sync python scripts/docs/generate_python_library_reference.py
+    ensure_node_docs_declarations
+    uv run --no-sync python scripts/docs/generate_node_library_reference.py
+    uv run --no-sync python scripts/docs/generate_rust_library_reference.py
+}
+
+prepare_parent_dir() {
+    mkdir -p "$(dirname "$1")"
+}
+
+artifact_path() {
+    local filename="$1"
+    local base_dir="${output_dir:-$NEMO_RELAY_REPO_ROOT/target/coverage}"
+    printf '%s/%s\n' "$base_dir" "$filename"
+}
+
+prepare_artifact() {
+    local path
+    path="$(artifact_path "$1")"
+    prepare_parent_dir "$path"
+    printf '%s\n' "$path"
+}
+
+# Package artifacts are grouped by ecosystem so local runs mirror CI layout.
+package_output_dir() {
+    local channel="$1"
+    local base_dir="${output_dir:-$NEMO_RELAY_REPO_ROOT/target/packages}"
+    printf '%s/%s\n' "$base_dir" "$channel"
+}
+
+prepare_package_dir() {
+    local path
+    path="$(package_output_dir "$1")"
+    mkdir -p "$path"
+    printf '%s\n' "$path"
+}
+
+head_git_sha() {
+    git -C "$NEMO_RELAY_REPO_ROOT" rev-parse --short=8 HEAD
+}
+
+# Version helpers intentionally mutate package metadata in-place to match how CI
+# sets release and non-release artifact versions before building them.
+read_npm_package_version() {
+    local pkg_path="$1"
+
+    node - "$pkg_path" <<'NODE'
+const fs = require('fs');
+const [pkgPath] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+
+if (!manifest.version) {
+  throw new Error(`${pkgPath} missing version field`);
+}
+
+console.log(manifest.version);
+NODE
+}
+
+set_npm_package_version() {
+    local pkg_path="$1"
+    local lock_path="${2:-}"
+    local version="$3"
+    local lock_package_path="${4:-}"
+
+    node - "$pkg_path" "$lock_path" "$version" "$lock_package_path" <<'NODE'
+const fs = require('fs');
+const [pkgPath, lockPath, version, lockPackagePath] = process.argv.slice(2);
+
+function readJson(path) {
+  return JSON.parse(fs.readFileSync(path, 'utf8'));
+}
+
+function writeJson(path, value) {
+  fs.writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
+}
+
+function requireVersion(value, label) {
+  if (
+    !Object.prototype.hasOwnProperty.call(value, 'version') ||
+    typeof value.version !== 'string' ||
+    value.version.length === 0
+  ) {
+    throw new Error(`${label} missing version field`);
+  }
+}
+
+try {
+  const manifest = readJson(pkgPath);
+  requireVersion(manifest, pkgPath);
+  const manifestChanged = manifest.version !== version;
+  let lock = null;
+  let lockChanged = false;
+  let lockPackageChanged = false;
+
+  if (lockPath) {
+    lock = readJson(lockPath);
+    if (!lock.packages) {
+      throw new Error(`${lockPath} missing packages`);
+    }
+
+    if (typeof lock.version === 'string' && lock.version.length > 0) {
+      lockChanged = lock.version !== version;
+    }
+
+    const packageEntryKey = lockPackagePath || '';
+    const packageEntry = lock.packages[packageEntryKey];
+    if (!packageEntry) {
+      throw new Error(`${lockPath} missing packages["${packageEntryKey}"]`);
+    }
+    requireVersion(packageEntry, `${lockPath} packages["${packageEntryKey}"]`);
+    lockPackageChanged = packageEntry.version !== version;
+  }
+
+  manifest.version = version;
+  if (lock) {
+    if (typeof lock.version === 'string' && lock.version.length > 0) {
+      lock.version = version;
+    }
+    const packageEntryKey = lockPackagePath || '';
+    lock.packages[packageEntryKey].version = version;
+  }
+
+  if (manifestChanged) {
+    writeJson(pkgPath, manifest);
+    console.log(`${pkgPath} version updated to ${version}`);
+  } else {
+    console.log(`${pkgPath} already set to ${version}`);
+  }
+
+  if (lockPath) {
+    if (lockChanged || lockPackageChanged) {
+      writeJson(lockPath, lock);
+      console.log(`${lockPath} version updated to ${version}`);
+    } else {
+      console.log(`${lockPath} already set to ${version}`);
+    }
+  }
+} catch (error) {
+  console.error(`Error updating package version: ${error.message}`);
+  process.exit(1);
+}
+NODE
+}
+
+set_npm_package_dependency_version() {
+    local pkg_path="$1"
+    local lock_path="${2:-}"
+    local lock_package_path="$3"
+    local dependency_name="$4"
+    local version="$5"
+
+    node - "$pkg_path" "$lock_path" "$lock_package_path" "$dependency_name" "$version" <<'NODE'
+const fs = require('fs');
+const [pkgPath, lockPath, lockPackagePath, dependencyName, version] = process.argv.slice(2);
+
+function readJson(path) {
+  return JSON.parse(fs.readFileSync(path, 'utf8'));
+}
+
+function writeJson(path, value) {
+  fs.writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
+}
+
+function requireDependency(container, label) {
+  if (
+    !container.dependencies ||
+    !Object.prototype.hasOwnProperty.call(container.dependencies, dependencyName)
+  ) {
+    throw new Error(`${label} missing dependencies["${dependencyName}"]`);
+  }
+}
+
+try {
+  const manifest = readJson(pkgPath);
+  requireDependency(manifest, pkgPath);
+  const manifestChanged = manifest.dependencies[dependencyName] !== version;
+
+  let lock = null;
+  let lockChanged = false;
+  if (lockPath) {
+    lock = readJson(lockPath);
+    if (!lock.packages) {
+      throw new Error(`${lockPath} missing packages`);
+    }
+    const packageEntry = lock.packages[lockPackagePath];
+    if (!packageEntry) {
+      throw new Error(`${lockPath} missing packages["${lockPackagePath}"]`);
+    }
+    requireDependency(packageEntry, `${lockPath} packages["${lockPackagePath}"]`);
+    lockChanged = packageEntry.dependencies[dependencyName] !== version;
+  }
+
+  manifest.dependencies[dependencyName] = version;
+  if (lock) {
+    lock.packages[lockPackagePath].dependencies[dependencyName] = version;
+  }
+
+  if (manifestChanged) {
+    writeJson(pkgPath, manifest);
+  }
+
+  if (lockPath) {
+    if (lockChanged) {
+      writeJson(lockPath, lock);
+    }
+  }
+} catch (error) {
+  console.error(`Error updating package dependency: ${error.message}`);
+  process.exit(1);
+}
+NODE
+}
+
+set_coding_agent_plugin_versions() {
+    local version="$1"
+
+    node - "$version" <<'NODE'
+const fs = require('fs');
+const version = process.argv[2];
+const manifests = [
+  'integrations/coding-agents/claude-code/.claude-plugin/plugin.json',
+  'integrations/coding-agents/codex/.codex-plugin/plugin.json',
+];
+
+for (const manifestPath of manifests) {
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  if (!manifest.version) {
+    throw new Error(`${manifestPath} missing version field`);
+  }
+  if (manifest.version === version) {
+    console.log(`${manifestPath} already set to ${version}`);
+    continue;
+  }
+  manifest.version = version;
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  console.log(`${manifestPath} version updated to ${version}`);
+}
+NODE
+}
+
+read_workspace_version() {
+    local python_executable=""
+    python_executable="$(uv_python_executable)"
+    "$python_executable" - <<'PY'
+from pathlib import Path
+import re
+
+text = Path("Cargo.toml").read_text()
+match = re.search(r'^version = "(.*)"$', text, flags=re.MULTILINE)
+if not match:
+    raise SystemExit("Failed to read version from Cargo.toml")
+print(match.group(1))
+PY
+}
+
+set_cargo_workspace_version() {
+    local version="$1"
+    local python_executable=""
+    python_executable="$(uv_python_executable)"
+
+    "$python_executable" - "$version" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+version = sys.argv[1]
+if version.startswith("v"):
+    raise SystemExit("Release tags must not start with 'v'; use raw SemVer such as 0.1.0")
+numeric_identifier = r"(?:0|[1-9][0-9]*)"
+if not re.fullmatch(
+    rf"{numeric_identifier}\.{numeric_identifier}\.{numeric_identifier}"
+    rf"(?:-(?:alpha|beta|rc)\.{numeric_identifier})?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+    version,
+):
+    raise SystemExit(
+        f"Unsupported Cargo version '{version}'; use 0.1.0, prereleases like "
+        "0.1.0-rc.1, or build metadata like 0.1.0+deadbeef"
+    )
+
+path = Path("Cargo.toml")
+text = path.read_text()
+section = ""
+output = []
+changed = []
+found_workspace_version = False
+local_dependencies = (
+    "nemo-relay-types",
+    "nemo-relay-worker-proto",
+    "nemo-relay-worker",
+    "nemo-relay",
+    "nemo-relay-plugin",
+    "nemo-relay-adaptive",
+    "nemo-relay-pii-redaction",
+    "nemo-relay-ffi",
+    "nemo-relay-cli",
+)
+found_dependencies = set()
+
+for line in text.splitlines(keepends=True):
+    section_match = re.match(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$", line)
+    if section_match:
+        section = section_match.group(1)
+
+    updated = line
+    if section == "workspace.package":
+        updated, count = re.subn(
+            r'^(version\s*=\s*")([^"]+)(".*)$',
+            rf"\g<1>{version}\g<3>",
+            line,
+        )
+        if count == 1:
+            found_workspace_version = True
+            if updated != line:
+                changed.append("workspace.package.version")
+    elif section == "workspace.dependencies":
+        for dependency in local_dependencies:
+            updated, count = re.subn(
+                rf"^({re.escape(dependency)}\s*=\s*\{{[^}}]*\bversion\s*=\s*\")([^\"]+)(\".*)$",
+                rf"\g<1>{version}\g<3>",
+                updated,
+            )
+            if count == 1:
+                found_dependencies.add(dependency)
+                if updated != line:
+                    changed.append(f"workspace.dependencies.{dependency}.version")
+                break
+
+    output.append(updated)
+
+missing = []
+if not found_workspace_version:
+    missing.append("workspace.package.version")
+for dependency in local_dependencies:
+    if dependency not in found_dependencies:
+        missing.append(f"workspace.dependencies.{dependency}.version")
+if missing:
+    raise SystemExit(f"Failed to find expected Cargo version fields: {', '.join(missing)}")
+
+path.write_text("".join(output))
+if changed:
+    print(f"Cargo.toml version set to {version}: {', '.join(changed)}")
+else:
+    print(f"Cargo.toml already set to {version}")
+PY
+
+    local metadata_file=""
+    metadata_file="$(mktemp)"
+    if ! cargo metadata --no-deps --format-version 1 > "$metadata_file"; then
+        rm -f "$metadata_file"
+        return 1
+    fi
+    if ! "$python_executable" - "$version" "$metadata_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+version = sys.argv[1]
+metadata = json.loads(Path(sys.argv[2]).read_text())
+workspace_members = set(metadata["workspace_members"])
+mismatched = []
+checked = 0
+
+for package in metadata["packages"]:
+    if package["id"] not in workspace_members or not package["name"].startswith("nemo-relay"):
+        continue
+    checked += 1
+    if package["version"] != version:
+        mismatched.append(f"{package['name']}={package['version']}")
+
+if checked == 0:
+    raise SystemExit("Cargo metadata did not include any nemo-relay workspace packages")
+if mismatched:
+    raise SystemExit(f"Cargo workspace packages do not all resolve to {version}: {', '.join(mismatched)}")
+print(f"Cargo metadata resolves {checked} nemo-relay workspace packages to {version}")
+PY
+    then
+        rm -f "$metadata_file"
+        return 1
+    fi
+    rm -f "$metadata_file"
+}
+
+set_node_package_versions() {
+    local version="$1"
+    set_npm_package_version crates/node/package.json package-lock.json "$version" crates/node
+    set_npm_package_version integrations/openclaw/package.json package-lock.json "$version" integrations/openclaw
+    set_npm_package_dependency_version integrations/openclaw/package.json package-lock.json integrations/openclaw nemo-relay-node "$version"
+    # `nemo-relay-pi` is private and not published, so this bump changes nothing today. It is here
+    # so the version cannot already be stale on the day that changes: a workspace member absent
+    # from this list drifts silently, with no lockfile mismatch and no CI failure to catch it.
+    #
+    # The manifest is written at its real path rather than through `integrations/pi`'s symlink to
+    # it. A checkout without symlink support leaves a text stub there, and writing through that
+    # would overwrite the link target's path with a manifest instead of bumping anything.
+    set_npm_package_version crates/cli/assets/pi-extension/package.json package-lock.json "$version" integrations/pi
+}
+
+set_node_package_version() {
+    set_node_package_versions "$1"
+}
+
+set_project_version() {
+    local version="$1"
+    set_cargo_workspace_version "$version"
+    set_node_package_versions "$version"
+    set_python_package_version "$version" false
+    set_python_plugin_package_version "$version"
+    set_coding_agent_plugin_versions "$version"
+}
+
+semver_to_pep440() {
+    local python_executable=""
+    python_executable="$(uv_python_executable)"
+
+    "$python_executable" - "$1" <<'PY'
+import re
+import sys
+
+pattern = re.compile(
+    r"^(?P<release>\d+\.\d+\.\d+)"
+    r"(?:-(?P<pre_label>alpha|beta|rc)(?:\.(?P<pre_num>\d+))?)?"
+    r"(?:\+(?P<local>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+match = pattern.fullmatch(sys.argv[1])
+if not match:
+    raise SystemExit(
+        "Unsupported Python package version format. Expected SemVer with optional "
+        "alpha/beta/rc prerelease and optional build metadata."
+    )
+
+pep440 = match.group("release")
+pre_label = match.group("pre_label")
+if pre_label:
+    pre_map = {"alpha": "a", "beta": "b", "rc": "rc"}
+    pre_num = match.group("pre_num") or "0"
+    pep440 += f"{pre_map[pre_label]}{pre_num}"
+
+local = match.group("local")
+if local:
+    normalized_local = ".".join(part.lower() for part in re.split(r"[._-]+", local) if part)
+    if not normalized_local:
+        raise SystemExit("Python package local version metadata cannot be empty")
+    pep440 += f"+{normalized_local}"
+
+print(pep440)
+PY
+}
+
+set_python_package_version() {
+    local cargo_version="$1"
+    local materialize_version="${2:-true}"
+    local version=""
+    local python_executable=""
+    version="$(semver_to_pep440 "$cargo_version")"
+    python_executable="$(uv_python_executable)"
+
+    "$python_executable" - "$version" "$materialize_version" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+version = sys.argv[1]
+materialize_version = sys.argv[2] == "true"
+path = Path("pyproject.toml")
+text = path.read_text()
+
+if materialize_version and 'dynamic = ["version"]' in text:
+    updated = text.replace('dynamic = ["version"]', f'version = "{version}"', 1)
+elif materialize_version and re.search(r'^version = "(.*)"$', text, flags=re.MULTILINE):
+    updated, count = re.subn(
+        r'^version = "(.*)"$',
+        f'version = "{version}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise SystemExit("Failed to update version in pyproject.toml")
+elif not materialize_version and 'dynamic = ["version"]' in text:
+    updated = text
+elif not materialize_version and re.search(r'^version = "(.*)"$', text, flags=re.MULTILINE):
+    updated, count = re.subn(
+        r'^version = "(.*)"$',
+        'dynamic = ["version"]',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise SystemExit("Failed to restore dynamic version in pyproject.toml")
+else:
+    raise SystemExit("Failed to find version field in pyproject.toml")
+
+if updated != text:
+    path.write_text(updated)
+if materialize_version:
+    print(f"pyproject.toml version updated to {version}")
+else:
+    print("pyproject.toml uses the dynamic Cargo version")
+
+path = Path("crates/python/Cargo.toml")
+text = path.read_text()
+
+if "version.workspace = true" in text:
+    updated = text
+elif re.search(r'^version = "(.*)"$', text, flags=re.MULTILINE):
+    updated, count = re.subn(
+        r'^version = "(.*)"$',
+        "version.workspace = true",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise SystemExit("Failed to update version in crates/python/Cargo.toml")
+else:
+    raise SystemExit("Failed to find workspace or static version field in crates/python/Cargo.toml")
+
+if updated != text:
+    path.write_text(updated)
+print("crates/python/Cargo.toml uses the workspace version")
+
+path = Path("python/cli-bin/pyproject.toml")
+text = path.read_text()
+updated, count = re.subn(
+    r'^version = "(.*)"$',
+    f'version = "{version}"',
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+if count != 1:
+    raise SystemExit("Failed to update version in python/cli-bin/pyproject.toml")
+if updated != text:
+    path.write_text(updated)
+print(f"python/cli-bin/pyproject.toml version updated to {version}")
+
+path = Path("pyproject.toml")
+text = path.read_text()
+updated, count = re.subn(
+    r'("nemo-relay-cli-bin==)[^"]+(")',
+    rf'\g<1>{version}\g<2>',
+    text,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("Failed to update the nemo-relay CLI extra version")
+if updated != text:
+    path.write_text(updated)
+print(f"nemo-relay CLI extra updated to {version}")
+PY
+}
+
+set_python_plugin_package_version() {
+    local version=""
+    local python_executable=""
+    version="$(semver_to_pep440 "$1")"
+    python_executable="$(uv_python_executable)"
+
+    "$python_executable" - "$version" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+version = sys.argv[1]
+path = Path("python/plugin/pyproject.toml")
+text = path.read_text()
+updated, count = re.subn(
+    r'^version = "(.*)"$',
+    f'version = "{version}"',
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+if count != 1:
+    raise SystemExit("Failed to update version in python/plugin/pyproject.toml")
+path.write_text(updated)
+print(f"python/plugin/pyproject.toml version updated to {version}")
+PY
+}
+
+published_cargo_packages() {
+    printf '%s\n' \
+        nemo-relay-types \
+        nemo-relay-plugin \
+        nemo-relay-worker-proto \
+        nemo-relay-worker \
+        nemo-relay \
+        nemo-relay-adaptive \
+        nemo-relay-pii-redaction \
+        nemo-relay-ffi \
+        nemo-relay-cli
+}
+
+# Keep local wheel packaging aligned with the CI matrix without requiring raw
+# maturin flags to be passed through `just --set`.
+linux_manylinux_compatibility() {
+    local glibc_version="${linux_glibc_version:-2.17}"
+    printf 'manylinux_%s\n' "${glibc_version//./_}"
+}
+
+python_wheel_build_args() {
+    local os_name
+    os_name="$(uname -s)"
+    case "$os_name" in
+        Linux)
+            printf '%s\0' --compatibility "$(linux_manylinux_compatibility)" --zig
+            ;;
+        Darwin)
+            printf '%s\0' --compatibility pypi
+            ;;
+        CYGWIN*|MINGW*|MSYS*)
+            printf '%s\0' --compatibility pypi
+            ;;
+        *)
+            echo "ERROR: unsupported OS for package-python: $os_name" >&2
+            exit 1
+            ;;
+    esac
+}
+
+python_plugin_grpc_dependencies_supported() {
+    local python_executable="$1"
+    "$python_executable" - <<'PY'
+import platform
+import sys
+
+is_windows_arm64 = sys.platform == "win32" and platform.machine().lower() in {"arm64", "aarch64"}
+raise SystemExit(1 if is_windows_arm64 else 0)
+PY
+}
+
+configure_python_plugin_test_environment() {
+    local python_executable="$1"
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        unset NEMO_RELAY_SKIP_PYTHON_PLUGIN_TESTS
+    else
+        echo "Skipping nemo-relay-plugin grpc dependencies on Windows ARM64; plugin SDK tests will be skipped"
+        export NEMO_RELAY_SKIP_PYTHON_PLUGIN_TESTS=1
+    fi
+}
+
+python_plugin_sync_args() {
+    local python_executable="$1"
+    if ! python_plugin_grpc_dependencies_supported "$python_executable"; then
+        printf '%s\0' \
+            --no-install-package grpcio \
+            --no-install-package nemo-relay-plugin
+    fi
+}
+
+python_plugin_grpcio_tools_version() {
+    local python_executable=""
+    python_executable="$(uv_python_executable)"
+    "$python_executable" - <<'PY'
+import tomllib
+from pathlib import Path
+
+requirements = tomllib.loads(
+    Path("python/plugin/pyproject.toml").read_text()
+)["build-system"]["requires"]
+prefix = "grpcio-tools=="
+for requirement in requirements:
+    if requirement.startswith(prefix):
+        print(requirement.removeprefix(prefix))
+        break
+else:
+    raise SystemExit("python/plugin/pyproject.toml must pin grpcio-tools")
+PY
+}
+
+generate_python_worker_proto_files() {
+    local output_dir="$1"
+    local grpcio_tools_version=""
+    grpcio_tools_version="$(python_plugin_grpcio_tools_version)"
+    uvx --from "grpcio-tools==$grpcio_tools_version" python python/plugin/build_backend.py --generate "$output_dir"
+}
+
+prepend_go_bin_to_path() {
+    local go_bin
+    go_bin="$(go env GOBIN)"
+    if [[ -z "$go_bin" ]]; then
+        go_bin="$(go env GOPATH)/bin"
+    fi
+    export PATH="$go_bin:$PATH"
+}
+
+prepare_test_plugin_fixtures() {
+    local target_dir="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures"
+    local native_library=""
+    local worker_executable="nemo-relay-worker-plugin-fixture"
+    local host_os=""
+
+    host_os="$(uname -s 2>/dev/null || true)"
+    case "${RUNNER_OS:-}:${OSTYPE:-}:$host_os" in
+        Windows:*|*:msys*:*|*:win32*:*|*:*:MINGW*|*:*:MSYS*|*:*:CYGWIN*)
+            native_library="nemo_relay_plugin_fixture.dll"
+            worker_executable="${worker_executable}.exe"
+            ;;
+        *:darwin*:*|*:*:Darwin)
+            native_library="libnemo_relay_plugin_fixture.dylib"
+            ;;
+        *)
+            native_library="libnemo_relay_plugin_fixture.so"
+            ;;
+    esac
+
+    cd "$NEMO_RELAY_REPO_ROOT"
+    cargo build --quiet --locked \
+        --manifest-path crates/core/tests/fixtures/native_plugin/Cargo.toml \
+        --target-dir "$target_dir"
+    cargo build --quiet --locked \
+        --manifest-path crates/core/tests/fixtures/worker_plugin/Cargo.toml \
+        --target-dir "$target_dir"
+
+    export NEMO_RELAY_TEST_NATIVE_PLUGIN="$target_dir/debug/$native_library"
+    export NEMO_RELAY_TEST_WORKER_PLUGIN="$target_dir/debug/$worker_executable"
+    if [[ ! -f "$NEMO_RELAY_TEST_NATIVE_PLUGIN" ]]; then
+        echo "ERROR: missing native plugin test fixture: $NEMO_RELAY_TEST_NATIVE_PLUGIN" >&2
+        exit 1
+    fi
+    if [[ ! -f "$NEMO_RELAY_TEST_WORKER_PLUGIN" ]]; then
+        echo "ERROR: missing worker plugin test fixture: $NEMO_RELAY_TEST_WORKER_PLUGIN" >&2
+        exit 1
+    fi
+
+    if command -v cygpath >/dev/null 2>&1; then
+        NEMO_RELAY_TEST_NATIVE_PLUGIN="$(cygpath -w "$NEMO_RELAY_TEST_NATIVE_PLUGIN")"
+        NEMO_RELAY_TEST_WORKER_PLUGIN="$(cygpath -w "$NEMO_RELAY_TEST_WORKER_PLUGIN")"
+        export NEMO_RELAY_TEST_NATIVE_PLUGIN NEMO_RELAY_TEST_WORKER_PLUGIN
+    fi
+}
+
+prepare_llvm_cov_workspace() {
+    eval "$(cargo llvm-cov show-env --sh)"
+    cargo llvm-cov clean --workspace
+}
+
+rust_source_coverage_supported() {
+    local host
+    host="$(rustc -vV | sed -n 's/^host: //p')"
+    case "$host" in
+        aarch64-pc-windows-msvc|*-unknown-linux-musl)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+is_true() {
+    case "$1" in
+        1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+            return 0
+            ;;
+        0|false|FALSE|False|no|NO|No|off|OFF|Off|"")
+            return 1
+            ;;
+        *)
+            echo "ERROR: expected a boolean-like value, got: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+'''
+
+# validate the documentation site, links, navigation, and generated references
+docs:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    ensure_docs_dependencies
+    generate_docs_api_references
+    cd "$NEMO_RELAY_REPO_ROOT/fern"
+    npx fern check --warnings
+    npx fern docs broken-links --strict
+
+# validate documentation links and navigation without a full site build
+docs-linkcheck:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    ensure_docs_dependencies
+    generate_docs_api_references
+    cd "$NEMO_RELAY_REPO_ROOT/fern"
+    npx fern check --warnings
+    npx fern docs broken-links --strict
+
+# regenerate the ignored Fern API reference pages
+docs-api-reference:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    ensure_docs_dependencies
+    generate_docs_api_references
+
+# --set [ci=true|false]
+build-rust:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    export_uv_python_runtime
+    cd "$NEMO_RELAY_REPO_ROOT"
+    if is_true "{{ ci }}"; then
+        prepare_llvm_cov_workspace
+        cargo test --workspace --no-run
+    else
+        # Maturin supplies the platform-specific linker configuration for the
+        # Python extension in build-python.
+        cargo build --workspace --exclude nemo-relay-python
+    fi
+
+# --set [ci=true|false]
+build-python:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv sync --inexact --no-install-project --no-install-package nemo-relay --extra langchain --extra langgraph --extra deepagents
+    activate_project_venv
+    if is_true "{{ ci }}"; then
+        prepare_llvm_cov_workspace
+    fi
+    python_executable="$(project_python_executable)"
+    "$python_executable" -m maturin develop
+
+build-python-plugin:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    python_executable="$(uv_python_executable)"
+    sync_args=(--inexact --no-install-project)
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        sync_args+=(--package nemo-relay-plugin --reinstall-package nemo-relay-plugin)
+    fi
+    while IFS= read -r -d '' arg; do
+        sync_args+=("$arg")
+    done < <(python_plugin_sync_args "$python_executable")
+    uv sync "${sync_args[@]}"
+    activate_project_venv
+    python_executable="$(project_python_executable)"
+    configure_python_plugin_test_environment "$python_executable"
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        "$python_executable" -c 'import nemo_relay_plugin; print(f"nemo-relay-plugin import ok: {nemo_relay_plugin.__name__}")'
+    else
+        echo "nemo-relay-plugin is unsupported on Windows ARM64"
+    fi
+
+generate-python-worker-proto:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    generate_python_worker_proto_files python/plugin/src/nemo_relay_plugin/_proto
+
+check-python-worker-proto:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    python_executable="$(uv_python_executable)"
+    if ! python_plugin_grpc_dependencies_supported "$python_executable"; then
+        echo "Skipping Python worker proto check on Windows ARM64"
+        exit 0
+    fi
+    tmp_dir="$(mktemp -d)"
+    cleanup_proto_tmp() {
+        rm -rf "$tmp_dir"
+    }
+    trap cleanup_proto_tmp EXIT
+    generate_python_worker_proto_files "$tmp_dir"
+    "$python_executable" - "$tmp_dir" <<'PY'
+    from pathlib import Path
+    import sys
+
+    sys.path.insert(0, str(Path(sys.argv[1])))
+    import plugin_worker_pb2 as pb
+
+    assert pb.HandshakeRequest.DESCRIPTOR.fields_by_name["worker_protocol"].number == 4
+    assert pb.InvokeRequest.DESCRIPTOR.fields_by_name["auth_token"].number == 7
+    assert {method.name for method in pb.DESCRIPTOR.services_by_name["PluginWorker"].methods} == {
+        "Handshake", "Health", "Validate", "Register", "Invoke", "InvokeStream", "CancelInvocation", "Shutdown"
+    }
+    assert pb.SUBSCRIBER == 1
+    assert pb.LLM_STREAM_EXECUTION_INTERCEPT == 25
+    tool_next = pb.DESCRIPTOR.services_by_name["RelayHostRuntime"].methods_by_name["ToolNext"]
+    assert tool_next.output_type.full_name == "nemo.relay.worker.v1.ToolExecutionResultResponse"
+    runtime_diagnostics = pb.DESCRIPTOR.services_by_name["RelayHostRuntime"].methods_by_name["GetRuntimeDiagnostics"]
+    assert runtime_diagnostics.input_type.full_name == "nemo.relay.worker.v1.GetRuntimeDiagnosticsRequest"
+    assert runtime_diagnostics.output_type.full_name == "nemo.relay.worker.v1.GetRuntimeDiagnosticsResponse"
+    runtime_diagnostic = pb.RuntimeDiagnostic.DESCRIPTOR.fields_by_name
+    assert runtime_diagnostic["code"].number == 1
+    assert runtime_diagnostic["message"].number == 2
+    assert runtime_diagnostic["count"].number == 3
+    runtime_diagnostics_response = pb.GetRuntimeDiagnosticsResponse.DESCRIPTOR.fields_by_name
+    assert runtime_diagnostics_response["entries"].number == 1
+    emit_mark = pb.EmitMarkRequest.DESCRIPTOR.fields_by_name
+    assert emit_mark["data_schema"].number == 7
+    assert emit_mark["severity"].number == 8
+    assert emit_mark["category"].number == 9
+    tool_result = pb.ToolExecutionResult.DESCRIPTOR.fields_by_name
+    assert tool_result["result"].message_type.full_name == "nemo.relay.worker.v1.JsonValue"
+    assert tool_result["annotation"].message_type.full_name == "nemo.relay.worker.v1.JsonValue"
+    outcome = pb.ToolExecutionInterceptResult.DESCRIPTOR.fields_by_name["outcome"]
+    assert outcome.message_type.full_name == "nemo.relay.worker.v1.ToolExecutionInterceptOutcome"
+    PY
+
+generate-test-plugin-lockfiles:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    cargo generate-lockfile --manifest-path crates/core/tests/fixtures/native_plugin/Cargo.toml
+    cargo generate-lockfile --manifest-path crates/core/tests/fixtures/worker_plugin/Cargo.toml
+
+generate-worker-plugin-lockfile: generate-test-plugin-lockfiles
+
+# Build the native and worker dynamic-plugin fixtures once for test processes.
+build-test-plugin-fixtures:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    prepare_test_plugin_fixtures
+    printf 'Native plugin fixture: %s\n' "$NEMO_RELAY_TEST_NATIVE_PLUGIN"
+    printf 'Worker plugin fixture: %s\n' "$NEMO_RELAY_TEST_WORKER_PLUGIN"
+
+
+# --set [ci=true|false]
+build-go:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    if is_true "{{ ci }}"; then
+        cargo build -p nemo-relay-ffi
+    else
+        cargo build --release -p nemo-relay-ffi
+    fi
+
+
+# --set [ci=true|false]
+build-node:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    if is_true "{{ ci }}"; then
+        prepare_llvm_cov_workspace
+    fi
+    cd "$NEMO_RELAY_REPO_ROOT"
+    npm install --workspace=nemo-relay-node --ignore-scripts
+    if is_true "{{ ci }}"; then
+        npm run build-debug --workspace=nemo-relay-node
+    else
+        npm run build --workspace=nemo-relay-node
+    fi
+
+build-all: build-rust build-python build-python-plugin build-go build-node
+
+# remove local build and test artifacts
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob globstar
+    rm -rf \
+        .coverage \
+        .pytest_cache \
+        *.profraw \
+        crates/**/*.profraw \
+        crates/node/*.node \
+        crates/node/coverage \
+        crates/node/index.d.ts \
+        crates/node/index.js \
+        crates/node/junit.xml \
+        crates/node/node_modules \
+        integrations/openclaw/*.profraw \
+        integrations/openclaw/.test-dist \
+        integrations/openclaw/dist \
+        integrations/openclaw/node_modules \
+        integrations/pi/node_modules \
+        node_modules \
+        docs/_build/ \
+        docs/reference/api/**/_generated/ \
+        docs/reference/api/**/_source/ \
+        go/nemo_relay/coverage.out \
+        python/nemo_relay/*.so \
+        python/nemo_relay/__pycache__ \
+        python/nemo_relay/_native*.pyd \
+        python/plugin/build \
+        python/plugin/dist \
+        python/plugin/proto \
+        python/plugin/src/nemo_relay_plugin/__pycache__ \
+        python/plugin/src/nemo_relay_plugin/_proto/__pycache__ \
+        python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2.py \
+        python/plugin/src/nemo_relay_plugin/_proto/plugin_worker_pb2_grpc.py \
+        python/plugin/src/nemo_relay_plugin.egg-info \
+        python/tests/__pycache__ \
+        python/tests/plugin/__pycache__ \
+        examples/python-grpc-worker-plugin/.pytest_cache \
+        examples/python-grpc-worker-plugin/.venv \
+        examples/python-grpc-worker-plugin/build \
+        examples/python-grpc-worker-plugin/dist \
+        examples/python-grpc-worker-plugin/__pycache__ \
+        examples/python-grpc-worker-plugin/nemo_relay_python_grpc_worker_example/__pycache__ \
+        examples/python-grpc-worker-plugin/*.egg-info \
+        examples/rust-native-plugin/Cargo.lock \
+        examples/rust-native-plugin/target \
+        target
+
+# Opt-in: requires a supported Codex installation and is intentionally outside test-rust/CI.
+test-codex-plugin-e2e:
+    ./scripts/test-codex-plugin-e2e.sh
+
+# Opt-in: requires a supported Claude Code installation and is intentionally outside test-rust/CI.
+test-claude-plugin-e2e:
+    ./scripts/test-claude-plugin-e2e.sh
+
+# Opt-in: builds the release CLI and runs configurable local latency suites.
+[positional-arguments]
+latency-benchmark *benchmark_args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    result_dir={{ quote(output_dir) }}
+    result_dir="${result_dir:-target/benchmark-results}"
+    for argument in "$@"; do
+        if [[ "$argument" == "-h" || "$argument" == "--help" ]]; then
+            exec uv run --locked python -m scripts.latency_benchmark.src "$@"
+        fi
+    done
+    cargo build --locked --release -p nemo-relay-cli
+    uv run --locked python -m scripts.latency_benchmark.src \
+        --relay-bin target/release/nemo-relay \
+        --output "$result_dir/nemo-relay-latency-report.json" \
+        "$@"
+
+# Runs the fast latency benchmark fixture tests without building Relay.
+test-latency-benchmark:
+    uv run --locked python -m pytest scripts/latency_benchmark/tests
+
+# --set [output_dir=<path>] [ci=true|false]
+test-rust:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    junit_out=""
+    test_config_root="$(mktemp -d)"
+    cleanup_test_config_root() {
+        rm -rf "$test_config_root"
+    }
+    trap cleanup_test_config_root EXIT
+
+    host_os="$(uname -s 2>/dev/null || true)"
+    is_windows=false
+    case "${RUNNER_OS:-}:${OSTYPE:-}:$host_os" in
+        Windows:*|*:msys*:*|*:win32*:*|*:*:MINGW*|*:*:MSYS*|*:*:CYGWIN*)
+            is_windows=true
+            ;;
+    esac
+    native_test_config_path() {
+        if [[ "$is_windows" == true ]] && command -v cygpath >/dev/null 2>&1; then
+            cygpath -w "$1"
+        else
+            printf '%s\n' "$1"
+        fi
+    }
+
+    xdg_config_home="$test_config_root/xdg"
+    mkdir -p "$xdg_config_home"
+    export XDG_CONFIG_HOME="$(native_test_config_path "$xdg_config_home")"
+    export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    if [[ "$is_windows" == true ]]; then
+        appdata_home="$test_config_root/AppData/Roaming"
+        localappdata_home="$test_config_root/AppData/Local"
+        mkdir -p "$appdata_home" "$localappdata_home"
+        export APPDATA="$(native_test_config_path "$appdata_home")"
+        export LOCALAPPDATA="$(native_test_config_path "$localappdata_home")"
+    fi
+
+    export_uv_python_runtime
+    cd "$NEMO_RELAY_REPO_ROOT"
+    if is_true "{{ ci }}"; then
+        coverage_out="$(prepare_artifact rust-workspace.xml)"
+        junit_out="$(prepare_artifact rust_junit_report.xml)"
+        if rust_source_coverage_supported; then
+            prepare_llvm_cov_workspace
+        fi
+        prepare_test_plugin_fixtures
+        cargo nextest run --locked --workspace --exclude nemo-relay-python --exclude nemo-relay-node --features nemo-relay-cli/__test-cli-port-override,nemo-relay-cli/__skip-implicit-config --profile ci --no-fail-fast
+        cp "$NEMO_RELAY_REPO_ROOT/target/nextest/ci/rust_junit_report.xml" "$junit_out"
+        if rust_source_coverage_supported; then
+            cargo llvm-cov report \
+                --ignore-filename-regex '.*/tests/.*\.rs$' \
+                --cobertura \
+                --output-path "$coverage_out"
+        fi
+    else
+        prepare_test_plugin_fixtures
+        cargo nextest run --locked --workspace --exclude nemo-relay-python --exclude nemo-relay-node --features nemo-relay-cli/__test-cli-port-override,nemo-relay-cli/__skip-implicit-config --profile ci --no-fail-fast
+    fi
+    cargo nextest run --manifest-path examples/rust-native-plugin/Cargo.toml --config-file "$NEMO_RELAY_REPO_ROOT/.config/nextest.toml" --profile ci
+    cargo nextest run --manifest-path examples/rust-grpc-worker-plugin/Cargo.toml --config-file "$NEMO_RELAY_REPO_ROOT/.config/nextest.toml" --profile ci
+    cargo nextest run --manifest-path examples/language-binding-plugin/rust/Cargo.toml --config-file "$NEMO_RELAY_REPO_ROOT/.config/nextest.toml" --profile ci
+
+# --set [output_dir=<path>] [ci=true|false]
+test-python:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    pytest_cmd=(pytest)
+    coverage_out=""
+    junit_out=""
+    rust_coverage_out=""
+    cd "$NEMO_RELAY_REPO_ROOT"
+    test_config_home="$(mktemp -d)"
+    trap 'rm -rf "$test_config_home"' EXIT
+    export XDG_CONFIG_HOME="$test_config_home"
+    export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    export_uv_python_runtime
+    if is_true "{{ ci }}"; then
+        coverage_out="$(prepare_artifact python-coverage.xml)"
+        junit_out="$(prepare_artifact python-junit.xml)"
+        pytest_cmd+=(--cov=nemo_relay --cov=nemo_relay_plugin --cov-report term-missing --cov-report "xml:$coverage_out")
+        pytest_cmd+=(--junit-xml "$junit_out")
+        if rust_source_coverage_supported; then
+            rust_coverage_out="$(prepare_artifact python-rust.xml)"
+            prepare_llvm_cov_workspace
+        fi
+    fi
+    cargo nextest run --locked -p nemo-relay-python --features __skip-implicit-config --lib --profile ci
+    python_executable="$(uv_python_executable)"
+    sync_args=(--inexact --all-packages --no-install-project --no-install-package nemo-relay)
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        sync_args+=(--reinstall-package nemo-relay-plugin)
+    fi
+    while IFS= read -r -d '' arg; do
+        sync_args+=("$arg")
+    done < <(python_plugin_sync_args "$python_executable")
+    uv sync "${sync_args[@]}"
+    activate_project_venv
+    export_uv_python_runtime
+    python_executable="$(project_python_executable)"
+    configure_python_plugin_test_environment "$python_executable"
+    if ! python_plugin_grpc_dependencies_supported "$python_executable"; then
+        pytest_cmd+=(--ignore=python/tests/plugin)
+    fi
+    use_project_python_source "$python_executable"
+    "$python_executable" -m maturin develop --features __skip-implicit-config --skip-install
+    prepare_test_plugin_fixtures
+    pytest_cmd+=(--durations=25)
+    "$python_executable" -m "${pytest_cmd[@]}" --ignore=python/tests/integrations
+    (cd examples/language-binding-plugin/python && uv run --locked --group test --reinstall-package nemo-relay pytest)
+    if is_true "{{ ci }}" && [[ -n "$rust_coverage_out" ]]; then
+        cargo llvm-cov report \
+            -p nemo-relay-python \
+            --ignore-filename-regex '.*/tests/.*\.rs$' \
+            --cobertura \
+            --output-path "$rust_coverage_out"
+    fi
+
+test-python-plugin:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    python_executable="$(uv_python_executable)"
+    sync_args=(--inexact --all-packages --no-install-project --no-install-package nemo-relay)
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        sync_args+=(--reinstall-package nemo-relay-plugin)
+    fi
+    while IFS= read -r -d '' arg; do
+        sync_args+=("$arg")
+    done < <(python_plugin_sync_args "$python_executable")
+    uv sync "${sync_args[@]}"
+    activate_project_venv
+    python_executable="$(project_python_executable)"
+    configure_python_plugin_test_environment "$python_executable"
+    if ! python_plugin_grpc_dependencies_supported "$python_executable"; then
+        exit 0
+    fi
+    "$python_executable" -m pytest \
+        python/tests/plugin \
+        --cov=nemo_relay_plugin \
+        --cov-report term-missing \
+        --cov-fail-under=95
+    (cd examples/python-grpc-worker-plugin && uv run --locked --group test --reinstall-package nemo-relay-plugin pytest)
+    (cd examples/language-binding-plugin/python && uv run --locked --group test --reinstall-package nemo-relay pytest)
+    just test-python-plugin-e2e
+
+test-python-plugin-e2e:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    python_executable="$(uv_python_executable)"
+    sync_args=(--inexact --all-packages --no-install-project --no-install-package nemo-relay)
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        sync_args+=(--reinstall-package nemo-relay-plugin)
+    fi
+    while IFS= read -r -d '' arg; do
+        sync_args+=("$arg")
+    done < <(python_plugin_sync_args "$python_executable")
+    uv sync "${sync_args[@]}"
+    activate_project_venv
+    python_executable="$(project_python_executable)"
+    configure_python_plugin_test_environment "$python_executable"
+    if ! python_plugin_grpc_dependencies_supported "$python_executable"; then
+        exit 0
+    fi
+    tmp="$(mktemp -d)"
+    gateway_pid=""
+    cleanup() {
+        if [[ -n "$gateway_pid" ]]; then
+            kill "$gateway_pid" 2>/dev/null || true
+            wait "$gateway_pid" 2>/dev/null || true
+        fi
+        rm -rf "$tmp"
+    }
+    trap cleanup EXIT
+
+    uv build --wheel --out-dir "$tmp/wheels" python/plugin
+    cargo build -p nemo-relay-cli
+    cli="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-relay"
+    config="$tmp/gateway.toml"
+    # Explicit --config paths must exist; plugin policy and state are sibling files.
+    : > "$config"
+    printf '[plugins.policy.defaults]\nattestation = "integrity_only"\n' > "$tmp/plugins.toml"
+    manifest="$NEMO_RELAY_REPO_ROOT/examples/python-grpc-worker-plugin/relay-plugin.toml"
+    PIP_FIND_LINKS="$tmp/wheels" NEMO_RELAY_PYTHON="$python_executable" \
+        "$cli" --config "$config" plugins add "$manifest"
+    "$cli" --config "$config" plugins enable examples.python_grpc_worker
+    environment_ref="$("$python_executable" -c \
+        'import json, sys; print(json.load(open(sys.argv[1]))["records"][0]["source"]["environment_ref"])' \
+        "$tmp/.dynamic-plugins.json")"
+    test -x "$environment_ref/bin/python" || test -x "$environment_ref/Scripts/python.exe"
+
+    port="$("$python_executable" -c \
+        'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+    "$cli" --config "$config" --bind "127.0.0.1:$port" >"$tmp/gateway.log" 2>&1 &
+    gateway_pid=$!
+    gateway_ready_timeout_seconds=30
+    gateway_ready_deadline=$((SECONDS + gateway_ready_timeout_seconds))
+    ready=false
+    while ((SECONDS < gateway_ready_deadline)); do
+        if "$python_executable" -c \
+            'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=0.2).read()' \
+            "http://127.0.0.1:$port/healthz" 2>/dev/null; then
+            ready=true
+            break
+        fi
+        if ! kill -0 "$gateway_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ "$ready" != true ]]; then
+        if kill -0 "$gateway_pid" 2>/dev/null; then
+            echo "gateway remained alive but did not become ready within ${gateway_ready_timeout_seconds}s" >&2
+        else
+            echo "gateway exited before becoming ready" >&2
+        fi
+        cat "$tmp/gateway.log"
+        exit 1
+    fi
+    NEMO_RELAY_PYTHON_PLUGIN_TEST_ENVIRONMENT="$environment_ref" \
+        cargo nextest run --locked -p nemo-relay --features worker-grpc \
+        --test worker_plugin_integration \
+        -E 'test(python_worker_host_runtime_mark_and_mutated_request_round_trip)' \
+        --no-capture \
+        --profile ci
+    kill "$gateway_pid" 2>/dev/null || true
+    wait "$gateway_pid" 2>/dev/null || true
+    gateway_pid=""
+    "$cli" --config "$config" plugins remove examples.python_grpc_worker
+    test ! -e "$environment_ref"
+
+test-python-langchain:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    pytest_cmd=(pytest)
+    cd "$NEMO_RELAY_REPO_ROOT"
+    export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    uv sync --inexact --no-install-project --no-install-package nemo-relay --extra langchain --extra langchain-nvidia --extra langgraph --extra deepagents
+    activate_project_venv
+    export_uv_python_runtime
+    python_executable="$(project_python_executable)"
+    use_project_python_source "$python_executable"
+    "$python_executable" -m maturin develop --features __skip-implicit-config --skip-install
+    "$python_executable" -m "${pytest_cmd[@]}" \
+        python/tests/integrations/deepagents_tests \
+        python/tests/integrations/langchain_tests \
+        python/tests/integrations/langgraph_tests
+
+# --set [output_dir=<path>] [ci=true|false]
+test-go:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+
+    target="release"
+    flag="--release"
+    go_test_cmd=(go test -v)
+    go_ldflags=()
+    if is_true "{{ ci }}"; then
+        target="debug"
+        flag=""
+    fi
+    coverage_out=""
+    junit_out=""
+    lib_dir="$NEMO_RELAY_REPO_ROOT/target/$target"
+    host_os="$(uname -s 2>/dev/null || true)"
+    is_windows=false
+    case "${RUNNER_OS:-}:${OSTYPE:-}:$host_os" in
+        Windows:*|*:msys*:*|*:win32*:*|*:*:MINGW*|*:*:MSYS*|*:*:CYGWIN*)
+            is_windows=true
+            ;;
+    esac
+    cd "$NEMO_RELAY_REPO_ROOT"
+    export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    cargo build $flag -p nemo-relay-ffi --features __skip-implicit-config
+    prepare_test_plugin_fixtures
+
+    if [[ "$is_windows" == true ]]; then
+        export CC=clang
+        export CXX=clang++
+        # Go's Windows linker checks -extldflags before deciding whether to
+        # inject a GNU linker script; CGO_LDFLAGS is too late for that check.
+        go_ldflags+=(-extldflags=-fuse-ld=lld)
+        if command -v cygpath >/dev/null 2>&1; then
+            export PATH="$(cygpath -u "$lib_dir"):$PATH"
+        else
+            export PATH="$lib_dir:$PATH"
+        fi
+    fi
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        export CGO_LDFLAGS="-Wl,-w ${CGO_LDFLAGS:-}"
+    fi
+    export CGO_LDFLAGS="-L$lib_dir ${CGO_LDFLAGS:-}"
+    export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export DYLD_LIBRARY_PATH="$lib_dir${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+    if is_true "{{ ci }}"; then
+        coverage_out="$(prepare_artifact go-coverage.xml)"
+        junit_out="$(prepare_artifact go-junit.xml)"
+        # Include the root binding package when shorthand-package tests exercise
+        # its delegated implementation so those calls are represented once the
+        # per-package profiles are merged.
+        go_test_cmd+=(-coverprofile=coverage.out -coverpkg=./...)
+        if [[ "$is_windows" == true ]]; then
+            go_ldflags+=(-w)
+        fi
+        go install github.com/jstemmer/go-junit-report/v2@latest
+        go install github.com/boumenot/gocover-cobertura@latest
+        prepend_go_bin_to_path
+    fi
+    if [[ "$is_windows" == true ]]; then
+        echo "Go Windows linker: RUNNER_OS=${RUNNER_OS:-} OSTYPE=${OSTYPE:-} uname=$host_os CC=$CC CXX=$CXX ldflags=${go_ldflags[*]:-}"
+    fi
+    if [[ ${#go_ldflags[@]} -gt 0 ]]; then
+        go_test_cmd+=("-ldflags=${go_ldflags[*]}")
+    fi
+    go_test_cmd+=(./...)
+    cd "$NEMO_RELAY_REPO_ROOT/go/nemo_relay"
+    if is_true "{{ ci }}"; then
+        # Work-around /dev/stderr not being available on Windows
+        "${go_test_cmd[@]}" 2>&1 | tee >(cat >&2) | go-junit-report -set-exit-code > "$junit_out"
+        gocover-cobertura < coverage.out > "$coverage_out"
+    else
+        "${go_test_cmd[@]}"
+    fi
+
+# --set [output_dir=<path>] [ci=true|false]
+test-node:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    coverage_out=""
+    junit_out=""
+    rust_coverage_out=""
+    cd "$NEMO_RELAY_REPO_ROOT"
+    test_config_home="$(mktemp -d)"
+    trap 'rm -rf "$test_config_home"' EXIT
+    export XDG_CONFIG_HOME="$test_config_home"
+    export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    if is_true "{{ ci }}"; then
+        coverage_out="$(prepare_artifact node-coverage.xml)"
+        junit_out="$(prepare_artifact node-junit.xml)"
+        if rust_source_coverage_supported; then
+            rust_coverage_out="$(prepare_artifact node-rust.xml)"
+            prepare_llvm_cov_workspace
+        fi
+    fi
+    cargo nextest run --locked -p nemo-relay-node --features __skip-implicit-config --lib --profile ci
+    npm install --workspace=nemo-relay-node --ignore-scripts
+    if is_true "{{ ci }}"; then
+        npm run coverage --workspace=nemo-relay-node
+        cp crates/node/coverage/cobertura-coverage.xml "$coverage_out"
+        cp crates/node/junit.xml "$junit_out"
+        cd "$NEMO_RELAY_REPO_ROOT"
+        if [[ -n "$rust_coverage_out" ]]; then
+            cargo llvm-cov report \
+                -p nemo-relay-node \
+                --ignore-filename-regex '.*/tests/.*\.rs$' \
+                --cobertura \
+                --output-path "$rust_coverage_out"
+        fi
+    else
+        npm test --workspace=nemo-relay-node
+    fi
+    npm test --workspace=nemo-relay-node-language-binding-plugin-example
+
+# run each checked plugin authoring example from its own project directory
+test-plugin-examples:
+    (cd examples/rust-native-plugin && cargo nextest run --config-file "$NEMO_RELAY_REPO_ROOT/.config/nextest.toml" --profile ci)
+    (cd examples/rust-grpc-worker-plugin && cargo nextest run --config-file "$NEMO_RELAY_REPO_ROOT/.config/nextest.toml" --profile ci)
+    (cd examples/language-binding-plugin/rust && cargo nextest run --config-file "$NEMO_RELAY_REPO_ROOT/.config/nextest.toml" --profile ci)
+    (cd examples/python-grpc-worker-plugin && uv run --locked --group test --reinstall-package nemo-relay-plugin pytest)
+    (cd examples/language-binding-plugin/python && uv run --locked --group test --reinstall-package nemo-relay pytest)
+    npm test --workspace=nemo-relay-node-language-binding-plugin-example
+
+# --set [ci=true|false]
+test-openclaw:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    if is_true "{{ ci }}"; then
+        npm ci --ignore-scripts
+        npm run build-debug --workspace=nemo-relay-node
+    else
+        npm install --ignore-scripts
+    fi
+    npm run typecheck --workspace=nemo-relay-openclaw
+    npm test --workspace=nemo-relay-openclaw
+    npm run test:live --workspace=nemo-relay-openclaw
+    npm run pack:check --workspace=nemo-relay-openclaw
+
+# --set [ci=true|false]
+test-pi:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    if is_true "{{ ci }}"; then
+        npm ci --ignore-scripts
+    else
+        npm install --ignore-scripts
+    fi
+    # No `build-debug` for the Node binding: the pi extension is a sidecar HTTP
+    # client and loads no native addon, so nothing here depends on it.
+    npm run typecheck --workspace=nemo-relay-pi
+    npm test --workspace=nemo-relay-pi
+
+# --set [output_dir=<path>] [ci=true|false]
+test-all: test-rust test-python test-python-langchain test-go test-node test-openclaw test-pi
+
+# Generate reproducible qualification artifacts. Use `quick` for a bounded local pass.
+qualification mode="full":
+    scripts/qualification/run.sh "{{ mode }}"
+
+# [version] or --set ref_name=<version>
+set-version version="":
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    version="{{ version }}"
+    if [[ -z "$version" ]]; then
+        version="{{ ref_name }}"
+    fi
+    if [[ -z "$version" ]]; then
+        echo "Error: version is required for set-version" >&2
+        exit 1
+    fi
+    cd "$NEMO_RELAY_REPO_ROOT"
+    set_project_version "$version"
+
+# Set only the Cargo workspace version for release artifact builds.
+# [version] or --set ref_name=<version>
+set-cargo-version version="":
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    version="{{ version }}"
+    if [[ -z "$version" ]]; then
+        version="{{ ref_name }}"
+    fi
+    if [[ -z "$version" ]]; then
+        echo "Error: version is required for set-cargo-version" >&2
+        exit 1
+    fi
+    cd "$NEMO_RELAY_REPO_ROOT"
+    set_cargo_workspace_version "$version"
+
+# --set [output_dir=<path>] [ref_name=<name>]
+package-rust:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    cd "$NEMO_RELAY_REPO_ROOT"
+    package_dir="$(prepare_package_dir crates)"
+    package_target_dir="$(mktemp -d)"
+    cleanup_package_target_dir() {
+        rm -rf "$package_target_dir"
+    }
+    trap cleanup_package_target_dir EXIT
+    ref_name={{ quote(ref_name) }}
+    if [[ -n "$ref_name" ]]; then
+        echo "Using explicit version $ref_name"
+        set_cargo_workspace_version "$ref_name"
+    fi
+    while IFS= read -r package; do
+        cargo_package_config=()
+        cargo_package_args=(--locked --package "$package" --target-dir "$package_target_dir")
+        if [[ -n "$ref_name" ]]; then
+            cargo_package_args+=(--allow-dirty)
+        fi
+        case "$package" in
+            nemo-relay)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                ;;
+            nemo-relay-adaptive)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                ;;
+            nemo-relay-worker)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-worker-proto.path="crates/worker-proto"')
+                ;;
+            nemo-relay-plugin)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                ;;
+            nemo-relay-pii-redaction)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                ;;
+            nemo-relay-ffi|nemo-relay-cli)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-adaptive.path="crates/adaptive"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-pii-redaction.path="crates/pii-redaction"')
+                ;;
+        esac
+        if ((${#cargo_package_config[@]} == 0)); then
+            cargo package "${cargo_package_args[@]}"
+        else
+            cargo package "${cargo_package_args[@]}" "${cargo_package_config[@]}"
+        fi
+    done < <(published_cargo_packages)
+    find "$package_target_dir/package" -maxdepth 1 -type f -name '*.crate' -exec cp {} "$package_dir"/ \;
+    shopt -s nullglob
+    packages=("$package_dir"/*.crate)
+    if ((${#packages[@]} == 0)); then
+        echo "Error: No Cargo package artifacts found in $package_dir"
+        exit 1
+    fi
+
+# --set [output_dir=<path>] [ref_name=<name>]
+package-node:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    # If `ref_name` is empty, append the current short HEAD SHA to the version.
+    # If `ref_name` is set, write it as the exact package version before packing.
+    linux_glibc_version="{{ linux_glibc_version }}"
+    node_platform="{{ node_platform }}"
+    node_target="{{ node_target }}"
+    node_build_strategy="{{ node_build_strategy }}"
+    python_executable="python"
+    if ! command -v "$python_executable" >/dev/null 2>&1; then
+        python_executable="python3"
+    fi
+    output_dir="{{ output_dir }}"
+    cd "$NEMO_RELAY_REPO_ROOT"
+    package_dir="$(prepare_package_dir npm)"
+    if [[ -z "{{ ref_name }}" ]]; then
+        sha="$(head_git_sha)"
+        version="$(read_npm_package_version crates/node/package.json)"
+        package_version="${version}+${sha}"
+        echo "Non-release build: appending commit hash to version"
+        set_npm_package_version crates/node/package.json package-lock.json "$package_version" crates/node
+        set_npm_package_dependency_version integrations/openclaw/package.json package-lock.json integrations/openclaw nemo-relay-node "$package_version"
+        set_npm_package_dependency_version examples/language-binding-plugin/node/package.json package-lock.json examples/language-binding-plugin/node nemo-relay-node "$package_version"
+    else
+        package_version="{{ ref_name }}"
+        echo "Using explicit version {{ ref_name }}"
+        set_npm_package_version crates/node/package.json package-lock.json "$package_version" crates/node
+        set_npm_package_dependency_version integrations/openclaw/package.json package-lock.json integrations/openclaw nemo-relay-node "$package_version"
+        set_npm_package_dependency_version examples/language-binding-plugin/node/package.json package-lock.json examples/language-binding-plugin/node nemo-relay-node "$package_version"
+    fi
+    build_args=(build --)
+    if [[ -n "$node_target" ]]; then
+        build_args+=(--target "$node_target")
+    fi
+    if [[ "$node_build_strategy" == "zig" ]]; then
+        # Zig is provided by the uv.lock `ziglang` entry; keep any explicit CI
+        # Zig version pin aligned with that lockfile version.
+        uv sync --inexact --no-install-project --no-install-package nemo-relay --no-default-groups --group dev
+        activate_project_venv
+        prepend_ziglang_to_path "$(project_python_executable)"
+        build_args+=(--zig)
+        if [[ "$node_target" == *-unknown-linux-gnu ]]; then
+            build_args+=(--zig-abi-suffix "$linux_glibc_version")
+        fi
+    elif is_true "{{ ci }}" && [[ "$(uname -s)" == "Linux" ]]; then
+        # Preserve the local CI-style build behavior when no cross target is set.
+        uv sync --inexact --no-install-project --no-install-package nemo-relay --no-default-groups --group dev
+        activate_project_venv
+        prepend_ziglang_to_path "$(project_python_executable)"
+        build_args+=(--zig --zig-abi-suffix "$linux_glibc_version")
+    fi
+    npm install --workspace=nemo-relay-node --ignore-scripts
+    npm run --workspace=nemo-relay-node "${build_args[@]}"
+    if [[ -z "$node_platform" ]]; then
+        case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) node_platform="linux-amd64" ;;
+            Linux-aarch64|Linux-arm64) node_platform="linux-arm64" ;;
+            Darwin-arm64) node_platform="macos-arm64" ;;
+            MINGW*|MSYS*|CYGWIN*)
+                if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
+                    node_platform="windows-arm64"
+                else
+                    node_platform="windows-amd64"
+                fi
+                ;;
+            *)
+                echo "Error: unsupported Node package host $(uname -s)/$(uname -m)" >&2
+                exit 1
+                ;;
+        esac
+    fi
+    package_args=(
+        --node-dir crates/node
+        --platform "$node_platform"
+        --version "$package_version"
+        --output-dir "$package_dir"
+    )
+    if [[ "$node_platform" == "linux-amd64" ]]; then
+        package_args+=(--metapackage)
+    fi
+    "$python_executable" scripts/package-node-bin.py "${package_args[@]}"
+    shopt -s nullglob
+    packages=("$package_dir"/*.tgz)
+    if ((${#packages[@]} == 0)); then
+        echo "Error: No npm packages found in $package_dir"
+        exit 1
+    fi
+
+# --set [output_dir=<path>] [ref_name=<name>] [ci=true|false]
+package-openclaw:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    # If `ref_name` is empty, append the current short HEAD SHA to the version.
+    # If `ref_name` is set, write it as the exact package version before packing.
+    output_dir="{{ output_dir }}"
+    cd "$NEMO_RELAY_REPO_ROOT"
+    package_dir="$(prepare_package_dir openclaw)"
+    if [[ -z "{{ ref_name }}" ]]; then
+        sha="$(head_git_sha)"
+        version="$(read_npm_package_version integrations/openclaw/package.json)"
+        package_version="${version}+${sha}"
+        echo "Non-release build: appending commit hash to version"
+        set_npm_package_version crates/node/package.json package-lock.json "$package_version" crates/node
+        set_npm_package_version integrations/openclaw/package.json package-lock.json "$package_version" integrations/openclaw
+        set_npm_package_dependency_version integrations/openclaw/package.json package-lock.json integrations/openclaw nemo-relay-node "$package_version"
+        set_npm_package_dependency_version examples/language-binding-plugin/node/package.json package-lock.json examples/language-binding-plugin/node nemo-relay-node "$package_version"
+    else
+        package_version="{{ ref_name }}"
+        echo "Using explicit version {{ ref_name }}"
+        set_npm_package_version crates/node/package.json package-lock.json "$package_version" crates/node
+        set_npm_package_version integrations/openclaw/package.json package-lock.json "$package_version" integrations/openclaw
+        set_npm_package_dependency_version integrations/openclaw/package.json package-lock.json integrations/openclaw nemo-relay-node "$package_version"
+        set_npm_package_dependency_version examples/language-binding-plugin/node/package.json package-lock.json examples/language-binding-plugin/node nemo-relay-node "$package_version"
+    fi
+    npm install --workspace=nemo-relay-node --workspace=nemo-relay-openclaw --ignore-scripts
+    if is_true "{{ ci }}"; then
+        npm run build-debug --workspace=nemo-relay-node
+    else
+        npm run build --workspace=nemo-relay-node
+    fi
+    npm pack --workspace=nemo-relay-openclaw --pack-destination "$package_dir"
+    shopt -s nullglob
+    packages=("$package_dir"/*.tgz)
+    if ((${#packages[@]} == 0)); then
+        echo "Error: No OpenClaw npm packages found in $package_dir"
+        exit 1
+    fi
+
+# --set [output_dir=<path>] [ref_name=<name>]
+package-python:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    # An explicit ref_name is synced into the Cargo workspace version first,
+    # so the compiled extension embeds the same version reported by the
+    # Python package, then written into pyproject.toml using PEP 440 before
+    # building a platform wheel.
+    output_dir="{{ output_dir }}"
+    linux_glibc_version="{{ linux_glibc_version }}"
+    export_uv_python_runtime
+    cd "$NEMO_RELAY_REPO_ROOT"
+    package_dir="$(prepare_package_dir wheels)"
+    sync_args=(--no-install-project --no-install-package nemo-relay)
+    uv sync --inexact "${sync_args[@]}"
+    activate_project_venv
+    if [[ -z "{{ ref_name }}" ]]; then
+        sha="$(head_git_sha)"
+        version="$(read_workspace_version)"
+        echo "Non-release build: appending commit hash to version"
+        set_python_package_version "${version}+${sha}" true
+    else
+        echo "Using explicit version {{ ref_name }}"
+        set_cargo_workspace_version "{{ ref_name }}"
+        set_python_package_version "{{ ref_name }}" true
+    fi
+    build_args=()
+    while IFS= read -r -d '' arg; do
+        build_args+=("$arg")
+    done < <(python_wheel_build_args)
+    maturin build --release "${build_args[@]}" --out "$package_dir"
+    shopt -s nullglob
+    wheels=("$package_dir"/*.whl)
+    if ((${#wheels[@]} == 0)); then
+        echo "Error: No wheels found in $package_dir"
+        exit 1
+    fi
+
+# --set [output_dir=<path>] [ref_name=<name>]
+package-python-sdist:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    export_uv_python_runtime
+    cd "$NEMO_RELAY_REPO_ROOT"
+    package_dir="$(prepare_package_dir sdists)"
+    sync_args=(--no-install-project --no-install-package nemo-relay)
+    uv sync --inexact "${sync_args[@]}"
+    activate_project_venv
+    if [[ -z "{{ ref_name }}" ]]; then
+        sha="$(head_git_sha)"
+        version="$(read_workspace_version)"
+        echo "Non-release build: appending commit hash to version"
+        set_python_package_version "${version}+${sha}" true
+    else
+        echo "Using explicit version {{ ref_name }}"
+        set_python_package_version "{{ ref_name }}" true
+    fi
+    maturin sdist --out "$package_dir"
+    shopt -s nullglob
+    sdists=("$package_dir"/nemo_relay-*.tar.gz)
+    if ((${#sdists[@]} == 0)); then
+        echo "Error: No nemo-relay source distributions found in $package_dir"
+        exit 1
+    fi
+
+# --set [output_dir=<path>] [ref_name=<name>]
+package-python-plugin:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    output_dir="{{ output_dir }}"
+    ref_name={{ quote(ref_name) }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    package_dir="$(prepare_package_dir plugin-wheels)"
+    python_executable="$(uv_python_executable)"
+    # This pure-Python wheel does not import grpcio while building. On Windows
+    # ARM64, python_plugin_sync_args excludes the unavailable runtime packages.
+    sync_args=(--inexact --no-install-project)
+    if python_plugin_grpc_dependencies_supported "$python_executable"; then
+        sync_args+=(--package nemo-relay-plugin)
+    fi
+    while IFS= read -r -d '' arg; do
+        sync_args+=("$arg")
+    done < <(python_plugin_sync_args "$python_executable")
+    uv sync "${sync_args[@]}"
+    activate_project_venv
+    if [[ -z "$ref_name" ]]; then
+        sha="$(head_git_sha)"
+        version="$(read_workspace_version)"
+        echo "Non-release build: appending commit hash to version"
+        set_python_plugin_package_version "${version}+${sha}"
+    else
+        echo "Using explicit version $ref_name"
+        set_python_plugin_package_version "$ref_name"
+    fi
+    uv build --wheel --package nemo-relay-plugin --out-dir "$package_dir"
+    shopt -s nullglob
+    wheels=("$package_dir"/*.whl)
+    if ((${#wheels[@]} == 0)); then
+        echo "Error: No Python plugin wheels found in $package_dir"
+        exit 1
+    fi
+    python_executable="$(project_python_executable)"
+    "$python_executable" scripts/validate_python_plugin_package.py
+
+# Package a prebuilt CLI binary for PyPI.
+package-cli-bin binary target version package_dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    args=(
+        --binary "{{ binary }}"
+        --target "{{ target }}"
+        --version "{{ version }}"
+        --output-dir "{{ package_dir }}"
+    )
+    uv run --no-project python scripts/package-cli-bin.py "${args[@]}"

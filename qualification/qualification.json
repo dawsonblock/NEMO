@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "qualification_level": "E2_LOCAL",
+  "overall": "FAIL",
+  "promotion": "DEV",
+  "checks": {
+    "rust-format": "PASS",
+    "clippy": "PASS",
+    "rust-tests": "FAIL",
+    "rust-doc-tests": "PASS",
+    "cargo-deny": "NOT_RUN",
+    "cargo-audit": "NOT_RUN",
+    "python-tests": "FAIL",
+    "node-tests": "NOT_RUN",
+    "go-tests": "FAIL",
+    "sbom": "NOT_RUN"
+  },
+  "notes": [
+    "Rust library and documentation checks pass; the CLI lifecycle suite still exposes process-global plugin registration coupling when run as one suite.",
+    "Python and Go binding recipes require the repository's pinned toolchain/build environment; Node tests require Node.js 24.",
+    "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
+    "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons."
+  ]
+}
