@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "b4d0a9c10a1af75977aa4bc596e56a9843c8cf61fa03ec531715ac366a2a220b",
+  "root_digest": "9fcc845bb463b6494d6fc41f7bb547f33f83f0ce01e75802ffe315a7ea044fc2",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -142,7 +142,7 @@
     "crates/adaptive/src/response_cache/mark.rs": "85d855929f71ea2f34450224252cde425dcab40609e03f1752d9d254d21537ff",
     "crates/adaptive/src/response_cache/mod.rs": "337589524f6096a245658384242359782adfe0481d995e2d78b1be5614aa6a4b",
     "crates/adaptive/src/response_cache/replay.rs": "bc9a0418d1b48b1eb9d92c87e4cdf3d6d358552f9544e27e231edc314af56a4d",
-    "crates/adaptive/src/response_cache/singleflight.rs": "de0565641e8516d2547ecf369929f58ed6e9ed1a1bf258deeb5573929864f7d0",
+    "crates/adaptive/src/response_cache/singleflight.rs": "14c59f12f830277b7e78f2d9158d9263b79c11d78544d2d0c98f408550163f24",
     "crates/adaptive/src/response_cache/store.rs": "66cfaaa04c601c9f11cc30fb25ef16bafdccab7fef31db9d7d640770f98f27de",
     "crates/adaptive/src/response_cache/tool.rs": "1830bfd071e7010e58be470bd2a07fbe57ccfde7acca2bc831a608c8f8984c61",
     "crates/adaptive/src/runtime/backend.rs": "7e615ea359ac64b7c6ca1662212f17a43afc7cc3967419a00b12b4b974591f57",
@@ -1286,15 +1286,15 @@
     "qualification"
   ],
   "source_archive_sha256": null,
-  "release_archive_sha256": "24d44ef5c0db125a0138542394292babd1e36d06f59381e2cd3ae968673ebccf",
+  "release_archive_sha256": "58b12064b0963e8caea2bb1161eadfe9772284e5116cd576aa38af9ebe021428",
   "lockfiles": {
     "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
     "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
     "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
   },
   "git": {
-    "commit": "509701bc73b87dc35d872a85420c5e602fdb6b4e",
-    "tree": "7b7264dc77dbfc1f834bc70aa2a83f3cb89aec25",
+    "commit": "aec591d32f3ae36368074632a2f990cb0ce86702",
+    "tree": "df9744dc541488c7918f2443feafddab06e89f8f",
     "status": []
   }
 }

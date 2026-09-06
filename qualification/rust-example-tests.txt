@@ -1,0 +1,20 @@
+# Exact post-fix Rust native-plugin example evidence
+# commit=aec591d32f3ae36368074632a2f990cb0ce86702
+# source_tree_sha256=9fcc845bb463b6494d6fc41f7bb547f33f83f0ce01e75802ffe315a7ea044fc2
+# result=10 passed, 0 skipped
+    Finished `test` profile [unoptimized] target(s) in 0.23s
+────────────
+ Nextest run ID 01101954-e449-428e-a0be-26bd0d6339bd with nextest profile: ci
+    Starting 10 tests across 3 binaries
+        PASS [   0.011s] ( 1/10) nemo-relay-rust-native-plugin-example::config shared_configuration_is_valid
+        PASS [   0.011s] ( 2/10) nemo-relay-rust-native-plugin-example::config enabled_registration_control_requires_distinct_targets
+        PASS [   0.011s] ( 3/10) nemo-relay-rust-native-plugin-example::config unsupported_mode_is_rejected
+        PASS [   0.011s] ( 4/10) nemo-relay-rust-native-plugin-example::config schema_declares_every_feature_group_and_executor
+        PASS [   0.011s] ( 5/10) nemo-relay-rust-native-plugin-example::config unknown_field_produces_diagnostic
+        PASS [   0.011s] ( 6/10) nemo-relay-rust-native-plugin-example::config invalid_values_are_rejected_at_their_fields
+        PASS [   0.011s] ( 7/10) nemo-relay-rust-native-plugin-example::config registration_control_parse_errors_are_rejected
+        PASS [   0.011s] ( 8/10) nemo-relay-rust-native-plugin-example::config wrong_types_are_rejected
+        PASS [   0.012s] ( 9/10) nemo-relay-rust-native-plugin-example::lifecycle toml_basic_string_escapes_windows_library_paths
+        PASS [  29.072s] (10/10) nemo-relay-rust-native-plugin-example::lifecycle built_cdylib_validates_activates_runs_and_unloads
+────────────
+     Summary [  29.072s] 10 tests run: 10 passed, 0 skipped
