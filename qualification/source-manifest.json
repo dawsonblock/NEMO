@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "5daa9364784a62146b958734bf00eab73b055445a0d3eea7c6f807bc6867a289",
+  "root_digest": "b4d0a9c10a1af75977aa4bc596e56a9843c8cf61fa03ec531715ac366a2a220b",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -371,7 +371,7 @@
     "crates/cli/src/process/supervision/windows.rs": "289710db625e543db86533408ae8e2c073c098b8991fceda4c03a40bab40e611",
     "crates/cli/src/process/types.rs": "4c0f5146db7f9ff132e0df0a42bc47ebf2af00e4abf3e06a1fc544a0fd1f1015",
     "crates/cli/src/provider_auth.rs": "45baa9a274759f449c7e4ed3b9903c76e54a060b9cc65d21930e5256291071be",
-    "crates/cli/src/server/mod.rs": "47d2cf92874640ef1ca7c609fca3ec2cb87b9933b93bc9c7ad9e04740688fd9e",
+    "crates/cli/src/server/mod.rs": "04555b5a73fbead8fbf53a0d8b1d08579c295059410fc2864a930fdf1efa3e28",
     "crates/cli/src/server/types.rs": "117553620e08798ec42d8560ebe81c9785c622e4ce873606838dd79b47076a8f",
     "crates/cli/src/sessions/correlation.rs": "e17457bc1b8a8058af64f6bd3dd97c95b8644dc5e4f6b0798ad7aa22384c0d66",
     "crates/cli/src/sessions/idle.rs": "fb8d4061e6a40fdfd0cd5eb27b97fcea10e6b4e8303e22ddd6e1f957c7df1458",
@@ -1286,19 +1286,30 @@
     "qualification"
   ],
   "source_archive_sha256": null,
-  "release_archive_sha256": "7abecbb623b75a7149f4e68a01dd7239c0155e1a3eaa8e54e99b144938476dfd",
+  "release_archive_sha256": "24d44ef5c0db125a0138542394292babd1e36d06f59381e2cd3ae968673ebccf",
   "lockfiles": {
     "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
     "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
     "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
   },
   "git": {
-    "commit": "078d45d0c68965ffd402252420ca7278beb7d633",
-    "tree": "a4a728b8207e8cbdc3b81e6c6d0edcc519bbbe7e",
+    "commit": "a2e6d500c3b724b38fde6cf8e8c9c037f97b4faa",
+    "tree": "d83711df7978c09ce24d52517e0402805f94361a",
     "status": [
+      " M qualification/cargo-deny.txt",
+      " M qualification/clippy.txt",
       " M qualification/environment-lock.json",
       " M qualification/environment-sha256.txt",
-      " M qualification/environment.json"
+      " M qualification/environment.json",
+      " M qualification/git-revision.txt",
+      " M qualification/provenance.json",
+      " M qualification/qualification.json",
+      " M qualification/release-archive.sha256",
+      " M qualification/rust-doc-tests.txt",
+      " M qualification/rust-tests.txt",
+      " M qualification/sbom.spdx.json",
+      " M qualification/source-manifest.json",
+      " M qualification/source-tree.sha256"
     ]
   }
 }
