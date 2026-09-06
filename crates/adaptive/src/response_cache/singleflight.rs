@@ -50,6 +50,19 @@ struct Counters {
     rejections: AtomicUsize,
 }
 
+fn remove_completed_call<T>(
+    calls: &Mutex<HashMap<String, ActiveCall<T>>>,
+    counters: &Counters,
+    key: &str,
+    call_id: usize,
+) {
+    let mut calls = calls.lock().unwrap_or_else(|error| error.into_inner());
+    if calls.get(key).is_some_and(|active| active.id == call_id) {
+        calls.remove(key);
+        counters.active_keys.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Shared provider/model concurrency limits for cache-miss provider calls.
 pub(crate) struct ProviderConcurrency {
     limits: SingleFlightLimits,
@@ -225,7 +238,7 @@ where
     where
         F: Future<Output = FlowResult<T>> + Send + 'static,
     {
-        let (call, leader, waiter) = {
+        let (call, leader, waiter, leader_call_id) = {
             let mut calls = self.calls.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(active) = calls.get_mut(&key) {
                 if active.waiters >= self.limits.max_waiters_per_key {
@@ -250,6 +263,7 @@ where
                         call_id: active.id,
                         counters: Arc::clone(&self.counters),
                     }),
+                    None,
                 )
             } else {
                 if calls.len() >= self.limits.max_active_keys {
@@ -281,7 +295,7 @@ where
                     },
                 );
                 self.counters.active_keys.fetch_add(1, Ordering::Relaxed);
-                (call, true, None)
+                (call, true, None, Some(call_id))
             }
         };
 
@@ -289,20 +303,29 @@ where
             let driver = call.clone();
             let calls = Arc::clone(&self.calls);
             let counters = Arc::clone(&self.counters);
+            let call_id = leader_call_id.expect("single-flight leader must have a call id");
+            let driver_key = key.clone();
             tokio::spawn(async move {
                 let _ = driver.await;
-                if calls
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove(&key)
-                    .is_some()
-                {
-                    counters.active_keys.fetch_sub(1, Ordering::Relaxed);
-                }
+                remove_completed_call(&calls, &counters, &driver_key, call_id);
             });
         }
 
         let result = call.await;
+        if leader {
+            // Remove a completed entry before returning to the caller. Without
+            // this synchronous cleanup, an immediate retry can join the
+            // already-completed shared future and replay a provider error (or
+            // an uncached response) as if it were a cache hit. The detached
+            // driver remains as the cancellation-safe fallback and uses the
+            // call id to avoid removing a newer call for the same key.
+            remove_completed_call(
+                &self.calls,
+                &self.counters,
+                &key,
+                leader_call_id.expect("single-flight leader must have a call id"),
+            );
+        }
         drop(waiter);
         (result, leader)
     }
