@@ -640,7 +640,8 @@ async fn forward_stream_to_channel(
 ///   May be null, in which case chunks are not collected.
 /// - `finalizer`: Callback invoked once when the stream is exhausted to produce
 ///   the aggregated response as a JSON C string. May be null, in which case the
-///   finalizer returns `Json::Null`.
+///   finalizer returns `Json::Null`. A non-null finalizer that returns null,
+///   malformed JSON, or invalid UTF-8 terminates the stream with an error.
 /// - `parent`: Optional parent scope handle, or null.
 /// - `attributes`: Bitfield of LLM attributes.
 /// - `data_json`: Optional JSON data, or null.
@@ -704,20 +705,21 @@ pub unsafe extern "C" fn nemo_relay_llm_stream_call_execute(
             None => Box::new(|_: serde_json::Value| Ok(())),
         };
 
-    let wrapped_finalizer: Box<dyn FnOnce() -> serde_json::Value + Send> = match finalizer {
-        Some(cb) => wrap_finalizer_fn(cb),
-        None => Box::new(|| serde_json::Value::Null),
-    };
+    let wrapped_finalizer: Box<dyn FnOnce() -> FlowResult<serde_json::Value> + Send> =
+        match finalizer {
+            Some(cb) => wrap_finalizer_fn(cb),
+            None => Box::new(|| Ok(serde_json::Value::Null)),
+        };
 
     let scope_stack = current_scope_stack();
     let result = tokio_runtime().block_on(TASK_SCOPE_STACK.scope(scope_stack, async {
-        core_llm_api::llm_stream_call_execute(
+        core_llm_api::llm_stream_call_execute_with_fallible_finalizer(
             core_llm_api::LlmStreamCallExecuteParams::builder()
                 .name(parsed.name)
                 .request(parsed.request)
                 .func(default_fn)
                 .collector(wrapped_collector)
-                .finalizer(wrapped_finalizer)
+                .finalizer(Box::new(|| serde_json::Value::Null))
                 .parent_opt(parsed.parent_handle)
                 .attributes(parsed.attrs)
                 .data_opt(parsed.data)
@@ -726,6 +728,7 @@ pub unsafe extern "C" fn nemo_relay_llm_stream_call_execute(
                 .codec_opt(parsed.codec)
                 .response_codec_opt(parsed.response_codec)
                 .build(),
+            wrapped_finalizer,
         )
         .await
     }));

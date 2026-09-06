@@ -12,7 +12,7 @@ use nemo_relay::codec::resolve::{ProviderSurface, supported_codec_names};
 use nemo_relay::plugin::{
     ConfigDiagnostic, ConfigPolicy, DiagnosticLevel, Plugin, PluginComponentSpec, PluginError,
     PluginRegistrationContext, Result as PluginResult, UnsupportedBehavior,
-    apply_global_config_policy, deregister_plugin, register_plugin,
+    apply_global_config_policy, deregister_plugin, lookup_plugin, register_plugin,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -427,6 +427,10 @@ impl Plugin for PiiRedactionPlugin {
         PII_REDACTION_PLUGIN_KIND
     }
 
+    fn implementation_id(&self) -> &'static str {
+        "nemo-relay-pii-redaction::PiiRedactionPlugin"
+    }
+
     fn allows_multiple_components(&self) -> bool {
         false
     }
@@ -460,7 +464,12 @@ impl Plugin for PiiRedactionPlugin {
 pub fn register_pii_redaction_component() -> PluginResult<()> {
     match register_plugin(Arc::new(PiiRedactionPlugin)) {
         Ok(()) => Ok(()),
-        Err(PluginError::RegistrationFailed(message)) if message.contains("already registered") => {
+        Err(PluginError::RegistrationFailed(message))
+            if message.contains("already registered")
+                && lookup_plugin(PII_REDACTION_PLUGIN_KIND).is_some_and(|plugin| {
+                    plugin.implementation_id() == "nemo-relay-pii-redaction::PiiRedactionPlugin"
+                }) =>
+        {
             Ok(())
         }
         Err(err) => Err(err),

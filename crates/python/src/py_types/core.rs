@@ -19,8 +19,8 @@ use nemo_relay::api::event::{
 use nemo_relay::api::llm::LlmRequestInterceptOutcome;
 use nemo_relay::api::runtime::subscriber_dispatcher::PublicationBuffer;
 use nemo_relay::api::runtime::{
-    LlmSanitizeRequestContext, LlmSanitizeResponseContext, PropagationContext,
-    ThreadScopeStackBinding,
+    IdentitySource, LlmSanitizeRequestContext, LlmSanitizeResponseContext, PropagationContext,
+    RuntimeIdentity, ThreadScopeStackBinding,
 };
 use nemo_relay::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
 
@@ -198,6 +198,50 @@ pub struct PyScopeStack {
 impl PyScopeStack {
     pub(crate) fn __repr__(&self) -> String {
         "<ScopeStack>".to_string()
+    }
+
+    /// Install an immutable identity from a trusted authentication boundary.
+    #[pyo3(signature = (tenant_id, principal_id, session_id, policy_epoch, source="local_trusted"))]
+    fn install_runtime_identity(
+        &self,
+        tenant_id: &str,
+        principal_id: &str,
+        session_id: &str,
+        policy_epoch: u64,
+        source: &str,
+    ) -> PyResult<()> {
+        let session_id = uuid::Uuid::parse_str(session_id).map_err(|error| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "invalid runtime identity session_id: {error}"
+            ))
+        })?;
+        let source = match source {
+            "local_trusted" => IdentitySource::LocalTrusted,
+            "oidc" => IdentitySource::Oidc,
+            "api_key" => IdentitySource::ApiKey,
+            "mutual_tls" => IdentitySource::MutualTls,
+            "worker_delegation" => IdentitySource::WorkerDelegation,
+            "system" => IdentitySource::System,
+            other => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "unknown runtime identity source: {other}"
+                )));
+            }
+        };
+        let mut stack = self.inner.write().map_err(|error| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "scope stack lock poisoned: {error}"
+            ))
+        })?;
+        stack
+            .install_runtime_identity(RuntimeIdentity::new(
+                tenant_id,
+                principal_id,
+                session_id,
+                policy_epoch,
+                source,
+            ))
+            .map_err(|error| PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string()))
     }
 }
 

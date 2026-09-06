@@ -330,6 +330,9 @@ def stream_execute(
         ``collector`` observes the post-intercept chunk values. ``finalizer``
         runs once at natural stream completion or explicit close and should
         return a representation of the full response, not the final chunk. If
+        ``finalizer`` raises or returns a value that cannot be converted to
+        JSON, the stream ends with that error; a valid ``None`` result remains
+        distinct and is recorded as JSON ``null``. If
         the caller stops consuming early, call ``await stream.aclose()`` to
         cancel the producer, finalize the partial response, and release native
         stream resources.

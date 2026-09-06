@@ -22,6 +22,16 @@ pub const DEFAULT_SUBSCRIBER_QUEUE_CAPACITY: usize = 4096;
 /// Capacity reserved for security, lifecycle, and dispatcher-control traffic.
 pub const SUBSCRIBER_QUEUE_PRIORITY_RESERVE: usize = 512;
 
+/// Hard cap for publications accumulated while a subscriber callback or
+/// sanitizer is executing. Nested callbacks cannot synchronously backpressure
+/// the dispatcher without deadlocking it, so low-priority work is shed at the
+/// reserve boundary and all nested work is capped at this limit.
+pub const MAX_NESTED_PUBLICATIONS: usize = 1024;
+
+/// Capacity reserved for lifecycle and security publications in a nested
+/// callback buffer.
+pub const NESTED_PUBLICATION_PRIORITY_RESERVE: usize = 128;
+
 /// Maximum detached stream-finalization jobs waiting to enter the shared executor.
 pub const BACKGROUND_PUBLICATION_QUEUE_CAPACITY: usize = 256;
 
@@ -223,6 +233,11 @@ mod native {
     type BackgroundPublicationState =
         Option<std::result::Result<SyncSender<BackgroundPublication>, String>>;
 
+    pub(super) enum PublicationBufferPushError {
+        Disabled(Box<DispatcherMessage>),
+        Full(Box<DispatcherMessage>),
+    }
+
     /// Opaque routing handle for publications emitted on foreign callback threads.
     #[derive(Clone)]
     pub struct PublicationBuffer {
@@ -238,24 +253,44 @@ mod native {
             }
         }
 
-        fn enabled() -> Self {
+        pub(super) fn enabled() -> Self {
             Self::new(Some(Vec::new()))
         }
 
-        fn push(
+        pub(super) fn push(
             &self,
             message: DispatcherMessage,
-        ) -> std::result::Result<(), Box<DispatcherMessage>> {
+        ) -> std::result::Result<(), PublicationBufferPushError> {
             let mut messages = self
                 .messages
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             match messages.as_mut() {
                 Some(messages) => {
+                    let low_priority_limit =
+                        MAX_NESTED_PUBLICATIONS.saturating_sub(NESTED_PUBLICATION_PRIORITY_RESERVE);
+                    let limit = if is_high_priority(&message) {
+                        MAX_NESTED_PUBLICATIONS
+                    } else {
+                        low_priority_limit
+                    };
+                    if messages.len() >= limit {
+                        process_state()
+                            .events_dropped_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::warn!(
+                            target: "nemo_relay.runtime",
+                            event = "nested_publication_dropped",
+                            reason = "buffer_full",
+                            high_priority = is_high_priority(&message);
+                            "Nested subscriber publication dropped because its bounded buffer is full"
+                        );
+                        return Err(PublicationBufferPushError::Full(Box::new(message)));
+                    }
                     messages.push(message);
                     Ok(())
                 }
-                None => Err(Box::new(message)),
+                None => Err(PublicationBufferPushError::Disabled(Box::new(message))),
             }
         }
 
@@ -995,7 +1030,8 @@ mod native {
         let message = if let Ok(buffer) = ASYNC_PUBLICATION_BUFFER.try_with(Clone::clone) {
             match buffer.push(message) {
                 Ok(()) => return true,
-                Err(message) => *message,
+                Err(PublicationBufferPushError::Disabled(message)) => *message,
+                Err(PublicationBufferPushError::Full(_message)) => return false,
             }
         } else {
             message
@@ -1005,7 +1041,8 @@ mod native {
         {
             match buffer.push(message) {
                 Ok(()) => return true,
-                Err(message) => *message,
+                Err(PublicationBufferPushError::Disabled(message)) => *message,
+                Err(PublicationBufferPushError::Full(_message)) => return false,
             }
         } else {
             message

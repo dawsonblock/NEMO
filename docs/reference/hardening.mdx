@@ -21,15 +21,34 @@ events apply backpressure. Queue counters are available as
 Rust, Python, and Node APIs. `flush_subscribers()` remains the graceful drain
 barrier for queued callbacks and terminal publications.
 
-`plugins validate` reports `policy_mode = declared` by default. Pass
-`--effective` to apply secure activation defaults (`required` startup and
-`signature_required` attestation) before evaluating the manifest.
+`plugins validate` reports `policy_mode = effective` by default and applies
+secure activation defaults (`required` startup and `signature_required`
+attestation) before evaluating the manifest. Pass `--declared` only when you
+need to inspect configuration without those runtime defaults. `--effective`
+remains accepted for script compatibility.
+
+All asynchronous runtime queues are required to have an explicit capacity and
+overflow policy. The current capacities, producer/consumer ownership, and
+shutdown behavior are tracked in [the queue inventory](../queue-inventory.md).
+Telemetry may be dropped with metrics; lifecycle, security, and execution
+traffic uses backpressure or an explicit rejection path. Nested subscriber
+publications are capped as well, so a callback cannot bypass the dispatcher
+bound by emitting an unbounded event storm.
 
 Response-cache identity is explicit and fail-closed. The default session
-partition includes the root scope and policy epoch; principal and tenant modes
-require identity metadata. Buffered LLM and tool misses use process-local
-single-flight coalescing. Cache writes expose `flush_cache_writes()` and
+partition includes the root scope and trusted policy epoch; principal and
+tenant modes require an immutable `RuntimeIdentity` installed by an
+authentication boundary. Ordinary scope metadata is ignored for cache
+partitioning. Buffered LLM and tool misses use process-local single-flight
+coalescing. Cache writes expose `flush_cache_writes()` and
 `wait_for_cache_idle()` for deterministic shutdown.
+
+Qualification is provenance-bound. The harness writes `source-manifest.json`,
+`source-tree.sha256`, `environment-lock.json`, and lockfile digests before it
+runs checks. Missing prerequisites are recorded as `NOT_RUN` with a reason;
+they do not become a test failure or an implicit pass. A report with any
+`NOT_RUN` or `INCONCLUSIVE` check remains `DEV`/`INCONCLUSIVE` and is not a
+release certificate.
 
 The authority, ledger, executor, isolation, and DLP crates are disabled
 contract skeletons. They define package boundaries and invariants for later

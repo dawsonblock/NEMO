@@ -1355,7 +1355,7 @@ fn llm_stream_call_execute<'py>(
                         .request(request.inner)
                         .func(default_fn)
                         .collector(collector_fn)
-                        .finalizer(finalizer_fn)
+                        .finalizer(Box::new(|| serde_json::Value::Null))
                         .parent(parent_handle)
                         .attributes(attrs)
                         .data_opt(data_json)
@@ -1364,7 +1364,11 @@ fn llm_stream_call_execute<'py>(
                         .codec_opt(codec_arc)
                         .response_codec_opt(response_codec_arc)
                         .build();
-                    let rust_stream = core_llm_api::llm_stream_call_execute(params)
+                    let rust_stream =
+                        core_llm_api::llm_stream_call_execute_with_fallible_finalizer(
+                            params,
+                            finalizer_fn,
+                        )
                         .await
                         .map_err(to_py_err)?;
 

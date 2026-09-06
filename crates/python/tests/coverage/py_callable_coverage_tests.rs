@@ -144,6 +144,9 @@ def collector_ok(chunk):
 def finalizer_bad_json():
     return object()
 
+def finalizer_null():
+    return None
+
 def llm_resp_bad_json(response, context):
     return object()
 
@@ -277,7 +280,15 @@ class RaisingResponseCodec:
 
         let finalizer =
             wrap_py_finalizer_fn(module.getattr("finalizer_bad_json").unwrap().unbind());
-        assert_eq!(finalizer(), serde_json::Value::Null);
+        assert!(
+            finalizer()
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to convert to JSON")
+        );
+
+        let finalizer = wrap_py_finalizer_fn(module.getattr("finalizer_null").unwrap().unbind());
+        assert_eq!(finalizer().unwrap(), serde_json::Value::Null);
 
         let llm_response =
             wrap_py_llm_sanitize_response_fn(module.getattr("llm_resp_bad_json").unwrap().unbind())

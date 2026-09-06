@@ -582,7 +582,7 @@ class TestLLMIntercepts:
             intercepts.deregister_llm_request("py_llm_req_raise")
 
     def test_request_intercept_raises_on_invalid_return(self):
-        intercepts.register_llm_request("py_llm_req_bad_return", 1, False, lambda name, request, annotated: object())  # type: ignore[arg-type] # ty: ignore[invalid-argument-type]
+        intercepts.register_llm_request("py_llm_req_bad_return", 1, False, lambda name, request, annotated: object())  # type: ignore[arg-type]
         try:
             with pytest.raises(RuntimeError, match="must return LLMRequestInterceptOutcome"):
                 llm.request_intercepts("bad_return_llm", make_request())
@@ -891,7 +891,7 @@ class TestLLMInterceptsAsync:
             stream = await llm.stream_execute(
                 "custom_iterator_context_llm",
                 make_request(),
-                lambda _request: None,  # ty: ignore[invalid-argument-type]
+                lambda _request: None,
                 lambda _chunk: None,
                 lambda: {},
             )
@@ -1319,7 +1319,7 @@ class TestLLMStreaming:
         stream = await llm.stream_execute(
             "stream_invalid_iter_llm",
             make_request(),
-            lambda request: object(),  # ty: ignore[invalid-argument-type]
+            lambda request: object(),
             lambda chunk: None,
             lambda: {},
         )
@@ -1490,7 +1490,7 @@ class TestLLMStreaming:
                 await llm.stream_execute(
                     "async_stream_callback_fail_llm",
                     make_request(),
-                    async_stream_func,  # ty: ignore[invalid-argument-type]
+                    async_stream_func,
                     lambda chunk: None,
                     lambda: {},
                 )
@@ -1521,7 +1521,7 @@ class TestLLMStreaming:
                 make_request(),
                 stream_func,
                 lambda chunk: None,
-                lambda: object(),  # ty: ignore[invalid-argument-type]
+                lambda: object(),
             )
             chunks = []
             async for chunk in stream:

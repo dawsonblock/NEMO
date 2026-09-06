@@ -554,6 +554,7 @@ async fn build_redis_store(_config: &ResponseCacheConfig) -> Result<Arc<dyn Cach
     ))
 }
 
+#[cfg(feature = "redis-backend")]
 fn redis_backend_url(config: &ResponseCacheConfig) -> Result<&str> {
     config
         .backend

@@ -2029,7 +2029,7 @@ fn cli_doctor_accepts_discovered_stderr_logging_opt_out() {
 }
 
 #[test]
-fn cli_plugins_validate_json_emits_versioned_success_output() {
+fn cli_plugins_validate_defaults_to_effective_runtime_policy() {
     let temp = tempfile::tempdir().unwrap();
     let plugin_dir = temp.path().join("plugins").join("acme");
     write_dynamic_plugin_manifest(&plugin_dir, "acme.cli-json");
@@ -2054,15 +2054,15 @@ fn cli_plugins_validate_json_emits_versioned_success_output() {
     assert_eq!(parsed["command"], "plugins validate");
     assert_eq!(parsed["data"]["target_kind"], "path");
     assert_eq!(parsed["data"]["resolved_plugin_id"], "acme.cli-json");
-    assert_eq!(parsed["data"]["valid"], true);
+    assert_eq!(parsed["data"]["valid"], false);
     assert_eq!(parsed["data"]["policy_state"], "valid");
-    assert_eq!(parsed["data"]["startup_class"], "optional");
-    assert_eq!(parsed["data"]["attestation_mode"], "integrity_only");
-    assert_eq!(parsed["data"]["policy_mode"], "declared");
+    assert_eq!(parsed["data"]["startup_class"], "required");
+    assert_eq!(parsed["data"]["attestation_mode"], "signature_required");
+    assert_eq!(parsed["data"]["policy_mode"], "effective");
 }
 
 #[test]
-fn cli_plugins_validate_effective_applies_activation_defaults() {
+fn cli_plugins_validate_declared_reports_configuration_without_runtime_defaults() {
     let temp = tempfile::tempdir().unwrap();
     let plugin_dir = temp.path().join("plugins").join("acme");
     write_dynamic_plugin_manifest(&plugin_dir, "acme.cli-effective");
@@ -2072,7 +2072,7 @@ fn cli_plugins_validate_effective_applies_activation_defaults() {
         .env("HOME", temp.path())
         .args(["plugins", "validate"])
         .arg(&plugin_dir)
-        .args(["--effective", "--json"])
+        .args(["--declared", "--json"])
         .output()
         .unwrap();
 
@@ -2082,10 +2082,10 @@ fn cli_plugins_validate_effective_applies_activation_defaults() {
         String::from_utf8_lossy(&output.stderr)
     );
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(parsed["data"]["policy_mode"], "effective");
-    assert_eq!(parsed["data"]["startup_class"], "required");
-    assert_eq!(parsed["data"]["attestation_mode"], "signature_required");
-    assert_eq!(parsed["data"]["valid"], false);
+    assert_eq!(parsed["data"]["policy_mode"], "declared");
+    assert_eq!(parsed["data"]["startup_class"], "optional");
+    assert_eq!(parsed["data"]["attestation_mode"], "integrity_only");
+    assert_eq!(parsed["data"]["valid"], true);
 }
 
 #[test]
@@ -2288,8 +2288,8 @@ allowed = false
     assert_eq!(parsed["data"]["target_kind"], "path");
     assert_eq!(parsed["data"]["valid"], false);
     assert_eq!(parsed["data"]["policy_state"], "invalid");
-    assert_eq!(parsed["data"]["startup_class"], "optional");
-    assert_eq!(parsed["data"]["attestation_mode"], "integrity_only");
+    assert_eq!(parsed["data"]["startup_class"], "required");
+    assert_eq!(parsed["data"]["attestation_mode"], "signature_required");
     assert!(
         parsed["data"]["errors"][0]
             .as_str()

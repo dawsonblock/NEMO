@@ -1658,25 +1658,19 @@ pub fn wrap_py_collector_fn(
     })
 }
 
-/// Wrap a Python callable `() -> Any` as a finalizer for streaming LLM calls.
+/// Wrap a Python callable `() -> Any` as a fallible finalizer for streaming
+/// LLM calls.
 ///
 /// The finalizer is called once when the stream is fully consumed or explicitly
 /// closed. Its return value is converted from a Python object to
-/// `serde_json::Value` (Json) and used as the aggregated response.
-pub fn wrap_py_finalizer_fn(py_fn: Py<PyAny>) -> Box<dyn FnOnce() -> Json + Send> {
+/// `serde_json::Value` (Json) and used as the aggregated response. A Python
+/// exception or conversion failure remains an error so it cannot be confused
+/// with a valid JSON `null` response.
+pub fn wrap_py_finalizer_fn(py_fn: Py<PyAny>) -> Box<dyn FnOnce() -> FlowResult<Json> + Send> {
     Box::new(move || {
         Python::attach(|py| {
-            let result = match py_fn.call0(py) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("nemo_relay: Python finalizer callable failed: {e}");
-                    return Json::Null;
-                }
-            };
-            py_to_json(result.bind(py)).unwrap_or_else(|e| {
-                eprintln!("nemo_relay: py_to_json failed in finalizer: {e}");
-                Json::Null
-            })
+            let result = py_fn.call0(py).map_err(python_callback_error)?;
+            py_to_json(result.bind(py)).map_err(python_callback_error)
         })
     })
 }

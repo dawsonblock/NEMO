@@ -5,22 +5,23 @@ SPDX-License-Identifier: Apache-2.0
 
 # NeMo Relay
 
-**A runtime boundary for observable, policy-aware AI agents.**
+**Observable execution boundaries for AI agents.**
 
 [![License](https://img.shields.io/github/license/dawsonblock/NEMO)](LICENSE)
 [![Development line](https://img.shields.io/badge/development-0.9.1--rc.1-blue)](RELEASING.md)
-[![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.96.1-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 
-NeMo Relay wraps the places where an agent interacts with models, tools,
-middleware, plugins, and telemetry. It gives application code, framework
-integrations, coding-agent hooks, and observability backends one execution
-contract without replacing the agent or provider SDK.
+NeMo Relay is a multi-language runtime boundary for applications that call
+LLMs, tools, agents, and plugins. It gives those calls one consistent model for
+scope lineage, middleware, lifecycle events, callbacks, and observability while
+leaving orchestration and provider ownership in the application.
 
-> **Project status:** this checkout is a hardened development line, not a
-> release qualification certificate. Use the qualification harness and the
-> pinned devcontainer before promoting it to production.
+> **Status:** This checkout is a hardened `0.9.1-rc.1` development line. The
+> checked-in qualification snapshot is provenance-bound but `INCONCLUSIVE`/`DEV`;
+> it is not a production or release certificate. See
+> [Qualification](#qualification) before promoting a build.
 
 ## Why Relay?
 
@@ -105,35 +106,60 @@ pip install nemo-relay-cli-bin
 nemo-relay --version
 ```
 
-The CLI can also be installed with the platform installer:
+The checked-in platform installers target the upstream NVIDIA release
+repository. Use them when you want an upstream GitHub Release binary; they do
+not install an unpublished build from this fork:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dawsonblock/NEMO/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh | sh
 ```
 
-## A minimal managed call
+## Quick start: Python
 
-The public bindings preserve the same runtime model. This Python example
-creates a scope, records a mark, and routes an application-owned model call
-through Relay's managed boundary:
+Install the Python binding:
+
+```bash
+uv add nemo-relay
+```
+
+Then route an application-owned provider callback through a Relay scope:
 
 ```python
+import asyncio
+
 import nemo_relay
-from nemo_relay import ScopeType
 
 
-def provider(request):
-    return {"text": "hello from the provider"}
+async def provider(request: nemo_relay.LLMRequest):
+    return {"text": "hello from the provider", "model": request.content["model"]}
 
 
-with nemo_relay.scope.scope("demo", ScopeType.AGENT):
-    nemo_relay.scope.mark("before_model")
-    result = nemo_relay.llm.call({"model": "demo", "messages": []}, provider)
+async def main() -> None:
+    request = nemo_relay.LLMRequest(
+        {},
+        {"model": "demo-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    with nemo_relay.scope.scope("demo-agent", nemo_relay.ScopeType.Agent) as handle:
+        nemo_relay.scope.event("before-model", handle=handle)
+        result = await nemo_relay.llm.execute(
+            "demo-provider",
+            request,
+            provider,
+            handle=handle,
+            model_name="demo-model",
+        )
+
     print(result)
+
+
+asyncio.run(main())
 ```
 
-For production integrations, use the documented codecs and wrappers so request
-and response shapes stay provider-correct:
+For codecs, streaming, and framework adapters, start with the
+[Python quick start](https://docs.nvidia.com/nemo/relay/getting-started/quick-start/python),
+[LLM integration guide](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-llm-calls),
+and [tool integration guide](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-tool-calls):
 
 - [Wrap LLM calls](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-llm-calls)
 - [Wrap tool calls](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-tool-calls)
@@ -172,30 +198,32 @@ Execution middleware can block, rewrite, route, retry, replace, or wrap the
 real callback. Sanitizers affect observability payloads only; they do not
 silently mutate the application's request or return value.
 
-The hardened development line also provides:
+The hardened development line provides the following safeguards:
 
-- bounded priority subscriber queues with queue-health metrics;
-- fallible Node stream finalizers that preserve callback errors;
-- effective plugin-policy validation via `nemo-relay plugins validate --effective`;
-- cache write drain barriers and keyed single-flight for buffered misses;
-- explicit session, principal, tenant, and global cache-sharing modes;
-- semantic tool-cache classes that keep side-effecting tools uncached;
-- disabled-by-default authority, ledger, executor, isolation, and DLP contract
-  crates for future qualified enforcement.
+| Area | Behavior |
+| --- | --- |
+| Streaming finalizers | Rust, Python, Node.js, and C FFI preserve callback, malformed JSON, invalid UTF-8, and null-pointer errors. A valid JSON `null` remains a valid result. |
+| Queue safety | Runtime delivery queues have explicit capacities and overflow policies. Lifecycle/security traffic uses backpressure or rejection; telemetry may be dropped with metrics. Nested publications are capped. |
+| Cache identity | Session, principal, tenant, and global sharing modes are explicit. Principal and tenant modes require an immutable `RuntimeIdentity`; ordinary scope metadata cannot spoof the partition. |
+| Cache semantics | Pure and approved read classes may cache. Volatile and side-effecting tools are never cached. Cache writes expose deterministic drain barriers. |
+| Plugin lifecycle | Built-in registrations are owner- and implementation-aware, so a same-name collision is not accepted as an equivalent plugin. |
+| Qualification | Reports include source-tree, environment, lockfile, and Git provenance plus an explicit reason for every `PASS`, `FAIL`, `NOT_RUN`, or `INCONCLUSIVE` result. |
 
-Telemetry is not a durable authority or audit ledger. The skeleton hardening
-crates are deliberately not wired into execution.
+These safeguards do not claim capabilities that are not enabled. The authority,
+ledger, durable executor, isolation, and outbound-DLP crates are currently
+disabled contract skeletons. Native and worker plugins are isolated processes,
+not hostile-code sandboxes, and telemetry is not a durable audit ledger.
 
 ## Support matrix
 
-| Surface | Status | Notes |
+| Surface | Status | Runtime / notes |
 | --- | --- | --- |
-| Rust runtime | Supported | Source of truth for runtime semantics. |
-| Python binding | Supported | PyO3 extension plus ergonomic Python wrappers. |
-| Node.js binding | Supported | N-API binding with generated TypeScript surface. |
-| Relay CLI | Supported | Agent hooks, gateway routing, and local observability. |
-| Go binding | Experimental | Source-first binding over the C FFI. |
-| Raw C FFI | Experimental | ABI surface for downstream bindings. |
+| Rust runtime | Supported | Rust 1.96.1 in this checkout; source of truth for runtime semantics. |
+| Python binding | Supported | Python 3.11+; PyO3 extension plus Python wrappers. |
+| Node.js binding | Supported | Node.js 24+; N-API binding with TypeScript declarations. |
+| Relay CLI | Supported | Python 3.11+ or packaged binary; hooks, gateway, and observability. |
+| Go binding | Experimental | Go 1.21+; source-first binding over the C FFI. |
+| Raw C FFI | Experimental | C ABI for downstream bindings. |
 
 Current framework integrations include LangChain, LangGraph, Deep Agents, and
 OpenClaw. Host-specific capabilities vary; blocking security hooks and model
@@ -205,22 +233,23 @@ routing depend on what the host exposes.
 
 ```text
 crates/core/       Rust runtime and public execution APIs
-crates/adaptive/  Adaptive hints, response cache, and cache telemetry
-crates/plugin/    Plugin SDK and lifecycle helpers
-crates/cli/       Relay gateway, agent hooks, and configuration CLI
-crates/python/    PyO3 native extension
-crates/node/      N-API binding and TypeScript package
-crates/ffi/       Experimental C ABI
-python/           Python package and tests
-go/               Experimental Go binding
-docs/             Fern documentation source
-scripts/          Stable build, test, docs, and qualification wrappers
+crates/adaptive/   Adaptive hints, response cache, and cache telemetry
+crates/plugin/     Plugin SDK and lifecycle helpers
+crates/cli/        Relay gateway, agent hooks, and configuration CLI
+crates/python/     PyO3 native extension
+crates/node/       N-API binding and TypeScript package
+crates/ffi/        Experimental C ABI
+python/            Python package and tests
+go/                Experimental Go binding
+docs/              Fern documentation source
+scripts/           Build, test, docs, and qualification wrappers
 ```
 
 ## Build and test from source
 
-Prerequisites are Rust 1.96.1, Python 3.11+, Node.js 24+, Go 1.26+, `uv`, and
-`just`. The reproducible environment is defined in `.devcontainer/`.
+Prerequisites are Rust 1.96.1, Python 3.11+, Node.js 24+, Go 1.21+, `uv`, and
+`just`. The reproducible environment is defined in `.devcontainer/`; its
+current Go image is newer than the minimum supported version.
 
 ```bash
 uv sync
@@ -232,6 +261,10 @@ just test-python
 just test-node
 just test-go
 ```
+
+For documentation changes, run `just docs` (or `just docs-linkcheck` for a
+link-only check). The Rust test recipe uses `cargo-nextest`; install the
+repository-pinned development tools before running the full matrix.
 
 For a bounded local diagnostic:
 
@@ -246,9 +279,16 @@ and run:
 scripts/qualification/run.sh
 ```
 
-Qualification results are written to `qualification/`. Missing tools and
-incomplete coverage remain visible as `NOT_RUN` or `INCONCLUSIVE`; they are
-never treated as an implicit pass.
+Qualification results are written to `qualification/`. Each run first emits a
+source manifest, environment digest, lockfile digests, and Git provenance, then
+binds `qualification.json` to that evidence. Missing tools and incomplete
+coverage remain visible as `NOT_RUN` or `INCONCLUSIVE` with an explicit reason;
+they are never treated as an implicit pass.
+
+Use `scripts/qualification/run.sh manifest` to capture provenance without
+running checks on a host that lacks the full toolchain. Use
+`scripts/qualification/run.sh provenance` when refreshing only the
+source/environment binding while preserving existing check logs.
 
 ## Documentation and contribution
 

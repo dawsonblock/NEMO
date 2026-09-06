@@ -58,6 +58,7 @@ type PluginMap = HashMap<String, RegisteredPlugin>;
 struct RegisteredPlugin {
     registration_id: u64,
     owner: PluginRegistrationOwner,
+    implementation_id: &'static str,
     plugin: Arc<dyn Plugin>,
 }
 
@@ -85,8 +86,15 @@ static NEXT_PLUGIN_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PLUGIN_HOST_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static PLUGIN_MUTATION_EXECUTOR: OnceLock<PluginMutationSender> = OnceLock::new();
 
+/// Maximum serialized plugin lifecycle mutations waiting for the host executor.
+///
+/// Plugin activation and teardown are control-plane operations. When the host
+/// cannot keep up, callers receive a deterministic retryable error instead of
+/// accumulating unbounded futures in process memory.
+const PLUGIN_MUTATION_QUEUE_CAPACITY: usize = 256;
+
 type PluginMutationJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-type PluginMutationSender = tokio::sync::mpsc::UnboundedSender<PluginMutationJob>;
+type PluginMutationSender = tokio::sync::mpsc::Sender<PluginMutationJob>;
 
 thread_local! {
     static IN_PLUGIN_MUTATION_EXECUTOR: Cell<bool> = const { Cell::new(false) };
@@ -1008,6 +1016,13 @@ pub trait Plugin: Send + Sync + 'static {
     /// Returns the unique plugin kind string.
     fn plugin_kind(&self) -> &str;
 
+    /// Returns the stable implementation identity used for built-in
+    /// registration collision checks. Custom plugins can override this when
+    /// several versions intentionally share a Rust type.
+    fn implementation_id(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     /// Returns whether the plugin kind can appear multiple times in the config.
     ///
     /// Return `false` for singleton components such as the built-in adaptive
@@ -1084,7 +1099,9 @@ pub(crate) fn register_builtin_plugin(plugin: Arc<dyn Plugin>) -> Result<()> {
             PluginError::Internal(format!("plugin registry lock poisoned: {err}"))
         })?;
         if let Some(existing) = guard.get(plugin_kind) {
-            if existing.owner == PluginRegistrationOwner::Builtin {
+            if existing.owner == PluginRegistrationOwner::Builtin
+                && existing.implementation_id == plugin.implementation_id()
+            {
                 return Ok(());
             }
             return Err(plugin_already_registered_error(
@@ -1133,6 +1150,7 @@ fn register_plugin_with_owner(
         RegisteredPlugin {
             registration_id,
             owner,
+            implementation_id: plugin.implementation_id(),
             plugin,
         },
     );
@@ -1622,7 +1640,7 @@ where
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     plugin_mutation_executor()?
-        .send(Box::pin(async move {
+        .try_send(Box::pin(async move {
             let result = tokio::spawn(operation())
                 .await
                 .map_err(|error| {
@@ -1631,10 +1649,13 @@ where
                 .and_then(|result| result);
             let _ = result_tx.send(result);
         }))
-        .map_err(|_| {
-            PluginError::Internal(format!(
+        .map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => PluginError::Internal(format!(
+                "failed to queue {operation_name}: plugin mutation executor is at capacity; retry later"
+            )),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => PluginError::Internal(format!(
                 "failed to queue {operation_name}: executor stopped"
-            ))
+            )),
         })?;
     result_rx.await.map_err(|_| {
         PluginError::Internal(format!(
@@ -1648,7 +1669,8 @@ fn plugin_mutation_executor() -> Result<&'static PluginMutationSender> {
         return Ok(sender);
     }
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<PluginMutationJob>();
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<PluginMutationJob>(PLUGIN_MUTATION_QUEUE_CAPACITY);
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("nemo-relay-plugin-host".into())

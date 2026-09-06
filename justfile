@@ -1144,7 +1144,9 @@ build-all: build-rust build-python build-python-plugin build-go build-node
 clean:
     #!/usr/bin/env bash
     set -euo pipefail
-    shopt -s nullglob globstar
+    # macOS ships Bash 3.2, which does not implement `globstar`. Keep the
+    # cleanup recipe portable across the supported developer environments.
+    shopt -s nullglob
     rm -rf \
         .coverage \
         .pytest_cache \

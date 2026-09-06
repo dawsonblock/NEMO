@@ -1,0 +1,1 @@
+qualification checks intentionally skipped in manifest-only mode

@@ -5324,12 +5324,15 @@ struct AtifRemoteStorage;
 /// caller is already inside another tokio runtime.
 #[cfg(feature = "object-store")]
 struct AtifRemoteStorage {
-    sender: std::sync::mpsc::Sender<AtifUploadRequest>,
+    sender: std::sync::mpsc::SyncSender<AtifUploadRequest>,
     key_prefix: String,
     index: usize,
     resource_kind: &'static str,
     access_state: AtomicU8,
 }
+
+#[cfg(feature = "object-store")]
+const ATIF_UPLOAD_QUEUE_CAPACITY: usize = 32;
 
 #[cfg(feature = "object-store")]
 struct AtifUploadRequest {
@@ -5436,7 +5439,8 @@ impl AtifRemoteStorage {
 
     fn build_http(index: usize, http: &HttpStorageConfig) -> std::io::Result<Self> {
         let upload_config = HttpUploadConfig::resolve(index, http)?;
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<AtifUploadRequest>();
+        let (req_tx, req_rx) =
+            std::sync::mpsc::sync_channel::<AtifUploadRequest>(ATIF_UPLOAD_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
 
         std::thread::Builder::new()
@@ -5507,7 +5511,8 @@ impl AtifRemoteStorage {
         let key_prefix = normalize_storage_key_prefix(s3.key_prefix.as_deref());
         let overrides = S3BuilderOverrides::resolve(index, s3)?;
 
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<AtifUploadRequest>();
+        let (req_tx, req_rx) =
+            std::sync::mpsc::sync_channel::<AtifUploadRequest>(ATIF_UPLOAD_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
 
         std::thread::Builder::new()

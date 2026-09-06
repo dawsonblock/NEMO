@@ -6,10 +6,11 @@
 use std::sync::Arc;
 
 use nemo_relay::api::runtime::{
-    PropagationContext, ScopeStack, TASK_SCOPE_STACK, capture_traceparent, create_scope_stack,
-    create_scope_stack_from_propagation, current_scope_stack, fork_scope_stack,
-    propagate_scope_to_thread, scope_stack_active, set_thread_scope_stack, sync_thread_scope_stack,
-    task_scope_push, task_scope_remove, task_scope_top, with_scope_stack,
+    IdentitySource, PropagationContext, RuntimeIdentity, ScopeStack, TASK_SCOPE_STACK,
+    capture_traceparent, create_scope_stack, create_scope_stack_from_propagation,
+    current_scope_stack, fork_scope_stack, propagate_scope_to_thread, scope_stack_active,
+    set_thread_scope_stack, sync_thread_scope_stack, task_scope_push, task_scope_remove,
+    task_scope_top, with_scope_stack,
 };
 use nemo_relay::api::scope::{
     PopScopeParams, PushScopeParams, ScopeHandle, ScopeType, pop_scope, push_scope,
@@ -54,6 +55,48 @@ fn test_two_scope_stacks_are_independent() {
     let root_b_uuid = stack_b.read().unwrap().top().uuid;
     // They each have their own root
     assert_ne!(root_a_uuid, root_b_uuid); // scope_a != scope_b
+}
+
+#[tokio::test]
+async fn trusted_runtime_identity_is_immutable_and_inherited_by_local_forks() {
+    let parent_stack = create_scope_stack();
+    let session_id = Uuid::now_v7();
+    TASK_SCOPE_STACK
+        .scope(parent_stack.clone(), async {
+            parent_stack
+                .write()
+                .unwrap()
+                .install_runtime_identity(RuntimeIdentity::new(
+                    "tenant-a",
+                    "principal-a",
+                    session_id,
+                    7,
+                    IdentitySource::LocalTrusted,
+                ))
+                .unwrap();
+            let replacement = RuntimeIdentity::new(
+                "tenant-b",
+                "principal-b",
+                Uuid::now_v7(),
+                8,
+                IdentitySource::ApiKey,
+            );
+            assert!(
+                parent_stack
+                    .write()
+                    .unwrap()
+                    .install_runtime_identity(replacement)
+                    .is_err()
+            );
+
+            let fork = fork_scope_stack().unwrap();
+            let identity = fork.read().unwrap().runtime_identity().unwrap();
+            assert_eq!(identity.tenant_id(), "tenant-a");
+            assert_eq!(identity.principal_id(), "principal-a");
+            assert_eq!(identity.session_id(), session_id);
+            assert_eq!(identity.policy_epoch(), 7);
+        })
+        .await;
 }
 
 #[test]

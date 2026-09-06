@@ -1267,7 +1267,8 @@ NemoRelayStatus nemo_relay_llm_call_execute(const char *name,
  *   May be null, in which case chunks are not collected.
  * - `finalizer`: Callback invoked once when the stream is exhausted to produce
  *   the aggregated response as a JSON C string. May be null, in which case the
- *   finalizer returns `Json::Null`.
+ *   finalizer returns `Json::Null`. A non-null finalizer that returns null,
+ *   malformed JSON, or invalid UTF-8 terminates the stream with an error.
  * - `parent`: Optional parent scope handle, or null.
  * - `attributes`: Bitfield of LLM attributes.
  * - `data_json`: Optional JSON data, or null.

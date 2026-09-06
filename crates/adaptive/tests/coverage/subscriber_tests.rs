@@ -58,7 +58,7 @@ fn make_test_event(
 
 #[test]
 fn test_create_subscriber_sends_event() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let subscriber = create_subscriber(tx);
 
     let event = make_test_event(EventType::Start, Some(ScopeType::Llm), Some("gpt-4"));
@@ -71,7 +71,7 @@ fn test_create_subscriber_sends_event() {
 
 #[test]
 fn test_subscriber_survives_dropped_receiver() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     let subscriber = create_subscriber(tx);
 
     // Drop the receiver — subscriber must not panic
@@ -83,7 +83,7 @@ fn test_subscriber_survives_dropped_receiver() {
 
 #[test]
 fn test_subscriber_restores_pending_count_when_receiver_is_dropped() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     let pending_events = Arc::new(AtomicUsize::new(0));
     let subscriber = create_subscriber_with_counter(tx, pending_events.clone());
     drop(rx);
@@ -95,6 +95,28 @@ fn test_subscriber_restores_pending_count_when_receiver_is_dropped() {
     ));
 
     assert_eq!(pending_events.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_subscriber_drops_when_bounded_telemetry_queue_is_full() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let pending_events = Arc::new(AtomicUsize::new(0));
+    let subscriber = create_subscriber_with_counter(tx, pending_events.clone());
+
+    subscriber(&make_test_event(
+        EventType::Start,
+        Some(ScopeType::Tool),
+        Some("first"),
+    ));
+    subscriber(&make_test_event(
+        EventType::Start,
+        Some(ScopeType::Tool),
+        Some("dropped"),
+    ));
+
+    assert_eq!(pending_events.load(Ordering::SeqCst), 1);
+    assert_eq!(rx.try_recv().unwrap().name(), "first");
+    assert!(rx.try_recv().is_err());
 }
 
 // -----------------------------------------------------------------------

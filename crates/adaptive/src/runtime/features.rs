@@ -48,7 +48,7 @@ use crate::response_cache::{
 use crate::runtime::backend::build_backend;
 use crate::runtime::validation::validate_config;
 use crate::storage::traits::StorageBackendDyn;
-use crate::subscriber::create_subscriber_with_counter;
+use crate::subscriber::{ADAPTIVE_TELEMETRY_QUEUE_CAPACITY, create_subscriber_with_counter};
 use crate::tool_parallelism_learner::ToolParallelismLearner;
 use crate::types::cache::HotCache;
 
@@ -67,8 +67,8 @@ pub struct AdaptiveRuntime {
     hot_cache: Arc<RwLock<HotCache>>,
     cache_diagnostics_tracker: Arc<RwLock<CacheDiagnosticsTracker>>,
     pending_events: Arc<AtomicUsize>,
-    event_tx: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
-    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Event>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<Event>>,
+    event_rx: Option<tokio::sync::mpsc::Receiver<Event>>,
     drain_task: Option<TelemetryDrainTask>,
     registered: bool,
     runtime_id: Uuid,
@@ -154,7 +154,7 @@ impl<'a> RegistrationContext<'a> {
             .map_err(Into::into)
     }
 
-    fn take_event_receiver(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Event>> {
+    fn take_event_receiver(&mut self) -> Result<tokio::sync::mpsc::Receiver<Event>> {
         self.runtime
             .event_rx
             .take()
@@ -211,7 +211,7 @@ impl AdaptiveRuntime {
             Some(state) => Some(build_backend(&state.backend).await?),
             None => None,
         };
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(ADAPTIVE_TELEMETRY_QUEUE_CAPACITY);
 
         Ok(Self {
             config,

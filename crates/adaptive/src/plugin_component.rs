@@ -63,6 +63,10 @@ impl Plugin for AdaptivePlugin {
         ADAPTIVE_PLUGIN_KIND
     }
 
+    fn implementation_id(&self) -> &'static str {
+        "nemo-relay-adaptive::AdaptivePlugin"
+    }
+
     fn allows_multiple_components(&self) -> bool {
         false
     }
@@ -127,14 +131,16 @@ impl Plugin for AdaptivePlugin {
 /// registered adaptive component.
 ///
 /// # Notes
-/// Re-registering the adaptive component is treated as success when the
-/// existing registration already resolves to the adaptive plugin kind.
+/// Re-registering the adaptive component is treated as success only when the
+/// existing registration is the expected first-party implementation.
 pub fn register_adaptive_component() -> Result<()> {
     match register_plugin(Arc::new(AdaptivePlugin)) {
         Ok(()) => Ok(()),
         Err(PluginError::RegistrationFailed(message))
             if message.contains("already registered")
-                && lookup_plugin(ADAPTIVE_PLUGIN_KIND).is_some() =>
+                && lookup_plugin(ADAPTIVE_PLUGIN_KIND).is_some_and(|plugin| {
+                    plugin.implementation_id() == "nemo-relay-adaptive::AdaptivePlugin"
+                }) =>
         {
             Ok(())
         }

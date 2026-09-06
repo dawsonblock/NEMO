@@ -855,7 +855,7 @@ class TestOpenTelemetryTypes:
             OpenTelemetryConfig()  # ty: ignore[missing-argument]
 
         invalid_type = OpenTelemetryConfig(
-            "invalid",  # ty: ignore[invalid-argument-type]
+            "invalid",
             "http://localhost:4318/v1/traces",
         )
         with pytest.raises(ValueError, match="type must be"):

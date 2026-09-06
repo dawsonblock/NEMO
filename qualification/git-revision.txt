@@ -1,2 +1,6 @@
-SOURCE_ARCHIVE
-git metadata unavailable in supplied tree
+commit=b997a119b6a0f0d8d5350bf3bcf5883a6f433a84
+tree=f27e0fa5b4144095eee7736beab9b85ecf96c1d8
+working_tree=dirty
+ M qualification/provenance.json
+ M qualification/source-manifest.json
+source_tree_sha256=2b0797d6a69c7e1d98d5ef6abe24d65722d5bcb644a5ccc94e9f207635b52447

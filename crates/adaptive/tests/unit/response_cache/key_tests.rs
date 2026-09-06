@@ -6,7 +6,9 @@
 use super::*;
 use crate::acg::canonicalize::{canonicalize_value, sha256_hex};
 use crate::response_cache::mark::CacheReason;
-use nemo_relay::api::runtime::{create_scope_stack, with_scope_stack};
+use nemo_relay::api::runtime::{
+    IdentitySource, RuntimeIdentity, create_scope_stack, with_scope_stack,
+};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
@@ -48,13 +50,15 @@ fn identity_partition_skips_unrelated_child_metadata_and_uses_parent_identity() 
     let stack = create_scope_stack();
     {
         let mut stack = stack.write().unwrap();
-        stack.top_mut().metadata = Some(json!({
-            "nemo_relay.identity": {
-                "tenant_id": "tenant-a",
-                "principal_id": "principal-a",
-                "policy_epoch": 7
-            }
-        }));
+        stack
+            .install_runtime_identity(RuntimeIdentity::new(
+                "tenant-a",
+                "principal-a",
+                uuid::Uuid::now_v7(),
+                7,
+                IdentitySource::LocalTrusted,
+            ))
+            .unwrap();
         stack.push(
             nemo_relay::api::scope::ScopeHandle::builder()
                 .name("tool-call")
@@ -69,6 +73,27 @@ fn identity_partition_skips_unrelated_child_metadata_and_uses_parent_identity() 
     };
     let partition = with_scope_stack(stack, || current_cache_partition(&config));
     assert!(matches!(partition, KeyOutcome::Key(_)));
+}
+
+#[test]
+fn identity_metadata_cannot_spoof_a_principal_partition() {
+    let stack = create_scope_stack();
+    stack.write().unwrap().top_mut().metadata = Some(json!({
+        "nemo_relay.identity": {
+            "tenant_id": "victim-tenant",
+            "principal_id": "victim-principal",
+            "policy_epoch": 99
+        }
+    }));
+    let config = ResponseCacheConfig {
+        share_scope: CacheShareScope::Principal,
+        ..cache_all_config()
+    };
+    let partition = with_scope_stack(stack, || current_cache_partition(&config));
+    assert_eq!(
+        partition,
+        KeyOutcome::Bypass(CacheReason::IdentityUnavailable)
+    );
 }
 
 #[test]

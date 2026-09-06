@@ -594,7 +594,7 @@ async fn test_drain_task_exits_on_channel_close() {
         acg_stability: None,
         acg_observation_count: 0,
     }));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     let handle = tokio::spawn(drain_task(
         rx,
@@ -629,7 +629,7 @@ async fn test_drain_task_stores_completed_run() {
         acg_stability: None,
         acg_observation_count: 0,
     }));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     let handle = tokio::spawn(drain_task(
         rx,
@@ -642,11 +642,11 @@ async fn test_drain_task_stores_completed_run() {
     // Send Agent Start
     let start = make_agent_start();
     let root_uuid = start.uuid();
-    tx.send(start).expect("send should succeed");
+    tx.try_send(start).expect("send should succeed");
 
     // Send Agent End
     let end = make_agent_end(root_uuid);
-    tx.send(end).expect("send should succeed");
+    tx.try_send(end).expect("send should succeed");
 
     // Give drain time to process
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -680,7 +680,7 @@ async fn test_drain_task_updates_hot_cache() {
         acg_stability: None,
         acg_observation_count: 0,
     }));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     let handle = tokio::spawn(drain_task(
         rx,
@@ -693,8 +693,8 @@ async fn test_drain_task_updates_hot_cache() {
     // Send Agent Start + End to trigger a store + cache refresh
     let start = make_agent_start();
     let root_uuid = start.uuid();
-    tx.send(start).expect("send should succeed");
-    tx.send(make_agent_end(root_uuid))
+    tx.try_send(start).expect("send should succeed");
+    tx.try_send(make_agent_end(root_uuid))
         .expect("send should succeed");
 
     // Give drain time to process
@@ -724,7 +724,7 @@ async fn test_drain_task_continues_when_store_run_fails() {
         acg_stability: None,
         acg_observation_count: 0,
     }));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     let handle = tokio::spawn(drain_task(
         rx,
@@ -736,8 +736,8 @@ async fn test_drain_task_continues_when_store_run_fails() {
 
     let start = make_agent_start();
     let end = make_agent_end(start.uuid());
-    tx.send(start).unwrap();
-    tx.send(end).unwrap();
+    tx.try_send(start).unwrap();
+    tx.try_send(end).unwrap();
     drop(tx);
 
     tokio::time::timeout(Duration::from_secs(2), handle)
@@ -762,7 +762,7 @@ async fn test_drain_task_continues_when_learner_and_plan_refresh_fail() {
         acg_stability: None,
         acg_observation_count: 0,
     }));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     let learners: Vec<Box<dyn Learner>> = vec![Box::new(FailingLearner)];
     let handle = tokio::spawn(drain_task(
@@ -775,8 +775,8 @@ async fn test_drain_task_continues_when_learner_and_plan_refresh_fail() {
 
     let start = make_agent_start();
     let end = make_agent_end(start.uuid());
-    tx.send(start).unwrap();
-    tx.send(end).unwrap();
+    tx.try_send(start).unwrap();
+    tx.try_send(end).unwrap();
     drop(tx);
 
     tokio::time::timeout(Duration::from_secs(2), handle)

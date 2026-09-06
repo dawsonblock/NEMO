@@ -377,10 +377,19 @@ struct LocalGuardrailsWorker {
     writer: Mutex<Option<WorkerCommandWriter>>,
     child: Mutex<Child>,
     waiters: Arc<Mutex<HashMap<String, std_mpsc::Sender<WorkerEnvelope>>>>,
-    stream_events: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WorkerEnvelope>>>>,
+    stream_events: Arc<Mutex<HashMap<String, mpsc::Sender<WorkerEnvelope>>>>,
     next_id: AtomicU64,
     shutdown_started: AtomicBool,
 }
+
+/// Bounded worker-response backlog for a Guardrails stream.
+///
+/// The worker reader applies backpressure to the child process when the
+/// consumer stops draining. Guardrails output is execution data, so blocking
+/// the dedicated reader is safer than silently dropping chunks or growing the
+/// host process without limit.
+const GUARDRAILS_STREAM_QUEUE_CAPACITY: usize = 256;
+const GUARDRAILS_COMMAND_QUEUE_CAPACITY: usize = 256;
 
 impl LocalGuardrailsWorker {
     fn start(config: &NeMoGuardrailsConfig) -> PluginResult<Arc<Self>> {
@@ -556,9 +565,9 @@ impl LocalGuardrailsWorker {
     fn start_stream(
         &self,
         messages: Vec<Json>,
-    ) -> FlowResult<(String, mpsc::UnboundedReceiver<WorkerEnvelope>)> {
+    ) -> FlowResult<(String, mpsc::Receiver<WorkerEnvelope>)> {
         let id = self.next_request_id();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(GUARDRAILS_STREAM_QUEUE_CAPACITY);
         self.stream_events
             .lock()
             .map_err(|err| FlowError::Internal(format!("worker stream lock poisoned: {err}")))?
@@ -670,14 +679,15 @@ impl Drop for LocalGuardrailsWorker {
 }
 
 struct WorkerCommandWriter {
-    sender: std_mpsc::Sender<String>,
+    sender: std_mpsc::SyncSender<String>,
     error: Arc<Mutex<Option<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl WorkerCommandWriter {
     fn spawn(mut stdin: ChildStdin) -> Self {
-        let (sender, receiver) = std_mpsc::channel::<String>();
+        let (sender, receiver) =
+            std_mpsc::sync_channel::<String>(GUARDRAILS_COMMAND_QUEUE_CAPACITY);
         let error = Arc::new(Mutex::new(None));
         let writer_error = Arc::clone(&error);
         let handle = thread::spawn(move || {
@@ -711,8 +721,13 @@ impl WorkerCommandWriter {
                 "failed to write worker command: {error}"
             )));
         }
-        self.sender.send(line).map_err(|err| {
-            FlowError::Internal(format!("worker command writer channel closed: {err}"))
+        self.sender.try_send(line).map_err(|err| match err {
+            std_mpsc::TrySendError::Full(_) => FlowError::Internal(format!(
+                "worker command writer queue is at capacity ({GUARDRAILS_COMMAND_QUEUE_CAPACITY}); retry later"
+            )),
+            std_mpsc::TrySendError::Disconnected(_) => {
+                FlowError::Internal("worker command writer channel closed".into())
+            }
         })
     }
 
@@ -804,7 +819,7 @@ fn set_request_id(payload: &mut Json, id: &str) -> FlowResult<()> {
 
 fn dispatch_worker_envelope(
     waiters: &Arc<Mutex<HashMap<String, std_mpsc::Sender<WorkerEnvelope>>>>,
-    stream_events: &Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WorkerEnvelope>>>>,
+    stream_events: &Arc<Mutex<HashMap<String, mpsc::Sender<WorkerEnvelope>>>>,
     envelope: WorkerEnvelope,
 ) {
     if envelope.event.is_some() {
@@ -813,7 +828,7 @@ fn dispatch_worker_envelope(
             .ok()
             .and_then(|streams| streams.get(&envelope.id).cloned());
         if let Some(sender) = sender {
-            let _ = sender.send(envelope);
+            let _ = sender.blocking_send(envelope);
         }
         return;
     }
@@ -829,7 +844,7 @@ fn dispatch_worker_envelope(
 
 fn notify_worker_closed(
     waiters: &Arc<Mutex<HashMap<String, std_mpsc::Sender<WorkerEnvelope>>>>,
-    stream_events: &Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WorkerEnvelope>>>>,
+    stream_events: &Arc<Mutex<HashMap<String, mpsc::Sender<WorkerEnvelope>>>>,
     message: String,
 ) {
     if let Ok(mut waiters) = waiters.lock() {
@@ -846,7 +861,7 @@ fn notify_worker_closed(
     }
     if let Ok(mut streams) = stream_events.lock() {
         for (id, sender) in streams.drain() {
-            let _ = sender.send(WorkerEnvelope {
+            let _ = sender.blocking_send(WorkerEnvelope {
                 id,
                 ok: false,
                 result: None,
@@ -1425,7 +1440,7 @@ async fn monitor_guardrails_stream(
     worker: Arc<LocalGuardrailsWorker>,
     stream_id: String,
     mut text_rx: mpsc::Receiver<Option<String>>,
-    mut event_rx: mpsc::UnboundedReceiver<WorkerEnvelope>,
+    mut event_rx: mpsc::Receiver<WorkerEnvelope>,
     blocked: Arc<Mutex<Option<String>>>,
 ) -> FlowResult<()> {
     let mut input_closed = false;

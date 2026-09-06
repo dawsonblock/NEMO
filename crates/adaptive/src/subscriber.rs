@@ -14,26 +14,43 @@ use nemo_relay::api::scope::ScopeType;
 
 use crate::types::records::{CallKind, CallRecord};
 
+/// Maximum telemetry events waiting for the adaptive drain task.
+///
+/// Adaptive learning is observational: preserving an unbounded backlog is
+/// worse than shedding telemetry while the backing store is unavailable.
+pub(crate) const ADAPTIVE_TELEMETRY_QUEUE_CAPACITY: usize = 1024;
+
 #[cfg(test)]
-pub(crate) fn create_subscriber(
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
-) -> EventSubscriberFn {
+pub(crate) fn create_subscriber(tx: tokio::sync::mpsc::Sender<Event>) -> EventSubscriberFn {
     create_subscriber_with_counter(tx, Arc::new(AtomicUsize::new(0)))
 }
 
 pub(crate) fn create_subscriber_with_counter(
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    tx: tokio::sync::mpsc::Sender<Event>,
     pending_events: Arc<AtomicUsize>,
 ) -> EventSubscriberFn {
     std::sync::Arc::new(move |event: &Event| {
         pending_events.fetch_add(1, Ordering::SeqCst);
-        if tx.send(event.clone()).is_err() {
-            pending_events.fetch_sub(1, Ordering::SeqCst);
-            log::warn!(
-                target: "nemo_relay.runtime",
-                event = "adaptive_telemetry_event_dropped";
-                "Adaptive telemetry event dropped because the drain receiver is unavailable"
-            );
+        match tx.try_send(event.clone()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                pending_events.fetch_sub(1, Ordering::SeqCst);
+                log::warn!(
+                    target: "nemo_relay.runtime",
+                    event = "adaptive_telemetry_event_dropped",
+                    reason = "queue_full";
+                    "Adaptive telemetry event dropped because the bounded drain queue is full"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                pending_events.fetch_sub(1, Ordering::SeqCst);
+                log::warn!(
+                    target: "nemo_relay.runtime",
+                    event = "adaptive_telemetry_event_dropped",
+                    reason = "receiver_closed";
+                    "Adaptive telemetry event dropped because the drain receiver is unavailable"
+                );
+            }
         }
     })
 }

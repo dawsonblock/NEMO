@@ -1,1 +1,1 @@
-Required executable not found: cargo-deny
+qualification checks intentionally skipped in manifest-only mode

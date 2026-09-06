@@ -1617,12 +1617,12 @@ fn endpoint_worker_helpers_acknowledge_flush_and_close_error_paths() {
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap();
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tx.send(EndpointMessage::Event("{}".into())).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.try_send(EndpointMessage::Event("{}".into())).unwrap();
     let (flush_tx, flush_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Flush(flush_tx)).unwrap();
+    tx.try_send(EndpointMessage::Flush(flush_tx)).unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Close(close_tx)).unwrap();
+    tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     drop(tx);
 
     tokio::runtime::Runtime::new()
@@ -1640,9 +1640,9 @@ fn endpoint_worker_helpers_acknowledge_flush_and_close_error_paths() {
 #[cfg(feature = "atof-streaming")]
 fn endpoint_worker_reports_flush_and_close_timeouts() {
     enable_operational_logs();
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    let worker = AtofEndpointWorker {
-        sender,
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let mut worker = AtofEndpointWorker {
+        sender: Some(sender),
         timeout: std::time::Duration::from_millis(1),
         index: 7,
         transport: AtofEndpointTransport::HttpPost,
@@ -1650,6 +1650,27 @@ fn endpoint_worker_reports_flush_and_close_timeouts() {
 
     worker.flush();
     worker.close();
+}
+
+#[test]
+#[cfg(feature = "atof-streaming")]
+fn endpoint_worker_reserves_control_capacity_when_telemetry_saturates() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+    let worker = AtofEndpointWorker {
+        sender: Some(sender),
+        timeout: std::time::Duration::from_millis(1),
+        index: 8,
+        transport: AtofEndpointTransport::HttpPost,
+    };
+
+    worker.enqueue("{\"event\":1}".to_string());
+    worker.enqueue("{\"event\":2}".to_string());
+
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EndpointMessage::Event(event)) if event == "{\"event\":1}"
+    ));
+    assert!(receiver.try_recv().is_err());
 }
 
 #[test]
@@ -1671,7 +1692,7 @@ fn http_endpoint_worker_acknowledges_flush_close_and_logs_http_errors() {
             .unwrap();
     });
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
     let worker = std::thread::spawn(move || {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             run_http_post_endpoint(
@@ -1687,15 +1708,15 @@ fn http_endpoint_worker_acknowledges_flush_close_and_logs_http_errors() {
         });
     });
 
-    tx.send(EndpointMessage::Event("{\"kind\":\"mark\"}".into()))
+    tx.try_send(EndpointMessage::Event("{\"kind\":\"mark\"}".into()))
         .unwrap();
     let (flush_tx, flush_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Flush(flush_tx)).unwrap();
+    tx.try_send(EndpointMessage::Flush(flush_tx)).unwrap();
     flush_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Close(close_tx)).unwrap();
+    tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     close_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
@@ -1707,7 +1728,7 @@ fn http_endpoint_worker_acknowledges_flush_close_and_logs_http_errors() {
 #[cfg(feature = "atof-streaming")]
 fn http_endpoint_worker_reports_request_transport_failure() {
     enable_operational_logs();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
     let worker = std::thread::spawn(move || {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             run_http_post_endpoint(
@@ -1726,10 +1747,10 @@ fn http_endpoint_worker_reports_request_transport_failure() {
         });
     });
 
-    tx.send(EndpointMessage::Event("{\"kind\":\"mark\"}".into()))
+    tx.try_send(EndpointMessage::Event("{\"kind\":\"mark\"}".into()))
         .unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Close(close_tx)).unwrap();
+    tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     close_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
@@ -1758,18 +1779,18 @@ fn ndjson_endpoint_worker_streams_events_flushes_and_closes() {
         AtofEndpointConfig::new(url, AtofEndpointTransport::Ndjson).with_timeout_millis(5_000),
     )
     .unwrap();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
     let worker = std::thread::spawn(move || run_endpoint_worker(0, endpoint, rx));
 
-    tx.send(EndpointMessage::Event("{\"kind\":\"mark\"}".into()))
+    tx.try_send(EndpointMessage::Event("{\"kind\":\"mark\"}".into()))
         .unwrap();
     let (flush_tx, flush_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Flush(flush_tx)).unwrap();
+    tx.try_send(EndpointMessage::Flush(flush_tx)).unwrap();
     flush_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel();
-    tx.send(EndpointMessage::Close(close_tx)).unwrap();
+    tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     close_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();

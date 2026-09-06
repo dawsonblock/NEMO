@@ -251,7 +251,7 @@ async fn request_timeout_stops_an_unresponsive_worker() {
     let _ = spdlog::init_log_crate_proxy();
     log::set_max_level(log::LevelFilter::Info);
     let child = Command::new("sleep").arg("60").spawn().unwrap();
-    let (sender, receiver) = std_mpsc::channel::<String>();
+    let (sender, receiver) = std_mpsc::sync_channel::<String>(GUARDRAILS_COMMAND_QUEUE_CAPACITY);
     let waiters = Arc::new(Mutex::new(HashMap::new()));
     let stream_events = Arc::new(Mutex::new(HashMap::new()));
     let closed_waiters = Arc::clone(&waiters);
@@ -777,7 +777,7 @@ fn worker_envelope_helpers_cover_delivery_shutdown_and_default_results() {
     );
     assert!(waiter_rx.recv().unwrap().ok);
 
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+    let (stream_tx, mut stream_rx) = mpsc::channel(1);
     stream_events
         .lock()
         .unwrap()
@@ -798,7 +798,7 @@ fn worker_envelope_helpers_cover_delivery_shutdown_and_default_results() {
 
     let (waiter_tx, waiter_rx) = std_mpsc::channel();
     waiters.lock().unwrap().insert("closed".into(), waiter_tx);
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+    let (stream_tx, mut stream_rx) = mpsc::channel(1);
     stream_events
         .lock()
         .unwrap()
@@ -842,7 +842,7 @@ fn worker_envelope_helpers_cover_delivery_shutdown_and_default_results() {
 
 #[test]
 fn worker_command_writer_reports_stored_and_closed_channel_errors() {
-    let (sender, receiver) = std_mpsc::channel();
+    let (sender, receiver) = std_mpsc::sync_channel(GUARDRAILS_COMMAND_QUEUE_CAPACITY);
     let writer = WorkerCommandWriter {
         sender,
         error: Arc::new(Mutex::new(Some("broken pipe".into()))),
@@ -857,7 +857,7 @@ fn worker_command_writer_reports_stored_and_closed_channel_errors() {
     );
     drop(receiver);
 
-    let (sender, receiver) = std_mpsc::channel();
+    let (sender, receiver) = std_mpsc::sync_channel(GUARDRAILS_COMMAND_QUEUE_CAPACITY);
     drop(receiver);
     let writer = WorkerCommandWriter {
         sender,
@@ -965,10 +965,10 @@ fn monitor_test_worker() -> Arc<LocalGuardrailsWorker> {
 async fn run_monitor_event(event: Option<WorkerEnvelope>) -> (FlowResult<()>, Option<String>) {
     let worker = monitor_test_worker();
     let (text_tx, text_rx) = mpsc::channel(1);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(1);
     let blocked = Arc::new(Mutex::new(None));
     if let Some(event) = event {
-        event_tx.send(event).unwrap();
+        event_tx.try_send(event).unwrap();
     }
     drop(event_tx);
     let result = monitor_guardrails_stream(

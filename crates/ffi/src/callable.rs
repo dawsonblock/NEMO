@@ -1017,18 +1017,40 @@ pub fn wrap_collector_fn(cb: NemoRelayCollectorCb) -> Box<dyn FnMut(Json) -> Res
     })
 }
 
-/// Wrap a C finalizer callback into a `Box<dyn FnOnce() -> Json + Send>` for
-/// use by the core runtime. The callback is invoked exactly once when the
-/// stream is exhausted. The returned C string is parsed as JSON and then freed.
+/// Wrap a C finalizer callback into a fallible closure for use by the core
+/// runtime. The callback is invoked exactly once when the stream is exhausted.
+/// The returned C string is parsed as JSON and then freed.
 ///
 /// # Safety
 /// The caller must ensure `cb` remains valid until the returned closure is
-/// invoked. The C callback must return a valid, heap-allocated JSON C string
-/// (or null, in which case `Json::Null` is returned).
-pub fn wrap_finalizer_fn(cb: NemoRelayFinalizerCb) -> Box<dyn FnOnce() -> Json + Send> {
+/// invoked. The C callback must return a valid, heap-allocated JSON C string.
+/// A null pointer, invalid UTF-8, or malformed JSON is returned as a finalizer
+/// error; callers that intend a JSON null response must return the string
+/// `"null"` instead.
+pub fn wrap_finalizer_fn(cb: NemoRelayFinalizerCb) -> Box<dyn FnOnce() -> Result<Json> + Send> {
     Box::new(move || {
+        clear_last_error();
         let result_ptr = unsafe { cb() };
-        let result = ptr_to_json(result_ptr);
+        let result = if result_ptr.is_null() {
+            Err(FlowError::Internal(last_error_message().unwrap_or_else(
+                || "LLM stream finalizer returned null".into(),
+            )))
+        } else {
+            unsafe { CStr::from_ptr(result_ptr) }
+                .to_str()
+                .map_err(|error| {
+                    FlowError::Internal(format!(
+                        "LLM stream finalizer returned invalid UTF-8: {error}"
+                    ))
+                })
+                .and_then(|value| {
+                    serde_json::from_str(value).map_err(|error| {
+                        FlowError::Internal(format!(
+                            "LLM stream finalizer returned invalid JSON: {error}"
+                        ))
+                    })
+                })
+        };
         unsafe { nemo_relay_string_free_internal(result_ptr) };
         result
     })

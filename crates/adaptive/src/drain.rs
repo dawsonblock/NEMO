@@ -240,7 +240,7 @@ async fn refresh_hot_cache_plan(
 /// the in-flight event counter.
 #[allow(dead_code)]
 pub(crate) async fn drain_task(
-    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    rx: tokio::sync::mpsc::Receiver<Event>,
     backend: Arc<dyn StorageBackendDyn + Send + Sync>,
     hot_cache: Arc<RwLock<HotCache>>,
     agent_id: String,
@@ -258,7 +258,7 @@ pub(crate) async fn drain_task(
 }
 
 pub(crate) async fn drain_task_with_counter(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    mut rx: tokio::sync::mpsc::Receiver<Event>,
     backend: Arc<dyn StorageBackendDyn + Send + Sync>,
     hot_cache: Arc<RwLock<HotCache>>,
     pending_events: Arc<AtomicUsize>,

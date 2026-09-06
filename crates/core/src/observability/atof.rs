@@ -29,6 +29,20 @@ use crate::api::runtime::EventSubscriberFn;
 use crate::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use crate::error::FlowError;
 
+/// Maximum telemetry records queued for one remote ATOF endpoint.
+///
+/// Remote ATOF delivery is observational. A stalled endpoint must not allow a
+/// subscriber callback to retain an unbounded amount of event data in memory.
+#[cfg(feature = "atof-streaming")]
+const ATOF_ENDPOINT_QUEUE_CAPACITY: usize = 1024;
+
+/// Capacity reserved for endpoint flush and close control messages.
+const ATOF_ENDPOINT_CONTROL_RESERVE: usize = 1;
+
+/// Maximum encoded records waiting for an NDJSON request body to consume.
+#[cfg(feature = "atof-streaming")]
+const ATOF_NDJSON_BODY_QUEUE_CAPACITY: usize = 1024;
+
 /// Result type for the ATOF JSONL exporter.
 pub type Result<T> = std::result::Result<T, AtofExporterError>;
 
@@ -552,7 +566,7 @@ impl AtofExporter {
                     .unwrap_or_else(|| PathBuf::from("<stream>")),
                 source,
             });
-        for endpoint in &state.endpoints {
+        for endpoint in &mut state.endpoints {
             endpoint.close();
         }
         flush_result?;
@@ -621,6 +635,17 @@ enum EndpointMessage {
     Close(std_mpsc::Sender<()>),
 }
 
+impl EndpointMessage {
+    fn acknowledge_if_control(self) {
+        match self {
+            Self::Flush(done) | Self::Close(done) => {
+                let _ = done.send(());
+            }
+            Self::Event(_) => {}
+        }
+    }
+}
+
 #[cfg(feature = "atof-streaming")]
 enum NdjsonBodyMessage {
     Event(Vec<u8>),
@@ -637,7 +662,7 @@ impl NdjsonBodyMessage {
 }
 
 struct AtofEndpointWorker {
-    sender: tokio::sync::mpsc::UnboundedSender<EndpointMessage>,
+    sender: Option<tokio::sync::mpsc::Sender<EndpointMessage>>,
     timeout: Duration,
     index: usize,
     transport: AtofEndpointTransport,
@@ -653,40 +678,117 @@ struct ActivatedAtofEndpoint {
 
 impl AtofEndpointWorker {
     fn enqueue(&self, raw_json: String) {
-        let _ = self.sender.send(EndpointMessage::Event(raw_json));
-    }
-
-    fn flush(&self) {
-        let (tx, rx) = std_mpsc::channel();
-        if self.sender.send(EndpointMessage::Flush(tx)).is_ok()
-            && rx.recv_timeout(self.timeout).is_err()
-        {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        if sender.capacity() <= ATOF_ENDPOINT_CONTROL_RESERVE {
             log::warn!(
                 target: "nemo_relay.observability",
-                event = "endpoint_flush_failed",
+                event = "endpoint_event_dropped",
                 exporter = "atof",
                 endpoint_index = self.index,
                 transport = self.transport.as_str(),
-                reason = "timeout";
-                "ATOF endpoint flush timed out"
+                reason = "priority_reserve";
+                "ATOF endpoint event dropped to preserve control capacity"
             );
+            return;
+        }
+        match sender.try_send(EndpointMessage::Event(raw_json)) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => log::warn!(
+                target: "nemo_relay.observability",
+                event = "endpoint_event_dropped",
+                exporter = "atof",
+                endpoint_index = self.index,
+                transport = self.transport.as_str(),
+                reason = "queue_full";
+                "ATOF endpoint event dropped because the bounded delivery queue is full"
+            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => log::warn!(
+                target: "nemo_relay.observability",
+                event = "endpoint_event_dropped",
+                exporter = "atof",
+                endpoint_index = self.index,
+                transport = self.transport.as_str(),
+                reason = "worker_closed";
+                "ATOF endpoint event dropped because the delivery worker is closed"
+            ),
         }
     }
 
-    fn close(&self) {
+    fn flush(&self) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
         let (tx, rx) = std_mpsc::channel();
-        if self.sender.send(EndpointMessage::Close(tx)).is_ok()
-            && rx.recv_timeout(self.timeout).is_err()
-        {
-            log::warn!(
-                target: "nemo_relay.observability",
-                event = "endpoint_close_failed",
-                exporter = "atof",
-                endpoint_index = self.index,
-                transport = self.transport.as_str(),
-                reason = "timeout";
-                "ATOF endpoint close timed out"
-            );
+        match sender.try_send(EndpointMessage::Flush(tx)) {
+            Ok(()) => {
+                if rx.recv_timeout(self.timeout).is_err() {
+                    log::warn!(
+                        target: "nemo_relay.observability",
+                        event = "endpoint_flush_failed",
+                        exporter = "atof",
+                        endpoint_index = self.index,
+                        transport = self.transport.as_str(),
+                        reason = "timeout";
+                        "ATOF endpoint flush timed out"
+                    );
+                }
+            }
+            Err(error) => {
+                let reason = match &error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "queue_full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "worker_closed",
+                };
+                error.into_inner().acknowledge_if_control();
+                log::warn!(
+                    target: "nemo_relay.observability",
+                    event = "endpoint_flush_failed",
+                    exporter = "atof",
+                    endpoint_index = self.index,
+                    transport = self.transport.as_str(),
+                    reason;
+                    "ATOF endpoint flush could not enter the bounded delivery queue"
+                );
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let (tx, rx) = std_mpsc::channel();
+        match sender.try_send(EndpointMessage::Close(tx)) {
+            Ok(()) => {
+                if rx.recv_timeout(self.timeout).is_err() {
+                    log::warn!(
+                        target: "nemo_relay.observability",
+                        event = "endpoint_close_failed",
+                        exporter = "atof",
+                        endpoint_index = self.index,
+                        transport = self.transport.as_str(),
+                        reason = "timeout";
+                        "ATOF endpoint close timed out"
+                    );
+                }
+            }
+            Err(error) => {
+                let reason = match &error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "queue_full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "worker_closed",
+                };
+                error.into_inner().acknowledge_if_control();
+                log::warn!(
+                    target: "nemo_relay.observability",
+                    event = "endpoint_close_failed",
+                    exporter = "atof",
+                    endpoint_index = self.index,
+                    transport = self.transport.as_str(),
+                    reason;
+                    "ATOF endpoint close could not enter the bounded delivery queue"
+                );
+            }
         }
     }
 }
@@ -721,7 +823,7 @@ fn start_endpoint_worker(index: usize, config: AtofEndpointConfig) -> Result<Ato
     let endpoint = validate_endpoint_config(config)?;
     let timeout = Duration::from_millis(endpoint.config.timeout_millis);
     let transport = endpoint.config.transport;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(ATOF_ENDPOINT_QUEUE_CAPACITY);
     std::thread::Builder::new()
         .name(format!("nemo-relay-atof-endpoint-{index}"))
         .spawn(move || run_endpoint_worker(index, endpoint, rx))
@@ -744,7 +846,7 @@ fn start_endpoint_worker(index: usize, config: AtofEndpointConfig) -> Result<Ato
         "Plugin resource access will be validated on first use"
     );
     Ok(AtofEndpointWorker {
-        sender: tx,
+        sender: Some(tx),
         timeout,
         index,
         transport,
@@ -824,7 +926,7 @@ fn resolved_header_map(
 fn run_endpoint_worker(
     index: usize,
     endpoint: ActivatedAtofEndpoint,
-    rx: tokio::sync::mpsc::UnboundedReceiver<EndpointMessage>,
+    rx: tokio::sync::mpsc::Receiver<EndpointMessage>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -856,7 +958,7 @@ fn run_endpoint_worker(
 async fn run_http_post_endpoint(
     index: usize,
     endpoint: ActivatedAtofEndpoint,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<EndpointMessage>,
+    mut rx: tokio::sync::mpsc::Receiver<EndpointMessage>,
 ) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(endpoint.config.timeout_millis))
@@ -932,7 +1034,7 @@ async fn run_http_post_endpoint(
 async fn run_websocket_endpoint(
     index: usize,
     endpoint: ActivatedAtofEndpoint,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<EndpointMessage>,
+    mut rx: tokio::sync::mpsc::Receiver<EndpointMessage>,
 ) {
     let mut pending = std::collections::VecDeque::new();
     let mut retry = WebSocketRetryState::default();
@@ -949,6 +1051,18 @@ async fn run_websocket_endpoint(
     while let Some(message) = rx.recv().await {
         match message {
             EndpointMessage::Event(raw_json) => {
+                if pending.len() >= ATOF_ENDPOINT_QUEUE_CAPACITY {
+                    log::warn!(
+                        target: "nemo_relay.observability",
+                        event = "endpoint_event_dropped",
+                        exporter = "atof",
+                        endpoint_index = index,
+                        transport = "websocket",
+                        reason = "pending_queue_full";
+                        "ATOF websocket event dropped because the retry backlog is full"
+                    );
+                    continue;
+                }
                 pending.push_back(endpoint_event_json(&endpoint.config, raw_json));
                 let _ = drain_websocket_pending(
                     index,
@@ -1149,7 +1263,7 @@ async fn connect_websocket(
 async fn run_ndjson_endpoint(
     index: usize,
     endpoint: ActivatedAtofEndpoint,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<EndpointMessage>,
+    mut rx: tokio::sync::mpsc::Receiver<EndpointMessage>,
 ) {
     let client = match build_ndjson_client(&endpoint) {
         Ok(client) => client,
@@ -1209,11 +1323,9 @@ fn build_ndjson_client(
 }
 
 #[cfg(feature = "atof-streaming")]
-fn ndjson_body_channel() -> (
-    tokio::sync::mpsc::UnboundedSender<NdjsonBodyMessage>,
-    reqwest::Body,
-) {
-    let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel::<NdjsonBodyMessage>();
+fn ndjson_body_channel() -> (tokio::sync::mpsc::Sender<NdjsonBodyMessage>, reqwest::Body) {
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<NdjsonBodyMessage>(ATOF_NDJSON_BODY_QUEUE_CAPACITY);
     let body_stream = stream::unfold(body_rx, |mut body_rx| async {
         loop {
             match body_rx.recv().await? {
@@ -1232,16 +1344,35 @@ fn ndjson_body_channel() -> (
 #[cfg(feature = "atof-streaming")]
 fn send_ndjson_event(
     index: usize,
-    body_tx: &tokio::sync::mpsc::UnboundedSender<NdjsonBodyMessage>,
+    body_tx: &tokio::sync::mpsc::Sender<NdjsonBodyMessage>,
     raw_json: String,
 ) {
-    if body_tx
-        .send(NdjsonBodyMessage::Event(
-            format!("{raw_json}\n").into_bytes(),
-        ))
-        .is_err()
-    {
+    if body_tx.capacity() <= ATOF_ENDPOINT_CONTROL_RESERVE {
         log::warn!(
+            target: "nemo_relay.observability",
+            event = "endpoint_event_dropped",
+            exporter = "atof",
+            endpoint_index = index,
+            transport = "ndjson",
+            reason = "body_priority_reserve";
+            "ATOF NDJSON event dropped to preserve control capacity"
+        );
+        return;
+    }
+    match body_tx.try_send(NdjsonBodyMessage::Event(
+        format!("{raw_json}\n").into_bytes(),
+    )) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => log::warn!(
+            target: "nemo_relay.observability",
+            event = "endpoint_event_dropped",
+            exporter = "atof",
+            endpoint_index = index,
+            transport = "ndjson",
+            reason = "body_queue_full";
+            "ATOF NDJSON event dropped because the bounded request-body queue is full"
+        ),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => log::warn!(
             target: "nemo_relay.observability",
             event = "endpoint_delivery_failed",
             exporter = "atof",
@@ -1249,27 +1380,31 @@ fn send_ndjson_event(
             transport = "ndjson",
             reason = "body_channel_closed";
             "ATOF endpoint delivery failed"
-        );
+        ),
     }
 }
 
 #[cfg(feature = "atof-streaming")]
 fn send_ndjson_flush(
     index: usize,
-    body_tx: &tokio::sync::mpsc::UnboundedSender<NdjsonBodyMessage>,
+    body_tx: &tokio::sync::mpsc::Sender<NdjsonBodyMessage>,
     done: std_mpsc::Sender<()>,
 ) {
-    if let Err(error) = body_tx.send(NdjsonBodyMessage::Flush(done)) {
+    if let Err(error) = body_tx.try_send(NdjsonBodyMessage::Flush(done)) {
+        let reason = match &error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => "body_queue_full",
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => "body_channel_closed",
+        };
         log::warn!(
             target: "nemo_relay.observability",
             event = "endpoint_flush_failed",
             exporter = "atof",
             endpoint_index = index,
             transport = "ndjson",
-            reason = "body_channel_closed";
+            reason;
             "ATOF endpoint flush failed"
         );
-        error.0.acknowledge_if_flush();
+        error.into_inner().acknowledge_if_flush();
     }
 }
 
@@ -1324,7 +1459,7 @@ async fn finish_ndjson_upload(
 }
 
 #[cfg(feature = "atof-streaming")]
-async fn drain_closed(mut rx: tokio::sync::mpsc::UnboundedReceiver<EndpointMessage>) {
+async fn drain_closed(mut rx: tokio::sync::mpsc::Receiver<EndpointMessage>) {
     while let Some(message) = rx.recv().await {
         match message {
             EndpointMessage::Flush(done) => {

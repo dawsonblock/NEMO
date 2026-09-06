@@ -55,27 +55,13 @@ pub(crate) fn current_cache_partition(config: &ResponseCacheConfig) -> KeyOutcom
         Ok(stack) => stack,
         Err(_) => return KeyOutcome::Bypass(CacheReason::IdentityUnavailable),
     };
-    let identity = stack
-        .scopes()
-        .iter()
-        .rev()
-        .filter_map(|scope| scope.metadata.as_ref())
-        .find_map(|metadata| {
-            metadata
-                .get("nemo_relay.identity")
-                .and_then(Json::as_object)
-                .or_else(|| {
-                    let object = metadata.as_object()?;
-                    object
-                        .contains_key("tenant_id")
-                        .then_some(object)
-                        .or_else(|| object.contains_key("principal_id").then_some(object))
-                        .or_else(|| object.contains_key("policy_epoch").then_some(object))
-                })
-        });
+    // Security-sensitive cache partitions must come from the immutable runtime
+    // identity installed by a trusted boundary. Ordinary scope metadata is
+    // application-controlled and is intentionally ignored here.
+    let identity = stack.runtime_identity();
     let policy_epoch = identity
-        .and_then(|identity| identity.get("policy_epoch"))
-        .cloned();
+        .as_ref()
+        .map(|identity| Json::from(identity.policy_epoch()));
     let partition = match config.share_scope {
         CacheShareScope::Session => json!({
             "scope": "session",
@@ -83,29 +69,23 @@ pub(crate) fn current_cache_partition(config: &ResponseCacheConfig) -> KeyOutcom
             "policy_epoch": policy_epoch,
         }),
         CacheShareScope::Principal => {
-            let Some(principal_id) = identity
-                .and_then(|identity| identity.get("principal_id"))
-                .filter(|value| !value.is_null())
-            else {
+            let Some(identity) = identity.as_ref() else {
                 return KeyOutcome::Bypass(CacheReason::IdentityUnavailable);
             };
             json!({
                 "scope": "principal",
-                "tenant_id": identity.and_then(|identity| identity.get("tenant_id")),
-                "principal_id": principal_id,
+                "tenant_id": identity.tenant_id(),
+                "principal_id": identity.principal_id(),
                 "policy_epoch": policy_epoch,
             })
         }
         CacheShareScope::Tenant => {
-            let Some(tenant_id) = identity
-                .and_then(|identity| identity.get("tenant_id"))
-                .filter(|value| !value.is_null())
-            else {
+            let Some(identity) = identity.as_ref() else {
                 return KeyOutcome::Bypass(CacheReason::IdentityUnavailable);
             };
             json!({
                 "scope": "tenant",
-                "tenant_id": tenant_id,
+                "tenant_id": identity.tenant_id(),
                 "policy_epoch": policy_epoch,
             })
         }

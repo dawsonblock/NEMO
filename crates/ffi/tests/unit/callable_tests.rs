@@ -682,7 +682,7 @@ fn assert_collector_and_finalizer_callbacks() {
     assert_eq!(COLLECTED_COUNT.load(Ordering::SeqCst), 1);
 
     let finalizer = wrap_finalizer_fn(finalizer_cb);
-    assert_eq!(finalizer(), json!({"done": true}));
+    assert_eq!(finalizer().unwrap(), json!({"done": true}));
 }
 
 fn assert_event_callbacks() {

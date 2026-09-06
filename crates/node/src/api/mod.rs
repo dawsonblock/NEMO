@@ -35,9 +35,9 @@ use nemo_relay::api::runtime::subscriber_dispatcher::{
     PublicationBuffer, capture_nested_publication_buffer, with_nested_publication_buffer,
 };
 use nemo_relay::api::runtime::{
-    EventMetadataInjectorFn, EventSanitizeFn, LlmExecutionNextFn, LlmJsonStream,
-    LlmStreamExecutionNextFn, LlmStreamInner, ScopeStackHandle as CoreScopeStackHandle,
-    ToolExecutionNextFn,
+    EventMetadataInjectorFn, EventSanitizeFn, IdentitySource, LlmExecutionNextFn, LlmJsonStream,
+    LlmStreamExecutionNextFn, LlmStreamInner, RuntimeIdentity,
+    ScopeStackHandle as CoreScopeStackHandle, ToolExecutionNextFn,
 };
 use nemo_relay::api::runtime::{
     TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
@@ -559,12 +559,13 @@ fn build_atof_config(
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(0);
 
-type StreamSender = tokio::sync::mpsc::UnboundedSender<FlowResult<Json>>;
+type StreamSender = tokio::sync::mpsc::Sender<FlowResult<Json>>;
 type RustJsonStream = LlmJsonStream;
 
 struct StreamChannel {
     sender: StreamSender,
     cancelled: AtomicBool,
+    cancellation: tokio::sync::watch::Sender<bool>,
     closed: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
 }
 
@@ -576,11 +577,13 @@ fn register_stream_channel(
     tx: StreamSender,
 ) -> tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>> {
     let (closed, closed_rx) = tokio::sync::watch::channel(None);
+    let (cancellation, _cancellation_rx) = tokio::sync::watch::channel(false);
     STREAM_CHANNELS.lock().unwrap().insert(
         id,
         Arc::new(StreamChannel {
             sender: tx,
             cancelled: AtomicBool::new(false),
+            cancellation,
             closed,
         }),
     );
@@ -589,6 +592,7 @@ fn register_stream_channel(
 
 fn finish_stream_channel(id: u64, result: std::result::Result<(), String>) {
     if let Some(channel) = STREAM_CHANNELS.lock().unwrap().remove(&id) {
+        channel.cancellation.send_replace(true);
         channel.closed.send_replace(Some(result));
     }
 }
@@ -596,6 +600,7 @@ fn finish_stream_channel(id: u64, result: std::result::Result<(), String>) {
 fn cancel_stream_channel(id: u64) {
     if let Some(channel) = STREAM_CHANNELS.lock().unwrap().get(&id) {
         channel.cancelled.store(true, Ordering::Release);
+        channel.cancellation.send_replace(true);
     }
 }
 
@@ -665,7 +670,7 @@ pub(crate) fn llm_stream_from_rust_stream(rust_stream: RustJsonStream) -> LlmStr
 }
 
 struct NodePushStream {
-    receiver: tokio_stream::wrappers::UnboundedReceiverStream<FlowResult<Json>>,
+    receiver: tokio_stream::wrappers::ReceiverStream<FlowResult<Json>>,
     stream_id: u64,
     closed: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
 }
@@ -710,9 +715,34 @@ impl LlmStreamInner for NodePushStream {
 pub fn push_stream_chunk(stream_id: f64, chunk: Json) -> bool {
     let id = stream_id as u64;
     if let Some(channel) = STREAM_CHANNELS.lock().unwrap().get(&id) {
-        !channel.cancelled.load(Ordering::Acquire) && channel.sender.send(Ok(chunk)).is_ok()
+        !channel.cancelled.load(Ordering::Acquire) && channel.sender.try_send(Ok(chunk)).is_ok()
     } else {
         false
+    }
+}
+
+/// Push a chunk while awaiting bounded bridge capacity.
+///
+/// The typed JavaScript stream adapter uses this function so a fast async
+/// generator applies backpressure instead of dropping chunks when the Rust
+/// consumer is temporarily slower. Cancellation also wakes a producer that is
+/// waiting for capacity.
+#[napi]
+pub async fn push_stream_chunk_wait(stream_id: f64, chunk: Json) -> bool {
+    let id = stream_id as u64;
+    let channel = STREAM_CHANNELS.lock().unwrap().get(&id).cloned();
+    let Some(channel) = channel else {
+        return false;
+    };
+    if channel.cancelled.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut cancellation = channel.cancellation.subscribe();
+    tokio::select! {
+        _ = cancellation.changed() => false,
+        result = channel.sender.send(Ok(chunk)) => {
+            result.is_ok() && !channel.cancelled.load(Ordering::Acquire)
+        }
     }
 }
 
@@ -2176,6 +2206,48 @@ pub fn create_scope_stack() -> ScopeStack {
     }
 }
 
+/// Install an immutable identity from a trusted authentication boundary.
+#[napi]
+pub fn install_runtime_identity(
+    stack: &ScopeStack,
+    tenant_id: String,
+    principal_id: String,
+    session_id: String,
+    policy_epoch: i64,
+    source: Option<String>,
+) -> napi::Result<()> {
+    let session_id = uuid::Uuid::parse_str(&session_id).map_err(|error| {
+        napi::Error::from_reason(format!("invalid runtime identity session_id: {error}"))
+    })?;
+    let source = match source.as_deref().unwrap_or("local_trusted") {
+        "local_trusted" => IdentitySource::LocalTrusted,
+        "oidc" => IdentitySource::Oidc,
+        "api_key" => IdentitySource::ApiKey,
+        "mutual_tls" => IdentitySource::MutualTls,
+        "worker_delegation" => IdentitySource::WorkerDelegation,
+        "system" => IdentitySource::System,
+        other => {
+            return Err(napi::Error::from_reason(format!(
+                "unknown runtime identity source: {other}"
+            )));
+        }
+    };
+    let policy_epoch = u64::try_from(policy_epoch)
+        .map_err(|_| napi::Error::from_reason("policy_epoch must be non-negative"))?;
+    stack
+        .inner
+        .write()
+        .map_err(|error| napi::Error::from_reason(format!("scope stack lock poisoned: {error}")))?
+        .install_runtime_identity(RuntimeIdentity::new(
+            tenant_id,
+            principal_id,
+            session_id,
+            policy_epoch,
+            source,
+        ))
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
+}
+
 /// Capture the current Relay causal parent for application-managed transport.
 #[napi]
 pub fn capture_propagation_context(env: Env) -> napi::Result<PropagationContext> {
@@ -3324,8 +3396,9 @@ pub fn llm_stream_call_execute(
 
     // Push-based stream bridge: JS iterates the async generator on the
     // event loop and pushes each chunk into Rust via `pushStreamChunk`.
-    // We create an unbounded channel here and pass the stream ID to JS
-    // so it knows where to send chunks.
+    // We create a bounded channel here and pass the stream ID to JS so it
+    // knows where to send chunks. The typed adapter uses the awaited push
+    // helper when it needs backpressure rather than dropping on a full queue.
     let func = std::sync::Arc::new(scoped_stream_callback_tsfn(&env, &func)?);
     let default_fn: LlmStreamExecutionNextFn = std::sync::Arc::new(move |req: LlmRequest| {
         let propagation_parent_uuid = match capture_propagation_context_handle() {
@@ -3333,7 +3406,7 @@ pub fn llm_stream_call_execute(
             Err(error) => return Box::pin(async move { Err(error) }),
         };
         let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(LLM_STREAM_BRIDGE_CAPACITY);
         let closed = register_stream_channel(stream_id, tx);
         let scope_stack = current_scope_stack_handle();
         let publication_buffer = capture_nested_publication_buffer();
@@ -3361,7 +3434,7 @@ pub fn llm_stream_call_execute(
             ensure_stream_callback_queued(stream_id, call_status)?;
 
             Ok(LlmJsonStream::from_closeable(NodePushStream {
-                receiver: tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                receiver: tokio_stream::wrappers::ReceiverStream::new(rx),
                 stream_id,
                 closed,
             }))

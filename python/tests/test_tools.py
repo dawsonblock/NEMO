@@ -124,7 +124,7 @@ class TestToolsAsync:
             await tools.execute(
                 "legacy_raw_result",
                 {},
-                lambda _args: {"legacy": True},  # ty: ignore[invalid-argument-type]
+                lambda _args: {"legacy": True},
             )
         assert "ToolExecutionResult(payload), not a raw dict" in str(error.value)
         assert "internal error" not in str(error.value)
@@ -939,7 +939,7 @@ class TestToolInterceptsAsync:
         intercepts.register_tool_execution(
             "py_exec_legacy",
             1,
-            lambda name, args, next: {"legacy_result": True},  # type: ignore[arg-type] # ty: ignore[invalid-argument-type]
+            lambda name, args, next: {"legacy_result": True},  # type: ignore[arg-type]
         )
         try:
             with pytest.raises(RuntimeError, match="must return ToolExecutionInterceptOutcome") as error:

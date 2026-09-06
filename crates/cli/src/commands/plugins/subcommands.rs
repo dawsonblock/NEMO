@@ -104,9 +104,14 @@ pub(crate) struct PluginsValidateCommand {
     /// Emit machine-readable JSON output.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Apply the secure runtime defaults used during activation.
-    #[arg(long)]
+    /// Validate using effective runtime policy. This is the default and is
+    /// retained for script compatibility.
+    #[arg(long, conflicts_with = "declared")]
     pub(crate) effective: bool,
+    /// Validate only the policy declared in configuration, without applying
+    /// secure runtime defaults.
+    #[arg(long, conflicts_with = "effective")]
+    pub(crate) declared: bool,
 }
 
 /// Args for `nemo-relay plugins list`.
@@ -193,7 +198,7 @@ impl PluginsValidateCommand {
         crate::plugins::PluginsValidateRequest {
             target: self.target,
             json: self.json,
-            effective: self.effective,
+            effective: self.effective || !self.declared,
         }
     }
 }

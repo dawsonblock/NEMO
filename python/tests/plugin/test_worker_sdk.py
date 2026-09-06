@@ -2505,7 +2505,7 @@ async def test_runtime_gate_operations_propagate_host_errors(host_stub: Recordin
         )
     with pytest.raises(TypeError, match="ConditionalMiddlewareGuardrailHandle"):
         await runtime.deregister_conditional_middleware_guardrail(
-            "gate-1"  # type: ignore[arg-type] # ty: ignore[invalid-argument-type]
+            "gate-1"  # type: ignore[arg-type]
         )
 
 

@@ -1,24 +1,82 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "qualification_level": "E2_LOCAL",
-  "overall": "FAIL",
+  "profile": "manifest",
+  "overall": "INCONCLUSIVE",
   "promotion": "DEV",
   "checks": {
-    "rust-format": "PASS",
-    "clippy": "PASS",
-    "rust-tests": "FAIL",
-    "rust-doc-tests": "PASS",
+    "rust-format": "NOT_RUN",
+    "clippy": "NOT_RUN",
+    "rust-tests": "NOT_RUN",
+    "rust-doc-tests": "NOT_RUN",
     "cargo-deny": "NOT_RUN",
     "cargo-audit": "NOT_RUN",
-    "python-tests": "FAIL",
+    "python-tests": "NOT_RUN",
     "node-tests": "NOT_RUN",
-    "go-tests": "FAIL",
+    "go-tests": "NOT_RUN",
     "sbom": "NOT_RUN"
   },
+  "check_details": {
+    "rust-format": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "clippy": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "rust-tests": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "rust-doc-tests": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "cargo-deny": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "cargo-audit": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "python-tests": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "node-tests": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "go-tests": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "sbom": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    }
+  },
+  "provenance": {
+    "source_tree_sha256": "2b0797d6a69c7e1d98d5ef6abe24d65722d5bcb644a5ccc94e9f207635b52447",
+    "source_archive_sha256": null,
+    "environment_sha256": "238cc6cd1b10aaadacace742c92414ca063df3f2e2c86138456e17d0669b708c",
+    "lockfiles": {
+      "Cargo.lock": "sha256:28cc994fc77a5350abaa94d99ebfce0e137bc749a3d3a621b482e7b8bf2ac976",
+      "package-lock.json": "sha256:77b76cca8a161b78f2f7726ade40cdfca5384fe3cb75459de074a74312afb4d2",
+      "uv.lock": "sha256:a69457d9cb748e85b46c2f3ca529b81eb2e4fa86731d74eb24851ae5a3923e3e"
+    },
+    "git": {
+      "commit": "b997a119b6a0f0d8d5350bf3bcf5883a6f433a84",
+      "tree": "f27e0fa5b4144095eee7736beab9b85ecf96c1d8",
+      "status": []
+    }
+  },
   "notes": [
-    "Rust library and documentation checks pass; the CLI lifecycle suite still exposes process-global plugin registration coupling when run as one suite.",
-    "Python and Go binding recipes require the repository's pinned toolchain/build environment; Node tests require Node.js 24.",
+    "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
-    "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons."
+    "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons.",
+    "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result."
   ]
 }

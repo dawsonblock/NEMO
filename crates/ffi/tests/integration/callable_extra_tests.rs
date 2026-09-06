@@ -159,6 +159,14 @@ unsafe extern "C" fn finalizer_null_cb() -> *mut c_char {
     ptr::null_mut()
 }
 
+unsafe extern "C" fn finalizer_json_null_cb() -> *mut c_char {
+    CString::new("null").unwrap().into_raw()
+}
+
+unsafe extern "C" fn finalizer_invalid_json_cb() -> *mut c_char {
+    CString::new("not-json").unwrap().into_raw()
+}
+
 fn make_request() -> LlmRequest {
     LlmRequest {
         headers: serde_json::Map::new(),
@@ -236,7 +244,23 @@ fn test_callable_extra_trampoline_and_helper_paths() {
     assert!(stream_err.to_string().contains("stream next failed"));
 
     let finalizer = wrap_finalizer_fn(finalizer_null_cb);
-    assert_eq!(finalizer(), Json::Null);
+    assert!(
+        finalizer()
+            .unwrap_err()
+            .to_string()
+            .contains("finalizer returned null")
+    );
+
+    let finalizer = wrap_finalizer_fn(finalizer_json_null_cb);
+    assert_eq!(finalizer().unwrap(), Json::Null);
+
+    let finalizer = wrap_finalizer_fn(finalizer_invalid_json_cb);
+    assert!(
+        finalizer()
+            .unwrap_err()
+            .to_string()
+            .contains("finalizer returned invalid JSON")
+    );
 }
 
 #[test]

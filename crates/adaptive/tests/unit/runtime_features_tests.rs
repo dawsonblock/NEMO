@@ -694,7 +694,7 @@ async fn adaptive_runtime_register_survives_hot_cache_seed_failures() {
         ..AdaptiveConfig::default()
     };
     let report = validate_config(&config);
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
     let mut runtime = AdaptiveRuntime {
         config,
         report,
@@ -1493,7 +1493,7 @@ fn queue_completed_agent_run(runtime: &mut AdaptiveRuntime) {
     let tx = runtime.event_tx.as_ref().unwrap().clone();
     for event in events {
         runtime.pending_events.fetch_add(1, Ordering::SeqCst);
-        tx.send(event).unwrap();
+        tx.try_send(event).unwrap();
     }
     drop(tx);
 }

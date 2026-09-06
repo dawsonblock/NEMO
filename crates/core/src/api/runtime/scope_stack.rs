@@ -22,6 +22,82 @@ use crate::context::registries::ScopeLocalRegistries;
 use crate::error::{FlowError, Result};
 use crate::registry::{RegistryEntry, SortedRegistry};
 
+/// Provenance for a runtime identity established at a trusted boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentitySource {
+    /// A local process boundary that the host explicitly trusts.
+    LocalTrusted,
+    /// An OpenID Connect or equivalent issuer assertion.
+    Oidc,
+    /// An API-key authenticated request.
+    ApiKey,
+    /// A mutually authenticated TLS connection.
+    MutualTls,
+    /// A delegated worker identity.
+    WorkerDelegation,
+    /// A Relay-owned system identity.
+    System,
+}
+
+/// Immutable identity context for security-sensitive runtime decisions.
+///
+/// Scope metadata is deliberately not part of this type. Callers should
+/// construct an identity only after authenticating a request at a trusted
+/// boundary, then install it on a [`ScopeStack`] before starting work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeIdentity {
+    tenant_id: String,
+    principal_id: String,
+    session_id: Uuid,
+    policy_epoch: u64,
+    source: IdentitySource,
+}
+
+impl RuntimeIdentity {
+    /// Create an identity from a trusted authentication boundary.
+    pub fn new(
+        tenant_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        session_id: Uuid,
+        policy_epoch: u64,
+        source: IdentitySource,
+    ) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            principal_id: principal_id.into(),
+            session_id,
+            policy_epoch,
+            source,
+        }
+    }
+
+    /// Stable tenant identifier used for tenant-scoped sharing.
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    /// Stable principal identifier used for principal-scoped sharing.
+    pub fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    /// Session identifier supplied by the trusted boundary.
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// Policy epoch that partitions security-sensitive cached results.
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+
+    /// Authentication provenance for this identity.
+    pub fn source(&self) -> &IdentitySource {
+        &self.source
+    }
+}
+
 /// Mutable stack of active scopes plus their scope-local registries.
 ///
 /// The stack always contains an implicit root agent scope. It owns freshness
@@ -31,6 +107,7 @@ use crate::registry::{RegistryEntry, SortedRegistry};
 /// removed when those spans close.
 pub struct ScopeStack {
     stack: Vec<ScopeHandle>,
+    runtime_identity: Option<Arc<RuntimeIdentity>>,
     scope_registries: HashMap<Uuid, ScopeLocalRegistries>,
     fresh_agents: HashSet<Uuid>,
     propagated_parent_uuid: Option<Uuid>,
@@ -119,6 +196,7 @@ impl ScopeStack {
     fn snapshot(&self) -> Self {
         Self {
             stack: self.stack.clone(),
+            runtime_identity: self.runtime_identity.clone(),
             scope_registries: self.scope_registries.clone(),
             fresh_agents: self.fresh_agents.clone(),
             propagated_parent_uuid: self.propagated_parent_uuid,
@@ -140,6 +218,7 @@ impl ScopeStack {
         let root_uuid = root.uuid;
         Self {
             stack: vec![root],
+            runtime_identity: None,
             scope_registries: HashMap::new(),
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: None,
@@ -183,6 +262,7 @@ impl ScopeStack {
         }
         Ok(Self {
             stack,
+            runtime_identity: None,
             scope_registries: HashMap::new(),
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: context.root_uuid.map(|_| context.parent_uuid),
@@ -200,6 +280,38 @@ impl ScopeStack {
             self.fresh_agents.insert(handle.uuid);
         }
         self.stack.push(handle);
+    }
+
+    /// Install the immutable identity for this local runtime stack.
+    ///
+    /// Identity can only be installed once. A replacement would make cache
+    /// and authority decisions depend on mutable request state, so callers
+    /// must create a new stack for a new authenticated session.
+    pub fn install_runtime_identity(&mut self, identity: RuntimeIdentity) -> Result<()> {
+        if self.runtime_identity.is_some() {
+            return Err(FlowError::InvalidArgument(
+                "runtime identity is immutable once installed".into(),
+            ));
+        }
+        if identity.tenant_id.trim().is_empty()
+            || identity.principal_id.trim().is_empty()
+            || identity.session_id.is_nil()
+        {
+            return Err(FlowError::InvalidArgument(
+                "runtime identity requires non-empty tenant/principal IDs and a session ID".into(),
+            ));
+        }
+        self.runtime_identity = Some(Arc::new(identity));
+        Ok(())
+    }
+
+    /// Return the trusted identity installed on this stack, if any.
+    pub fn runtime_identity(&self) -> Option<Arc<RuntimeIdentity>> {
+        self.runtime_identity.clone()
+    }
+
+    pub(crate) fn inherit_runtime_identity(&mut self, identity: Option<Arc<RuntimeIdentity>>) {
+        self.runtime_identity = identity;
     }
 
     /// Return the current top-most scope handle.
@@ -512,7 +624,16 @@ pub fn create_scope_stack_from_propagation(
 /// ```
 pub fn fork_scope_stack() -> Result<ScopeStackHandle> {
     let context = capture_propagation_context()?;
-    create_scope_stack_from_propagation(&context)
+    let parent_identity = current_scope_stack()
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?
+        .runtime_identity();
+    let child = create_scope_stack_from_propagation(&context)?;
+    child
+        .write()
+        .map_err(|error| FlowError::Internal(error.to_string()))?
+        .inherit_runtime_identity(parent_identity);
+    Ok(child)
 }
 
 /// Capture the current causal parent and its Relay root when available.

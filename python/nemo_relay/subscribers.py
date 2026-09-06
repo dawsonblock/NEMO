@@ -39,9 +39,6 @@ from nemo_relay._native import (
     register_subscriber as _native_register,
 )
 from nemo_relay._native import (
-    subscriber_dispatcher_metrics as _native_metrics,
-)
-from nemo_relay._native import (
     subscriber_dispatcher_after_fork_child as _native_after_fork_child,
 )
 from nemo_relay._native import (
@@ -49,6 +46,9 @@ from nemo_relay._native import (
 )
 from nemo_relay._native import (
     subscriber_dispatcher_before_fork as _native_before_fork,
+)
+from nemo_relay._native import (
+    subscriber_dispatcher_metrics as _native_metrics,
 )
 
 if TYPE_CHECKING:

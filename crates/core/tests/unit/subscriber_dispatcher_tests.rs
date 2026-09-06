@@ -32,6 +32,35 @@ fn dispatcher_metrics_use_stable_relay_metric_names() {
 }
 
 #[test]
+fn nested_publication_buffer_has_a_hard_low_priority_cap() {
+    let buffer = super::native::PublicationBuffer::enabled();
+    let message = || super::native::DispatcherMessage::Deliver {
+        event: Box::new(Event::Mark(MarkEvent::new(
+            BaseEvent::builder().name("nested").build(),
+            None,
+            None,
+        ))),
+        transform: None,
+        injectors: Vec::new(),
+        sanitizers: Vec::new(),
+        subscribers: Vec::new(),
+        scope_stack: current_scope_stack(),
+        publication_context: None,
+        lineage: None,
+        completion: None,
+    };
+    for _ in
+        0..super::MAX_NESTED_PUBLICATIONS.saturating_sub(super::NESTED_PUBLICATION_PRIORITY_RESERVE)
+    {
+        assert!(buffer.push(message()).is_ok());
+    }
+    assert!(matches!(
+        buffer.push(message()),
+        Err(super::native::PublicationBufferPushError::Full(_))
+    ));
+}
+
+#[test]
 fn publication_context_and_completed_delivery_restore_the_calling_thread() {
     assert!(publication_context::<String>().is_none());
     let observed = with_publication_context(Some(Arc::new("binding".to_string())), || {

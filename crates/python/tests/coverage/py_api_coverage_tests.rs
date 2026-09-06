@@ -416,6 +416,9 @@ async def llm_stream_intercept(request, next):
 def collector(chunk):
     chunks.append(chunk["delta"])
 
+def discard_collector(chunk):
+    return None
+
 def finalizer():
     return {
         "id": "chatcmpl-stream",
@@ -426,6 +429,9 @@ def finalizer():
         }],
         "chunks": list(chunks)
     }
+
+def finalizer_fail():
+    raise RuntimeError("finalizer boom")
 
 async def await_value(awaitable):
     return await awaitable
@@ -844,6 +850,30 @@ async def run_stream(api, request, func, collector, finalizer, handle, attribute
                     crate::convert::py_to_json(&stream_items).unwrap(),
                     json!([{"delta": 11}, {"delta": 12}])
                 );
+
+                let error = event_loop
+                    .call_method1(
+                        "run_until_complete",
+                        (runner
+                            .getattr("run_stream")
+                            .unwrap()
+                            .call1((
+                                api_module.clone(),
+                                llm_request.clone(),
+                                helpers.getattr("llm_stream_exec").unwrap(),
+                                helpers.getattr("discard_collector").unwrap(),
+                                helpers.getattr("finalizer_fail").unwrap(),
+                                child.clone(),
+                                PyLLMAttributes {
+                                    inner: nemo_relay::api::llm::LlmAttributes::STREAMING,
+                                },
+                                None::<Py<PyAny>>,
+                                None::<Py<PyAny>>,
+                            ))
+                            .unwrap(),),
+                    )
+                    .unwrap_err();
+                assert!(error.to_string().contains("finalizer boom"));
             });
             assert!(
                 deregister_tool_conditional_execution_guardrail(&async_sync_rejection_name)

@@ -1106,6 +1106,16 @@ class ScopeStack:
     def __repr__(self) -> str:
         """Return a debug representation of the native scope stack."""
         ...
+    def install_runtime_identity(
+        self,
+        tenant_id: str,
+        principal_id: str,
+        session_id: str,
+        policy_epoch: int,
+        source: str = ...,
+    ) -> None:
+        """Install an immutable identity from a trusted authentication boundary."""
+        ...
 
 class LlmStream:
     """An async iterator of JSON chunks from a streaming LLM response.
@@ -2309,6 +2319,10 @@ def flush_subscribers() -> None:
     guardrails, and request or execution intercepts. The public Python wrapper
     handles the limited queued tool/LLM observability-sanitizer exception.
     """
+    ...
+
+def subscriber_dispatcher_metrics() -> dict[str, int]:
+    """Return a point-in-time snapshot of bounded subscriber queue health."""
     ...
 
 def subscriber_dispatcher_before_fork() -> None:
