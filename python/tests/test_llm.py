@@ -1505,7 +1505,7 @@ class TestLLMStreaming:
         assert isinstance(metadata, dict)
         assert metadata["exception.type"] == "TypeError"
 
-    async def test_stream_execute_finalizer_failure_records_null_output(self):
+    async def test_stream_execute_finalizer_conversion_failure_propagates(self):
         events = []
         subscribers.register("py_llm_finalizer_fail_sub", lambda event: events.append(event))
 
@@ -1524,8 +1524,9 @@ class TestLLMStreaming:
                 lambda: object(),
             )
             chunks = []
-            async for chunk in stream:
-                chunks.append(chunk)
+            with pytest.raises(RuntimeError, match="Failed to convert to JSON"):
+                async for chunk in stream:
+                    chunks.append(chunk)
             assert chunks == [{"token": "hello"}]
         finally:
             try:
@@ -1535,8 +1536,9 @@ class TestLLMStreaming:
 
         end = _llm_event(events, "stream_finalizer_fail_llm", "end")
         assert end.data is None
+        assert end.metadata["exception.type"] == "ValueError"
 
-    async def test_stream_execute_finalizer_callable_error_records_null_output(self):
+    async def test_stream_execute_finalizer_callable_error_propagates(self):
         events = []
         subscribers.register("py_llm_finalizer_callable_fail_sub", lambda event: events.append(event))
 
@@ -1555,8 +1557,9 @@ class TestLLMStreaming:
                 lambda: raise_runtime_error("finalizer boom"),
             )
             chunks = []
-            async for chunk in stream:
-                chunks.append(chunk)
+            with pytest.raises(RuntimeError, match="finalizer boom"):
+                async for chunk in stream:
+                    chunks.append(chunk)
             assert chunks == [{"token": "hello"}]
         finally:
             try:
@@ -1566,6 +1569,7 @@ class TestLLMStreaming:
 
         end = _llm_event(events, "stream_finalizer_callable_fail_llm", "end")
         assert end.data is None
+        assert end.metadata["exception.type"] == "RuntimeError"
 
     async def test_subscriber_exception_does_not_break_streaming(self):
         seen = []

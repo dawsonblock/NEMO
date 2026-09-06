@@ -1,1 +1,132 @@
-qualification checks intentionally skipped in manifest-only mode
+warning[duplicate]: found 2 duplicate entries for crate 'rand'
+    ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/Cargo.lock:254:1
+    │  
+254 │ ╭ rand 0.9.4 registry+https://github.com/rust-lang/crates.io-index
+255 │ │ rand 0.10.1 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rand v0.9.4
+      ├── opentelemetry_sdk v0.32.1
+      │   ├── (dev) nemo-relay v0.9.1-rc.2
+      │   │   ├── nemo-relay-adaptive v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-cli v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-ffi v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-node v0.9.1-rc.2
+      │   │   │   └── nemo-relay-python v0.9.1-rc.2
+      │   │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+      │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+      │   │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+      │   │   ├── (dev) nemo-relay-pii-redaction v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+      │   │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+      │   │   │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+      │   │   │   └── nemo-relay-python v0.9.1-rc.2 (*)
+      │   │   └── nemo-relay-python v0.9.1-rc.2 (*)
+      │   ├── (dev) nemo-relay-cli v0.9.1-rc.2 (*)
+      │   ├── (dev) nemo-relay-pii-redaction v0.9.1-rc.2 (*)
+      │   ├── opentelemetry-otlp v0.32.0
+      │   │   └── nemo-relay v0.9.1-rc.2 (*)
+      │   └── opentelemetry-proto v0.32.0
+      │       ├── (dev) nemo-relay v0.9.1-rc.2 (*)
+      │       ├── (dev) nemo-relay-pii-redaction v0.9.1-rc.2 (*)
+      │       └── opentelemetry-otlp v0.32.0 (*)
+      └── tungstenite v0.27.0
+          └── tokio-tungstenite v0.27.0
+              ├── nemo-relay v0.9.1-rc.2 (*)
+              └── nemo-relay-cli v0.9.1-rc.2 (*)
+    ├ rand v0.10.1
+      └── object_store v0.14.1
+          └── nemo-relay v0.9.1-rc.2
+              ├── nemo-relay-adaptive v0.9.1-rc.2
+              │   ├── nemo-relay-cli v0.9.1-rc.2
+              │   ├── nemo-relay-ffi v0.9.1-rc.2
+              │   ├── nemo-relay-node v0.9.1-rc.2
+              │   └── nemo-relay-python v0.9.1-rc.2
+              ├── nemo-relay-cli v0.9.1-rc.2 (*)
+              ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+              ├── nemo-relay-node v0.9.1-rc.2 (*)
+              ├── (dev) nemo-relay-pii-redaction v0.9.1-rc.2
+              │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+              │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+              │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+              │   └── nemo-relay-python v0.9.1-rc.2 (*)
+              └── nemo-relay-python v0.9.1-rc.2 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'winnow'
+    ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/Cargo.lock:416:1
+    │  
+416 │ ╭ winnow 0.7.15 registry+https://github.com/rust-lang/crates.io-index
+417 │ │ winnow 1.0.3 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ winnow v0.7.15
+      ├── toml v0.9.12+spec-1.1.0
+      │   ├── cbindgen v0.29.2
+      │   │   └── (build) nemo-relay-ffi v0.9.1-rc.2
+      │   ├── nemo-relay v0.9.1-rc.2
+      │   │   ├── nemo-relay-adaptive v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-cli v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+      │   │   │   ├── nemo-relay-node v0.9.1-rc.2
+      │   │   │   └── nemo-relay-python v0.9.1-rc.2
+      │   │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+      │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+      │   │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+      │   │   ├── (dev) nemo-relay-pii-redaction v0.9.1-rc.2
+      │   │   │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+      │   │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+      │   │   │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+      │   │   │   └── nemo-relay-python v0.9.1-rc.2 (*)
+      │   │   └── nemo-relay-python v0.9.1-rc.2 (*)
+      │   └── nemo-relay-cli v0.9.1-rc.2 (*)
+      └── toml_edit v0.23.10+spec-1.0.0
+          └── nemo-relay-cli v0.9.1-rc.2 (*)
+    ├ winnow v1.0.3
+      └── toml_parser v1.1.2+spec-1.1.0
+          ├── toml v0.9.12+spec-1.1.0
+          │   ├── cbindgen v0.29.2
+          │   │   └── (build) nemo-relay-ffi v0.9.1-rc.2
+          │   ├── nemo-relay v0.9.1-rc.2
+          │   │   ├── nemo-relay-adaptive v0.9.1-rc.2
+          │   │   │   ├── nemo-relay-cli v0.9.1-rc.2
+          │   │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+          │   │   │   ├── nemo-relay-node v0.9.1-rc.2
+          │   │   │   └── nemo-relay-python v0.9.1-rc.2
+          │   │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+          │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+          │   │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+          │   │   ├── (dev) nemo-relay-pii-redaction v0.9.1-rc.2
+          │   │   │   ├── nemo-relay-cli v0.9.1-rc.2 (*)
+          │   │   │   ├── nemo-relay-ffi v0.9.1-rc.2 (*)
+          │   │   │   ├── nemo-relay-node v0.9.1-rc.2 (*)
+          │   │   │   └── nemo-relay-python v0.9.1-rc.2 (*)
+          │   │   └── nemo-relay-python v0.9.1-rc.2 (*)
+          │   └── nemo-relay-cli v0.9.1-rc.2 (*)
+          └── toml_edit v0.23.10+spec-1.0.0
+              └── nemo-relay-cli v0.9.1-rc.2 (*)
+
+warning[unmatched-skip]: skipped crate 'getrandom = =0.4.2' was not encountered
+   ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/deny.toml:12:16
+   │
+12 │     { crate = "getrandom@0.4.2", reason = "build-only duplicate internal to cbindgen's tempfile stack" },
+   │                ━━━━━━━━━━━━━━━             ────────────────────────────────────────────────────────── reason
+   │                │                            
+   │                unmatched skip configuration
+
+warning[unmatched-skip]: skipped crate 'rand = =0.9.3' was not encountered
+   ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/deny.toml:18:16
+   │
+18 │     { crate = "rand@0.9.3", reason = "required by OpenTelemetry and tungstenite alongside object_store's rand 0.10" },
+   │                ━━━━━━━━━━             ──────────────────────────────────────────────────────────────────────────── reason
+   │                │                       
+   │                unmatched skip configuration
+
+warning[unmatched-skip]: skipped crate 'winnow = =1.0.1' was not encountered
+   ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/deny.toml:25:16
+   │
+25 │     { crate = "winnow@1.0.1", reason = "build-only duplicate internal to cbindgen's TOML parser stack" },
+   │                ━━━━━━━━━━━━             ───────────────────────────────────────────────────────────── reason
+   │                │                         
+   │                unmatched skip configuration
+
+advisories ok, bans ok, licenses ok, sources ok

@@ -245,7 +245,12 @@ async def flush_async() -> None:
 
 
 def metrics() -> dict[str, int]:
-    """Return bounded event-dispatch queue depth and cumulative health counters."""
+    """Return bounded event-dispatch queue depth and cumulative health counters.
+
+    Returns:
+        A snapshot containing queue depth, capacity, high-watermark, enqueue,
+        drop, and backpressure counters.
+    """
     return _native_metrics()
 
 

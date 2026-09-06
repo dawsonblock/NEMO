@@ -1,1 +1,1 @@
-qualification checks intentionally skipped in manifest-only mode
+quick profile excludes Python binding tests
