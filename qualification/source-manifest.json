@@ -1293,23 +1293,8 @@
     "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
   },
   "git": {
-    "commit": "a2e6d500c3b724b38fde6cf8e8c9c037f97b4faa",
-    "tree": "d83711df7978c09ce24d52517e0402805f94361a",
-    "status": [
-      " M qualification/cargo-deny.txt",
-      " M qualification/clippy.txt",
-      " M qualification/environment-lock.json",
-      " M qualification/environment-sha256.txt",
-      " M qualification/environment.json",
-      " M qualification/git-revision.txt",
-      " M qualification/provenance.json",
-      " M qualification/qualification.json",
-      " M qualification/release-archive.sha256",
-      " M qualification/rust-doc-tests.txt",
-      " M qualification/rust-tests.txt",
-      " M qualification/sbom.spdx.json",
-      " M qualification/source-manifest.json",
-      " M qualification/source-tree.sha256"
-    ]
+    "commit": "509701bc73b87dc35d872a85420c5e602fdb6b4e",
+    "tree": "7b7264dc77dbfc1f834bc70aa2a83f3cb89aec25",
+    "status": []
   }
 }
