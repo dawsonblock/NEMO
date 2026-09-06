@@ -1002,6 +1002,9 @@ async fn initialize_plugin_host(
             .transpose()
             .map_err(|error| CliError::Config(format!("invalid plugin config: {error}")))?
             .unwrap_or_default();
+        ensure_builtin_plugins_registered().map_err(|error| {
+            CliError::Config(format!("built-in plugin initialization failed: {error}"))
+        })?;
         if let Some(error) = register_and_validate_plugin_components(&plugin_config)
             .into_iter()
             .next()
@@ -1045,18 +1048,18 @@ impl PluginActivation {
                 .map_err(|error| CliError::Config(format!("invalid plugin config: {error}")))?,
             None => PluginConfig::default(),
         };
-        if let Some(error) = register_and_validate_plugin_components(&plugin_config)
-            .into_iter()
-            .next()
-        {
-            return Err(CliError::Config(error.to_string()));
-        }
         // Reserve and register Relay's built-in plugin kinds before loading
         // untrusted dynamic plugin code. This keeps the CLI activation path
         // consistent with the runtime-owned dynamic plugin host.
         ensure_builtin_plugins_registered().map_err(|error| {
             CliError::Config(format!("built-in plugin initialization failed: {error}"))
         })?;
+        if let Some(error) = register_and_validate_plugin_components(&plugin_config)
+            .into_iter()
+            .next()
+        {
+            return Err(CliError::Config(error.to_string()));
+        }
         let static_plugin_config = plugin_config.clone();
         plugin_config
             .components
