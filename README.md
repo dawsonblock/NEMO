@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 **Observable execution boundaries for AI agents.**
 
 [![License](https://img.shields.io/github/license/dawsonblock/NEMO)](LICENSE)
-[![Development line](https://img.shields.io/badge/development-0.9.1--rc.1-blue)](RELEASING.md)
+[![Development line](https://img.shields.io/badge/development-0.9.1--rc.2-blue)](RELEASING.md)
 [![Rust](https://img.shields.io/badge/Rust-1.96.1-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -18,7 +18,7 @@ LLMs, tools, agents, and plugins. It gives those calls one consistent model for
 scope lineage, middleware, lifecycle events, callbacks, and observability while
 leaving orchestration and provider ownership in the application.
 
-> **Status:** This checkout is a hardened `0.9.1-rc.1` development line. The
+> **Status:** This checkout is a hardened `0.9.1-rc.2` development line. The
 > checked-in qualification snapshot is provenance-bound but `INCONCLUSIVE`/`DEV`;
 > it is not a production or release certificate. See
 > [Qualification](#qualification) before promoting a build.
@@ -90,7 +90,7 @@ uv add "nemo-relay[langchain,langgraph,deepagents]"
 Node.js 24 or newer is required.
 
 ```bash
-npm install nemo-relay-node@0.9.1-rc.1
+npm install nemo-relay-node@0.9.1-rc.2
 ```
 
 ### Rust
@@ -290,12 +290,26 @@ running checks on a host that lacks the full toolchain. Use
 `scripts/qualification/run.sh provenance` when refreshing only the
 source/environment binding while preserving existing check logs.
 
+To produce a reproducible source archive for a candidate, use the release
+packager, then bind the archive digest into the qualification record:
+
+```bash
+python3 scripts/qualification/package_release.py
+NEMO_RELAY_RELEASE_ARCHIVE=release/artifacts/NEMO-0.9.1-rc.2-source.zip \
+  scripts/qualification/run.sh provenance
+```
+
+The resulting ZIP uses sorted paths, normalized timestamps and permissions,
+and a sidecar source/archive manifest. It is a source candidate artifact, not
+a production release certificate.
+
 ## Documentation and contribution
 
 - [Documentation](https://docs.nvidia.com/nemo/relay)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Release process](RELEASING.md)
+- [Fork provenance](FORK_PROVENANCE.md)
 - [Local hardening notes](docs/reference/hardening.mdx)
 
 Please open an issue before submitting an external contribution. Keep public

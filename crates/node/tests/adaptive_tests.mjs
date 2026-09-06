@@ -464,6 +464,13 @@ describe('adaptive helpers', () => {
       keyStrategy: adaptive.ResponseCacheKeyStrategy.ExactRequest,
       headerAllowlist: [],
       backend: adaptive.inMemoryBackend(),
+      singleFlight: {
+        maxActiveKeys: 4096,
+        maxWaitersPerKey: 256,
+        maxGlobalProviderConcurrency: 512,
+        maxProviderConcurrency: 128,
+        maxModelConcurrency: 64,
+      },
     });
     assert.deepEqual(adaptive.ComponentSpec({ version: 1, responseCache }).config, {
       version: 1,
@@ -476,6 +483,13 @@ describe('adaptive helpers', () => {
         key_strategy: 'exact_request',
         header_allowlist: [],
         backend: adaptive.inMemoryBackend(),
+        singleflight: {
+          max_active_keys: 4096,
+          max_waiters_per_key: 256,
+          max_global_provider_concurrency: 512,
+          max_provider_concurrency: 128,
+          max_model_concurrency: 64,
+        },
       },
     });
   });
@@ -526,5 +540,16 @@ describe('adaptive helpers', () => {
     };
     assert.equal(adaptive.validateConfig(config).diagnostics[0].code, 'response_cache.invalid_ttl');
     assert.throws(() => new adaptive.AdaptiveRuntime(config), /ttl_seconds must be greater than 0/);
+
+    const bounded = adaptive.ComponentSpec({
+      version: 1,
+      responseCache: { namespace: 'node-bounded', singleFlight: { maxActiveKeys: 2 } },
+    });
+    assert.deepEqual(bounded.config.response_cache.singleflight, { max_active_keys: 2 });
+    const invalid = adaptive.validateConfig({
+      version: 1,
+      responseCache: { namespace: 'node-bounded', singleFlight: { maxActiveKeys: 0 } },
+    });
+    assert.ok(invalid.diagnostics.some(({ code }) => code === 'response_cache.invalid_singleflight_limit'));
   });
 });

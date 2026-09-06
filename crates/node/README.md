@@ -63,7 +63,7 @@ The Node.js package provides the following capabilities:
 Install the npm package in a Node.js 24 or newer project:
 
 ```bash
-npm install nemo-relay-node@0.9.1-rc.1
+npm install nemo-relay-node@0.9.1-rc.2
 ```
 
 ## Getting Started

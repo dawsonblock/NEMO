@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-plugin"
-version = "0.9.1-rc.1"
+version = "0.9.1-rc.2"
 dependencies = [
  "futures",
  "nemo-relay-types",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-types"
-version = "0.9.1-rc.1"
+version = "0.9.1-rc.2"
 dependencies = [
  "bitflags",
  "chrono",

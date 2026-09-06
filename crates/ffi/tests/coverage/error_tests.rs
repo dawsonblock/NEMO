@@ -67,6 +67,13 @@ fn test_status_from_error_maps_variants_and_sets_message() {
             NemoRelayStatus::GuardrailRejected,
         ),
         (
+            FlowError::ResourceExhausted {
+                resource: "singleflight.active_keys",
+                limit: 1,
+            },
+            NemoRelayStatus::ResourceExhausted,
+        ),
+        (
             FlowError::Internal("boom".into()),
             NemoRelayStatus::Internal,
         ),
@@ -122,6 +129,14 @@ fn test_status_from_plugin_error_maps_variants_and_sets_message() {
             PluginError::RegistrationFailed("register failed".into()),
             NemoRelayStatus::Internal,
             "register failed",
+        ),
+        (
+            PluginError::ResourceExhausted {
+                resource: "plugin.mutation_queue",
+                limit: 256,
+            },
+            NemoRelayStatus::ResourceExhausted,
+            "plugin.mutation_queue",
         ),
     ];
 

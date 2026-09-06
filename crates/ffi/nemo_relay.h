@@ -55,6 +55,10 @@ enum NemoRelayStatus {
    * A function argument had an invalid value (e.g. malformed UUID).
    */
   NEMO_RELAY_STATUS_INVALID_ARG = 9,
+  /**
+   * A bounded runtime resource has reached its configured capacity.
+   */
+  NEMO_RELAY_STATUS_RESOURCE_EXHAUSTED = 10,
 };
 typedef int32_t NemoRelayStatus;
 

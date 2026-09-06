@@ -1508,12 +1508,12 @@ test = [
 
 [[package]]
 name = "nemo-relay-cli-bin"
-version = "0.9.1rc1"
+version = "0.9.1rc2"
 source = { directory = "python/cli-bin" }
 
 [[package]]
 name = "nemo-relay-plugin"
-version = "0.9.1rc1"
+version = "0.9.1rc2"
 source = { editable = "python/plugin" }
 dependencies = [
     { name = "grpcio" },

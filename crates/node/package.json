@@ -1,6 +1,6 @@
 {
   "name": "nemo-relay-node",
-  "version": "0.9.1-rc.1",
+  "version": "0.9.1-rc.2",
   "description": "Node.js bindings for the NeMo Relay agent runtime.",
   "keywords": [
     "agents",

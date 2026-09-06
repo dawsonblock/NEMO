@@ -23,7 +23,7 @@ pub(crate) mod singleflight;
 pub mod store;
 pub(crate) mod tool;
 
-pub use crate::config::ResponseCacheConfig;
+pub use crate::config::{ResponseCacheConfig, SingleFlightLimits};
 pub use crate::response_cache::config::{
     BackendConfig, CacheShareScope, ResponseCacheKeyStrategy, ToolCacheConfig,
 };

@@ -222,6 +222,9 @@ pub struct ResponseCacheConfig {
     pub header_allowlist: Vec<String>,
     /// Storage backend selection.
     pub backend: BackendConfig,
+    /// Bounds process-local collapse of concurrent cache misses and live
+    /// provider work started by cache misses.
+    pub singleflight: SingleFlightLimits,
     /// Opt-in tool-result cache configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolCacheConfig>,
@@ -239,7 +242,36 @@ impl Default for ResponseCacheConfig {
             key_strategy: ResponseCacheKeyStrategy::ExactRequest,
             header_allowlist: Vec::new(),
             backend: BackendConfig::default(),
+            singleflight: SingleFlightLimits::default(),
             tools: None,
+        }
+    }
+}
+
+/// Limits that prevent cache-miss coalescing from creating unbounded work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SingleFlightLimits {
+    /// Maximum distinct cache keys that may execute at once.
+    pub max_active_keys: usize,
+    /// Maximum followers allowed to wait on one active cache key.
+    pub max_waiters_per_key: usize,
+    /// Maximum concurrent provider calls started by this response-cache feature.
+    pub max_global_provider_concurrency: usize,
+    /// Maximum concurrent provider calls for one provider name.
+    pub max_provider_concurrency: usize,
+    /// Maximum concurrent provider calls for one provider/model pair.
+    pub max_model_concurrency: usize,
+}
+
+impl Default for SingleFlightLimits {
+    fn default() -> Self {
+        Self {
+            max_active_keys: 4096,
+            max_waiters_per_key: 256,
+            max_global_provider_concurrency: 512,
+            max_provider_concurrency: 128,
+            max_model_concurrency: 64,
         }
     }
 }
@@ -509,6 +541,12 @@ nemo_relay::editor_config! {
             nested: BackendConfig,
             default: BackendConfig,
         },
+        singleflight => {
+            label: "singleflight",
+            kind: Section,
+            nested: SingleFlightLimits,
+            default: SingleFlightLimits,
+        },
         tools => {
             label: "tools",
             kind: Section,
@@ -516,6 +554,16 @@ nemo_relay::editor_config! {
             nested: ToolCacheConfig,
             default: ToolCacheConfig,
         },
+    }
+}
+
+nemo_relay::editor_config! {
+    impl SingleFlightLimits {
+        max_active_keys => { label: "max_active_keys", kind: Integer },
+        max_waiters_per_key => { label: "max_waiters_per_key", kind: Integer },
+        max_global_provider_concurrency => { label: "max_global_provider_concurrency", kind: Integer },
+        max_provider_concurrency => { label: "max_provider_concurrency", kind: Integer },
+        max_model_concurrency => { label: "max_model_concurrency", kind: Integer },
     }
 }
 

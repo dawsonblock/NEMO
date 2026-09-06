@@ -126,6 +126,23 @@ fn expect_registration_failed(result: Result<()>, message_fragment: &str) {
     }
 }
 
+#[test]
+fn plugin_mutation_queue_capacity_error_is_typed_and_retryable() {
+    let (sender, _receiver) = tokio::sync::mpsc::channel::<PluginMutationJob>(1);
+    sender.try_send(Box::pin(async {})).unwrap();
+    let error = plugin_mutation_enqueue_error(
+        "test mutation",
+        sender.try_send(Box::pin(async {})).unwrap_err(),
+    );
+    assert!(matches!(
+        error,
+        PluginError::ResourceExhausted {
+            resource: "plugin.mutation_queue",
+            limit: PLUGIN_MUTATION_QUEUE_CAPACITY,
+        }
+    ));
+}
+
 fn set_conflicting_runtime_owner_for_tests() {
     unsafe {
         std::env::set_var(

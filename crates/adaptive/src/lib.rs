@@ -48,7 +48,8 @@ pub mod types;
 
 pub use config::{
     AcgComponentConfig, AdaptiveConfig, AdaptiveHintsComponentConfig, BackendSpec,
-    ResponseCacheConfig, StateConfig, TelemetryComponentConfig, ToolParallelismComponentConfig,
+    ResponseCacheConfig, SingleFlightLimits, StateConfig, TelemetryComponentConfig,
+    ToolParallelismComponentConfig,
 };
 pub use context_helpers::{
     LATENCY_SENSITIVITY_POINTER, extract_scope_path, read_manual_latency_sensitivity,

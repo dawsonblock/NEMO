@@ -377,6 +377,43 @@ class ToolCacheConfig:
 
 
 @dataclass(slots=True)
+class SingleFlightLimits:
+    """Bounds cache-miss coalescing and provider work.
+
+    These limits bound distinct cache keys, followers waiting for a hot key,
+    and concurrent provider calls. A value of zero is invalid when the
+    response-cache feature is enabled.
+
+    Args:
+        max_active_keys: Maximum distinct cache misses executing or waiting for
+            provider capacity at once.
+        max_waiters_per_key: Maximum followers allowed to join one active miss.
+        max_global_provider_concurrency: Maximum provider calls across the
+            response-cache feature.
+        max_provider_concurrency: Maximum provider calls for one provider.
+        max_model_concurrency: Maximum provider calls for one provider/model pair.
+    """
+
+    max_active_keys: int = 4096
+    max_waiters_per_key: int = 256
+    max_global_provider_concurrency: int = 512
+    max_provider_concurrency: int = 128
+    max_model_concurrency: int = 64
+
+    def to_dict(self) -> JsonObject:
+        """Serialize these limits to the canonical JSON object shape."""
+        return _normalize_object(
+            {
+                "max_active_keys": self.max_active_keys,
+                "max_waiters_per_key": self.max_waiters_per_key,
+                "max_global_provider_concurrency": self.max_global_provider_concurrency,
+                "max_provider_concurrency": self.max_provider_concurrency,
+                "max_model_concurrency": self.max_model_concurrency,
+            }
+        )
+
+
+@dataclass(slots=True)
 class ResponseCacheConfig:
     """Opt-in LLM response and tool-result cache settings.
 
@@ -398,6 +435,7 @@ class ResponseCacheConfig:
         header_allowlist: Request headers folded into the key; never auth headers.
         backend: Cache storage backend (``in_memory`` or ``redis``).
         tools: Opt-in tool-result cache; ``None`` leaves it off.
+        singleflight: Bounds cache-miss coalescing and provider concurrency.
     """
 
     ttl_seconds: int = 3600
@@ -409,6 +447,7 @@ class ResponseCacheConfig:
     header_allowlist: list[str] = field(default_factory=list)
     backend: BackendSpec = field(default_factory=BackendSpec.in_memory)
     tools: ToolCacheConfig | None = None
+    singleflight: SingleFlightLimits = field(default_factory=SingleFlightLimits)
 
     def to_dict(self) -> JsonObject:
         """Serialize this response-cache config to the canonical JSON object shape."""
@@ -426,6 +465,7 @@ class ResponseCacheConfig:
                 ),
                 "header_allowlist": self.header_allowlist,
                 "backend": _normalize(self.backend),
+                "singleflight": _normalize(self.singleflight),
                 "tools": _normalize(self.tools),
             }
         )
@@ -570,6 +610,7 @@ __all__ = [
     "ComponentSpec",
     "ResponseCacheConfig",
     "ResponseCacheKeyStrategy",
+    "SingleFlightLimits",
     "StateConfig",
     "TelemetryConfig",
     "ToolCacheConfig",

@@ -47,6 +47,8 @@ pub enum NemoRelayStatus {
     InvalidUtf8 = 8,
     /// A function argument had an invalid value (e.g. malformed UUID).
     InvalidArg = 9,
+    /// A bounded runtime resource has reached its configured capacity.
+    ResourceExhausted = 10,
 }
 
 thread_local! {
@@ -120,6 +122,7 @@ impl From<&FlowError> for NemoRelayStatus {
             FlowError::InvalidArgument(_) => NemoRelayStatus::InvalidArg,
             FlowError::ScopeStackEmpty => NemoRelayStatus::ScopeStackEmpty,
             FlowError::GuardrailRejected(_) => NemoRelayStatus::GuardrailRejected,
+            FlowError::ResourceExhausted { .. } => NemoRelayStatus::ResourceExhausted,
             FlowError::Upstream(_)
             | FlowError::Internal(_)
             | FlowError::CallbackException { .. } => NemoRelayStatus::Internal,
@@ -144,6 +147,7 @@ pub fn status_from_plugin_error(e: &PluginError) -> NemoRelayStatus {
         PluginError::InvalidConfig(_) | PluginError::Serialization(_) => {
             NemoRelayStatus::InvalidArg
         }
+        PluginError::ResourceExhausted { .. } => NemoRelayStatus::ResourceExhausted,
         PluginError::Internal(_) | PluginError::RegistrationFailed(_) => NemoRelayStatus::Internal,
     }
 }

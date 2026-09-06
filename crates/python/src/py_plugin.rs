@@ -811,7 +811,8 @@ impl PluginTeardownError {
             PluginError::NotFound(_) => PluginTeardownErrorKind::NotFound,
             PluginError::Conflict(_)
             | PluginError::Internal(_)
-            | PluginError::RegistrationFailed(_) => PluginTeardownErrorKind::Runtime,
+            | PluginError::RegistrationFailed(_)
+            | PluginError::ResourceExhausted { .. } => PluginTeardownErrorKind::Runtime,
         };
         Self { kind, message }
     }

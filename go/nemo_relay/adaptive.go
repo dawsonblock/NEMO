@@ -104,8 +104,22 @@ type ResponseCacheConfig struct {
 	// Backend selects the cache's own storage backend (distinct from the adaptive
 	// state backend). Defaults to in-memory when nil.
 	Backend *ResponseCacheBackendConfig `json:"backend,omitempty"`
+	// SingleFlight bounds cache-miss coalescing and provider work. Nil delegates
+	// to Rust's bounded defaults; explicit zero values are rejected.
+	SingleFlight *SingleFlightLimits `json:"singleflight,omitempty"`
 	// Tools configures the optional tool-result cache.
 	Tools *ResponseCacheToolsConfig `json:"tools,omitempty"`
+}
+
+// SingleFlightLimits bounds distinct cache misses, followers of a hot key, and
+// provider work started by response-cache misses. Pointer fields preserve the
+// distinction between omitted values (Rust defaults) and explicit zero (invalid).
+type SingleFlightLimits struct {
+	MaxActiveKeys                *uint64 `json:"max_active_keys,omitempty"`
+	MaxWaitersPerKey             *uint64 `json:"max_waiters_per_key,omitempty"`
+	MaxGlobalProviderConcurrency *uint64 `json:"max_global_provider_concurrency,omitempty"`
+	MaxProviderConcurrency       *uint64 `json:"max_provider_concurrency,omitempty"`
+	MaxModelConcurrency          *uint64 `json:"max_model_concurrency,omitempty"`
 }
 
 // ResponseCacheToolsConfig configures caching for read-only, stable tools.
@@ -231,11 +245,29 @@ func NewAcgConfig() AcgConfig {
 func NewResponseCacheConfig() ResponseCacheConfig {
 	ttlSeconds := uint64(3600)
 	priority := int32(50)
+	singleFlight := NewSingleFlightLimits()
 	return ResponseCacheConfig{
 		TTLSeconds:            &ttlSeconds,
 		Priority:              &priority,
 		CacheNondeterministic: false,
 		KeyStrategy:           ResponseCacheKeyStrategyExactRequest,
+		SingleFlight:          &singleFlight,
+	}
+}
+
+// NewSingleFlightLimits returns the response-cache bounds used by Rust defaults.
+func NewSingleFlightLimits() SingleFlightLimits {
+	maxActiveKeys := uint64(4096)
+	maxWaitersPerKey := uint64(256)
+	maxGlobalProviderConcurrency := uint64(512)
+	maxProviderConcurrency := uint64(128)
+	maxModelConcurrency := uint64(64)
+	return SingleFlightLimits{
+		MaxActiveKeys:                &maxActiveKeys,
+		MaxWaitersPerKey:             &maxWaitersPerKey,
+		MaxGlobalProviderConcurrency: &maxGlobalProviderConcurrency,
+		MaxProviderConcurrency:       &maxProviderConcurrency,
+		MaxModelConcurrency:          &maxModelConcurrency,
 	}
 }
 

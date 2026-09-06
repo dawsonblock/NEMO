@@ -17,6 +17,7 @@ from nemo_relay.adaptive import (
     ConfigPolicy,
     ResponseCacheConfig,
     ResponseCacheKeyStrategy,
+    SingleFlightLimits,
     StateConfig,
     TelemetryConfig,
     ToolCacheConfig,
@@ -171,7 +172,43 @@ class TestDynamicConfigContract:
             "key_strategy": "exact_request",
             "header_allowlist": [],
             "backend": {"kind": "in_memory", "config": {}},
+            "singleflight": {
+                "max_active_keys": 4096,
+                "max_waiters_per_key": 256,
+                "max_global_provider_concurrency": 512,
+                "max_provider_concurrency": 128,
+                "max_model_concurrency": 64,
+            },
         }
+
+    def test_response_cache_singleflight_limits_serialize_and_validate(self):
+        config = ResponseCacheConfig(
+            namespace="bounded-cache",
+            singleflight=SingleFlightLimits(max_active_keys=2, max_waiters_per_key=3),
+        )
+        assert config.to_dict()["singleflight"] == {
+            "max_active_keys": 2,
+            "max_waiters_per_key": 3,
+            "max_global_provider_concurrency": 512,
+            "max_provider_concurrency": 128,
+            "max_model_concurrency": 64,
+        }
+
+        report = plugin.validate(
+            plugin.PluginConfig(
+                components=[
+                    ComponentSpec(
+                        AdaptiveConfig(
+                            response_cache=ResponseCacheConfig(
+                                namespace="bounded-cache",
+                                singleflight=SingleFlightLimits(max_active_keys=0),
+                            )
+                        )
+                    )
+                ]
+            )
+        )
+        assert any(diag["code"] == "response_cache.invalid_singleflight_limit" for diag in report["diagnostics"])
 
     def test_response_cache_key_strategy_enum_serializes(self):
         config = ResponseCacheConfig(

@@ -413,6 +413,9 @@ fn plugin_error_context(
         PluginError::RegistrationFailed(message) => {
             PluginError::RegistrationFailed(format!("{prefix}: {message}"))
         }
+        PluginError::ResourceExhausted { resource, limit } => {
+            PluginError::ResourceExhausted { resource, limit }
+        }
     }
 }
 

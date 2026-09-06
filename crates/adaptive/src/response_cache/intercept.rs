@@ -33,7 +33,7 @@ use crate::response_cache::mark::{
     CacheMark, CacheMarkStatus, CacheReason, emit_cache_mark, savings_from,
 };
 use crate::response_cache::replay::{replay_aggregate, replay_is_lossy};
-use crate::response_cache::singleflight::SingleFlight;
+use crate::response_cache::singleflight::{ProviderConcurrency, SingleFlight};
 use crate::response_cache::store::{CacheEntry, CacheStore, now_unix_ms, tracked_set};
 
 /// Bounded channel capacity for the streaming tee: it forwards live chunks to
@@ -116,8 +116,12 @@ impl LlmStreamInner for ResponseCacheReceiver {
 pub(crate) fn make_intercept(
     store: Arc<dyn CacheStore>,
     config: Arc<ResponseCacheConfig>,
+    concurrency: Arc<ProviderConcurrency>,
 ) -> LlmExecutionFn {
-    let singleflight = Arc::new(SingleFlight::<Json>::default());
+    let singleflight = Arc::new(SingleFlight::<Json>::with_concurrency(
+        config.singleflight.clone(),
+        concurrency,
+    ));
     Arc::new(
         move |provider: &str, request: LlmRequest, next: LlmExecutionNextFn| {
             let store = Arc::clone(&store);
@@ -229,7 +233,7 @@ async fn run_cache(
             let call_provider = provider.clone();
             let call_model = model.clone();
             let (result, leader) = singleflight
-                .run(call_key.clone(), async move {
+                .run_with_context(call_key.clone(), &provider, model.as_deref(), async move {
                     let response = next(request).await?;
                     maybe_store(
                         &call_store,

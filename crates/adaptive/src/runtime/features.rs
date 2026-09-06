@@ -42,6 +42,7 @@ use crate::error::{AdaptiveError, Result};
 use crate::intercepts::create_tool_execution_intercept_with_mode;
 use crate::learner::latency::LatencySensitivityLearner;
 use crate::learner::traits::Learner;
+use crate::response_cache::singleflight::ProviderConcurrency;
 use crate::response_cache::{
     build_store, make_intercept, make_stream_intercept, make_tool_intercept,
 };
@@ -892,10 +893,11 @@ impl AdaptiveFeature for ResponseCacheFeature {
                 Err(error) => return Err(error),
             };
             let config = Arc::new(self.config.clone());
+            let concurrency = Arc::new(ProviderConcurrency::new(config.singleflight.clone()));
             ctx.register_llm_execution_intercept(
                 &self.name,
                 self.priority,
-                make_intercept(store.clone(), config.clone()),
+                make_intercept(store.clone(), config.clone(), Arc::clone(&concurrency)),
             )?;
             ctx.register_llm_stream_execution_intercept(
                 &self.stream_name,
@@ -907,7 +909,7 @@ impl AdaptiveFeature for ResponseCacheFeature {
                 ctx.register_tool_execution_intercept(
                     &self.tool_name,
                     priority,
-                    make_tool_intercept(store, config, Arc::new(tools)),
+                    make_tool_intercept(store, config, Arc::new(tools), concurrency),
                 )?;
             }
             Ok(())

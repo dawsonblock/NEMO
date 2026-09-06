@@ -79,6 +79,15 @@ fn test_plugin_error_conversion_maps_all_variants() {
 
     let registration = AdaptiveError::from(PluginError::RegistrationFailed("subscriber".into()));
     assert_eq!(format!("{registration}"), "registration failed: subscriber");
+
+    let exhausted = AdaptiveError::from(PluginError::ResourceExhausted {
+        resource: "plugin.mutation_queue",
+        limit: 256,
+    });
+    assert_eq!(
+        format!("{exhausted}"),
+        "resource exhausted: plugin.mutation_queue reached limit 256"
+    );
 }
 
 #[cfg(feature = "redis-backend")]

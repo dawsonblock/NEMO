@@ -28,7 +28,7 @@ use crate::response_cache::key::{
 use crate::response_cache::mark::{
     CacheMark, CacheMarkStatus, CacheReason, CacheSurface, emit_cache_mark,
 };
-use crate::response_cache::singleflight::SingleFlight;
+use crate::response_cache::singleflight::{ProviderConcurrency, SingleFlight};
 use crate::response_cache::store::{CacheEntry, CacheStore, now_unix_ms, tracked_set};
 
 const TOOL_RESULT_CACHE_ENTRY_SCHEMA: &str = "nemo.relay.ResponseCacheToolResult@1";
@@ -227,8 +227,12 @@ pub(crate) fn make_tool_intercept(
     store: Arc<dyn CacheStore>,
     response_cache: Arc<ResponseCacheConfig>,
     tools: Arc<ToolCacheConfig>,
+    concurrency: Arc<ProviderConcurrency>,
 ) -> ToolExecutionFn {
-    let singleflight = Arc::new(SingleFlight::<ToolExecutionResult>::default());
+    let singleflight = Arc::new(SingleFlight::<ToolExecutionResult>::with_concurrency(
+        response_cache.singleflight.clone(),
+        concurrency,
+    ));
     Arc::new(move |name: &str, args: Json, next: ToolExecutionNextFn| {
         let store = Arc::clone(&store);
         let response_cache = Arc::clone(&response_cache);
@@ -354,8 +358,9 @@ async fn run_tool_cache_with_singleflight(
             let call_store = Arc::clone(&store);
             let cache_errors = tools.cache_errors;
             let ttl = policy.ttl;
+            let provider_label = format!("tool:{name}");
             let (result, leader) = singleflight
-                .run(call_key.clone(), async move {
+                .run_with_context(call_key.clone(), &provider_label, None, async move {
                     let result = next(args).await?;
                     store_tool_result(&call_store, &call_key, ttl, &result, cache_errors).await;
                     Ok(result)
@@ -393,16 +398,9 @@ async fn run_tool_cache(
     response_cache: Arc<ResponseCacheConfig>,
     tools: Arc<ToolCacheConfig>,
 ) -> FlowResult<ToolExecutionInterceptOutcome> {
-    run_tool_cache_with_singleflight(
-        name,
-        args,
-        next,
-        store,
-        response_cache,
-        tools,
-        Arc::new(SingleFlight::default()),
-    )
-    .await
+    let singleflight = Arc::new(SingleFlight::new(response_cache.singleflight.clone()));
+    run_tool_cache_with_singleflight(name, args, next, store, response_cache, tools, singleflight)
+        .await
 }
 
 async fn store_tool_result(

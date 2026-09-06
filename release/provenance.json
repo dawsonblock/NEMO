@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "project": "NVIDIA NeMo Relay",
+    "repository": "https://github.com/NVIDIA/NeMo-Relay",
+    "source_revision": null,
+    "source_tree": null,
+    "source_archive": {
+      "filename": "NeMo-Relay-main.zip",
+      "sha256": "8b84004ecfb5d214db2a827d8d7828bc070ff2b28e8211de74e7ce4de7fce53f",
+      "observed_workspace_version": "0.9.0",
+      "note": "The supplied archive did not include upstream Git metadata; no upstream commit or tree is asserted."
+    }
+  },
+  "fork": {
+    "name": "NEMO",
+    "repository": "https://github.com/dawsonblock/NEMO",
+    "version": "0.9.1-rc.2",
+    "initial_import_commit": "80051910d9426e382b8d3cd2a992be222b796629",
+    "rc_1_stabilization_commit": "ba7458509e7f2be478eddb444c48d7db8f4a4f8f"
+  },
+  "patch_lineage": [
+    "supplied 0.9.0 source archive",
+    "0.9.1-rc.1 hardened development line",
+    "0.9.1-rc.2 stabilization line"
+  ],
+  "relationship": "Derived development fork; not an official NVIDIA release."
+}

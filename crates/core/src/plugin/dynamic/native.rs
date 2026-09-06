@@ -1488,6 +1488,7 @@ fn status_from_plugin_error(err: PluginError) -> NemoRelayStatus {
         PluginError::InvalidConfig(_) | PluginError::Serialization(_) => {
             NemoRelayStatus::InvalidArg
         }
+        PluginError::ResourceExhausted { .. } => NemoRelayStatus::Backpressured,
         PluginError::Internal(_) | PluginError::RegistrationFailed(_) => NemoRelayStatus::Internal,
     }
 }
@@ -1500,6 +1501,10 @@ fn status_from_flow_error(err: FlowError) -> NemoRelayStatus {
         FlowError::InvalidArgument(_) => NemoRelayStatus::InvalidArg,
         FlowError::ScopeStackEmpty => NemoRelayStatus::ScopeStackEmpty,
         FlowError::GuardrailRejected(_) => NemoRelayStatus::GuardrailRejected,
+        // The stable native ABI already exposes a retryable capacity result.
+        // Preserve that distinction instead of collapsing bounded-resource
+        // admission failures into an opaque internal error.
+        FlowError::ResourceExhausted { .. } => NemoRelayStatus::Backpressured,
         FlowError::Upstream(_) | FlowError::Internal(_) | FlowError::CallbackException { .. } => {
             NemoRelayStatus::Internal
         }

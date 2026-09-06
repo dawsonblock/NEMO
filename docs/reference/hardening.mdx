@@ -30,6 +30,8 @@ remains accepted for script compatibility.
 All asynchronous runtime queues are required to have an explicit capacity and
 overflow policy. The current capacities, producer/consumer ownership, and
 shutdown behavior are tracked in [the queue inventory](../queue-inventory.md).
+The corresponding mutable registries and per-runtime isolation rules are
+tracked in [the runtime global-state inventory](../runtime-global-state.md).
 Telemetry may be dropped with metrics; lifecycle, security, and execution
 traffic uses backpressure or an explicit rejection path. Nested subscriber
 publications are capped as well, so a callback cannot bypass the dispatcher

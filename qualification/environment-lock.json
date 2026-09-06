@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "environment_sha256": "238cc6cd1b10aaadacace742c92414ca063df3f2e2c86138456e17d0669b708c",
+  "environment_sha256": "16e13612875f231bf202727408b9b079d9f058cc86237b3ffcb5a79603d94ec5",
   "environment": {
     "schema_version": 2,
     "platform": "macOS-26.2-arm64-arm-64bit",
@@ -8,17 +8,17 @@
     "tools": {
       "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
       "cargo": "cargo 1.96.1 (356927216 2026-06-26)",
-      "node": "v24.0.0",
-      "npm": "11.3.0",
-      "python": "Python 3.11.14",
+      "node": "v22.22.3",
+      "npm": "10.9.8",
+      "python": "Python 3.12.0",
       "uv": "uv 0.11.8 (0e961dd9a 2026-04-27 aarch64-apple-darwin)",
-      "go": "go version go1.26.1 darwin/arm64",
+      "go": "go version go1.25.1 darwin/arm64",
       "protoc": "libprotoc 33.1",
       "just": "just 1.47.1",
-      "cargo-nextest": "cargo-nextest 0.9.133 (65e806bd5 2026-04-14)",
-      "cargo-deny": "cargo-deny 0.19.1",
+      "cargo-nextest": null,
+      "cargo-deny": null,
       "cargo-audit": "cargo-audit-audit 0.22.2",
-      "cargo-about": "cargo-about 0.9.1"
+      "cargo-about": null
     }
   }
 }

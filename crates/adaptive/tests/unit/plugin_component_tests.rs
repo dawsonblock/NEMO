@@ -300,6 +300,16 @@ fn assert_adaptive_internal_and_serialization_errors() {
         nemo_relay::plugin::PluginError::RegistrationFailed(message) if message == "register"
     ));
     assert!(matches!(
+        adaptive_to_plugin_error(AdaptiveError::ResourceExhausted {
+            resource: "plugin.mutation_queue",
+            limit: 256,
+        }),
+        nemo_relay::plugin::PluginError::ResourceExhausted {
+            resource: "plugin.mutation_queue",
+            limit: 256,
+        }
+    ));
+    assert!(matches!(
         adaptive_to_plugin_error(AdaptiveError::ChannelClosed("closed".into())),
         nemo_relay::plugin::PluginError::Internal(message) if message == "closed"
     ));
@@ -376,6 +386,36 @@ fn validate_adaptive_plugin_config_reports_component_specific_unknown_fields() {
         diag.code == "adaptive.unknown_field"
             && diag.component.as_deref() == Some("response_cache")
             && diag.field.as_deref() == Some("skip_keys")
+    }));
+}
+
+#[test]
+fn response_cache_recognizes_share_scope_and_singleflight_limits() {
+    let config = json!({
+        "version": 1,
+        "response_cache": {
+            "namespace": "plugin-component-test",
+            "share_scope": "session",
+            "singleflight": {
+                "max_active_keys": 2,
+                "max_waiters_per_key": 3,
+                "max_global_provider_concurrency": 4,
+                "max_provider_concurrency": 5,
+                "max_model_concurrency": 6,
+                "unexpected": true
+            }
+        },
+        "policy": {"unknown_field": "warn"}
+    });
+
+    let diagnostics = validate_adaptive_plugin_config(config.as_object().unwrap());
+    assert!(!diagnostics.iter().any(|diag| {
+        diag.code == "adaptive.unknown_field" && diag.component.as_deref() == Some("response_cache")
+    }));
+    assert!(diagnostics.iter().any(|diag| {
+        diag.code == "adaptive.unknown_field"
+            && diag.component.as_deref() == Some("response_cache.singleflight")
+            && diag.field.as_deref() == Some("unexpected")
     }));
 }
 

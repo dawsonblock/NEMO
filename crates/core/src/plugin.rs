@@ -133,6 +133,15 @@ pub enum PluginError {
     /// A runtime middleware/subscriber registration failed.
     #[error("registration failed: {0}")]
     RegistrationFailed(String),
+
+    /// A bounded plugin-runtime resource reached its configured capacity.
+    #[error("resource exhausted: {resource} reached limit {limit}")]
+    ResourceExhausted {
+        /// Stable identifier for the saturated resource.
+        resource: &'static str,
+        /// Configured capacity at the time of rejection.
+        limit: usize,
+    },
 }
 
 /// Specialized [`Result`](std::result::Result) type for plugin operations.
@@ -1649,19 +1658,27 @@ where
                 .and_then(|result| result);
             let _ = result_tx.send(result);
         }))
-        .map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => PluginError::Internal(format!(
-                "failed to queue {operation_name}: plugin mutation executor is at capacity; retry later"
-            )),
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => PluginError::Internal(format!(
-                "failed to queue {operation_name}: executor stopped"
-            )),
-        })?;
+        .map_err(|error| plugin_mutation_enqueue_error(operation_name, error))?;
     result_rx.await.map_err(|_| {
         PluginError::Internal(format!(
             "{operation_name} task stopped before returning a result"
         ))
     })?
+}
+
+fn plugin_mutation_enqueue_error(
+    operation_name: &'static str,
+    error: tokio::sync::mpsc::error::TrySendError<PluginMutationJob>,
+) -> PluginError {
+    match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => PluginError::ResourceExhausted {
+            resource: "plugin.mutation_queue",
+            limit: PLUGIN_MUTATION_QUEUE_CAPACITY,
+        },
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => PluginError::Internal(format!(
+            "failed to queue {operation_name}: executor stopped"
+        )),
+    }
 }
 
 fn plugin_mutation_executor() -> Result<&'static PluginMutationSender> {

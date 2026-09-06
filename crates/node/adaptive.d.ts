@@ -59,6 +59,15 @@ export interface AcgConfig {
   stability_thresholds?: AcgStabilityThresholds;
 }
 
+/** Limits that bound cache-miss coalescing and provider work. */
+export interface SingleFlightLimits {
+  maxActiveKeys?: number;
+  maxWaitersPerKey?: number;
+  maxGlobalProviderConcurrency?: number;
+  maxProviderConcurrency?: number;
+  maxModelConcurrency?: number;
+}
+
 /** Opt-in LLM response and tool-result cache settings. */
 export interface ResponseCacheConfig {
   ttlSeconds?: number;
@@ -73,8 +82,18 @@ export interface ResponseCacheConfig {
   keyStrategy?: ResponseCacheKeyStrategy;
   headerAllowlist?: string[];
   backend?: BackendSpec;
+  /** Bounded admission and concurrency controls for cache misses. */
+  singleFlight?: SingleFlightLimits;
   /** Opt-in tool-result cache; omit to leave the tool surface off. */
   tools?: ToolCacheConfig;
+}
+
+interface SingleFlightPluginConfig {
+  max_active_keys?: number;
+  max_waiters_per_key?: number;
+  max_global_provider_concurrency?: number;
+  max_provider_concurrency?: number;
+  max_model_concurrency?: number;
 }
 
 interface ResponseCachePluginConfig {
@@ -87,6 +106,7 @@ interface ResponseCachePluginConfig {
   key_strategy?: ResponseCacheKeyStrategy;
   header_allowlist?: string[];
   backend?: BackendSpec;
+  singleflight?: SingleFlightPluginConfig;
   tools?: ToolCachePluginConfig;
 }
 

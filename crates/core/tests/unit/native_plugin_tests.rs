@@ -4043,6 +4043,13 @@ fn native_timestamp_scope_type_and_error_mappings_cover_variants() {
         status_from_plugin_error(PluginError::RegistrationFailed("registration".into())),
         NemoRelayStatus::Internal
     );
+    assert_eq!(
+        status_from_plugin_error(PluginError::ResourceExhausted {
+            resource: "plugin.mutation_queue",
+            limit: 256,
+        }),
+        NemoRelayStatus::Backpressured
+    );
 
     for (error, status) in [
         (
@@ -4061,6 +4068,13 @@ fn native_timestamp_scope_type_and_error_mappings_cover_variants() {
         (
             FlowError::GuardrailRejected("blocked".into()),
             NemoRelayStatus::GuardrailRejected,
+        ),
+        (
+            FlowError::ResourceExhausted {
+                resource: "singleflight.active_keys",
+                limit: 1,
+            },
+            NemoRelayStatus::Backpressured,
         ),
         (
             FlowError::Internal("internal".into()),

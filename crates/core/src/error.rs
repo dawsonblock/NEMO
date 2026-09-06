@@ -107,6 +107,15 @@ pub enum FlowError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// A bounded runtime resource has no remaining capacity.
+    #[error("resource exhausted: {resource} reached limit {limit}")]
+    ResourceExhausted {
+        /// Stable identifier for the saturated resource.
+        resource: &'static str,
+        /// Configured maximum capacity for that resource.
+        limit: usize,
+    },
+
     /// The scope stack is empty.
     ///
     /// This should not occur under normal operation because the root scope is
@@ -155,6 +164,7 @@ impl FlowError {
             Self::AlreadyExists(_) => "already_exists",
             Self::NotFound(_) => "not_found",
             Self::InvalidArgument(_) => "invalid_argument",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
             Self::ScopeStackEmpty => "scope_stack_empty",
             Self::GuardrailRejected(_) => "guardrail_rejected",
             Self::Upstream(failure) => match failure.class {

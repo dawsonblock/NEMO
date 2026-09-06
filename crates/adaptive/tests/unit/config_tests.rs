@@ -38,11 +38,38 @@ fn test_typed_section_helpers_default() {
         response_cache.key_strategy,
         ResponseCacheKeyStrategy::ExactRequest
     );
+    assert_eq!(response_cache.singleflight.max_active_keys, 4096);
+    assert_eq!(response_cache.singleflight.max_waiters_per_key, 256);
+    assert_eq!(
+        response_cache.singleflight.max_global_provider_concurrency,
+        512
+    );
+    assert_eq!(response_cache.singleflight.max_provider_concurrency, 128);
+    assert_eq!(response_cache.singleflight.max_model_concurrency, 64);
 
     let tools = ToolCacheConfig::default();
     assert!(!tools.enabled);
     assert!(!tools.cache_errors);
     assert_eq!(tools.priority, 100);
+}
+
+#[test]
+fn test_response_cache_rejects_zero_singleflight_limits() {
+    let mut response_cache = ResponseCacheConfig {
+        namespace: "cache-tests".to_string(),
+        ..ResponseCacheConfig::default()
+    };
+    response_cache.singleflight.max_active_keys = 0;
+
+    let report = crate::runtime::features::AdaptiveRuntime::validate_config(&AdaptiveConfig {
+        response_cache: Some(response_cache),
+        ..AdaptiveConfig::default()
+    });
+
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "response_cache.invalid_singleflight_limit"
+            && diagnostic.message.contains("max_active_keys")
+    }));
 }
 
 #[test]

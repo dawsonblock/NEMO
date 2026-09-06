@@ -19,10 +19,13 @@ def package_id(package: dict[str, Any]) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: generate_spdx_sbom.py <cargo-about.json> <spdx.json>")
+    if len(sys.argv) != 4:
+        raise SystemExit(
+            "usage: generate_spdx_sbom.py <cargo-about.json> <spdx.json> <release-version>"
+        )
 
     inventory = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    release_version = sys.argv[3]
     crates = inventory.get("crates", [])
     by_name = {crate["package"]["name"]: crate for crate in crates}
     packages: list[dict[str, Any]] = []
@@ -68,8 +71,8 @@ def main() -> int:
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
         "SPDXID": "SPDXRef-DOCUMENT",
-        "name": "NeMo Relay Rust dependency inventory",
-        "documentNamespace": "https://github.com/dawsonblock/NEMO/spdx/0.9.1-rc.1",
+        "name": f"NEMO {release_version} Rust dependency inventory",
+        "documentNamespace": f"https://github.com/dawsonblock/NEMO/spdx/{release_version}",
         "creationInfo": {
             "created": "1970-01-01T00:00:00Z",
             "creators": ["Tool: cargo-about 0.9.1", "Organization: NVIDIA CORPORATION & AFFILIATES"],

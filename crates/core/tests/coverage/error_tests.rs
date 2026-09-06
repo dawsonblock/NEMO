@@ -30,6 +30,19 @@ fn test_invalid_argument_display() {
 }
 
 #[test]
+fn resource_exhausted_is_typed_and_has_a_stable_error_code() {
+    let error = FlowError::ResourceExhausted {
+        resource: "singleflight.active_keys",
+        limit: 4,
+    };
+    assert_eq!(
+        error.to_string(),
+        "resource exhausted: singleflight.active_keys reached limit 4"
+    );
+    assert_eq!(error.otel_error_type(), "resource_exhausted");
+}
+
+#[test]
 fn test_guardrail_rejected_display() {
     let e = FlowError::GuardrailRejected("blocked".into());
     assert_eq!(format!("{e}"), "guardrail rejected: blocked");

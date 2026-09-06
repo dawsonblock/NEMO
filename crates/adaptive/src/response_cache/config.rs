@@ -82,9 +82,9 @@ pub enum CacheShareScope {
     /// Isolate entries to the current Relay root scope. This is the safe default.
     #[default]
     Session,
-    /// Share within the current principal; requires identity metadata.
+    /// Share within the current principal; requires a trusted runtime identity.
     Principal,
-    /// Share within the current tenant; requires identity metadata.
+    /// Share within the current tenant; requires a trusted runtime identity.
     Tenant,
     /// Share across all identities in the configured namespace. Explicit opt-in only.
     Global,

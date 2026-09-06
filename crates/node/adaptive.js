@@ -168,7 +168,7 @@ function acgConfig(config = {}) {
  * the empty helper default is an unconfigured sentinel.
  */
 function responseCacheConfig(config = {}) {
-  const { backend, ...rest } = config;
+  const { backend, singleFlight, ...rest } = config;
   return {
     ttlSeconds: 3600,
     namespace: '',
@@ -178,6 +178,14 @@ function responseCacheConfig(config = {}) {
     keyStrategy: ResponseCacheKeyStrategy.ExactRequest,
     headerAllowlist: [],
     backend: backend ?? inMemoryBackend(),
+    singleFlight: {
+      maxActiveKeys: 4096,
+      maxWaitersPerKey: 256,
+      maxGlobalProviderConcurrency: 512,
+      maxProviderConcurrency: 128,
+      maxModelConcurrency: 64,
+      ...singleFlight,
+    },
     ...rest,
   };
 }
@@ -188,6 +196,15 @@ const RESPONSE_CACHE_PLUGIN_FIELDS = {
   cacheNondeterministic: 'cache_nondeterministic',
   keyStrategy: 'key_strategy',
   headerAllowlist: 'header_allowlist',
+  singleFlight: 'singleflight',
+};
+
+const SINGLE_FLIGHT_PLUGIN_FIELDS = {
+  maxActiveKeys: 'max_active_keys',
+  maxWaitersPerKey: 'max_waiters_per_key',
+  maxGlobalProviderConcurrency: 'max_global_provider_concurrency',
+  maxProviderConcurrency: 'max_provider_concurrency',
+  maxModelConcurrency: 'max_model_concurrency',
 };
 
 const TOOL_CLASS_PLUGIN_FIELDS = {
@@ -233,6 +250,9 @@ function toToolCachePluginConfig(config) {
 function toResponseCachePluginConfig(config) {
   const serialized = mapPluginFields(config, RESPONSE_CACHE_PLUGIN_FIELDS);
   if (serialized === config) return config;
+  if (serialized.singleflight !== undefined) {
+    serialized.singleflight = mapPluginFields(serialized.singleflight, SINGLE_FLIGHT_PLUGIN_FIELDS);
+  }
   if (serialized.tools !== undefined) {
     serialized.tools = toToolCachePluginConfig(serialized.tools);
   }

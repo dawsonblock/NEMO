@@ -86,6 +86,7 @@ CHANGELOG.md
 # Relay
 /.nemo-relay
 /artifacts/
+/release/artifacts/
 
 # Generated per machine by the dynamic-plugin recipe: local dylib name + sha256.
 examples/**/relay-plugin.local.toml

@@ -77,6 +77,19 @@ run_go_tests() {
 }
 
 cd "${repo_root}"
+release_version="$(awk '
+    /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+    /^\[/ { in_workspace_package = 0 }
+    in_workspace_package && /^version = / {
+        gsub(/version = |"/, "")
+        print
+        exit
+    }
+' Cargo.toml)"
+if [[ -z "${release_version}" ]]; then
+    printf 'Unable to determine workspace release version from Cargo.toml\n' >&2
+    exit 1
+fi
 
 # Capture a canonical source-tree manifest before running any checks. This is
 # independent of Git commit metadata, so an extracted archive can still bind
@@ -114,13 +127,24 @@ def git_output(arguments):
 
 
 def excluded(relative):
-    return bool(relative.parts) and relative.parts[0] in {
+    if not relative.parts:
+        return False
+    if relative.parts[0] in {
         ".git",
         "target",
         "node_modules",
         "coverage",
         "qualification",
-    }
+        ".venv",
+        ".uv-cache",
+        ".pytest_cache",
+        ".mypy_cache",
+    }:
+        return True
+    # Deterministic release packages and their sidecar evidence are generated
+    # outputs, not source inputs. Keep them out of the tree hash to avoid a
+    # self-referential archive/provenance cycle.
+    return relative.parts[:2] == ("release", "artifacts")
 
 
 tracked = git_output(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
@@ -153,6 +177,18 @@ if archive_value:
         (out / "source-archive.sha256").write_text("NOT_AVAILABLE\n")
 else:
     (out / "source-archive.sha256").write_text("NOT_PROVIDED\n")
+
+release_archive_value = os.environ.get("NEMO_RELAY_RELEASE_ARCHIVE")
+release_archive_sha256 = None
+if release_archive_value:
+    release_archive = pathlib.Path(release_archive_value).expanduser()
+    if release_archive.is_file():
+        release_archive_sha256 = hashlib.sha256(release_archive.read_bytes()).hexdigest()
+        (out / "release-archive.sha256").write_text(release_archive_sha256 + "\n")
+    else:
+        (out / "release-archive.sha256").write_text("NOT_AVAILABLE\n")
+else:
+    (out / "release-archive.sha256").write_text("NOT_PROVIDED\n")
 
 environment = {
     "schema_version": 2,
@@ -197,6 +233,7 @@ manifest = {
     "files": file_hashes,
     "excluded_roots": [".git", "target", "node_modules", "coverage", "qualification"],
     "source_archive_sha256": source_archive_sha256,
+    "release_archive_sha256": release_archive_sha256,
     "lockfiles": locks,
     "git": {
         "commit": (git_output(["rev-parse", "HEAD"]) or "").strip() or None,
@@ -209,6 +246,7 @@ manifest = {
 provenance = {
     "source_tree_sha256": source_tree_sha256,
     "source_archive_sha256": source_archive_sha256,
+    "release_archive_sha256": release_archive_sha256,
     "environment_sha256": environment_sha256,
     "lockfiles": locks,
     "git": manifest["git"],
@@ -306,7 +344,7 @@ else
         about_json="$(mktemp)"
         if cargo about generate --config about.toml --format json --locked -o "${about_json}" \
             >"${output_dir}/sbom.txt" 2>&1 \
-            && python3 "${script_dir}/generate_spdx_sbom.py" "${about_json}" "${output_dir}/sbom.spdx.json"; then
+            && python3 "${script_dir}/generate_spdx_sbom.py" "${about_json}" "${output_dir}/sbom.spdx.json" "${release_version}"; then
             record_status sbom PASS "cargo-about inventory converted to SPDX 2.3"
         else
             record_status sbom FAIL "cargo-about exited non-zero"
@@ -318,7 +356,7 @@ else
     fi
 fi
 
-python3 - "${status_file}" "${output_dir}/qualification.json" "${output_dir}/provenance.json" "${mode}" <<'PY'
+python3 - "${status_file}" "${output_dir}/qualification.json" "${output_dir}/provenance.json" "${mode}" "${release_version}" <<'PY'
 import json
 import pathlib
 import sys
@@ -360,6 +398,7 @@ if profile == "provenance":
 report = {
     "schema_version": 2,
     "qualification_level": "E2_LOCAL",
+    "release_version": sys.argv[5],
     "profile": profile,
     "overall": overall,
     "promotion": "QUALIFIED_LOCAL" if overall == "PASS" else "DEV",

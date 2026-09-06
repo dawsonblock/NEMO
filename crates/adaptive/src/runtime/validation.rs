@@ -8,7 +8,7 @@ use nemo_relay::plugin::{
 };
 use serde_json::Value as Json;
 
-use crate::config::{AdaptiveConfig, BackendSpec, ResponseCacheConfig};
+use crate::config::{AdaptiveConfig, BackendSpec, ResponseCacheConfig, SingleFlightLimits};
 use crate::response_cache::config::{ResponseCacheKeyStrategy, ToolCacheConfig, ToolClass};
 use crate::response_cache::tool::{is_supported_tool_pattern, wildcard_patterns_overlap};
 
@@ -123,6 +123,7 @@ fn validate_response_cache(report: &mut ConfigReport, config: &ResponseCacheConf
             "bypass_rate must be in [0.0, 1.0]".to_string(),
         ));
     }
+    validate_singleflight_limits(report, &config.singleflight);
     if matches!(config.key_strategy, ResponseCacheKeyStrategy::Unknown(_)) {
         report.diagnostics.push(response_cache_error(
             "response_cache.unsupported_key_strategy",
@@ -208,6 +209,27 @@ fn validate_response_cache(report: &mut ConfigReport, config: &ResponseCacheConf
 
     if let Some(tools) = &config.tools {
         validate_tool_cache(report, tools);
+    }
+}
+
+fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlightLimits) {
+    for (field, value) in [
+        ("max_active_keys", limits.max_active_keys),
+        ("max_waiters_per_key", limits.max_waiters_per_key),
+        (
+            "max_global_provider_concurrency",
+            limits.max_global_provider_concurrency,
+        ),
+        ("max_provider_concurrency", limits.max_provider_concurrency),
+        ("max_model_concurrency", limits.max_model_concurrency),
+    ] {
+        if value == 0 {
+            report.diagnostics.push(response_cache_error(
+                "response_cache.invalid_singleflight_limit",
+                Some("singleflight"),
+                format!("singleflight.{field} must be greater than 0"),
+            ));
+        }
     }
 }
 

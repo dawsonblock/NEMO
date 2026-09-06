@@ -202,6 +202,12 @@ func assertResponseCacheConstructorDefaults(t *testing.T, config ResponseCacheCo
 	if config.KeyStrategy != ResponseCacheKeyStrategyExactRequest {
 		t.Fatalf("constructor key strategy default mismatch: %#v", config.KeyStrategy)
 	}
+	if config.SingleFlight == nil || config.SingleFlight.MaxActiveKeys == nil || *config.SingleFlight.MaxActiveKeys != 4096 {
+		t.Fatalf("constructor singleflight max_active_keys mismatch: %#v", config.SingleFlight)
+	}
+	if config.SingleFlight.MaxWaitersPerKey == nil || *config.SingleFlight.MaxWaitersPerKey != 256 {
+		t.Fatalf("constructor singleflight max_waiters_per_key mismatch: %#v", config.SingleFlight)
+	}
 }
 
 func assertResponseCacheJSONSurface(t *testing.T, responseCache ResponseCacheConfig) {
@@ -234,6 +240,9 @@ func assertResponseCacheJSONSurface(t *testing.T, responseCache ResponseCacheCon
 	}
 	if b, ok := section["backend"].(map[string]any); !ok || b["kind"] != "in_memory" {
 		t.Fatalf("backend not preserved: %#v", section["backend"])
+	}
+	if limits, ok := section["singleflight"].(map[string]any); !ok || limits["max_active_keys"] != float64(4096) {
+		t.Fatalf("singleflight limits not preserved: %#v", section["singleflight"])
 	}
 }
 
@@ -339,6 +348,7 @@ func TestResponseCacheConfigPreservesOmissionAndExplicitZero(t *testing.T) {
 	t.Run("missing namespace remains invalid", testMissingResponseCacheNamespace)
 	t.Run("explicit TTL zero remains invalid", testExplicitZeroResponseCacheTTL)
 	t.Run("explicit priority zero remains valid", testExplicitZeroResponseCachePriority)
+	t.Run("explicit singleflight zero remains invalid", testExplicitZeroSingleFlightLimit)
 }
 
 func marshalResponseCacheConfig(t *testing.T, responseCache ResponseCacheConfig) map[string]any {
@@ -419,6 +429,23 @@ func testExplicitZeroResponseCachePriority(t *testing.T) {
 	}
 	if report := validateResponseCacheConfig(t, responseCache); len(report.Diagnostics) != 0 {
 		t.Fatalf("expected priority=0 to validate cleanly, got %#v", report.Diagnostics)
+	}
+}
+
+func testExplicitZeroSingleFlightLimit(t *testing.T) {
+	zero := uint64(0)
+	responseCache := ResponseCacheConfig{
+		Namespace: "dev",
+		SingleFlight: &SingleFlightLimits{
+			MaxActiveKeys: &zero,
+		},
+	}
+	if got := marshalResponseCacheConfig(t, responseCache)["singleflight"].(map[string]any)["max_active_keys"]; got != float64(0) {
+		t.Fatalf("explicit max_active_keys=0 was not preserved: %#v", got)
+	}
+	report := validateResponseCacheConfig(t, responseCache)
+	if !hasAdaptiveDiagnostic(report, "response_cache.invalid_singleflight_limit") {
+		t.Fatalf("expected response_cache.invalid_singleflight_limit, got %#v", report.Diagnostics)
 	}
 }
 

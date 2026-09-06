@@ -29,8 +29,9 @@ use one namespace across mutually untrusted tenants or upstreams.
 `header_allowlist` does not replace this trust boundary.
 
 Cache identity is partitioned by `share_scope`, which defaults to `session`.
-Use `principal` or `tenant` only when the active scope carries the matching
-`nemo_relay.identity` metadata; missing identity fails closed with an
+Use `principal` or `tenant` only when the host installs an immutable
+`RuntimeIdentity` at a trusted request boundary; ordinary scope metadata is
+ignored for cache partitioning. Missing runtime identity fails closed with an
 `identity_unavailable` cache mark. `global` is an explicit opt-in for data that
 is safe to share across every caller. The partition also includes
 `policy_epoch`, so policy changes do not reuse older entries.
@@ -74,6 +75,13 @@ cache_nondeterministic = false # set true to cache nondeterministic requests
 
 [components.config.response_cache.backend]
 kind = "in_memory"        # or "redis" for a shared cache
+
+[components.config.response_cache.singleflight]
+max_active_keys = 4096                # distinct buffered misses in flight
+max_waiters_per_key = 256             # followers for one identical miss
+max_global_provider_concurrency = 512 # cache-miss calls across providers
+max_provider_concurrency = 128        # cache-miss calls for one provider
+max_model_concurrency = 64            # cache-miss calls for one provider/model
 ```
 
 With this configuration the first eligible occurrence of a request runs the
@@ -334,6 +342,32 @@ writes to settle. Buffered LLM misses and cacheable tool misses use process
 single-flight coalescing; streaming LLM misses remain conservative because a
 provider stream cannot be cloned without changing its semantics.
 
+## Bounded Single-Flight Admission
+
+Single-flight avoids duplicate work when callers miss the same buffered LLM or
+cacheable-tool key concurrently. It does not make an unbounded number of
+different cache keys safe by itself, so `response_cache.singleflight` applies
+five independent bounds:
+
+- `max_active_keys` limits distinct cache misses, including work waiting for
+  provider capacity. A new key over this limit is rejected with a typed
+  `resource_exhausted` error; it is not silently turned into a live call.
+- `max_waiters_per_key` limits followers attached to a hot key. Extra followers
+  receive the same typed admission error.
+- Global, provider, and provider/model limits apply permits immediately before
+  the external callback. They backpressure cache-miss work rather than creating
+  additional provider calls.
+
+The defaults (`4096`, `256`, `512`, `128`, and `64`) are starting operational
+limits, not universal sizing recommendations. Set them from observed request
+size, provider capacity, latency, and the memory budget of the process. Zero is
+invalid for every single-flight limit.
+
+The leader's provider work remains detached from any one caller: if the leader
+is cancelled, an admitted follower can still receive the shared result. This
+does not apply to streaming LLM calls, which preserve the one-consumer stream
+contract and do not single-flight a miss.
+
 A buffered hit returns the stored response unchanged. A streaming hit replays
 an equivalent provider-native stream. Available saved-token and estimated-cost
 values are reported on the `response_cache` mark, never by editing a buffered
@@ -514,7 +548,7 @@ cacheable classes and cacheable overrides, plus the default policy.
 |---|---|---|
 | `ttl_seconds` | `3600` | Maximum entry age in seconds; a backend can evict an entry sooner. |
 | `namespace` | `""` (unconfigured) | Required non-empty trust-domain partition folded into every key. Empty or whitespace-only values are rejected. |
-| `share_scope` | `"session"` | Identity partition: `session`, `principal`, `tenant`, or explicit `global`. Principal and tenant modes fail closed when active identity metadata is absent. |
+| `share_scope` | `"session"` | Identity partition: `session`, `principal`, `tenant`, or explicit `global`. Principal and tenant modes require a trusted `RuntimeIdentity` and fail closed when it is absent. |
 | `priority` | `50` | LLM execution intercept priority. Lower values run earlier. |
 | `bypass_rate` | `0.0` | Probability in `[0.0, 1.0]` of running a cacheable call live. A sampled call attempts to refresh the entry when its result is cacheable and the write succeeds. |
 | `cache_nondeterministic` | `false` | Only requests with an explicit numeric `temperature = 0` are eligible. Set `true` to cache and reuse sampled responses. |
@@ -524,6 +558,11 @@ cacheable classes and cacheable overrides, plus the default policy.
 | `backend.config.max_bytes` | 256 MiB | In-memory size budget; the oldest entries are evicted first. |
 | `backend.config.url` | — | Redis connection URL. Required for the `redis` backend. |
 | `backend.config.key_prefix` | `"nemo-relay:llm-cache:"` | Prefix for keys in Redis. |
+| `singleflight.max_active_keys` | `4096` | Maximum distinct buffered cache misses that may exist at once, including misses waiting for provider capacity. A new distinct key over the limit is rejected. |
+| `singleflight.max_waiters_per_key` | `256` | Maximum followers that may join one active key. Extra followers are rejected. |
+| `singleflight.max_global_provider_concurrency` | `512` | Maximum cache-miss provider callbacks across all providers. Requests wait for a permit rather than starting extra provider work. |
+| `singleflight.max_provider_concurrency` | `128` | Maximum cache-miss provider callbacks for one provider name. |
+| `singleflight.max_model_concurrency` | `64` | Maximum cache-miss provider callbacks for one provider/model pair. |
 
 ### Tool Cache Fields
 
@@ -562,6 +601,8 @@ Redis capacity and eviction in Redis itself.
 - `header_allowlist` names an auth header such as `authorization` or
   `x-api-key`.
 - `in_memory` `max_bytes` is zero or is not an integer.
+- A `singleflight` limit is zero. Every active-key, follower, provider, and
+  model limit must be a positive integer.
 - `backend.kind` is unknown; or `redis` has a missing, non-string, or
   whitespace-only `backend.config.url`, uses a non-string `key_prefix`, or is
   unavailable because Relay was built without the `redis-backend` feature.

@@ -1,6 +1,6 @@
 {
   "name": "nemo-relay-pi",
-  "version": "0.9.1-rc.1",
+  "version": "0.9.1-rc.2",
   "private": true,
   "description": "NeMo Relay proof-of-concept extension for the pi coding agent.",
   "type": "module",

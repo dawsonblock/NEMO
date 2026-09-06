@@ -33,6 +33,15 @@ pub enum AdaptiveError {
     #[error("registration failed: {0}")]
     RegistrationFailed(String),
 
+    /// A bounded Relay runtime resource reached its configured capacity.
+    #[error("resource exhausted: {resource} reached limit {limit}")]
+    ResourceExhausted {
+        /// Stable identifier for the saturated resource.
+        resource: &'static str,
+        /// Configured capacity at the time of rejection.
+        limit: usize,
+    },
+
     /// The internal telemetry channel was closed unexpectedly.
     #[error("channel closed: {0}")]
     ChannelClosed(String),
@@ -58,6 +67,9 @@ impl From<PluginError> for AdaptiveError {
             PluginError::Serialization(err) => Self::Serialization(err),
             PluginError::Internal(message) => Self::Internal(message),
             PluginError::RegistrationFailed(message) => Self::RegistrationFailed(message),
+            PluginError::ResourceExhausted { resource, limit } => {
+                Self::ResourceExhausted { resource, limit }
+            }
         }
     }
 }

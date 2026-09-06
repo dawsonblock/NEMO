@@ -338,12 +338,14 @@ fn validate_response_cache_section(
         &[
             "ttl_seconds",
             "namespace",
+            "share_scope",
             "priority",
             "bypass_rate",
             "cache_nondeterministic",
             "key_strategy",
             "header_allowlist",
             "backend",
+            "singleflight",
             "tools",
         ],
     );
@@ -367,6 +369,24 @@ fn validate_response_cache_section(
                 backend_config_json,
             );
         }
+    }
+    if let Some(singleflight_json) = response_cache_json
+        .get("singleflight")
+        .and_then(Json::as_object)
+    {
+        validate_unknown_fields(
+            diagnostics,
+            policy,
+            Some("response_cache.singleflight".to_string()),
+            singleflight_json,
+            &[
+                "max_active_keys",
+                "max_waiters_per_key",
+                "max_global_provider_concurrency",
+                "max_provider_concurrency",
+                "max_model_concurrency",
+            ],
+        );
     }
     if let Some(tools_json) = response_cache_json.get("tools").and_then(Json::as_object) {
         validate_response_cache_tools_fields(diagnostics, policy, tools_json);
@@ -542,6 +562,9 @@ fn adaptive_to_plugin_error(err: AdaptiveError) -> PluginError {
         AdaptiveError::Serialization(err) => PluginError::Serialization(err),
         AdaptiveError::Internal(message) => PluginError::Internal(message),
         AdaptiveError::RegistrationFailed(message) => PluginError::RegistrationFailed(message),
+        AdaptiveError::ResourceExhausted { resource, limit } => {
+            PluginError::ResourceExhausted { resource, limit }
+        }
         AdaptiveError::ChannelClosed(message) => PluginError::Internal(message),
         #[cfg(feature = "redis-backend")]
         AdaptiveError::Redis(err) => PluginError::Internal(err.to_string()),
