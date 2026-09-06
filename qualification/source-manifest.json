@@ -1293,8 +1293,12 @@
     "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
   },
   "git": {
-    "commit": "c2df6dc23c617ad0352f137c20a9dcfcc9237673",
-    "tree": "ac63327bd973c04ee50b4d6fd3ee91392f4c34d3",
-    "status": []
+    "commit": "078d45d0c68965ffd402252420ca7278beb7d633",
+    "tree": "a4a728b8207e8cbdc3b81e6c6d0edcc519bbbe7e",
+    "status": [
+      " M qualification/environment-lock.json",
+      " M qualification/environment-sha256.txt",
+      " M qualification/environment.json"
+    ]
   }
 }

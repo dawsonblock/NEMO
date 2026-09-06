@@ -63,16 +63,20 @@
     "source_tree_sha256": "5daa9364784a62146b958734bf00eab73b055445a0d3eea7c6f807bc6867a289",
     "source_archive_sha256": null,
     "release_archive_sha256": "7abecbb623b75a7149f4e68a01dd7239c0155e1a3eaa8e54e99b144938476dfd",
-    "environment_sha256": "16e13612875f231bf202727408b9b079d9f058cc86237b3ffcb5a79603d94ec5",
+    "environment_sha256": "22f93bc6547adbb0b3fd71dda33be3bed3de262f0fbadbb4b522df18393ed222",
     "lockfiles": {
       "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
       "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
       "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
     },
     "git": {
-      "commit": "c2df6dc23c617ad0352f137c20a9dcfcc9237673",
-      "tree": "ac63327bd973c04ee50b4d6fd3ee91392f4c34d3",
-      "status": []
+      "commit": "078d45d0c68965ffd402252420ca7278beb7d633",
+      "tree": "a4a728b8207e8cbdc3b81e6c6d0edcc519bbbe7e",
+      "status": [
+        " M qualification/environment-lock.json",
+        " M qualification/environment-sha256.txt",
+        " M qualification/environment.json"
+      ]
     }
   },
   "notes": [

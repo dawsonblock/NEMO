@@ -1,6 +1,9 @@
-commit=c2df6dc23c617ad0352f137c20a9dcfcc9237673
-tree=ac63327bd973c04ee50b4d6fd3ee91392f4c34d3
+commit=078d45d0c68965ffd402252420ca7278beb7d633
+tree=a4a728b8207e8cbdc3b81e6c6d0edcc519bbbe7e
 working_tree=dirty
+ M qualification/environment-lock.json
+ M qualification/environment-sha256.txt
+ M qualification/environment.json
  M qualification/provenance.json
  M qualification/source-manifest.json
 source_tree_sha256=5daa9364784a62146b958734bf00eab73b055445a0d3eea7c6f807bc6867a289
