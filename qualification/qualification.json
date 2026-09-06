@@ -70,29 +70,9 @@
       "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
     },
     "git": {
-      "commit": "8e26c5204a0e432cd5c157186b98feb755b4d371",
-      "tree": "e50f57c7bfbd340510b9a756f6153f14262a4f58",
-      "status": [
-        " M python/nemo_relay/subscribers.py",
-        " M python/tests/test_llm.py",
-        " M qualification/cargo-audit.txt",
-        " M qualification/cargo-deny.txt",
-        " M qualification/clippy.txt",
-        " M qualification/git-revision.txt",
-        " M qualification/go-tests.txt",
-        " M qualification/node-tests.txt",
-        " M qualification/provenance.json",
-        " M qualification/python-tests.txt",
-        " M qualification/qualification.json",
-        " M qualification/release-archive.sha256",
-        " M qualification/rust-doc-tests.txt",
-        " M qualification/rust-format.txt",
-        " M qualification/rust-tests.txt",
-        " M qualification/sbom.spdx.json",
-        " M qualification/sbom.txt",
-        " M qualification/source-manifest.json",
-        " M qualification/source-tree.sha256"
-      ]
+      "commit": "c2df6dc23c617ad0352f137c20a9dcfcc9237673",
+      "tree": "ac63327bd973c04ee50b4d6fd3ee91392f4c34d3",
+      "status": []
     }
   },
   "notes": [
