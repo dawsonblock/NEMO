@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 [![Development line](https://img.shields.io/badge/development-0.9.1--rc.3-blue)](RELEASING.md)
 [![Rust](https://img.shields.io/badge/Rust-1.96.1-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-24.x-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 
 NeMo Relay is a multi-language runtime boundary for applications that call
 LLMs, tools, agents, and plugins. It gives those calls one consistent model for
@@ -87,7 +87,7 @@ uv add "nemo-relay[langchain,langgraph,deepagents]"
 
 ### Node.js
 
-Node.js 24 or newer is required.
+Node.js 24.16.0 is the pinned build runtime. Run `nvm use` to select it.
 
 ```bash
 npm install nemo-relay-node@0.9.1-rc.3
@@ -220,7 +220,7 @@ not hostile-code sandboxes, and telemetry is not a durable audit ledger.
 | --- | --- | --- |
 | Rust runtime | Supported | Rust 1.96.1 in this checkout; source of truth for runtime semantics. |
 | Python binding | Supported | Python 3.11+; PyO3 extension plus Python wrappers. |
-| Node.js binding | Supported | Node.js 24+; N-API binding with TypeScript declarations. |
+| Node.js binding | Supported | Node.js 24.x; N-API binding with TypeScript declarations. |
 | Relay CLI | Supported | Python 3.11+ or packaged binary; hooks, gateway, and observability. |
 | Go binding | Experimental | Go 1.21+; source-first binding over the C FFI. |
 | Raw C FFI | Experimental | C ABI for downstream bindings. |
@@ -247,7 +247,7 @@ scripts/           Build, test, docs, and qualification wrappers
 
 ## Build and test from source
 
-Prerequisites are Rust 1.96.1, Python 3.11+, Node.js 24+, Go 1.21+, `uv`, and
+Prerequisites are Rust 1.96.1, Python 3.11+, Node.js 24.x, Go 1.21+, `uv`, and
 `just`. The reproducible environment is defined in `.devcontainer/`; its
 current Go image is newer than the minimum supported version.
 

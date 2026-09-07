@@ -502,7 +502,6 @@ describe('adaptive helpers', () => {
     });
   });
 
-
   it('serializes nested tool-cache config', () => {
     const spec = adaptive.ComponentSpec({
       version: 1,

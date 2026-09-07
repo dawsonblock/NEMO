@@ -1,77 +1,37 @@
-commit=270cad86063534bd54a9bbe3a8e56e469b677d65
-tree=dacab9f805082f4c7e0f5ce2ed038e4b85792d92
+commit=83f8416d04c7cf15af1ce73816ee0f96000fb644
+tree=13534da5da829d7cd617475a33fa9a2a220f045e
 working_tree=dirty
- M Cargo.lock
- M Cargo.toml
- M FORK_PROVENANCE.md
+ M .devcontainer/Dockerfile
+ M .github/ci-tool-versions.env
+ M AGENTS.md
  M README.md
- M crates/adaptive/src/config.rs
- M crates/adaptive/src/response_cache/intercept.rs
- M crates/adaptive/src/response_cache/mod.rs
- M crates/adaptive/src/response_cache/singleflight.rs
- M crates/adaptive/src/response_cache/tool.rs
- M crates/adaptive/src/runtime/features.rs
- M crates/adaptive/tests/unit/response_cache/singleflight_tests.rs
- M crates/adaptive/tests/unit/runtime_features_tests.rs
- M crates/cli/assets/pi-extension/package.json
- M crates/cli/src/error.rs
- M crates/cli/src/gateway/mod.rs
- M crates/core/src/plugin/dynamic/native.rs
- M crates/core/tests/unit/native_plugin_tests.rs
- M crates/ffi/src/error.rs
- M crates/ffi/tests/coverage/error_tests.rs
+ M crates/core/tests/fixtures/native_plugin/Cargo.lock
+ M crates/core/tests/fixtures/worker_plugin/Cargo.lock
  M crates/node/README.md
- M crates/node/adaptive.d.ts
- M crates/node/adaptive.js
  M crates/node/package.json
  M crates/node/tests/adaptive_tests.mjs
- M docs/build-plugins/native/build-and-package.mdx
- M docs/build-plugins/workers/rust.mdx
- M docs/getting-started/installation.mdx
- M docs/getting-started/quick-start/nodejs.mdx
- M docs/getting-started/quick-start/python.mdx
- M docs/getting-started/quick-start/rust.mdx
- M docs/queue-inventory.md
- M docs/runtime-global-state.md
- M docs/supported-integrations/openclaw-plugin.mdx
- M examples/language-binding-plugin/node/package.json
- M examples/language-binding-plugin/python/pyproject.toml
- M examples/language-binding-plugin/rust/Cargo.toml
- M examples/rust-grpc-worker-plugin/Cargo.toml
- M examples/rust-native-plugin/Cargo.toml
- M examples/rust-native-plugin/README.md
- M go/nemo_relay/adaptive.go
- M integrations/coding-agents/claude-code/.claude-plugin/plugin.json
- M integrations/coding-agents/codex/.codex-plugin/plugin.json
- M integrations/openclaw/package.json
+ M crates/node/tests/logging_tests.mjs
+ M crates/node/tests/runtime_registrations_tests.mjs
+ M crates/node/tests/types_tests.mjs
+ M docs/about-nemo-relay/release-notes/index.mdx
+ M docs/contribute/development-setup.mdx
+ M docs/getting-started/prerequisites.mdx
+ M examples/language-binding-plugin/rust/Cargo.lock
  M package-lock.json
- M pyproject.toml
- M python/cli-bin/pyproject.toml
- M python/nemo_relay/adaptive.py
- M python/plugin/pyproject.toml
- M python/tests/test_adaptive_config.py
- M qualification/baseline-rc3/environment-lock.json
- M qualification/cargo-audit.txt
- M qualification/cargo-deny.txt
+ M package.json
  M qualification/clippy.txt
  M qualification/dependency-lock-digests.json
  M qualification/environment-lock.json
  M qualification/environment-sha256.txt
  M qualification/environment.json
  M qualification/git-revision.txt
- M qualification/go-tests.txt
- M qualification/node-tests.txt
  M qualification/provenance.json
- M qualification/python-tests.txt
  M qualification/qualification.json
  M qualification/release-archive.sha256
  M qualification/rust-doc-tests.txt
- M qualification/rust-format.txt
  M qualification/rust-tests.txt
- M qualification/sbom.spdx.json
- M qualification/sbom.txt
  M qualification/source-manifest.json
  M qualification/source-tree.sha256
- M release/provenance.json
-?? qualification/baseline-rc3/environment.json
-source_tree_sha256=e555bc3ecb29925559242561de958354d5bb0a2eeee9de16ba7725027632c1f7
+ M uv.lock
+?? .nvmrc
+source_tree_sha256=f526c093cb64261212db47b8948a7401361540b955649bfe916e029310940626

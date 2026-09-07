@@ -41,7 +41,7 @@ Use the Node.js binding for the following tasks:
 
 The Node.js package provides the following capabilities:
 
-- **npm package for Node.js**: A Node.js 24 or newer package backed by a
+- **npm package for Node.js**: A Node.js 24.x package backed by a
   napi-rs native extension.
 - **Managed tool and LLM execution**: Helpers that emit lifecycle events and
   run middleware in a consistent order.
@@ -60,7 +60,7 @@ The Node.js package provides the following capabilities:
 
 ## Installation
 
-Install the npm package in a Node.js 24 or newer project:
+Install the npm package in a Node.js 24.x project:
 
 ```bash
 npm install nemo-relay-node@0.9.1-rc.3
