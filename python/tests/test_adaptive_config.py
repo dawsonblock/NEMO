@@ -178,6 +178,10 @@ class TestDynamicConfigContract:
                 "max_global_provider_concurrency": 512,
                 "max_provider_concurrency": 128,
                 "max_model_concurrency": 64,
+                "max_global_waiters": 32768,
+                "max_pending_provider_requests": 2048,
+                "max_pending_provider_per_provider": 512,
+                "provider_admission_timeout_ms": 30000,
             },
         }
 
@@ -192,6 +196,10 @@ class TestDynamicConfigContract:
             "max_global_provider_concurrency": 512,
             "max_provider_concurrency": 128,
             "max_model_concurrency": 64,
+            "max_global_waiters": 32768,
+            "max_pending_provider_requests": 2048,
+            "max_pending_provider_per_provider": 512,
+            "provider_admission_timeout_ms": 30000,
         }
 
         report = plugin.validate(
@@ -224,6 +232,7 @@ class TestDynamicConfigContract:
 
         assert config.policy is policy
         assert config.response_cache is None
+
 
     def test_response_cache_rides_the_adaptive_component(self):
         component = ComponentSpec(AdaptiveConfig(response_cache=ResponseCacheConfig(namespace="dev"))).to_dict()

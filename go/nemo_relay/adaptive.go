@@ -112,14 +112,18 @@ type ResponseCacheConfig struct {
 }
 
 // SingleFlightLimits bounds distinct cache misses, followers of a hot key, and
-// provider work started by response-cache misses. Pointer fields preserve the
+// provider work admitted by the adaptive runtime. Pointer fields preserve the
 // distinction between omitted values (Rust defaults) and explicit zero (invalid).
 type SingleFlightLimits struct {
-	MaxActiveKeys                *uint64 `json:"max_active_keys,omitempty"`
-	MaxWaitersPerKey             *uint64 `json:"max_waiters_per_key,omitempty"`
-	MaxGlobalProviderConcurrency *uint64 `json:"max_global_provider_concurrency,omitempty"`
-	MaxProviderConcurrency       *uint64 `json:"max_provider_concurrency,omitempty"`
-	MaxModelConcurrency          *uint64 `json:"max_model_concurrency,omitempty"`
+	MaxActiveKeys                 *uint64 `json:"max_active_keys,omitempty"`
+	MaxWaitersPerKey              *uint64 `json:"max_waiters_per_key,omitempty"`
+	MaxGlobalProviderConcurrency  *uint64 `json:"max_global_provider_concurrency,omitempty"`
+	MaxProviderConcurrency        *uint64 `json:"max_provider_concurrency,omitempty"`
+	MaxModelConcurrency           *uint64 `json:"max_model_concurrency,omitempty"`
+	MaxGlobalWaiters              *uint64 `json:"max_global_waiters,omitempty"`
+	MaxPendingProviderRequests    *uint64 `json:"max_pending_provider_requests,omitempty"`
+	MaxPendingProviderPerProvider *uint64 `json:"max_pending_provider_per_provider,omitempty"`
+	ProviderAdmissionTimeoutMs    *uint64 `json:"provider_admission_timeout_ms,omitempty"`
 }
 
 // ResponseCacheToolsConfig configures caching for read-only, stable tools.
@@ -262,12 +266,20 @@ func NewSingleFlightLimits() SingleFlightLimits {
 	maxGlobalProviderConcurrency := uint64(512)
 	maxProviderConcurrency := uint64(128)
 	maxModelConcurrency := uint64(64)
+	maxGlobalWaiters := uint64(32768)
+	maxPendingProviderRequests := uint64(2048)
+	maxPendingProviderPerProvider := uint64(512)
+	providerAdmissionTimeoutMs := uint64(30000)
 	return SingleFlightLimits{
-		MaxActiveKeys:                &maxActiveKeys,
-		MaxWaitersPerKey:             &maxWaitersPerKey,
-		MaxGlobalProviderConcurrency: &maxGlobalProviderConcurrency,
-		MaxProviderConcurrency:       &maxProviderConcurrency,
-		MaxModelConcurrency:          &maxModelConcurrency,
+		MaxActiveKeys:                 &maxActiveKeys,
+		MaxWaitersPerKey:              &maxWaitersPerKey,
+		MaxGlobalProviderConcurrency:  &maxGlobalProviderConcurrency,
+		MaxProviderConcurrency:        &maxProviderConcurrency,
+		MaxModelConcurrency:           &maxModelConcurrency,
+		MaxGlobalWaiters:              &maxGlobalWaiters,
+		MaxPendingProviderRequests:    &maxPendingProviderRequests,
+		MaxPendingProviderPerProvider: &maxPendingProviderPerProvider,
+		ProviderAdmissionTimeoutMs:    &providerAdmissionTimeoutMs,
 	}
 }
 

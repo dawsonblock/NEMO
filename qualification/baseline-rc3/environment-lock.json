@@ -1,16 +1,31 @@
 {
-  "captured_at": "2026-09-07",
-  "os": "Darwin 25.2.0",
-  "architecture": "arm64",
-  "rustc": "1.96.1 (31fca3adb 2026-06-26)",
-  "node_host": "22.22.3",
-  "node_qualification_runtime": "/tmp/nemo-relay-qualification-tools/node24/bin/node",
-  "python": "3.12.0",
-  "go": "go1.25.1 darwin/arm64",
-  "lockfiles": {
-    "Cargo.lock": "e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
-    "package-lock.json": "6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
-    "uv.lock": "1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
+  "schema_version": 1,
+  "environment_sha256": "a071a63889f111d5b4e1e97e233a2c9d0b6f291e16c8b198087c999f02532b6d",
+  "environment": {
+    "schema_version": 2,
+    "platform": "Darwin 25.2.0",
+    "machine": "arm64",
+    "tools": {
+      "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+      "cargo": "1.96.1 (31fca3adb 2026-06-26)",
+      "node": "v22.22.3",
+      "node_qualification_runtime": "/tmp/nemo-relay-qualification-tools/node24/bin/node",
+      "python": "Python 3.12.0",
+      "go": "go1.25.1 darwin/arm64",
+      "protoc": null,
+      "just": null,
+      "uv": null,
+      "npm": null,
+      "cargo-nextest": null,
+      "cargo-deny": null,
+      "cargo-audit": null,
+      "cargo-about": null
+    }
   },
-  "qualification_note": "This is a pre-hardening baseline. Existing qualification evidence is stale for later source changes."
+  "lockfiles": {
+    "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
+    "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
+    "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
+  },
+  "qualification_note": "Pre-hardening baseline only; it is not qualification evidence for the current RC3 source."
 }

@@ -1,85 +1,158 @@
 {
   "schema_version": 2,
   "qualification_level": "E2_LOCAL",
-  "release_version": "0.9.1-rc.2",
-  "profile": "rust-postfix",
+  "release_version": "0.9.1-rc.3",
+  "profile": "manifest",
   "overall": "INCONCLUSIVE",
   "promotion": "DEV",
   "checks": {
-    "rust-format": "PASS",
-    "clippy": "PASS",
-    "rust-tests": "PASS",
-    "rust-doc-tests": "PASS",
-    "cargo-deny": "PASS",
-    "cargo-audit": "PASS",
+    "rust-format": "NOT_RUN",
+    "clippy": "NOT_RUN",
+    "rust-tests": "NOT_RUN",
+    "rust-doc-tests": "NOT_RUN",
+    "cargo-deny": "NOT_RUN",
+    "cargo-audit": "NOT_RUN",
     "python-tests": "NOT_RUN",
     "node-tests": "NOT_RUN",
     "go-tests": "NOT_RUN",
-    "sbom": "PASS"
+    "sbom": "NOT_RUN"
   },
   "check_details": {
     "rust-format": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "clippy": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "rust-tests": {
-      "status": "PASS",
-      "reason": "cargo nextest workspace run completed: 4642 tests passed"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "rust-doc-tests": {
-      "status": "PASS",
-      "reason": "workspace Rust doctests completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "cargo-deny": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "cargo-audit": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "python-tests": {
       "status": "NOT_RUN",
-      "reason": "quick profile excludes Python binding tests"
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "node-tests": {
       "status": "NOT_RUN",
-      "reason": "quick profile excludes Node.js binding tests"
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "go-tests": {
       "status": "NOT_RUN",
-      "reason": "quick profile excludes Go binding tests"
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "sbom": {
-      "status": "PASS",
-      "reason": "cargo-about inventory converted to SPDX 2.3"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     }
   },
   "provenance": {
-    "source_tree_sha256": "9fcc845bb463b6494d6fc41f7bb547f33f83f0ce01e75802ffe315a7ea044fc2",
+    "source_tree_sha256": "e555bc3ecb29925559242561de958354d5bb0a2eeee9de16ba7725027632c1f7",
     "source_archive_sha256": null,
-    "release_archive_sha256": "58b12064b0963e8caea2bb1161eadfe9772284e5116cd576aa38af9ebe021428",
-    "environment_sha256": "5d935f2a7d4a4386b06703c7eff769aecbc0960dcdbd6243621b0ceaf2754deb",
+    "release_archive_sha256": "239bc58c8e7f248f69999eed77677b790ad3146a73b98fa291274222ecb28283",
+    "environment_sha256": "16e13612875f231bf202727408b9b079d9f058cc86237b3ffcb5a79603d94ec5",
     "lockfiles": {
-      "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
-      "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
+      "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
+      "package-lock.json": "sha256:e4c0448c597feba4f54e43b1f6a084340e607282d2fe3ce610adfd22df07ef5e",
       "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
     },
     "git": {
-      "commit": "aec591d32f3ae36368074632a2f990cb0ce86702",
-      "tree": "df9744dc541488c7918f2443feafddab06e89f8f",
-      "status": []
+      "commit": "270cad86063534bd54a9bbe3a8e56e469b677d65",
+      "tree": "dacab9f805082f4c7e0f5ce2ed038e4b85792d92",
+      "status": [
+        " M Cargo.lock",
+        " M Cargo.toml",
+        " M FORK_PROVENANCE.md",
+        " M README.md",
+        " M crates/adaptive/src/config.rs",
+        " M crates/adaptive/src/response_cache/intercept.rs",
+        " M crates/adaptive/src/response_cache/mod.rs",
+        " M crates/adaptive/src/response_cache/singleflight.rs",
+        " M crates/adaptive/src/response_cache/tool.rs",
+        " M crates/adaptive/src/runtime/features.rs",
+        " M crates/adaptive/tests/unit/response_cache/singleflight_tests.rs",
+        " M crates/adaptive/tests/unit/runtime_features_tests.rs",
+        " M crates/cli/assets/pi-extension/package.json",
+        " M crates/cli/src/error.rs",
+        " M crates/cli/src/gateway/mod.rs",
+        " M crates/core/src/plugin/dynamic/native.rs",
+        " M crates/core/tests/unit/native_plugin_tests.rs",
+        " M crates/ffi/src/error.rs",
+        " M crates/ffi/tests/coverage/error_tests.rs",
+        " M crates/node/README.md",
+        " M crates/node/adaptive.d.ts",
+        " M crates/node/adaptive.js",
+        " M crates/node/package.json",
+        " M crates/node/tests/adaptive_tests.mjs",
+        " M docs/build-plugins/native/build-and-package.mdx",
+        " M docs/build-plugins/workers/rust.mdx",
+        " M docs/getting-started/installation.mdx",
+        " M docs/getting-started/quick-start/nodejs.mdx",
+        " M docs/getting-started/quick-start/python.mdx",
+        " M docs/getting-started/quick-start/rust.mdx",
+        " M docs/queue-inventory.md",
+        " M docs/runtime-global-state.md",
+        " M docs/supported-integrations/openclaw-plugin.mdx",
+        " M examples/language-binding-plugin/node/package.json",
+        " M examples/language-binding-plugin/python/pyproject.toml",
+        " M examples/language-binding-plugin/rust/Cargo.toml",
+        " M examples/rust-grpc-worker-plugin/Cargo.toml",
+        " M examples/rust-native-plugin/Cargo.toml",
+        " M examples/rust-native-plugin/README.md",
+        " M go/nemo_relay/adaptive.go",
+        " M integrations/coding-agents/claude-code/.claude-plugin/plugin.json",
+        " M integrations/coding-agents/codex/.codex-plugin/plugin.json",
+        " M integrations/openclaw/package.json",
+        " M package-lock.json",
+        " M pyproject.toml",
+        " M python/cli-bin/pyproject.toml",
+        " M python/nemo_relay/adaptive.py",
+        " M python/plugin/pyproject.toml",
+        " M python/tests/test_adaptive_config.py",
+        " M qualification/baseline-rc3/environment-lock.json",
+        " M qualification/cargo-audit.txt",
+        " M qualification/cargo-deny.txt",
+        " M qualification/clippy.txt",
+        " M qualification/dependency-lock-digests.json",
+        " M qualification/environment-lock.json",
+        " M qualification/environment-sha256.txt",
+        " M qualification/environment.json",
+        " M qualification/git-revision.txt",
+        " M qualification/go-tests.txt",
+        " M qualification/node-tests.txt",
+        " M qualification/provenance.json",
+        " M qualification/python-tests.txt",
+        " M qualification/qualification.json",
+        " M qualification/release-archive.sha256",
+        " M qualification/rust-doc-tests.txt",
+        " M qualification/rust-format.txt",
+        " M qualification/rust-tests.txt",
+        " M qualification/sbom.spdx.json",
+        " M qualification/sbom.txt",
+        " M qualification/source-manifest.json",
+        " M qualification/source-tree.sha256",
+        " M release/provenance.json",
+        "?? qualification/baseline-rc3/environment.json"
+      ]
     }
   },
   "notes": [
     "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
     "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons.",
-    "Rust-focused post-fix evidence includes the full workspace nextest (4642/4642), workspace doctests, and rust-native-plugin example suite (10/10).",
     "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result."
   ]
 }

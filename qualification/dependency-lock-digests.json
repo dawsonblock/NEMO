@@ -1,5 +1,5 @@
 {
-  "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
-  "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
+  "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
+  "package-lock.json": "sha256:e4c0448c597feba4f54e43b1f6a084340e607282d2fe3ce610adfd22df07ef5e",
   "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
 }

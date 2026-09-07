@@ -12,9 +12,9 @@
     "go": "go version go1.25.1 darwin/arm64",
     "protoc": "libprotoc 33.1",
     "just": "just 1.47.1",
-    "cargo-nextest": "cargo-nextest 0.9.133 (65e806bd5 2026-04-14)",
-    "cargo-deny": "cargo-deny 0.19.1",
+    "cargo-nextest": null,
+    "cargo-deny": null,
     "cargo-audit": "cargo-audit-audit 0.22.2",
-    "cargo-about": "cargo-about 0.9.1"
+    "cargo-about": null
   }
 }

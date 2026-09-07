@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use nemo_relay::api::runtime::LlmJsonStream;
 use nemo_relay::error::FlowError;
@@ -413,6 +414,49 @@ async fn provider_admission_skips_blocked_provider_without_starving_other_provid
     let admitted_a = pending_a.await.unwrap().unwrap();
     drop(admitted_a);
     assert_eq!(concurrency.active_requests(), 0);
+}
+
+#[tokio::test]
+async fn immediate_admission_bypasses_a_full_unrelated_pending_queue() {
+    let concurrency = Arc::new(ProviderConcurrency::new(SingleFlightLimits {
+        max_global_provider_concurrency: 2,
+        max_provider_concurrency: 1,
+        max_model_concurrency: 1,
+        max_pending_provider_requests: 1,
+        max_pending_provider_per_provider: 1,
+        provider_admission_timeout_ms: 1000,
+        ..SingleFlightLimits::default()
+    }));
+    let first_a = concurrency
+        .acquire("provider-a", Some("model"))
+        .await
+        .unwrap();
+    let pending_a = {
+        let concurrency = Arc::clone(&concurrency);
+        tokio::spawn(async move { concurrency.acquire("provider-a", Some("model")).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while concurrency.pending_requests() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider-a pending request was not enqueued");
+
+    // The pending queue is full for provider A, but global capacity remains
+    // available. Provider B must be admitted immediately rather than rejected
+    // because another provider is saturated.
+    let second_b = concurrency
+        .acquire("provider-b", Some("model"))
+        .await
+        .unwrap();
+    assert_eq!(concurrency.active_requests(), 2);
+    drop(second_b);
+    drop(first_a);
+    let admitted_a = pending_a.await.unwrap().unwrap();
+    drop(admitted_a);
+    assert_eq!(concurrency.active_requests(), 0);
+    assert_eq!(concurrency.pending_requests(), 0);
 }
 
 #[tokio::test]

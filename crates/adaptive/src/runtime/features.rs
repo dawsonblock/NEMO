@@ -44,7 +44,8 @@ use crate::learner::latency::LatencySensitivityLearner;
 use crate::learner::traits::Learner;
 use crate::response_cache::singleflight::ProviderConcurrency;
 use crate::response_cache::{
-    build_store, make_intercept, make_stream_intercept, make_tool_intercept,
+    build_store, make_admission_intercept, make_admission_stream_intercept,
+    make_admission_tool_intercept, make_intercept, make_stream_intercept, make_tool_intercept,
 };
 use crate::runtime::backend::build_backend;
 use crate::runtime::validation::validate_config;
@@ -501,6 +502,8 @@ impl AdaptiveRuntime {
         // intercepts plus an opt-in tool execution intercept.
         if let Some(config) = self.config.response_cache.clone() {
             pending.push(Box::new(ResponseCacheFeature::new(config, self.runtime_id)));
+        } else {
+            pending.push(Box::new(ProviderAdmissionFeature::new(self.runtime_id)));
         }
         pending
     }
@@ -861,6 +864,57 @@ struct ResponseCacheFeature {
     config: ResponseCacheConfig,
 }
 
+/// Always-on provider admission for adaptive runtimes that do not enable the
+/// optional response cache. This keeps overload protection independent from
+/// cache storage availability.
+struct ProviderAdmissionFeature {
+    name: String,
+    stream_name: String,
+    tool_name: String,
+}
+
+impl ProviderAdmissionFeature {
+    fn new(runtime_id: Uuid) -> Self {
+        Self {
+            name: format!("adaptive_{runtime_id}_provider_admission_llm_execution"),
+            stream_name: format!("adaptive_{runtime_id}_provider_admission_llm_stream_execution"),
+            tool_name: format!("adaptive_{runtime_id}_provider_admission_tool_execution"),
+        }
+    }
+}
+
+impl AdaptiveFeature for ProviderAdmissionFeature {
+    fn register<'a>(
+        &'a mut self,
+        ctx: &'a mut RegistrationContext<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let concurrency = Arc::new(ProviderConcurrency::new(
+                crate::config::SingleFlightLimits::default(),
+            ));
+            // Lowest priority makes admission the outermost execution boundary
+            // while preserving the normal intercept chain inside it.
+            let priority = i32::MIN;
+            ctx.register_llm_execution_intercept(
+                &self.name,
+                priority,
+                make_admission_intercept(Arc::clone(&concurrency)),
+            )?;
+            ctx.register_llm_stream_execution_intercept(
+                &self.stream_name,
+                priority,
+                make_admission_stream_intercept(Arc::clone(&concurrency)),
+            )?;
+            ctx.register_tool_execution_intercept(
+                &self.tool_name,
+                priority,
+                make_admission_tool_intercept(concurrency),
+            )?;
+            Ok(())
+        })
+    }
+}
+
 impl ResponseCacheFeature {
     fn new(config: ResponseCacheConfig, runtime_id: Uuid) -> Self {
         Self {
@@ -886,8 +940,26 @@ impl AdaptiveFeature for ResponseCacheFeature {
                         target: "nemo_relay.runtime",
                         event = "adaptive_response_cache_store_init_failed";
                         "Adaptive runtime could not initialize the optional response cache; \
-                         managed LLM and tool calls will run live: {error}"
+                         managed calls will run live under bounded provider admission: {error}"
                     );
+                    let concurrency =
+                        Arc::new(ProviderConcurrency::new(self.config.singleflight.clone()));
+                    let priority = i32::MIN;
+                    ctx.register_llm_execution_intercept(
+                        &self.name,
+                        priority,
+                        make_admission_intercept(Arc::clone(&concurrency)),
+                    )?;
+                    ctx.register_llm_stream_execution_intercept(
+                        &self.stream_name,
+                        priority,
+                        make_admission_stream_intercept(Arc::clone(&concurrency)),
+                    )?;
+                    ctx.register_tool_execution_intercept(
+                        &self.tool_name,
+                        priority,
+                        make_admission_tool_intercept(concurrency),
+                    )?;
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -910,6 +982,12 @@ impl AdaptiveFeature for ResponseCacheFeature {
                     &self.tool_name,
                     priority,
                     make_tool_intercept(store, config, Arc::new(tools), concurrency),
+                )?;
+            } else {
+                ctx.register_tool_execution_intercept(
+                    &self.tool_name,
+                    i32::MIN,
+                    make_admission_tool_intercept(concurrency),
                 )?;
             }
             Ok(())

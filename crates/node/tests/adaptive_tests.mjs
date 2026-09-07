@@ -470,6 +470,10 @@ describe('adaptive helpers', () => {
         maxGlobalProviderConcurrency: 512,
         maxProviderConcurrency: 128,
         maxModelConcurrency: 64,
+        maxGlobalWaiters: 32768,
+        maxPendingProviderRequests: 2048,
+        maxPendingProviderPerProvider: 512,
+        providerAdmissionTimeoutMs: 30000,
       },
     });
     assert.deepEqual(adaptive.ComponentSpec({ version: 1, responseCache }).config, {
@@ -489,10 +493,15 @@ describe('adaptive helpers', () => {
           max_global_provider_concurrency: 512,
           max_provider_concurrency: 128,
           max_model_concurrency: 64,
+          max_global_waiters: 32768,
+          max_pending_provider_requests: 2048,
+          max_pending_provider_per_provider: 512,
+          provider_admission_timeout_ms: 30000,
         },
       },
     });
   });
+
 
   it('serializes nested tool-cache config', () => {
     const spec = adaptive.ComponentSpec({

@@ -18,7 +18,7 @@ upstream commit or tree hash.
 The fork lineage is:
 
 ```text
-supplied 0.9.0 archive → 0.9.1-rc.1 hardened development line → 0.9.1-rc.2 stabilization line
+supplied 0.9.0 archive → 0.9.1-rc.1 hardened development line → 0.9.1-rc.2 stabilization line → 0.9.1-rc.3 admission hardening line
 ```
 
 Machine-readable provenance is in [`release/provenance.json`](release/provenance.json).

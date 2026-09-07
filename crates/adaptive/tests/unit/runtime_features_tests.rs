@@ -743,7 +743,7 @@ async fn adaptive_runtime_register_is_idempotent_for_active_features() {
     let registrations_after_first = runtime.registrations.len();
     runtime.register().await.unwrap();
 
-    assert_eq!(registrations_after_first, 2);
+    assert_eq!(registrations_after_first, 5);
     assert_eq!(runtime.registrations.len(), registrations_after_first);
 
     runtime.deregister().unwrap();
@@ -852,7 +852,7 @@ async fn adaptive_runtime_helper_methods_cover_report_wait_for_idle_and_feature_
 
     assert_eq!(runtime_without_backend.agent_id(), "explicit-agent");
     assert!(!runtime_without_backend.report().has_errors());
-    assert_eq!(runtime_without_backend.pending_features("agent-a").len(), 2);
+    assert_eq!(runtime_without_backend.pending_features("agent-a").len(), 3);
     assert_eq!(
         build_learners(
             "agent-a",
@@ -882,7 +882,7 @@ async fn adaptive_runtime_helper_methods_cover_report_wait_for_idle_and_feature_
     })
     .await
     .unwrap();
-    assert_eq!(runtime_with_backend.pending_features("agent-a").len(), 4);
+    assert_eq!(runtime_with_backend.pending_features("agent-a").len(), 5);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1337,10 +1337,12 @@ async fn response_cache_store_initialization_failure_fails_open() {
     runtime.register().await.unwrap();
 
     assert!(runtime.registered);
-    assert!(
-        runtime.registrations.is_empty(),
-        "an unavailable optional cache must not install intercepts"
+    assert_eq!(
+        runtime.registrations.len(),
+        3,
+        "an unavailable cache must retain bounded LLM, stream, and tool admission"
     );
+    runtime.deregister().unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

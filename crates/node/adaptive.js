@@ -184,6 +184,10 @@ function responseCacheConfig(config = {}) {
       maxGlobalProviderConcurrency: 512,
       maxProviderConcurrency: 128,
       maxModelConcurrency: 64,
+      maxGlobalWaiters: 32768,
+      maxPendingProviderRequests: 2048,
+      maxPendingProviderPerProvider: 512,
+      providerAdmissionTimeoutMs: 30000,
       ...singleFlight,
     },
     ...rest,
@@ -205,6 +209,10 @@ const SINGLE_FLIGHT_PLUGIN_FIELDS = {
   maxGlobalProviderConcurrency: 'max_global_provider_concurrency',
   maxProviderConcurrency: 'max_provider_concurrency',
   maxModelConcurrency: 'max_model_concurrency',
+  maxGlobalWaiters: 'max_global_waiters',
+  maxPendingProviderRequests: 'max_pending_provider_requests',
+  maxPendingProviderPerProvider: 'max_pending_provider_per_provider',
+  providerAdmissionTimeoutMs: 'provider_admission_timeout_ms',
 };
 
 const TOOL_CLASS_PLUGIN_FIELDS = {

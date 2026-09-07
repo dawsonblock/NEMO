@@ -223,7 +223,7 @@ pub struct ResponseCacheConfig {
     /// Storage backend selection.
     pub backend: BackendConfig,
     /// Bounds process-local collapse of concurrent cache misses and live
-    /// provider work started by cache misses.
+    /// provider work admitted by the adaptive runtime.
     pub singleflight: SingleFlightLimits,
     /// Opt-in tool-result cache configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,7 +258,7 @@ pub struct SingleFlightLimits {
     pub max_waiters_per_key: usize,
     /// Maximum followers waiting across all active cache keys.
     pub max_global_waiters: usize,
-    /// Maximum concurrent provider calls started by this response-cache feature.
+    /// Maximum concurrent provider calls admitted by the adaptive runtime.
     pub max_global_provider_concurrency: usize,
     /// Maximum concurrent provider calls for one provider name.
     pub max_provider_concurrency: usize,
