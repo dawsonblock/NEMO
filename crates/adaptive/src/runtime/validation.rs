@@ -223,6 +223,14 @@ fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlight
         ),
         ("max_provider_concurrency", limits.max_provider_concurrency),
         ("max_model_concurrency", limits.max_model_concurrency),
+        (
+            "max_pending_provider_requests",
+            limits.max_pending_provider_requests,
+        ),
+        (
+            "max_pending_provider_per_provider",
+            limits.max_pending_provider_per_provider,
+        ),
     ] {
         if value == 0 {
             report.diagnostics.push(response_cache_error(
@@ -231,6 +239,13 @@ fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlight
                 format!("singleflight.{field} must be greater than 0"),
             ));
         }
+    }
+    if limits.provider_admission_timeout_ms == 0 {
+        report.diagnostics.push(response_cache_error(
+            "response_cache.invalid_singleflight_limit",
+            Some("singleflight"),
+            "singleflight.provider_admission_timeout_ms must be greater than 0".into(),
+        ));
     }
 }
 

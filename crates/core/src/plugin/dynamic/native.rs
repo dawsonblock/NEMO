@@ -1505,6 +1505,7 @@ fn status_from_flow_error(err: FlowError) -> NemoRelayStatus {
         // Preserve that distinction instead of collapsing bounded-resource
         // admission failures into an opaque internal error.
         FlowError::ResourceExhausted { .. } => NemoRelayStatus::Backpressured,
+        FlowError::Timeout { .. } => NemoRelayStatus::Internal,
         FlowError::Upstream(_) | FlowError::Internal(_) | FlowError::CallbackException { .. } => {
             NemoRelayStatus::Internal
         }

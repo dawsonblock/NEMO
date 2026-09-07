@@ -123,6 +123,7 @@ impl From<&FlowError> for NemoRelayStatus {
             FlowError::ScopeStackEmpty => NemoRelayStatus::ScopeStackEmpty,
             FlowError::GuardrailRejected(_) => NemoRelayStatus::GuardrailRejected,
             FlowError::ResourceExhausted { .. } => NemoRelayStatus::ResourceExhausted,
+            FlowError::Timeout { .. } => NemoRelayStatus::Internal,
             FlowError::Upstream(_)
             | FlowError::Internal(_)
             | FlowError::CallbackException { .. } => NemoRelayStatus::Internal,

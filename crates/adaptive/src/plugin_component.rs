@@ -386,6 +386,9 @@ fn validate_response_cache_section(
                 "max_global_provider_concurrency",
                 "max_provider_concurrency",
                 "max_model_concurrency",
+                "max_pending_provider_requests",
+                "max_pending_provider_per_provider",
+                "provider_admission_timeout_ms",
             ],
         );
     }

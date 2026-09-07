@@ -291,6 +291,131 @@ async fn streaming_provider_permit_lives_until_stream_eof() {
 }
 
 #[tokio::test]
+async fn streaming_provider_permit_lives_through_terminalization_until_close() {
+    let concurrency = Arc::new(ProviderConcurrency::new(SingleFlightLimits {
+        max_global_provider_concurrency: 1,
+        ..SingleFlightLimits::default()
+    }));
+    let permits = concurrency
+        .acquire("provider", Some("model"))
+        .await
+        .unwrap();
+    let mut stream = concurrency.guard_stream(
+        LlmJsonStream::new(tokio_stream::iter(vec![Ok(json!({"chunk": 1}))])),
+        permits,
+    );
+
+    stream.terminalize();
+    assert_eq!(concurrency.active_requests(), 1);
+    stream.close().await.unwrap();
+    assert_eq!(concurrency.active_requests(), 0);
+}
+
+#[tokio::test]
+async fn provider_pending_admission_is_bounded() {
+    let concurrency = Arc::new(ProviderConcurrency::new(SingleFlightLimits {
+        max_global_provider_concurrency: 1,
+        max_provider_concurrency: 1,
+        max_model_concurrency: 1,
+        max_pending_provider_requests: 2,
+        provider_admission_timeout_ms: 1000,
+        ..SingleFlightLimits::default()
+    }));
+    let first = concurrency
+        .acquire("provider", Some("model"))
+        .await
+        .unwrap();
+
+    let pending_a = {
+        let concurrency = Arc::clone(&concurrency);
+        tokio::spawn(async move { concurrency.acquire("provider", Some("model")).await })
+    };
+    let pending_b = {
+        let concurrency = Arc::clone(&concurrency);
+        tokio::spawn(async move { concurrency.acquire("provider", Some("model")).await })
+    };
+    while concurrency.pending_requests() != 2 {
+        tokio::task::yield_now().await;
+    }
+
+    let rejected = concurrency.acquire("provider", Some("model")).await;
+    assert!(matches!(
+        rejected,
+        Err(FlowError::ResourceExhausted {
+            resource: "provider_admission.pending",
+            limit: 2,
+        })
+    ));
+
+    pending_a.abort();
+    pending_b.abort();
+    let _ = pending_a.await;
+    let _ = pending_b.await;
+    assert_eq!(concurrency.pending_requests(), 0);
+    drop(first);
+    assert_eq!(concurrency.active_requests(), 0);
+}
+
+#[tokio::test]
+async fn provider_admission_timeout_releases_pending_state() {
+    let concurrency = Arc::new(ProviderConcurrency::new(SingleFlightLimits {
+        max_global_provider_concurrency: 1,
+        max_provider_concurrency: 1,
+        max_model_concurrency: 1,
+        max_pending_provider_requests: 1,
+        provider_admission_timeout_ms: 5,
+        ..SingleFlightLimits::default()
+    }));
+    let first = concurrency
+        .acquire("provider", Some("model"))
+        .await
+        .unwrap();
+    let timed_out = concurrency.acquire("provider", Some("model")).await;
+    assert!(matches!(
+        timed_out,
+        Err(FlowError::Timeout {
+            resource: "provider_admission",
+        })
+    ));
+    assert_eq!(concurrency.pending_requests(), 0);
+    drop(first);
+}
+
+#[tokio::test]
+async fn provider_admission_skips_blocked_provider_without_starving_other_provider() {
+    let concurrency = Arc::new(ProviderConcurrency::new(SingleFlightLimits {
+        max_global_provider_concurrency: 2,
+        max_provider_concurrency: 1,
+        max_model_concurrency: 1,
+        provider_admission_timeout_ms: 1000,
+        ..SingleFlightLimits::default()
+    }));
+    let first_a = concurrency
+        .acquire("provider-a", Some("model"))
+        .await
+        .unwrap();
+
+    let pending_a = {
+        let concurrency = Arc::clone(&concurrency);
+        tokio::spawn(async move { concurrency.acquire("provider-a", Some("model")).await })
+    };
+    while concurrency.pending_requests() != 1 {
+        tokio::task::yield_now().await;
+    }
+
+    let second_b = concurrency
+        .acquire("provider-b", Some("model"))
+        .await
+        .unwrap();
+    assert_eq!(concurrency.active_requests(), 2);
+    drop(second_b);
+    drop(first_a);
+    let admitted_a = pending_a.await.unwrap().unwrap();
+    drop(admitted_a);
+    assert_eq!(concurrency.active_requests(), 0);
+}
+
+#[tokio::test]
 async fn provider_model_limit_serializes_distinct_cache_misses() {
     let flight = Arc::new(SingleFlight::new(SingleFlightLimits {
         max_active_keys: 2,

@@ -43,6 +43,18 @@ fn resource_exhausted_is_typed_and_has_a_stable_error_code() {
 }
 
 #[test]
+fn admission_timeout_is_typed_and_has_a_stable_error_code() {
+    let error = FlowError::Timeout {
+        resource: "provider_admission",
+    };
+    assert_eq!(
+        error.to_string(),
+        "timeout waiting for resource: provider_admission"
+    );
+    assert_eq!(error.otel_error_type(), "timeout");
+}
+
+#[test]
 fn test_guardrail_rejected_display() {
     let e = FlowError::GuardrailRejected("blocked".into());
     assert_eq!(format!("{e}"), "guardrail rejected: blocked");

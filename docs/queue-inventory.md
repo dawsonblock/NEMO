@@ -22,6 +22,7 @@ measured event sizes and service latency.
 | ATOF NDJSON request body | 1024 (one control slot reserved) | Events are dropped when the request body is stalled; flush remains observable. | Closing the body finishes or times out the upload. |
 | ATIF remote upload worker | 32 | Upload submissions apply synchronous backpressure while the dedicated storage worker drains them. | Dropping the sender lets the worker finish queued uploads. |
 | Plugin mutation executor | 256 | Activation and teardown return a retryable capacity error instead of queueing another future. | The host thread drains queued mutations before its sender is released. |
+| Provider admission queue | 2048 globally / 512 per provider | New live provider operations receive `ResourceExhausted`; queued operations time out after the configured admission deadline. | Cancellation removes the pending reservation; releasing an active permit wakes queued operations. |
 | Node push-stream bridge | 32 | The synchronous compatibility push returns `false`; the typed adapter awaits bounded capacity. | Cancellation wakes a producer waiting for capacity. |
 | NeMo Guardrails worker commands | 256 | Commands are rejected with a retryable capacity error when the child stdin writer is saturated. | Sender drop lets the writer flush and exit. |
 | NeMo Guardrails worker stream | 256 | The worker reader blocks on the bounded stream channel, applying backpressure to the child process. | Closed consumers release the reader; worker shutdown sends a terminal error. |

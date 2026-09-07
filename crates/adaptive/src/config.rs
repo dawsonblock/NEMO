@@ -264,6 +264,12 @@ pub struct SingleFlightLimits {
     pub max_provider_concurrency: usize,
     /// Maximum concurrent provider calls for one provider/model pair.
     pub max_model_concurrency: usize,
+    /// Maximum provider operations waiting for coordinated admission.
+    pub max_pending_provider_requests: usize,
+    /// Maximum pending provider operations for one provider name.
+    pub max_pending_provider_per_provider: usize,
+    /// Maximum time a provider operation may wait for admission.
+    pub provider_admission_timeout_ms: u64,
 }
 
 impl Default for SingleFlightLimits {
@@ -275,6 +281,9 @@ impl Default for SingleFlightLimits {
             max_global_provider_concurrency: 512,
             max_provider_concurrency: 128,
             max_model_concurrency: 64,
+            max_pending_provider_requests: 2048,
+            max_pending_provider_per_provider: 512,
+            provider_admission_timeout_ms: 30_000,
         }
     }
 }
@@ -568,6 +577,9 @@ nemo_relay::editor_config! {
         max_global_provider_concurrency => { label: "max_global_provider_concurrency", kind: Integer },
         max_provider_concurrency => { label: "max_provider_concurrency", kind: Integer },
         max_model_concurrency => { label: "max_model_concurrency", kind: Integer },
+        max_pending_provider_requests => { label: "max_pending_provider_requests", kind: Integer },
+        max_pending_provider_per_provider => { label: "max_pending_provider_per_provider", kind: Integer },
+        provider_admission_timeout_ms => { label: "provider_admission_timeout_ms", kind: Integer },
     }
 }
 
