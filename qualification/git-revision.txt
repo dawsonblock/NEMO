@@ -1,37 +1,6 @@
-commit=83f8416d04c7cf15af1ce73816ee0f96000fb644
-tree=13534da5da829d7cd617475a33fa9a2a220f045e
+commit=f5ed06b525347a35496f5351c3086790c96586b5
+tree=d98ff178f9a3eef105f9c66291a2ac3bc3f78aa2
 working_tree=dirty
- M .devcontainer/Dockerfile
- M .github/ci-tool-versions.env
- M AGENTS.md
- M README.md
- M crates/core/tests/fixtures/native_plugin/Cargo.lock
- M crates/core/tests/fixtures/worker_plugin/Cargo.lock
- M crates/node/README.md
- M crates/node/package.json
- M crates/node/tests/adaptive_tests.mjs
- M crates/node/tests/logging_tests.mjs
- M crates/node/tests/runtime_registrations_tests.mjs
- M crates/node/tests/types_tests.mjs
- M docs/about-nemo-relay/release-notes/index.mdx
- M docs/contribute/development-setup.mdx
- M docs/getting-started/prerequisites.mdx
- M examples/language-binding-plugin/rust/Cargo.lock
- M package-lock.json
- M package.json
- M qualification/clippy.txt
- M qualification/dependency-lock-digests.json
- M qualification/environment-lock.json
- M qualification/environment-sha256.txt
- M qualification/environment.json
- M qualification/git-revision.txt
  M qualification/provenance.json
- M qualification/qualification.json
- M qualification/release-archive.sha256
- M qualification/rust-doc-tests.txt
- M qualification/rust-tests.txt
  M qualification/source-manifest.json
- M qualification/source-tree.sha256
- M uv.lock
-?? .nvmrc
 source_tree_sha256=f526c093cb64261212db47b8948a7401361540b955649bfe916e029310940626
