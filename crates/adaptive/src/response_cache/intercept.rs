@@ -120,7 +120,7 @@ pub(crate) fn make_intercept(
 ) -> LlmExecutionFn {
     let singleflight = Arc::new(SingleFlight::<Json>::with_concurrency(
         config.singleflight.clone(),
-        concurrency,
+        Arc::clone(&concurrency),
     ));
     Arc::new(
         move |provider: &str, request: LlmRequest, next: LlmExecutionNextFn| {
@@ -128,6 +128,7 @@ pub(crate) fn make_intercept(
             let config = Arc::clone(&config);
             let provider = provider.to_string();
             let singleflight = Arc::clone(&singleflight);
+            let concurrency = Arc::clone(&concurrency);
             Box::pin(run_cache(
                 provider,
                 request,
@@ -135,6 +136,7 @@ pub(crate) fn make_intercept(
                 store,
                 config,
                 singleflight,
+                concurrency,
             ))
         },
     )
@@ -151,13 +153,22 @@ pub(crate) fn make_intercept(
 pub(crate) fn make_stream_intercept(
     store: Arc<dyn CacheStore>,
     config: Arc<ResponseCacheConfig>,
+    concurrency: Arc<ProviderConcurrency>,
 ) -> LlmStreamExecutionFn {
     Arc::new(
         move |provider: &str, request: LlmRequest, next: LlmStreamExecutionNextFn| {
             let store = Arc::clone(&store);
             let config = Arc::clone(&config);
             let provider = provider.to_string();
-            Box::pin(run_cache_stream(provider, request, next, store, config))
+            let concurrency = Arc::clone(&concurrency);
+            Box::pin(run_cache_stream(
+                provider,
+                request,
+                next,
+                store,
+                config,
+                concurrency,
+            ))
         },
     )
 }
@@ -171,8 +182,10 @@ async fn run_cache(
     store: Arc<dyn CacheStore>,
     config: Arc<ResponseCacheConfig>,
     singleflight: Arc<SingleFlight<Json>>,
+    concurrency: Arc<ProviderConcurrency>,
 ) -> FlowResult<Json> {
     let backend = store.backend_kind();
+    let model = request_model(&request);
 
     // Decision marks are emitted before `next()` (like the runtime's start
     // event) so every decision is recorded even when the provider then errors.
@@ -180,7 +193,9 @@ async fn run_cache(
         KeyOutcome::Key(partition) => partition,
         KeyOutcome::Bypass(reason) => {
             emit_cache_mark(CacheMark::new(CacheMarkStatus::Bypass, backend).reason(reason));
-            return next(request).await;
+            return concurrency
+                .execute(&provider, model.as_deref(), next(request))
+                .await;
         }
     };
     let key =
@@ -188,11 +203,11 @@ async fn run_cache(
             KeyOutcome::Key(key) => key,
             KeyOutcome::Bypass(reason) => {
                 emit_cache_mark(CacheMark::new(CacheMarkStatus::Bypass, backend).reason(reason));
-                return next(request).await;
+                return concurrency
+                    .execute(&provider, model.as_deref(), next(request))
+                    .await;
             }
         };
-
-    let model = request_model(&request);
 
     // Sampled bypass: re-run live to catch drift, refreshing the stored answer.
     if should_bypass(config.bypass_rate) {
@@ -201,7 +216,9 @@ async fn run_cache(
                 .reason(CacheReason::Sampled)
                 .key_hash(&key),
         );
-        let response = next(request).await?;
+        let response = concurrency
+            .execute(&provider, model.as_deref(), next(request))
+            .await?;
         maybe_store(&store, &config, &key, &provider, model, &response).await;
         return Ok(response);
     }
@@ -263,7 +280,9 @@ async fn run_cache(
                     .reason(CacheReason::StoreError)
                     .key_hash(&key),
             );
-            next(request).await
+            concurrency
+                .execute(&provider, model.as_deref(), next(request))
+                .await
         }
     }
 }
@@ -280,8 +299,10 @@ async fn run_cache_stream(
     next: LlmStreamExecutionNextFn,
     store: Arc<dyn CacheStore>,
     config: Arc<ResponseCacheConfig>,
+    concurrency: Arc<ProviderConcurrency>,
 ) -> FlowResult<LlmJsonStream> {
     let backend = store.backend_kind();
+    let model = request_model(&request);
 
     // Assembling streamed chunks into a stored response needs a streaming codec,
     // inferred via the shared request-surface detector (the observability/ACG
@@ -296,7 +317,7 @@ async fn run_cache_stream(
             emit_cache_mark(
                 CacheMark::new(CacheMarkStatus::Bypass, backend).reason(CacheReason::StreamNoCodec),
             );
-            return next(request).await;
+            return execute_stream(&concurrency, &provider, model.as_deref(), next, request).await;
         }
     };
     let codec = streaming_codec(surface);
@@ -306,7 +327,7 @@ async fn run_cache_stream(
         KeyOutcome::Key(partition) => partition,
         KeyOutcome::Bypass(reason) => {
             emit_cache_mark(CacheMark::new(CacheMarkStatus::Bypass, backend).reason(reason));
-            return next(request).await;
+            return execute_stream(&concurrency, &provider, model.as_deref(), next, request).await;
         }
     };
     let key =
@@ -314,11 +335,10 @@ async fn run_cache_stream(
             KeyOutcome::Key(key) => key,
             KeyOutcome::Bypass(reason) => {
                 emit_cache_mark(CacheMark::new(CacheMarkStatus::Bypass, backend).reason(reason));
-                return next(request).await;
+                return execute_stream(&concurrency, &provider, model.as_deref(), next, request)
+                    .await;
             }
         };
-
-    let model = request_model(&request);
 
     // Sampled bypass: run live (and re-aggregate to refresh the stored answer).
     if should_bypass(config.bypass_rate) {
@@ -327,7 +347,7 @@ async fn run_cache_stream(
                 .reason(CacheReason::Sampled)
                 .key_hash(&key),
         );
-        let live = next(request).await?;
+        let live = execute_stream(&concurrency, &provider, model.as_deref(), next, request).await?;
         return Ok(tee_and_aggregate(
             live, codec, store, config, key, provider, model,
         ));
@@ -343,7 +363,8 @@ async fn run_cache_stream(
                         .reason(CacheReason::ReplayLossy)
                         .key_hash(&key),
                 );
-                return next(request).await;
+                return execute_stream(&concurrency, &provider, model.as_deref(), next, request)
+                    .await;
             }
             let age_ms = now_unix_ms().saturating_sub(entry.created_unix_ms);
             let (saved_tokens, saved_cost) = savings_from(&entry);
@@ -363,7 +384,8 @@ async fn run_cache_stream(
                     .key_hash(&key)
                     .ttl_ms(config.ttl().as_millis() as u64),
             );
-            let live = next(request).await?;
+            let live =
+                execute_stream(&concurrency, &provider, model.as_deref(), next, request).await?;
             Ok(tee_and_aggregate(
                 live, codec, store, config, key, provider, model,
             ))
@@ -375,7 +397,24 @@ async fn run_cache_stream(
                     .reason(CacheReason::StoreError)
                     .key_hash(&key),
             );
-            next(request).await
+            execute_stream(&concurrency, &provider, model.as_deref(), next, request).await
+        }
+    }
+}
+
+async fn execute_stream(
+    concurrency: &Arc<ProviderConcurrency>,
+    provider: &str,
+    model: Option<&str>,
+    next: LlmStreamExecutionNextFn,
+    request: LlmRequest,
+) -> FlowResult<LlmJsonStream> {
+    let permits = concurrency.acquire(provider, model).await?;
+    match next(request).await {
+        Ok(stream) => Ok(concurrency.guard_stream(stream, permits)),
+        Err(error) => {
+            drop(permits);
+            Err(error)
         }
     }
 }

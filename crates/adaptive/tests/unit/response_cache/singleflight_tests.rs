@@ -4,9 +4,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use nemo_relay::api::runtime::LlmJsonStream;
 use nemo_relay::error::FlowError;
 use serde_json::json;
 use tokio::sync::Notify;
+use tokio_stream::StreamExt;
 
 use super::*;
 
@@ -211,6 +213,81 @@ async fn follower_admission_is_bounded_and_cancellation_releases_its_reservation
     release.notify_one();
     assert_eq!(leader.await.unwrap().0.unwrap(), json!("complete"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn global_follower_admission_is_bounded_across_keys() {
+    let flight = Arc::new(SingleFlight::new(SingleFlightLimits {
+        max_global_waiters: 1,
+        ..SingleFlightLimits::default()
+    }));
+    let release = Arc::new(Notify::new());
+
+    let leader = {
+        let flight = Arc::clone(&flight);
+        let release = Arc::clone(&release);
+        tokio::spawn(async move {
+            flight
+                .run("global-waiter-key".into(), async move {
+                    release.notified().await;
+                    Ok(json!("complete"))
+                })
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    let follower = {
+        let flight = Arc::clone(&flight);
+        tokio::spawn(async move {
+            flight
+                .run("global-waiter-key".into(), async { Ok(json!("wrong")) })
+                .await
+        })
+    };
+    while flight.stats().waiters < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    let (result, is_leader) = flight
+        .run("global-waiter-key".into(), async { Ok(json!("wrong")) })
+        .await;
+    assert!(!is_leader);
+    assert!(matches!(
+        result,
+        Err(FlowError::ResourceExhausted {
+            resource: "singleflight.global_waiters",
+            limit: 1,
+        })
+    ));
+
+    release.notify_one();
+    assert_eq!(leader.await.unwrap().0.unwrap(), json!("complete"));
+    assert_eq!(follower.await.unwrap().0.unwrap(), json!("complete"));
+    assert_eq!(flight.stats().waiters, 0);
+}
+
+#[tokio::test]
+async fn streaming_provider_permit_lives_until_stream_eof() {
+    let limits = SingleFlightLimits {
+        max_global_provider_concurrency: 1,
+        ..SingleFlightLimits::default()
+    };
+    let concurrency = Arc::new(ProviderConcurrency::new(limits));
+    let permits = concurrency
+        .acquire("provider", Some("model"))
+        .await
+        .unwrap();
+    let mut stream = concurrency.guard_stream(
+        LlmJsonStream::new(tokio_stream::iter(vec![Ok(json!({"chunk": 1}))])),
+        permits,
+    );
+
+    assert_eq!(concurrency.active_requests(), 1);
+    assert_eq!(stream.next().await.unwrap().unwrap(), json!({"chunk": 1}));
+    assert_eq!(concurrency.active_requests(), 1);
+    assert!(stream.next().await.is_none());
+    assert_eq!(concurrency.active_requests(), 0);
 }
 
 #[tokio::test]

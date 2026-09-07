@@ -231,7 +231,7 @@ pub(crate) fn make_tool_intercept(
 ) -> ToolExecutionFn {
     let singleflight = Arc::new(SingleFlight::<ToolExecutionResult>::with_concurrency(
         response_cache.singleflight.clone(),
-        concurrency,
+        Arc::clone(&concurrency),
     ));
     Arc::new(move |name: &str, args: Json, next: ToolExecutionNextFn| {
         let store = Arc::clone(&store);
@@ -261,6 +261,7 @@ async fn run_tool_cache_with_singleflight(
     singleflight: Arc<SingleFlight<ToolExecutionResult>>,
 ) -> FlowResult<ToolExecutionInterceptOutcome> {
     let policy = resolve_policy(&name, &response_cache, &tools);
+    let provider_label = format!("tool:{name}");
 
     if !policy.cacheable {
         emit_cache_mark(
@@ -268,7 +269,10 @@ async fn run_tool_cache_with_singleflight(
                 .surface(CacheSurface::Tool)
                 .reason(CacheReason::Uncacheable),
         );
-        return next(args).await.map(Into::into);
+        return singleflight
+            .execute(&provider_label, None, next(args))
+            .await
+            .map(Into::into);
     }
 
     let backend = store.backend_kind();
@@ -281,7 +285,10 @@ async fn run_tool_cache_with_singleflight(
                     .surface(CacheSurface::Tool)
                     .reason(reason),
             );
-            return next(args).await.map(Into::into);
+            return singleflight
+                .execute(&provider_label, None, next(args))
+                .await
+                .map(Into::into);
         }
     };
     let key = match build_tool_cache_key_with_partition(
@@ -300,7 +307,10 @@ async fn run_tool_cache_with_singleflight(
                     .surface(CacheSurface::Tool)
                     .reason(reason),
             );
-            return next(args).await.map(Into::into);
+            return singleflight
+                .execute(&provider_label, None, next(args))
+                .await
+                .map(Into::into);
         }
     };
 
@@ -311,7 +321,9 @@ async fn run_tool_cache_with_singleflight(
                 .reason(CacheReason::Sampled)
                 .key_hash(&key),
         );
-        let result = next(args).await?;
+        let result = singleflight
+            .execute(&provider_label, None, next(args))
+            .await?;
         store_tool_result(&store, &key, policy.ttl, &result, tools.cache_errors).await;
         return Ok(result.into());
     }
@@ -330,7 +342,9 @@ async fn run_tool_cache_with_singleflight(
                     .reason(CacheReason::CachedError)
                     .key_hash(&key),
             );
-            let result = next(args).await?;
+            let result = singleflight
+                .execute(&provider_label, None, next(args))
+                .await?;
             store_tool_result(&store, &key, policy.ttl, &result, tools.cache_errors).await;
             Ok(result.into())
         }
@@ -358,7 +372,6 @@ async fn run_tool_cache_with_singleflight(
             let call_store = Arc::clone(&store);
             let cache_errors = tools.cache_errors;
             let ttl = policy.ttl;
-            let provider_label = format!("tool:{name}");
             let (result, leader) = singleflight
                 .run_with_context(call_key.clone(), &provider_label, None, async move {
                     let result = next(args).await?;
@@ -384,7 +397,10 @@ async fn run_tool_cache_with_singleflight(
                     .reason(CacheReason::StoreError)
                     .key_hash(&key),
             );
-            next(args).await.map(Into::into)
+            singleflight
+                .execute(&provider_label, None, next(args))
+                .await
+                .map(Into::into)
         }
     }
 }

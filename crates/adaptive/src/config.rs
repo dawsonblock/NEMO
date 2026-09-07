@@ -256,6 +256,8 @@ pub struct SingleFlightLimits {
     pub max_active_keys: usize,
     /// Maximum followers allowed to wait on one active cache key.
     pub max_waiters_per_key: usize,
+    /// Maximum followers waiting across all active cache keys.
+    pub max_global_waiters: usize,
     /// Maximum concurrent provider calls started by this response-cache feature.
     pub max_global_provider_concurrency: usize,
     /// Maximum concurrent provider calls for one provider name.
@@ -269,6 +271,7 @@ impl Default for SingleFlightLimits {
         Self {
             max_active_keys: 4096,
             max_waiters_per_key: 256,
+            max_global_waiters: 32_768,
             max_global_provider_concurrency: 512,
             max_provider_concurrency: 128,
             max_model_concurrency: 64,
@@ -561,6 +564,7 @@ nemo_relay::editor_config! {
     impl SingleFlightLimits {
         max_active_keys => { label: "max_active_keys", kind: Integer },
         max_waiters_per_key => { label: "max_waiters_per_key", kind: Integer },
+        max_global_waiters => { label: "max_global_waiters", kind: Integer },
         max_global_provider_concurrency => { label: "max_global_provider_concurrency", kind: Integer },
         max_provider_concurrency => { label: "max_provider_concurrency", kind: Integer },
         max_model_concurrency => { label: "max_model_concurrency", kind: Integer },

@@ -479,7 +479,9 @@ impl LlmJsonStream {
         self.inner.as_mut().close().await
     }
 
-    pub(crate) fn terminalize(&mut self) {
+    /// Mark the consumer-visible stream as complete while retaining its
+    /// producer for explicit asynchronous cleanup.
+    pub fn terminalize(&mut self) {
         self.inner.as_mut().terminalize();
     }
 }

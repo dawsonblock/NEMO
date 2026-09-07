@@ -2516,10 +2516,10 @@ pub fn test_closed_collector_callback(
 
 /// Internal test helper: invoke a closed JS finalizer wrapper and surface the failure.
 #[napi(js_name = "__testClosedFinalizerCallback")]
-pub fn test_closed_finalizer_callback(
-    callback: ThreadsafeFunction<(), ErrorStrategy::Fatal>,
-) -> Result<Json> {
+pub fn test_closed_finalizer_callback(env: Env, callback: JsFunction) -> Result<Json> {
     clear_recorded_callback_error();
+    let callback = callable::safe_middleware_callback(&env, &callback)?;
+    let callback = json_callback_tsfn(&env, &callback)?;
     let _ = callback.clone().abort();
     let wrapped = callable::wrap_js_finalizer_fn(callback);
     wrapped().map_err(to_napi_err)
@@ -3365,7 +3365,7 @@ pub fn llm_stream_call_execute(
     request: Json,
     func: JsFunction,
     collector: Option<ThreadsafeFunction<Json, ErrorStrategy::Fatal>>,
-    finalizer: Option<ThreadsafeFunction<(), ErrorStrategy::Fatal>>,
+    finalizer: Option<JsFunction>,
     handle: Option<&ScopeHandle>,
     attributes: Option<u32>,
     data: Option<Json>,
@@ -3390,7 +3390,11 @@ pub fn llm_stream_call_execute(
     };
 
     let wrapped_finalizer: Box<dyn FnOnce() -> FlowResult<Json> + Send> = match finalizer {
-        Some(cb) => callable::wrap_js_finalizer_fn(cb),
+        Some(cb) => {
+            let cb = callable::safe_middleware_callback(&env, &cb)?;
+            let cb = json_callback_tsfn(&env, &cb)?;
+            callable::wrap_js_finalizer_fn(cb)
+        }
         None => Box::new(|| Ok(Json::Null)),
     };
 

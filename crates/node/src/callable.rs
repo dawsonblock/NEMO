@@ -1256,12 +1256,12 @@ pub fn wrap_js_collector_fn(
 /// It takes no arguments and must return a JSON value representing the
 /// aggregated response.
 pub fn wrap_js_finalizer_fn(
-    func: ThreadsafeFunction<(), ErrorStrategy::Fatal>,
+    func: ThreadsafeFunction<Json, ErrorStrategy::Fatal>,
 ) -> Box<dyn FnOnce() -> Result<Json> + Send> {
     Box::new(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let status = func.call_with_return_value(
-            (),
+            Json::Null,
             ThreadsafeFunctionCallMode::Blocking,
             move |val: Option<Json>| {
                 let _ = tx.send(callback_json(val));
@@ -1273,9 +1273,9 @@ pub fn wrap_js_finalizer_fn(
             record_callback_error(message.clone());
             return Err(FlowError::Internal(message));
         }
-        recv_json_result(rx, "nemo_relay: JS finalizer callback failed").inspect_err(|error| {
-            record_callback_error(error.to_string());
-        })
+        let result = recv_json_result(rx, "nemo_relay: JS finalizer callback failed")?;
+        unwrap_middleware_result(result, "nemo_relay: JS finalizer callback failed")
+            .inspect_err(|error| record_callback_error(error.to_string()))
     })
 }
 

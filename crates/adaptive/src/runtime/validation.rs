@@ -216,6 +216,7 @@ fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlight
     for (field, value) in [
         ("max_active_keys", limits.max_active_keys),
         ("max_waiters_per_key", limits.max_waiters_per_key),
+        ("max_global_waiters", limits.max_global_waiters),
         (
             "max_global_provider_concurrency",
             limits.max_global_provider_concurrency,

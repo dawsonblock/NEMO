@@ -382,6 +382,7 @@ fn validate_response_cache_section(
             &[
                 "max_active_keys",
                 "max_waiters_per_key",
+                "max_global_waiters",
                 "max_global_provider_concurrency",
                 "max_provider_concurrency",
                 "max_model_concurrency",

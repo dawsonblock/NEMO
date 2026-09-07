@@ -5,13 +5,18 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
+use nemo_relay::api::runtime::{LlmJsonStream, LlmStreamInner};
 use nemo_relay::error::{FlowError, Result as FlowResult};
+use serde_json::Value as Json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_stream::Stream;
 
 use crate::config::SingleFlightLimits;
 
@@ -50,6 +55,26 @@ struct Counters {
     rejections: AtomicUsize,
 }
 
+impl Counters {
+    fn try_reserve_waiter(&self, limit: usize) -> bool {
+        let mut current = self.waiters.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.waiters.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 fn remove_completed_call<T>(
     calls: &Mutex<HashMap<String, ActiveCall<T>>>,
     counters: &Counters,
@@ -84,7 +109,7 @@ impl ProviderConcurrency {
         }
     }
 
-    async fn acquire(
+    pub(crate) async fn acquire(
         self: &Arc<Self>,
         provider: &str,
         model: Option<&str>,
@@ -129,17 +154,82 @@ impl ProviderConcurrency {
         })
     }
 
+    /// Run a live provider operation while holding the global, provider, and
+    /// model concurrency permits for the complete operation lifetime.
+    pub(crate) async fn execute<F, T>(
+        self: &Arc<Self>,
+        provider: &str,
+        model: Option<&str>,
+        future: F,
+    ) -> FlowResult<T>
+    where
+        F: std::future::Future<Output = FlowResult<T>>,
+    {
+        let _permits = self.acquire(provider, model).await?;
+        future.await
+    }
+
+    /// Attach provider permits to a stream so they remain held until EOF,
+    /// terminalization, explicit close, or drop. Long-lived streaming calls
+    /// therefore count against the same budgets as buffered calls.
+    pub(crate) fn guard_stream(
+        self: &Arc<Self>,
+        stream: LlmJsonStream,
+        permits: ProviderPermits,
+    ) -> LlmJsonStream {
+        let _ = self;
+        LlmJsonStream::from_closeable(GuardedProviderStream {
+            stream,
+            permits: Some(permits),
+        })
+    }
+
     #[cfg(test)]
     fn active_requests(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
 }
 
-struct ProviderPermits {
+pub(crate) struct ProviderPermits {
     _global: OwnedSemaphorePermit,
     _provider: OwnedSemaphorePermit,
     _model: Option<OwnedSemaphorePermit>,
     limiter: Arc<ProviderConcurrency>,
+}
+
+struct GuardedProviderStream {
+    stream: LlmJsonStream,
+    permits: Option<ProviderPermits>,
+}
+
+impl Stream for GuardedProviderStream {
+    type Item = FlowResult<Json>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.stream).poll_next(cx);
+        if matches!(result, Poll::Ready(None)) {
+            this.permits.take();
+        }
+        result
+    }
+}
+
+impl LlmStreamInner for GuardedProviderStream {
+    fn terminalize(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.permits.take();
+        Pin::new(&mut this.stream).terminalize();
+    }
+
+    fn close(self: Pin<&mut Self>) -> Pin<Box<dyn Future<Output = FlowResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let this = self.get_mut();
+            let result = this.stream.close().await;
+            this.permits.take();
+            result
+        })
+    }
 }
 
 impl Drop for ProviderPermits {
@@ -251,8 +341,20 @@ where
                         false,
                     );
                 }
+                if !self
+                    .counters
+                    .try_reserve_waiter(self.limits.max_global_waiters)
+                {
+                    self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+                    return (
+                        Err(FlowError::ResourceExhausted {
+                            resource: "singleflight.global_waiters",
+                            limit: self.limits.max_global_waiters,
+                        }),
+                        false,
+                    );
+                }
                 active.waiters += 1;
-                self.counters.waiters.fetch_add(1, Ordering::Relaxed);
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 (
                     active.call.clone(),
@@ -328,6 +430,20 @@ where
         }
         drop(waiter);
         (result, leader)
+    }
+
+    /// Run work through the limiter shared by this single-flight set without
+    /// requiring a cache key. This covers uncached and fail-open executions.
+    pub(crate) async fn execute<F, U>(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+        future: F,
+    ) -> FlowResult<U>
+    where
+        F: Future<Output = FlowResult<U>>,
+    {
+        self.concurrency.execute(provider, model, future).await
     }
 
     /// Return bounded-resource counters for focused pressure tests.

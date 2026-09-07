@@ -40,6 +40,7 @@ fn test_typed_section_helpers_default() {
     );
     assert_eq!(response_cache.singleflight.max_active_keys, 4096);
     assert_eq!(response_cache.singleflight.max_waiters_per_key, 256);
+    assert_eq!(response_cache.singleflight.max_global_waiters, 32_768);
     assert_eq!(
         response_cache.singleflight.max_global_provider_concurrency,
         512

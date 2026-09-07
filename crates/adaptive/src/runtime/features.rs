@@ -902,7 +902,7 @@ impl AdaptiveFeature for ResponseCacheFeature {
             ctx.register_llm_stream_execution_intercept(
                 &self.stream_name,
                 self.priority,
-                make_stream_intercept(store.clone(), config.clone()),
+                make_stream_intercept(store.clone(), config.clone(), Arc::clone(&concurrency)),
             )?;
             if let Some(tools) = self.config.tools.clone().filter(|tools| tools.enabled) {
                 let priority = tools.priority;

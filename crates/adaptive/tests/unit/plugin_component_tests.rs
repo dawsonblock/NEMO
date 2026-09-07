@@ -399,6 +399,7 @@ fn response_cache_recognizes_share_scope_and_singleflight_limits() {
             "singleflight": {
                 "max_active_keys": 2,
                 "max_waiters_per_key": 3,
+                "max_global_waiters": 7,
                 "max_global_provider_concurrency": 4,
                 "max_provider_concurrency": 5,
                 "max_model_concurrency": 6,
