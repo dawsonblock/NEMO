@@ -60,9 +60,9 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "f526c093cb64261212db47b8948a7401361540b955649bfe916e029310940626",
+    "source_tree_sha256": "f20bb91e910954f2150af7a2f1616d9d66f7ba462689811e8bfd69e53d1eb274",
     "source_archive_sha256": null,
-    "release_archive_sha256": "88cafdcb05fa8e74fcdd84ced224113e46dd1ce9879de2fe4f7ab1d2006b4cb3",
+    "release_archive_sha256": "452c1f92e37707c4f0b152f4492fdccbcb69f85e681d649fdb941647bcb2d2b6",
     "environment_sha256": "05ac56d2ecf499dd5151767cc49ad79ba6ac927fd7230d0afb96ee6baab7d89c",
     "lockfiles": {
       "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
@@ -70,9 +70,12 @@
       "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
     },
     "git": {
-      "commit": "f5ed06b525347a35496f5351c3086790c96586b5",
-      "tree": "d98ff178f9a3eef105f9c66291a2ac3bc3f78aa2",
-      "status": []
+      "commit": "d8963fc7f794d3bfcd9d7e25f72f504ca27af033",
+      "tree": "4041e59e25be389cbc6d7a4b06b242b3c4cc0068",
+      "status": [
+        " M qualification/release-archive.sha256",
+        " M qualification/source-tree.sha256"
+      ]
     }
   },
   "notes": [

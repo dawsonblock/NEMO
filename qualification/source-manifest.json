@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "f526c093cb64261212db47b8948a7401361540b955649bfe916e029310940626",
+  "root_digest": "f20bb91e910954f2150af7a2f1616d9d66f7ba462689811e8bfd69e53d1eb274",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -68,6 +68,7 @@
     ".github/workflows/ci_rust.yml": "d8a7c849bedab8e36df3cc75b9ee437997fb7cc72deebafef53eb622c33bd63c",
     ".github/workflows/fern-docs.yml": "921b13d81684578c99b1db36b42256f1eddbc4d633dc87dc0a7d79557fd451d0",
     ".github/workflows/nightly-alpha-tag.yaml": "cb0e7817a77442f34c4e17437a78ff50ed74753102f334ae9944ff17001a3b55",
+    ".github/workflows/node-24-runtime.yml": "460964249777fee367a3eae6156915ff9378c6cea3808df47bbb3ede52dd7aa2",
     ".github/workflows/pr-labels.yaml": "f3557551d45cc2275976f47677b4c38500efd624288a6f5502b703249fe04773",
     ".github/workflows/request-nvskills-ci.yml": "b888a48a91fa4a1de590c5f7c2167de28f261e735b693b3bdab3327056e9f200",
     ".github/workflows/stale.yaml": "7313ca0ae022b13d6bc2f47f66eb59d1c10bc547baf5720473f03d96276de422",
@@ -1287,15 +1288,18 @@
     "qualification"
   ],
   "source_archive_sha256": null,
-  "release_archive_sha256": "88cafdcb05fa8e74fcdd84ced224113e46dd1ce9879de2fe4f7ab1d2006b4cb3",
+  "release_archive_sha256": "452c1f92e37707c4f0b152f4492fdccbcb69f85e681d649fdb941647bcb2d2b6",
   "lockfiles": {
     "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
     "package-lock.json": "sha256:f81a84f3c9a83c8dc0b1ab1a70654b407edfdd46461a058f7c5a97e9952a3bf5",
     "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
   },
   "git": {
-    "commit": "f5ed06b525347a35496f5351c3086790c96586b5",
-    "tree": "d98ff178f9a3eef105f9c66291a2ac3bc3f78aa2",
-    "status": []
+    "commit": "d8963fc7f794d3bfcd9d7e25f72f504ca27af033",
+    "tree": "4041e59e25be389cbc6d7a4b06b242b3c4cc0068",
+    "status": [
+      " M qualification/release-archive.sha256",
+      " M qualification/source-tree.sha256"
+    ]
   }
 }

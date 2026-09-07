@@ -1,6 +1,8 @@
-commit=f5ed06b525347a35496f5351c3086790c96586b5
-tree=d98ff178f9a3eef105f9c66291a2ac3bc3f78aa2
+commit=d8963fc7f794d3bfcd9d7e25f72f504ca27af033
+tree=4041e59e25be389cbc6d7a4b06b242b3c4cc0068
 working_tree=dirty
  M qualification/provenance.json
+ M qualification/release-archive.sha256
  M qualification/source-manifest.json
-source_tree_sha256=f526c093cb64261212db47b8948a7401361540b955649bfe916e029310940626
+ M qualification/source-tree.sha256
+source_tree_sha256=f20bb91e910954f2150af7a2f1616d9d66f7ba462689811e8bfd69e53d1eb274
