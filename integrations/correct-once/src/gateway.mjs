@@ -8,20 +8,29 @@ export function createCorrectOnceGatewayClient({ baseUrl, token, fetchImpl = glo
     throw new TypeError('baseUrl, token, and fetchImpl are required');
   return Object.freeze({
     async execute(request) {
-      const response = await fetchImpl(new URL('/gateway/tool-call', baseUrl), {
-        method: 'POST',
-        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          subject: request.subject,
-          server: request.server,
-          tool: request.tool,
-          arguments: request.args,
-          action_id: request.actionId,
-          idempotency_key: request.idempotencyKey,
-          approval_token: request.approvalToken,
-          semantic_metadata: { nemo_grant: request.grant, nemo_grant_digest: request.grantDigest },
-        }),
-      });
+      let response;
+      try {
+        response = await fetchImpl(new URL('/gateway/tool-call', baseUrl), {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            subject: request.subject,
+            server: request.server,
+            tool: request.tool,
+            arguments: request.args,
+            action_id: request.actionId,
+            idempotency_key: request.idempotencyKey,
+            approval_token: request.approvalToken,
+            semantic_metadata: { nemo_grant: request.grant, nemo_grant_digest: request.grantDigest },
+          }),
+        });
+      } catch (error) {
+        throw new CapabilityError(
+          'RECONCILIATION_REQUIRED',
+          'Correct-Once transport failed after dispatch may have occurred',
+          { outcome: 'unknown', retryable: false, cause: String(error) },
+        );
+      }
       const body = await response.json().catch(() => null);
       if (!response.ok) {
         throw new CapabilityError(

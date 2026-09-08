@@ -26,7 +26,7 @@ test('Correct-Once client calls the authenticated Effect Fabric tool endpoint', 
     actionId: 'action-1',
     idempotencyKey: 'idem-1',
     approvalToken: 'coap1.approval',
-    grant: 'coap2.grant',
+    grant: 'coap3.grant',
     grantDigest: 'digest',
   });
   assert.deepEqual(result, { receipt: 'ok' });
@@ -34,5 +34,29 @@ test('Correct-Once client calls the authenticated Effect Fabric tool endpoint', 
   assert.equal(observed.options.headers.authorization, 'Bearer gateway-token');
   assert.equal(observed.body.action_id, 'action-1');
   assert.equal(observed.body.approval_token, 'coap1.approval');
-  assert.equal(observed.body.semantic_metadata.nemo_grant, 'coap2.grant');
+  assert.equal(observed.body.semantic_metadata.nemo_grant, 'coap3.grant');
+});
+
+test('transport failure is surfaced as reconciliation required', async () => {
+  const client = createCorrectOnceGatewayClient({
+    baseUrl: 'http://127.0.0.1:8765',
+    token: 'gateway-token',
+    fetchImpl: async () => {
+      throw new Error('connection reset');
+    },
+  });
+  await assert.rejects(
+    () =>
+      client.execute({
+        subject: 'alice',
+        server: 'filesystem',
+        tool: 'delete',
+        args: {},
+        actionId: 'a',
+        idempotencyKey: 'i',
+        grant: 'coap3.g',
+        grantDigest: 'd',
+      }),
+    (error) => error.code === 'RECONCILIATION_REQUIRED' && error.details.outcome === 'unknown',
+  );
 });
