@@ -13,6 +13,7 @@ pub const DURABLE_EXECUTION_ENABLED: bool = false;
 /// Opt-in experimental contracts.
 #[cfg(feature = "unstable-hardening")]
 pub mod unstable {
+    use nemo_relay_ledger::unstable::{ExecutionState, ReceiptRecord};
     use serde::{Deserialize, Serialize};
     use serde_json::Value as Json;
 
@@ -170,6 +171,21 @@ pub mod unstable {
         pub outcome_certainty: OutcomeCertainty,
         /// Optional authoritative receipt digest.
         pub receipt_digest: Option<String>,
+        /// Complete authoritative receipt supplied by an effect backend.
+        ///
+        /// Pure and read backends leave this absent. Consequential backends
+        /// return it only after Effect Fabric has created the evidence object.
+        pub receipt: Option<ReceiptRecord>,
+    }
+
+    /// Result of provider reconciliation for an action previously marked
+    /// `UNKNOWN` by the external effect implementation.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ReconciliationResult {
+        /// Authoritative state established by reconciliation.
+        pub state: ExecutionState,
+        /// Optional evidence receipt created during reconciliation.
+        pub receipt: Option<ReceiptRecord>,
     }
 
     /// Adapter boundary for execution backends owned by another subsystem.
@@ -182,6 +198,16 @@ pub mod unstable {
             &self,
             request: &ExecutionRequest,
         ) -> Result<ExecutionResult, EffectExecutionError>;
+    }
+
+    /// Adapter boundary for resolving an externally ambiguous action.
+    ///
+    /// Effect Fabric or its provider adapter owns reconciliation mechanics.
+    /// Relay only requests evidence for a stable action identifier and records
+    /// the resulting shared effect state through its supplied contracts.
+    pub trait ReconciliationProvider: Send + Sync {
+        /// Reconcile one action previously marked `UNKNOWN`.
+        fn reconcile(&self, action_id: &str) -> Result<ReconciliationResult, EffectExecutionError>;
     }
 
     fn class_mismatch(expected: &str, actual: ExecutionClass) -> EffectExecutionError {
@@ -266,6 +292,7 @@ pub mod unstable {
                     output: request.args.clone(),
                     outcome_certainty: OutcomeCertainty::ConfirmedSuccess,
                     receipt_digest: Some("receipt".into()),
+                    receipt: None,
                 })
             }
         }
@@ -323,6 +350,7 @@ pub mod unstable {
                         output: json!({"path": "function-hooks"}),
                         outcome_certainty: OutcomeCertainty::ConfirmedSuccess,
                         receipt_digest: None,
+                        receipt: None,
                     })
                 },
             );
@@ -332,6 +360,7 @@ pub mod unstable {
                         output: json!({"path": "effect-fabric"}),
                         outcome_certainty: OutcomeCertainty::ConfirmedSuccess,
                         receipt_digest: Some("receipt".into()),
+                        receipt: None,
                     })
                 },
             );

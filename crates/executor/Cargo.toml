@@ -15,8 +15,9 @@ workspace = true
 
 [features]
 default = []
-unstable-hardening = ["dep:serde", "dep:serde_json"]
+unstable-hardening = ["dep:nemo-relay-ledger", "dep:serde", "dep:serde_json"]
 
 [dependencies]
+nemo-relay-ledger = { workspace = true, features = ["unstable-hardening"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

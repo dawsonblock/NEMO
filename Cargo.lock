@@ -1705,6 +1705,7 @@ dependencies = [
  "log",
  "nemo-relay-authority",
  "nemo-relay-executor",
+ "nemo-relay-ledger",
  "nemo-relay-plugin",
  "nemo-relay-types",
  "nemo-relay-worker-proto",
@@ -1840,6 +1841,7 @@ dependencies = [
 name = "nemo-relay-executor"
 version = "0.9.1-rc.4"
 dependencies = [
+ "nemo-relay-ledger",
  "serde",
  "serde_json",
 ]

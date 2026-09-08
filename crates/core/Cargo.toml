@@ -50,6 +50,7 @@ worker-grpc = [
 ]
 unstable-hardening = [
     "dep:nemo-relay-authority",
+    "dep:nemo-relay-ledger",
     "dep:nemo-relay-executor",
 ]
 
@@ -58,6 +59,7 @@ nemo-relay-types.workspace = true
 nemo-relay-plugin.workspace = true
 nemo-relay-worker-proto = { workspace = true, optional = true }
 nemo-relay-authority = { workspace = true, optional = true, features = ["unstable-hardening"] }
+nemo-relay-ledger = { workspace = true, optional = true, features = ["unstable-hardening"] }
 nemo-relay-executor = { workspace = true, optional = true, features = ["unstable-hardening"] }
 uuid = { workspace = true, features = ["v7", "serde"] }
 serde = { version = "1", features = ["derive", "rc"] }

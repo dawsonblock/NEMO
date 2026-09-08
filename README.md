@@ -84,9 +84,11 @@ downgrade the class, replace the identity, or redirect the route.
 
 The Node Correct-Once integration uses signed `coap3` grants bound to the
 subject, capability, admission, policy version, operation, registered route,
-action ID, idempotency key, and canonical argument digest. Rust kernel adapters
-do not issue or verify external Correct-Once grants themselves; they pass the
-trusted, bound identity to the external authority adapter.
+action ID, idempotency key, and canonical argument digest. The opt-in Rust
+kernel accepts a `VerifiedGrant` only after its external `GrantVerifier` checks
+the authority artifact and Relay confirms that every security-sensitive claim
+matches the bound request. Relay does not issue Correct-Once grants or own the
+authority's signing keys.
 
 Malformed or mismatched gateway receipts are treated as
 `RECONCILIATION_REQUIRED`, never as ordinary retryable failures. The reference
@@ -95,13 +97,22 @@ state and reconciliation remain Effect Fabric responsibilities.
 
 ### Kernel adapter wiring
 
-The opt-in Rust `unstable-hardening` feature exposes `Kernel::invoke` as the
+The opt-in Rust `unstable-hardening` feature exposes `Kernel::begin` as the
 capability entry point. A harness submits only a capability ID, arguments, and
 optional trace context. The kernel resolves the immutable registration,
 validates the schema, binds runtime identity and canonical argument digest, and
-creates an opaque request for its internal `BackendRouter`. The router selects
-Function Hooks for `PURE`/`READ` and requires an `AuthorityProvider` before
-dispatching `MUTATION`/`CRITICAL` work to an `ExecutionBackend`.
+creates an opaque request for its internal `BackendRouter`. Consequential
+actions are atomically prepared through the supplied `ActionStore` before
+authority evaluation. The router selects Function Hooks for `PURE`/`READ` and
+requires a verified authority grant before dispatching `MUTATION`/`CRITICAL`
+work to an `ExecutionBackend`.
+
+When authority requires approval, `Kernel::begin` returns an opaque
+`PendingAction`; `Kernel::resume` accepts only an approval reference and keeps
+the original action and idempotency identities. Effect Fabric supplies any
+durable `ActionStore`, `ReceiptStore`, and reconciliation implementation. Relay
+binds and persists returned receipts through those contracts, but does not
+claim durable storage, retries, or provider reconciliation of its own.
 
 `BackendRouter` is deliberately a post-binding component, not a public
 harness entry point. Correct-Once and Effect Fabric implementations plug into

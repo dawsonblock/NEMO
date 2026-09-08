@@ -137,13 +137,13 @@ pub mod unstable {
             action: &ActionPreparation,
         ) -> Result<PrepareActionResult, Self::Error>;
 
-        /// Load the current state for an execution, if one exists.
-        fn load_state(&self, execution_id: &str) -> Result<Option<ExecutionState>, Self::Error>;
+        /// Load the current state for an action, if one exists.
+        fn load_state(&self, action_id: &str) -> Result<Option<ExecutionState>, Self::Error>;
 
         /// Apply one state transition under the backend's concurrency policy.
         fn transition(
             &self,
-            execution_id: &str,
+            action_id: &str,
             expected: Option<ExecutionState>,
             next: ExecutionState,
         ) -> Result<(), Self::Error>;

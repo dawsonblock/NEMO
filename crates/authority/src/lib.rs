@@ -60,12 +60,70 @@ pub mod unstable {
         pub approval_reference: Option<String>,
     }
 
+    /// A signed authority artifact bound to one exact execution request.
+    ///
+    /// Correct-Once owns issuance and cryptographic verification. Relay checks
+    /// the returned claims against the already-bound request before it crosses
+    /// a backend boundary.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VerifiedGrant {
+        /// Opaque authority token forwarded to the execution backend.
+        pub token: String,
+        /// Stable digest of the verified grant bytes.
+        pub digest: String,
+        /// Stable action identity authorized by the grant.
+        pub action_id: String,
+        /// Idempotency identity authorized by the grant.
+        pub idempotency_key: String,
+        /// Principal authorized to execute the action.
+        pub principal_id: String,
+        /// Capability authorized by the grant.
+        pub capability_id: String,
+        /// Registered capability generation authorized by the grant.
+        pub capability_generation: u64,
+        /// Registered descriptor digest authorized by the grant.
+        pub registration_digest: String,
+        /// Execution classification authorized by the grant.
+        pub execution_class: ExecutionClass,
+        /// Operation authorized by the grant.
+        pub operation: String,
+        /// Registered route digest authorized by the grant.
+        pub route_digest: String,
+        /// Canonical argument digest authorized by the grant.
+        pub args_digest: String,
+        /// Policy version evaluated by the authority.
+        pub policy_version: String,
+        /// Policy epoch evaluated by the authority.
+        pub policy_epoch: String,
+        /// Approval artifact consumed for this grant, when required.
+        pub approval_reference: Option<String>,
+    }
+
+    impl VerifiedGrant {
+        /// Return whether every security-sensitive claim matches the request.
+        pub fn binds(&self, request: &AuthorityRequest) -> bool {
+            self.action_id == request.action_id
+                && self.idempotency_key == request.idempotency_key
+                && self.principal_id == request.principal_id
+                && self.capability_id == request.capability_id
+                && self.capability_generation == request.capability_generation
+                && self.registration_digest == request.registration_digest
+                && self.execution_class == request.execution_class
+                && self.operation == request.operation
+                && self.route_digest == request.route_digest
+                && self.args_digest == request.args_digest
+                && self.policy_version == request.policy_version
+                && self.policy_epoch == request.policy_epoch
+                && self.approval_reference == request.approval_reference
+        }
+    }
+
     /// Closed authority decision vocabulary.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum AuthorityDecision {
         /// Permit the exact request.
-        Allow,
+        Allow(Box<VerifiedGrant>),
         /// Refuse execution.
         Deny,
         /// Permit only after applying the supplied constraints.
@@ -76,16 +134,33 @@ pub mod unstable {
         Defer,
     }
 
+    /// Cryptographic verifier for authority-issued execution grants.
+    ///
+    /// Implementations verify signatures, issuer/audience policy, expiry, and
+    /// any authority-specific key-rotation rules. Relay separately verifies
+    /// that the claims bind to its immutable execution request.
+    pub trait GrantVerifier: Send + Sync {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Verify an authority artifact for one exact request.
+        fn verify_grant(
+            &self,
+            request: &AuthorityRequest,
+            grant: &VerifiedGrant,
+        ) -> Result<(), Self::Error>;
+    }
+
     /// Adapter boundary for the authoritative policy engine.
     ///
     /// NeMo Relay does not implement this trait. A Correct-Once or other
     /// externally qualified authority supplies the implementation.
-    pub trait AuthorityProvider: Send + Sync {
-        /// Adapter-specific failure type.
-        type Error;
-
+    pub trait AuthorityProvider: GrantVerifier {
         /// Evaluate one exact, identity-bound capability request.
-        fn decide(&self, request: &AuthorityRequest) -> Result<AuthorityDecision, Self::Error>;
+        fn decide(
+            &self,
+            request: &AuthorityRequest,
+        ) -> Result<AuthorityDecision, <Self as GrantVerifier>::Error>;
     }
 
     /// Thin adapter around a Correct-Once client owned by another subsystem.
@@ -93,25 +168,45 @@ pub mod unstable {
     /// The client is responsible for transport, signature verification, and
     /// authority-specific policy. Relay only supplies the exact bound request
     /// and receives the closed decision vocabulary.
-    pub struct CorrectOnceAuthorityAdapter<C> {
+    pub struct CorrectOnceAuthorityAdapter<C, V> {
         client: C,
+        verifier: V,
     }
 
-    impl<C> CorrectOnceAuthorityAdapter<C> {
-        /// Wrap an external Correct-Once decision function.
-        pub const fn new(client: C) -> Self {
-            Self { client }
+    impl<C, V> CorrectOnceAuthorityAdapter<C, V> {
+        /// Wrap external Correct-Once decision and verification functions.
+        pub const fn new(client: C, verifier: V) -> Self {
+            Self { client, verifier }
         }
     }
 
-    impl<C, E> AuthorityProvider for CorrectOnceAuthorityAdapter<C>
+    impl<C, V, E> GrantVerifier for CorrectOnceAuthorityAdapter<C, V>
     where
-        C: Fn(&AuthorityRequest) -> Result<AuthorityDecision, E> + Send + Sync,
+        C: Send + Sync,
+        V: Fn(&AuthorityRequest, &VerifiedGrant) -> Result<(), E> + Send + Sync,
         E: Send + Sync,
     {
         type Error = E;
 
-        fn decide(&self, request: &AuthorityRequest) -> Result<AuthorityDecision, Self::Error> {
+        fn verify_grant(
+            &self,
+            request: &AuthorityRequest,
+            grant: &VerifiedGrant,
+        ) -> Result<(), Self::Error> {
+            (self.verifier)(request, grant)
+        }
+    }
+
+    impl<C, V, E> AuthorityProvider for CorrectOnceAuthorityAdapter<C, V>
+    where
+        C: Fn(&AuthorityRequest) -> Result<AuthorityDecision, E> + Send + Sync,
+        V: Fn(&AuthorityRequest, &VerifiedGrant) -> Result<(), E> + Send + Sync,
+        E: Send + Sync,
+    {
+        fn decide(
+            &self,
+            request: &AuthorityRequest,
+        ) -> Result<AuthorityDecision, <Self as GrantVerifier>::Error> {
             (self.client)(request)
         }
     }
@@ -150,12 +245,46 @@ pub mod unstable {
 
         struct TestAuthority;
 
-        impl AuthorityProvider for TestAuthority {
+        impl GrantVerifier for TestAuthority {
             type Error = std::convert::Infallible;
 
-            fn decide(&self, request: &AuthorityRequest) -> Result<AuthorityDecision, Self::Error> {
+            fn verify_grant(
+                &self,
+                request: &AuthorityRequest,
+                grant: &VerifiedGrant,
+            ) -> Result<(), Self::Error> {
+                assert!(grant.binds(request));
+                Ok(())
+            }
+        }
+
+        impl AuthorityProvider for TestAuthority {
+            fn decide(
+                &self,
+                request: &AuthorityRequest,
+            ) -> Result<AuthorityDecision, <Self as GrantVerifier>::Error> {
                 assert_eq!(request.capability_id, "test.capability");
-                Ok(AuthorityDecision::Allow)
+                Ok(AuthorityDecision::Allow(Box::new(grant(request))))
+            }
+        }
+
+        fn grant(request: &AuthorityRequest) -> VerifiedGrant {
+            VerifiedGrant {
+                token: "token".into(),
+                digest: "digest".into(),
+                action_id: request.action_id.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                principal_id: request.principal_id.clone(),
+                capability_id: request.capability_id.clone(),
+                capability_generation: request.capability_generation,
+                registration_digest: request.registration_digest.clone(),
+                execution_class: request.execution_class,
+                operation: request.operation.clone(),
+                route_digest: request.route_digest.clone(),
+                args_digest: request.args_digest.clone(),
+                policy_version: request.policy_version.clone(),
+                policy_epoch: request.policy_epoch.clone(),
+                approval_reference: request.approval_reference.clone(),
             }
         }
 
@@ -196,17 +325,26 @@ pub mod unstable {
             let decision = TestAuthority
                 .decide(&request)
                 .expect("test authority should decide");
-            assert_eq!(decision, AuthorityDecision::Allow);
+            assert_eq!(
+                decision,
+                AuthorityDecision::Allow(Box::new(grant(&request)))
+            );
             assert_eq!(request.route_digest, "route");
             assert_eq!(request.args_digest, "args");
         }
 
         #[test]
         fn correct_once_adapter_delegates_without_owning_policy() {
-            let adapter = CorrectOnceAuthorityAdapter::new(|request: &AuthorityRequest| {
-                assert_eq!(request.policy_epoch, "epoch");
-                Ok::<_, std::convert::Infallible>(AuthorityDecision::RequireApproval)
-            });
+            let adapter = CorrectOnceAuthorityAdapter::new(
+                |request: &AuthorityRequest| {
+                    assert_eq!(request.policy_epoch, "epoch");
+                    Ok::<_, std::convert::Infallible>(AuthorityDecision::RequireApproval)
+                },
+                |request: &AuthorityRequest, grant: &VerifiedGrant| {
+                    assert!(grant.binds(request));
+                    Ok::<_, std::convert::Infallible>(())
+                },
+            );
             assert_eq!(
                 adapter.decide(&request_from_identity(&identity())).unwrap(),
                 AuthorityDecision::RequireApproval
