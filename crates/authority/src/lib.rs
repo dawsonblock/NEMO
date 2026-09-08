@@ -48,4 +48,16 @@ pub mod unstable {
         /// Defer the decision to another authority.
         Defer,
     }
+
+    /// Adapter boundary for the authoritative policy engine.
+    ///
+    /// NeMo Relay does not implement this trait. A Correct-Once or other
+    /// externally qualified authority supplies the implementation.
+    pub trait AuthorityProvider {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Evaluate one exact, identity-bound capability request.
+        fn decide(&self, request: &AuthorityRequest) -> Result<AuthorityDecision, Self::Error>;
+    }
 }
