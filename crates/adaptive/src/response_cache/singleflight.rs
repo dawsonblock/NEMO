@@ -368,8 +368,9 @@ impl ProviderConcurrency {
         state.pending_global = state.pending_global.saturating_sub(1);
         decrement_count(&mut state.pending_provider, &pending.provider);
         self.pending_requests.fetch_sub(1, Ordering::Relaxed);
+        let grants = self.schedule_pending_locked(&mut state);
         drop(state);
-        self.schedule_pending();
+        self.send_grants(grants);
     }
 
     fn release(self: &Arc<Self>, provider: &str, model: Option<&str>) {
@@ -383,8 +384,9 @@ impl ProviderConcurrency {
             );
         }
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        let grants = self.schedule_pending_locked(&mut state);
         drop(state);
-        self.schedule_pending();
+        self.send_grants(grants);
     }
 
     /// Grant the oldest eligible pending requests without waking every waiter.
@@ -393,38 +395,49 @@ impl ProviderConcurrency {
     /// leapfrogged by a newer request. Requests for a saturated provider/model
     /// may be skipped so unrelated providers continue making progress.
     fn schedule_pending(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let grants = self.schedule_pending_locked(&mut state);
+        drop(state);
+        self.send_grants(grants);
+    }
+
+    fn schedule_pending_locked(
+        self: &Arc<Self>,
+        state: &mut AdmissionState,
+    ) -> Vec<(oneshot::Sender<ProviderPermits>, ProviderPermits)> {
         let mut grants = Vec::new();
+        while let Some(index) = state
+            .queue
+            .iter()
+            .position(|pending| self.can_admit(state, pending))
         {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            while let Some(index) = state
-                .queue
-                .iter()
-                .position(|pending| self.can_admit(&state, pending))
-            {
-                let pending = state.queue.remove(index).expect("pending admission index");
-                state.pending_global = state.pending_global.saturating_sub(1);
-                decrement_count(&mut state.pending_provider, &pending.provider);
-                state.active_global += 1;
+            let pending = state.queue.remove(index).expect("pending admission index");
+            state.pending_global = state.pending_global.saturating_sub(1);
+            decrement_count(&mut state.pending_provider, &pending.provider);
+            state.active_global += 1;
+            *state
+                .active_provider
+                .entry(pending.provider.clone())
+                .or_default() += 1;
+            if let Some(model) = &pending.model {
                 *state
-                    .active_provider
-                    .entry(pending.provider.clone())
+                    .active_model
+                    .entry((pending.provider.clone(), model.clone()))
                     .or_default() += 1;
-                if let Some(model) = &pending.model {
-                    *state
-                        .active_model
-                        .entry((pending.provider.clone(), model.clone()))
-                        .or_default() += 1;
-                }
-                self.pending_requests.fetch_sub(1, Ordering::Relaxed);
-                self.active_requests.fetch_add(1, Ordering::Relaxed);
-                let permits = ProviderPermits {
-                    controller: Arc::clone(self),
-                    provider: pending.provider,
-                    model: pending.model,
-                };
-                grants.push((pending.grant, permits));
             }
+            self.pending_requests.fetch_sub(1, Ordering::Relaxed);
+            self.active_requests.fetch_add(1, Ordering::Relaxed);
+            let permits = ProviderPermits {
+                controller: Arc::clone(self),
+                provider: pending.provider,
+                model: pending.model,
+            };
+            grants.push((pending.grant, permits));
         }
+        grants
+    }
+
+    fn send_grants(&self, grants: Vec<(oneshot::Sender<ProviderPermits>, ProviderPermits)>) {
         for (grant, permits) in grants {
             if grant.send(permits).is_err() {
                 // A cancelled receiver drops the permit, returning capacity to

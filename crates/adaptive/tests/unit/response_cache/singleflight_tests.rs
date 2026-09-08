@@ -8,7 +8,7 @@ use std::time::Duration;
 use nemo_relay::api::runtime::LlmJsonStream;
 use nemo_relay::error::FlowError;
 use serde_json::json;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::StreamExt;
 
 use super::*;
@@ -457,6 +457,71 @@ async fn immediate_admission_bypasses_a_full_unrelated_pending_queue() {
     drop(admitted_a);
     assert_eq!(concurrency.active_requests(), 0);
     assert_eq!(concurrency.pending_requests(), 0);
+}
+
+#[tokio::test]
+async fn release_grants_existing_eligible_waiter_before_new_arrival() {
+    for _ in 0..64 {
+        let concurrency = Arc::new(ProviderConcurrency::new(SingleFlightLimits {
+            max_global_provider_concurrency: 1,
+            max_provider_concurrency: 1,
+            max_model_concurrency: 1,
+            max_pending_provider_requests: 4,
+            max_pending_provider_per_provider: 4,
+            provider_admission_timeout_ms: 1000,
+            ..SingleFlightLimits::default()
+        }));
+        let first = concurrency
+            .acquire("provider", Some("model"))
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let waiting = {
+            let concurrency = Arc::clone(&concurrency);
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let permit = concurrency
+                    .acquire("provider", Some("model"))
+                    .await
+                    .unwrap();
+                sender.send('a').unwrap();
+                drop(permit);
+            })
+        };
+        while concurrency.pending_requests() != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(first);
+        let arriving = {
+            let concurrency = Arc::clone(&concurrency);
+            tokio::spawn(async move {
+                let permit = concurrency
+                    .acquire("provider", Some("model"))
+                    .await
+                    .unwrap();
+                sender.send('b').unwrap();
+                drop(permit);
+            })
+        };
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some('a')
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some('b')
+        );
+        waiting.await.unwrap();
+        arriving.await.unwrap();
+        assert_eq!(concurrency.active_requests(), 0);
+        assert_eq!(concurrency.pending_requests(), 0);
+    }
 }
 
 #[tokio::test]
