@@ -393,6 +393,10 @@ test('ambiguous critical effects are journaled as UNKNOWN', async () => {
             constructor() {
               super('unknown');
               this.code = 'RECONCILIATION_REQUIRED';
+              this.details = {
+                dispatchState: 'DISPATCH_ATTEMPTED',
+                outcomeCertainty: 'UNKNOWN',
+              };
             }
           })();
         },
@@ -406,8 +410,100 @@ test('ambiguous critical effects are journaled as UNKNOWN', async () => {
   );
   assert.deepEqual(
     entries.map((entry) => entry.state),
-    ['PREPARED', 'UNKNOWN'],
+    ['PREPARED', 'DISPATCHING', 'UNKNOWN'],
   );
+});
+
+test('malformed successful gateway receipts are UNKNOWN and cannot be retried as new effects', async () => {
+  const entries = [];
+  let calls = 0;
+  const registry = new CapabilityRegistry();
+  const critical = registry.register({
+    id: 'mutation.malformed-receipt',
+    capabilityClass: 'mutation',
+    executionClass: 'critical',
+    operation: 'mutation.malformed-receipt',
+    approvalRequired: true,
+    server: 'gateway',
+    tool: 'send',
+  });
+  const gateway = createCorrectOnceGatewayClient({
+    baseUrl: 'http://127.0.0.1:8765',
+    token: 'gateway-token',
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response('{malformed', { status: 200 });
+    },
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks: new FunctionHooksBridge({ registry, signingSecret: secret }),
+    effectFabric: new EffectFabricBridge({
+      registry,
+      signingSecret: secret,
+      journal: { append: async (entry) => entries.push(entry) },
+      criticalGateway: gateway,
+    }),
+    signingSecret: secret,
+  });
+  await assert.rejects(
+    () => runtime.execute(critical.id, {}, { approvalToken: 'approval', idempotencyKey: 'malformed-1' }),
+    (error) => error.code === 'RECONCILIATION_REQUIRED' && error.details.retryable === false,
+  );
+  await assert.rejects(
+    () => runtime.execute(critical.id, {}, { approvalToken: 'approval', idempotencyKey: 'malformed-1' }),
+    (error) => error.code === 'RECONCILIATION_REQUIRED',
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(
+    entries.map((entry) => entry.state),
+    ['PREPARED', 'DISPATCHING', 'UNKNOWN'],
+  );
+});
+
+test('a committed effect whose journal write fails becomes UNKNOWN before caching success', async () => {
+  let calls = 0;
+  const registry = new CapabilityRegistry();
+  const mutation = registry.register({
+    id: 'mutation.commit-journal-failure',
+    capabilityClass: 'mutation',
+    operation: 'mutation.commit-journal-failure',
+  });
+  const effectFabric = new EffectFabricBridge({
+    registry,
+    signingSecret: secret,
+    handlers: new Map([
+      [
+        mutation.id,
+        async () => {
+          calls += 1;
+          return { committed: true };
+        },
+      ],
+    ]),
+    journal: {
+      append: async (entry) => {
+        if (entry.state === 'COMMITTED') throw new Error('journal unavailable');
+      },
+    },
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks: new FunctionHooksBridge({ registry, signingSecret: secret }),
+    effectFabric,
+    signingSecret: secret,
+  });
+  await assert.rejects(
+    () => runtime.execute(mutation.id, {}, { idempotencyKey: 'journal-failure-1' }),
+    (error) => error.code === 'RECONCILIATION_REQUIRED' && error.details.outcome === 'unknown',
+  );
+  await assert.rejects(
+    () => runtime.execute(mutation.id, {}, { idempotencyKey: 'journal-failure-1' }),
+    (error) => error.code === 'RECONCILIATION_REQUIRED',
+  );
+  assert.equal(calls, 1);
 });
 
 test('NEMO tool installation routes marked calls and rejects marker collisions', async () => {

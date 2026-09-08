@@ -101,7 +101,10 @@ test('successful gateway responses must contain a JSON receipt object', async ()
         grant: 'coap3.g',
         grantDigest: 'd',
       }),
-    /invalid receipt/,
+    (error) =>
+      error.code === 'RECONCILIATION_REQUIRED' &&
+      error.details.dispatchState === 'DISPATCH_ATTEMPTED' &&
+      error.details.outcomeCertainty === 'UNKNOWN',
   );
 });
 
@@ -123,6 +126,9 @@ test('successful gateway responses must bind action and idempotency claims', asy
         grant: 'coap3.g',
         grantDigest: 'd',
       }),
-    (error) => error.code === 'INVALID_GATEWAY_RECEIPT',
+    (error) =>
+      error.code === 'RECONCILIATION_REQUIRED' &&
+      error.details.dispatchState === 'DISPATCH_ATTEMPTED' &&
+      error.details.outcomeCertainty === 'UNKNOWN',
   );
 });

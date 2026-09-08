@@ -90,6 +90,14 @@ the Effect Fabric bridge’s `criticalGateway`. The gateway token belongs only t
 the runtime client; the approval signing secret remains with the approval
 authority.
 
+The reference bridge records the effect lifecycle as `PREPARED` → `DISPATCHING`
+→ `COMMITTED`, `FAILED`, or `UNKNOWN`. A response received after dispatch is
+ambiguous unless it contains the exact action and idempotency bindings required
+by the request. Malformed, mismatched, or unavailable gateway receipts therefore
+produce `RECONCILIATION_REQUIRED` and are never treated as retryable failures.
+The bridge’s journal and idempotency maps remain an in-process reference adapter;
+durable recovery belongs to the real Effect Fabric.
+
 The integration carries its deterministic `coap3` capability grant in
 `semantic_metadata.nemo_grant` and sends the native Correct-Once `coap1`
 approval token separately as `approval_token`. This keeps capability/argument

@@ -3,8 +3,15 @@
 
 import { randomUUID } from 'node:crypto';
 import { verifyGrant } from './grants.mjs';
-import { CapabilityError } from './errors.mjs';
+import { CapabilityError, classifyEffectError } from './errors.mjs';
 import { digestArguments, sha256Domain } from './canonical.mjs';
+
+const JOURNAL_TRANSITIONS = Object.freeze({
+  PREPARED: new Set(['DISPATCHING']),
+  DISPATCHING: new Set(['COMMITTED', 'FAILED', 'UNKNOWN']),
+  UNKNOWN: new Set(['RECONCILING']),
+  RECONCILING: new Set(['COMMITTED', 'FAILED']),
+});
 
 export class EffectFabricBridge {
   constructor({ registry, signingSecret, handlers = new Map(), criticalGateway = null, journal = null }) {
@@ -14,7 +21,21 @@ export class EffectFabricBridge {
     this.criticalGateway = criticalGateway;
     this.journal = journal;
     this.receipts = new Map();
+    this.uncertain = new Map();
     this.inFlight = new Map();
+    this.journalState = new Map();
+  }
+
+  async appendJournal(actionId, state, entry) {
+    const previous = this.journalState.get(actionId);
+    if (previous && !JOURNAL_TRANSITIONS[previous]?.has(state)) {
+      throw new CapabilityError('INVALID_EFFECT_TRANSITION', `illegal effect transition ${previous} -> ${state}`, {
+        previous,
+        state,
+      });
+    }
+    await this.journal?.append?.({ ...entry, state });
+    this.journalState.set(actionId, state);
   }
 
   async execute(capabilityId, args, context) {
@@ -84,6 +105,12 @@ export class EffectFabricBridge {
         throw new CapabilityError('IDEMPOTENCY_CONFLICT', 'idempotency key is bound to a different request');
       return { ...existing.receipt, replayed: true };
     }
+    const uncertain = this.uncertain.get(context.idempotencyKey);
+    if (uncertain) {
+      if (uncertain.fingerprint !== fingerprint)
+        throw new CapabilityError('IDEMPOTENCY_CONFLICT', 'idempotency key is bound to a different request');
+      throw uncertain.error;
+    }
     const pending = this.inFlight.get(context.idempotencyKey);
     if (pending) {
       if (pending.fingerprint !== fingerprint)
@@ -91,7 +118,8 @@ export class EffectFabricBridge {
       return { ...(await pending.promise), replayed: true };
     }
     const promise = (async () => {
-      await this.journal?.append?.({ state: 'PREPARED', request });
+      await this.appendJournal(request.actionId, 'PREPARED', { request });
+      await this.appendJournal(request.actionId, 'DISPATCHING', { request });
       let result;
       try {
         if (capability.executionClass === 'critical') {
@@ -105,25 +133,43 @@ export class EffectFabricBridge {
           result = await handler(args, { capability, grant, request });
         }
       } catch (error) {
-        const state = error?.code === 'RECONCILIATION_REQUIRED' ? 'UNKNOWN' : 'FAILED';
-        await this.journal?.append?.({
-          state,
+        const classification = classifyEffectError(error);
+        await this.appendJournal(request.actionId, classification.state, {
           request,
           error: String(error),
-          outcome: state === 'UNKNOWN' ? 'unknown' : 'failed',
+          outcome: classification.outcome,
+          dispatchState: classification.dispatchState,
+          outcomeCertainty: classification.outcomeCertainty,
         });
+        if (classification.state === 'UNKNOWN') this.uncertain.set(context.idempotencyKey, { fingerprint, error });
         throw error;
       }
       const receipt = Object.freeze({
         route: 'effect-fabric',
-        state: 'SUCCEEDED',
+        state: 'COMMITTED',
         transactionId,
         idempotencyKey: context.idempotencyKey,
         result,
         grantDigest: grant.grantDigest,
       });
+      try {
+        await this.appendJournal(request.actionId, 'COMMITTED', { request, receipt });
+      } catch (error) {
+        const uncertain = new CapabilityError(
+          'RECONCILIATION_REQUIRED',
+          'effect succeeded but its committed journal entry could not be persisted',
+          {
+            outcome: 'unknown',
+            retryable: false,
+            dispatchState: 'DISPATCH_CONFIRMED',
+            outcomeCertainty: 'UNKNOWN',
+            cause: String(error),
+          },
+        );
+        this.uncertain.set(context.idempotencyKey, { fingerprint, error: uncertain });
+        throw uncertain;
+      }
       this.receipts.set(context.idempotencyKey, { fingerprint, receipt });
-      await this.journal?.append?.({ state: 'SUCCEEDED', request, receipt });
       return receipt;
     })();
     this.inFlight.set(context.idempotencyKey, { fingerprint, promise });
