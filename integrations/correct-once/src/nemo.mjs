@@ -1,0 +1,130 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Apache-2.0
+
+import { randomUUID } from 'node:crypto';
+import { issueGrant } from './grants.mjs';
+import { CapabilityError } from './errors.mjs';
+
+const MARKER = '__nemo_relay_correct_once_v1';
+
+export function createNemoCorrectOnceRuntime({
+  nemo,
+  registry,
+  functionHooks,
+  effectFabric,
+  signingSecret,
+  subject = 'local',
+}) {
+  if (!nemo || !registry || !functionHooks || !effectFabric)
+    throw new TypeError('nemo, registry, functionHooks, and effectFabric are required');
+
+  async function execute(capabilityId, args, options = {}) {
+    const capability = registry.get(capabilityId);
+    const policyVersion = options.policyVersion ?? 'nemo-local-v1';
+    const admission = registry.admit(capabilityId, policyVersion);
+    const finalActionId = options.actionId ?? randomUUID();
+    const finalIdempotencyKey = options.idempotencyKey ?? randomUUID();
+    const context = {
+      ...options,
+      subject: options.subject ?? subject,
+      actionId: finalActionId,
+      idempotencyKey: finalIdempotencyKey,
+      policyVersion,
+      admissionId: admission.admissionId,
+      grant:
+        options.grant ??
+        issueGrant(
+          {
+            subject: options.subject ?? subject,
+            capabilityId,
+            executionClass: capability.executionClass,
+            admissionId: admission.admissionId,
+            registrationDigest: capability.registrationDigest,
+            policyVersion,
+            operation: capability.operation,
+            actionId: finalActionId,
+            idempotencyKey: finalIdempotencyKey,
+          },
+          args,
+          { signingSecret, now: options.now },
+        ).token,
+      approvalToken: options.approvalToken,
+    };
+    if (capability.capabilityClass === 'pure' || capability.capabilityClass === 'read')
+      return functionHooks.execute(capabilityId, args, context);
+    return effectFabric.execute(capabilityId, args, context);
+  }
+
+  function installTool({
+    toolName,
+    capabilityId,
+    priority = 10000,
+    actionId,
+    idempotencyKey,
+    approvalToken,
+    policyVersion = 'nemo-local-v1',
+  }) {
+    if (typeof toolName !== 'string' || typeof capabilityId !== 'string')
+      throw new TypeError('toolName and capabilityId are required');
+    const capability = registry.get(capabilityId);
+    const requestName = `correct_once_request_${capabilityId}`;
+    const executionName = `correct_once_execution_${capabilityId}`;
+    nemo.registerToolRequestIntercept(requestName, priority, false, (name, args) => {
+      if (name !== toolName) return args;
+      if (Object.prototype.hasOwnProperty.call(args, MARKER))
+        throw new CapabilityError('MARKER_COLLISION', 'reserved capability marker is present in tool arguments');
+      const admission = registry.admit(capabilityId, policyVersion);
+      const finalActionId = actionId ?? randomUUID();
+      const finalIdempotencyKey = idempotencyKey ?? randomUUID();
+      const grant = issueGrant(
+        {
+          subject,
+          capabilityId,
+          executionClass: capability.executionClass,
+          admissionId: admission.admissionId,
+          registrationDigest: capability.registrationDigest,
+          policyVersion,
+          operation: capability.operation,
+          actionId: finalActionId,
+          idempotencyKey: finalIdempotencyKey,
+        },
+        args,
+        { signingSecret },
+      );
+      return {
+        ...args,
+        [MARKER]: {
+          capabilityId,
+          grant: grant.token,
+          approvalToken,
+          admissionId: admission.admissionId,
+          actionId: finalActionId,
+          idempotencyKey: finalIdempotencyKey,
+          policyVersion,
+        },
+      };
+    });
+    nemo.registerToolExecutionIntercept(executionName, priority, async (args, next) => {
+      const marker = args?.[MARKER];
+      if (!marker || marker.capabilityId !== capabilityId) return next(args);
+      const cleanArgs = { ...args };
+      delete cleanArgs[MARKER];
+      const context = { ...marker, subject, grant: marker.grant };
+      if (capability.capabilityClass === 'pure' || capability.capabilityClass === 'read') {
+        const routed = await functionHooks.execute(capabilityId, cleanArgs, {
+          ...context,
+          handler: (value) => next(value),
+        });
+        return routed.result;
+      }
+      const routed = await effectFabric.execute(capabilityId, cleanArgs, context);
+      return { result: routed };
+    });
+    return () => {
+      nemo.deregisterToolRequestIntercept(requestName);
+      nemo.deregisterToolExecutionIntercept(executionName);
+    };
+  }
+
+  return Object.freeze({ execute, installTool, marker: MARKER });
+}

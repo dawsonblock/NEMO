@@ -18,6 +18,7 @@ on:
       - 'crates/node/**'
       - 'crates/core/**'
       - 'crates/adaptive/**'
+      - 'integrations/correct-once/**'
       - 'justfile'
       - 'package-lock.json'
       - 'package.json'
@@ -35,6 +36,7 @@ on:
       - 'crates/node/**'
       - 'crates/core/**'
       - 'crates/adaptive/**'
+      - 'integrations/correct-once/**'
       - 'justfile'
       - 'package-lock.json'
       - 'package.json'
@@ -107,6 +109,11 @@ jobs:
           set -euo pipefail
           npm run format:check --workspace=nemo-relay-node
           npm audit --omit=dev --workspace=nemo-relay-node
+          npm run format:check --workspace=nemo-relay-correct-once
+          npm audit --omit=dev --workspace=nemo-relay-correct-once
 
       - name: Run Node.js binding tests
         run: just test-node
+
+      - name: Run Correct-Once contract tests
+        run: npm test --workspace=nemo-relay-correct-once

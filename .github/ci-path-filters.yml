@@ -188,6 +188,7 @@ node:
   - 'crates/node/*.js'
   - 'crates/node/src/**'
   - 'crates/node/tests/**/*.mjs'
+  - 'integrations/correct-once/**'
   - 'scripts/test-support/**'
 
 openclaw:

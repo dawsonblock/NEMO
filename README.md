@@ -266,6 +266,15 @@ For documentation changes, run `just docs` (or `just docs-linkcheck` for a
 link-only check). The Rust test recipe uses `cargo-nextest`; install the
 repository-pinned development tools before running the full matrix.
 
+The Node-first Correct-Once integration is available at
+`integrations/correct-once`. It binds PURE and READ capabilities to Function
+Hooks and MUTATION capabilities to Effect Fabric with signed, argument-bound
+`coap2` grants. Run its focused contract suite with:
+
+```bash
+npm test --workspace=nemo-relay-correct-once
+```
+
 For a bounded local diagnostic:
 
 ```bash
