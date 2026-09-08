@@ -61,8 +61,8 @@
   },
   "provenance": {
     "source_tree_sha256": "5c0cdeeac37c2c6a8556c0ef8d5321e031038048e7ce429e15c00fb7a44c86bc",
-    "source_archive_sha256": null,
-    "release_archive_sha256": null,
+    "source_archive_sha256": "569f20f22dc140571961bf5dd2df5a555fc4d785c4e7c9b98fa59c69f083b2c7",
+    "release_archive_sha256": "569f20f22dc140571961bf5dd2df5a555fc4d785c4e7c9b98fa59c69f083b2c7",
     "environment_sha256": "4fd791fc929649182d4b47de1be18245aca6ce772decd4c27312db3dfa33128b",
     "lockfiles": {
       "Cargo.lock": "sha256:69c8701c1e3c62ef945e487ba0820e40949d878336f95e490551fd5af3337f55",
@@ -70,8 +70,8 @@
       "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
     },
     "git": {
-      "commit": "35e3ee00c8ec4aa07310306bcd1d1bae69901461",
-      "tree": "d487e053e012d7fbe9f841d631297a0e4ff62460",
+      "commit": "88981cb61ef4510ab416afd7d1c08f36f69c7d58",
+      "tree": "a83563fc1fddaad7521944a46ec2dafa89484628",
       "source_tree_sha256": "5c0cdeeac37c2c6a8556c0ef8d5321e031038048e7ce429e15c00fb7a44c86bc",
       "status": []
     }
