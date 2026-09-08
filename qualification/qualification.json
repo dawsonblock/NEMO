@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "qualification_level": "E2_LOCAL",
-  "release_version": "0.9.1-rc.3",
+  "release_version": "0.9.1-rc.4",
   "profile": "manifest",
   "overall": "INCONCLUSIVE",
   "promotion": "DEV",
@@ -60,18 +60,19 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "7eb65ba910ea25d1b9e3009fbd6544a05c21aceabefbafcc9d04b30b85f8b267",
-    "source_archive_sha256": "01f6a117575691e6aed26f6930c7ef27456c4ddcd7c90d79009a185d290b7958",
-    "release_archive_sha256": "01f6a117575691e6aed26f6930c7ef27456c4ddcd7c90d79009a185d290b7958",
+    "source_tree_sha256": "5c0cdeeac37c2c6a8556c0ef8d5321e031038048e7ce429e15c00fb7a44c86bc",
+    "source_archive_sha256": null,
+    "release_archive_sha256": null,
     "environment_sha256": "4fd791fc929649182d4b47de1be18245aca6ce772decd4c27312db3dfa33128b",
     "lockfiles": {
-      "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
-      "package-lock.json": "sha256:2db1df6db654b3a96366b84cb80628b6cab5ebb1ac5e4ee79baf00c010bff7a9",
+      "Cargo.lock": "sha256:69c8701c1e3c62ef945e487ba0820e40949d878336f95e490551fd5af3337f55",
+      "package-lock.json": "sha256:532646d54d6fa89d4b3cb3103e6f20b1ee205908cfd0107946ed50dce5037f22",
       "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
     },
     "git": {
-      "commit": "d4fb270c318834424b9daa0a7dab9a8952f9e197",
-      "tree": "337a684bc5c98be934f5f18e6b659a4884b6ba55",
+      "commit": "35e3ee00c8ec4aa07310306bcd1d1bae69901461",
+      "tree": "d487e053e012d7fbe9f841d631297a0e4ff62460",
+      "source_tree_sha256": "5c0cdeeac37c2c6a8556c0ef8d5321e031038048e7ce429e15c00fb7a44c86bc",
       "status": []
     }
   },
