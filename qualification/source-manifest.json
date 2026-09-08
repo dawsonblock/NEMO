@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "7bc985f5bf14d8ce82e0a2abfe3ac21c1b8d01830e7c9dcd3be9687d89cc7ab3",
+  "root_digest": "c9856a92b973d395357a8dfbcfd5b50bcb614ff3347cfe349f20c22131cd95b9",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -87,7 +87,7 @@
     "Cargo.toml": "914a00c3fc84a5b4bd7fe805d8d01bd3853b8fc416d2f914775baeabcebff9d4",
     "FORK_PROVENANCE.md": "96415da356ec964ee2c230c8dab64a5b007bbce5171ee954dfb3c450c1c8fb0b",
     "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
-    "README.md": "580157a083bceec7ca74d986bb5dc1613a4d3317439d975160764ba8a78f2c0b",
+    "README.md": "359041083f4852c174dafbae2721da997dbf2bff7e3de7079cd0aa186bbe8466",
     "RELEASING.md": "44f4161139402d60696b101e1a6619cfc20cdac79d88a75f5b475c9440d5508e",
     "SECURITY.md": "6d936690c3f6bf49a1286dc3556c3c7504d142b87a08fd4123dafa5bdc1c72cd",
     "about.toml": "e2d903a4fb0d7009a08912b9f2d669e9244e0cd4bc307605aab650e0df1c2439",
@@ -1308,17 +1308,17 @@
     "coverage",
     "qualification"
   ],
-  "source_archive_sha256": "84dcdf695310801166e3d39cda55ade774eb6a690eea88f0ce3a952bf742fa74",
-  "release_archive_sha256": "84dcdf695310801166e3d39cda55ade774eb6a690eea88f0ce3a952bf742fa74",
+  "source_archive_sha256": "3747257a183e65935aeedf593de8e87d2b047614159200707382a6963b72f086",
+  "release_archive_sha256": "3747257a183e65935aeedf593de8e87d2b047614159200707382a6963b72f086",
   "lockfiles": {
     "Cargo.lock": "sha256:69c8701c1e3c62ef945e487ba0820e40949d878336f95e490551fd5af3337f55",
     "package-lock.json": "sha256:532646d54d6fa89d4b3cb3103e6f20b1ee205908cfd0107946ed50dce5037f22",
     "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
   },
   "git": {
-    "commit": "11a64a47c7fbff8c3729c74b78a9c7c43cd0bfbc",
-    "tree": "83cdec77e9415cfb3b15f2e4d347fabe0854dcc5",
-    "source_tree_sha256": "7bc985f5bf14d8ce82e0a2abfe3ac21c1b8d01830e7c9dcd3be9687d89cc7ab3",
+    "commit": "5fb754e0f5ee7cf427c4d400cafe83cf2d996fad",
+    "tree": "b45f9f08c3655c95678301d685f076f9597d6838",
+    "source_tree_sha256": "c9856a92b973d395357a8dfbcfd5b50bcb614ff3347cfe349f20c22131cd95b9",
     "status": []
   }
 }
