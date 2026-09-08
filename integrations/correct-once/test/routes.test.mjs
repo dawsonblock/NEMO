@@ -105,6 +105,39 @@ test('critical mutation binds the grant and native approval to the Correct-Once 
   assert.match(observed.body.semantic_metadata.nemo_grant_digest, /^[0-9a-f]{64}$/);
 });
 
+test('approval-required mutations fail before contacting the gateway without approval', async () => {
+  let calls = 0;
+  const registry = new CapabilityRegistry();
+  const critical = registry.register({
+    id: 'mutation.approval-required',
+    capabilityClass: 'mutation',
+    executionClass: 'critical',
+    operation: 'mutation.approval-required',
+    approvalRequired: true,
+    server: 'local-filesystem',
+    tool: 'delete',
+  });
+  const functionHooks = new FunctionHooksBridge({ registry, signingSecret: secret });
+  const effectFabric = new EffectFabricBridge({
+    registry,
+    signingSecret: secret,
+    criticalGateway: {
+      execute: async () => {
+        calls += 1;
+      },
+    },
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks,
+    effectFabric,
+    signingSecret: secret,
+  });
+  await assert.rejects(() => runtime.execute(critical.id, { path: 'x' }), /approval token/);
+  assert.equal(calls, 0);
+});
+
 test('NEMO tool installation routes marked calls and rejects marker collisions', async () => {
   const requestInterceptors = new Map();
   const executionInterceptors = new Map();

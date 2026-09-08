@@ -64,6 +64,9 @@ export class EffectFabricBridge {
         'critical capabilities require Correct-Once server and tool bindings',
       );
     }
+    if (capability.approvalRequired && typeof request.approvalToken !== 'string') {
+      throw new CapabilityError('APPROVAL_REQUIRED', 'this capability requires a Correct-Once approval token');
+    }
     await this.journal?.append?.({ state: 'PREPARED', request });
     let result;
     try {
