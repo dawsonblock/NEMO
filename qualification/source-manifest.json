@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "2d0791a271d895e08b97dc8747061d351b8d904c9871239328dbbb197d6aee9d",
+  "root_digest": "d2964cd2d9f5d3694983e96d9335b1fa98124950034b01e69d9aa28c84a10245",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -1007,7 +1007,7 @@
     "integrations/correct-once/package.json": "7723b5d6e10b3a451522e0dc06fe4af5c306f273fe88aaa3814f444bc919f1b8",
     "integrations/correct-once/src/canonical.mjs": "242da74d7eb82502bc75f4794287bf9d4806ff3de556c7076a5c8c41619be51a",
     "integrations/correct-once/src/capabilities.mjs": "f500fa8f61022d774a95279f71ff59a35d74b5d4fd18134d06bc3f11ec87ddb4",
-    "integrations/correct-once/src/effect-fabric.mjs": "4f7864b70bfe7b4049552562d84cddfeaa3b11f9f71631217d58ae90b2e9ec80",
+    "integrations/correct-once/src/effect-fabric.mjs": "06fe62310fd5f9764bbaecc2ca93dc53443c46001db3f83cdedf135c6ea94689",
     "integrations/correct-once/src/errors.mjs": "808bf3e86c0d4980aa44532dcaad870d362c3ac2cda7468b575bc2cb023ecfb8",
     "integrations/correct-once/src/function-hooks.mjs": "9123c6b789caf2a6fefbba1d966452aee205686da6bc3ae601703af190f46f73",
     "integrations/correct-once/src/gateway.mjs": "37fc137a18ca089de4bb7bb44f5baf19bb948a26040b8f066fdd6303ed68fe70",
@@ -1017,7 +1017,7 @@
     "integrations/correct-once/test/capabilities.test.mjs": "ea829b774cdbde746a1eeffad3a4eaa22a96197d6c771c466c531e1747ea8808",
     "integrations/correct-once/test/gateway.test.mjs": "4d289edd004fdc09ec00eead8d3bc551bf236300942a2d06aaa866d195117046",
     "integrations/correct-once/test/grants.test.mjs": "35cc24ee23739269b3aafc0e9540d16c92970fcdae9b849a733875903c92c39f",
-    "integrations/correct-once/test/routes.test.mjs": "4a3c4adec02013dca6c21b2cd0aadeba0244c16c04938a84034fe5e6471c1a50",
+    "integrations/correct-once/test/routes.test.mjs": "cae0e3095d0050732309ea4e9be72c5ce0643e893af6c62e1346f3644ce9802b",
     "integrations/openclaw/README.md": "c7e897b5184230ffb4c84f458ce2ebb9e3683f54eb51da26cbfd2f3b41dcaff9",
     "integrations/openclaw/index.ts": "4fdaa565af0b1a4dec0ef2f50865a314f7f50ec6a50de467d3029cefe4d0cd52",
     "integrations/openclaw/openclaw.plugin.json": "0b1e3aa792d1feee14cd48764807cb3c45506e5d8254ed9d93801c4d54ea77ad",
@@ -1305,16 +1305,16 @@
     "coverage",
     "qualification"
   ],
-  "source_archive_sha256": "449045dbeb42c11b535a664f1a4579166d68347b410b6df8b0324b0c7a8bd59a",
-  "release_archive_sha256": "449045dbeb42c11b535a664f1a4579166d68347b410b6df8b0324b0c7a8bd59a",
+  "source_archive_sha256": "dbf93077c12fa818e22f2e5f1959b2d63756b54f3cd3a4b10afd2348a37e40c0",
+  "release_archive_sha256": "dbf93077c12fa818e22f2e5f1959b2d63756b54f3cd3a4b10afd2348a37e40c0",
   "lockfiles": {
     "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
     "package-lock.json": "sha256:2db1df6db654b3a96366b84cb80628b6cab5ebb1ac5e4ee79baf00c010bff7a9",
     "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
   },
   "git": {
-    "commit": "be0124be842ff88651a8d127eeda76b7fcd6cdb1",
-    "tree": "c254f5661a845e0c3001590025d7df72ec4fc3ea",
+    "commit": "d2a8234323ce89b74dc9959773420a7eb060ccf3",
+    "tree": "89b0f7807bfcfd06d65f921b4ed5b1955921fb7a",
     "status": []
   }
 }
