@@ -246,19 +246,28 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Audit production Node dependencies
-        run: npm audit --workspaces --omit=dev --audit-level=high
+        id: npm-audit
+        run: |
+          set +e
+          npm audit --workspaces --omit=dev --audit-level=high --json > npm-audit.json
+          status=$?
+          cat npm-audit.json
+          exit "$status"
 
       - name: Generate SPDX dependency inventory
+        if: ${{ always() }}
         run: |
           set -euo pipefail
           cargo about generate --config about.toml --format json --locked > sbom.json
           python3 scripts/qualification/generate_spdx_sbom.py sbom.json sbom.spdx.json "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
 
       - name: Upload security evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-evidence-${{ github.run_id }}
           path: |
+            npm-audit.json
             sbom.spdx.json
             sbom.json
           if-no-files-found: error
