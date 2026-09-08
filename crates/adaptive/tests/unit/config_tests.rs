@@ -211,6 +211,7 @@ fn test_adaptive_editor_schema_covers_canonical_options() {
             "adaptive_hints",
             "tool_parallelism",
             "acg",
+            "provider_admission",
             "response_cache",
             "policy",
         ]
