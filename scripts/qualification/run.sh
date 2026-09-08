@@ -238,6 +238,7 @@ manifest = {
     "git": {
         "commit": (git_output(["rev-parse", "HEAD"]) or "").strip() or None,
         "tree": (git_output(["rev-parse", "HEAD^{tree}"]) or "").strip() or None,
+        "source_tree_sha256": source_tree_sha256,
         "status": [
             line
             for line in (git_output(["status", "--short"]) or "").splitlines()

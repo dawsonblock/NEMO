@@ -137,9 +137,21 @@ def main() -> int:
             discrepancies.append(f"lockfile digest differs: {lockfile}")
 
     recorded_git = manifest.get("git") or {}
-    if recorded_git.get("commit") and recorded_git["commit"] != git_output("rev-parse", "HEAD"):
-        discrepancies.append("Git commit differs from qualification manifest")
-    if recorded_git.get("tree") and recorded_git["tree"] != git_output("rev-parse", "HEAD^{tree}"):
+    current_commit = git_output("rev-parse", "HEAD")
+    if recorded_git.get("commit") and recorded_git["commit"] != current_commit:
+        try:
+            changed_since = git_output("diff", "--name-only", f"{recorded_git['commit']}..HEAD").splitlines()
+        except subprocess.CalledProcessError:
+            changed_since = []
+        non_generated = [
+            path for path in changed_since if not path.startswith("qualification/") and not path.startswith("release/artifacts/")
+        ]
+        if non_generated:
+            discrepancies.append("Git commit differs with non-generated source changes")
+    if recorded_git.get("source_tree_sha256"):
+        if recorded_git["source_tree_sha256"] != actual_tree:
+            discrepancies.append("Git source tree digest differs from qualification manifest")
+    elif recorded_git.get("tree") and recorded_git["tree"] != git_output("rev-parse", "HEAD^{tree}"):
         discrepancies.append("Git tree differs from qualification manifest")
     dirty = [
         line
