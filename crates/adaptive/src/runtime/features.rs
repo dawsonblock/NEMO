@@ -501,9 +501,16 @@ impl AdaptiveRuntime {
         // its own CacheStore and installs buffered and streaming LLM execution
         // intercepts plus an opt-in tool execution intercept.
         if let Some(config) = self.config.response_cache.clone() {
-            pending.push(Box::new(ResponseCacheFeature::new(config, self.runtime_id)));
+            pending.push(Box::new(ResponseCacheFeature::new(
+                config,
+                self.config.provider_admission.clone(),
+                self.runtime_id,
+            )));
         } else {
-            pending.push(Box::new(ProviderAdmissionFeature::new(self.runtime_id)));
+            pending.push(Box::new(ProviderAdmissionFeature::new(
+                self.config.provider_admission.clone(),
+                self.runtime_id,
+            )));
         }
         pending
     }
@@ -862,6 +869,7 @@ struct ResponseCacheFeature {
     tool_name: String,
     priority: i32,
     config: ResponseCacheConfig,
+    provider_admission: crate::config::SingleFlightLimits,
 }
 
 /// Always-on provider admission for adaptive runtimes that do not enable the
@@ -871,14 +879,16 @@ struct ProviderAdmissionFeature {
     name: String,
     stream_name: String,
     tool_name: String,
+    limits: crate::config::SingleFlightLimits,
 }
 
 impl ProviderAdmissionFeature {
-    fn new(runtime_id: Uuid) -> Self {
+    fn new(limits: crate::config::SingleFlightLimits, runtime_id: Uuid) -> Self {
         Self {
             name: format!("adaptive_{runtime_id}_provider_admission_llm_execution"),
             stream_name: format!("adaptive_{runtime_id}_provider_admission_llm_stream_execution"),
             tool_name: format!("adaptive_{runtime_id}_provider_admission_tool_execution"),
+            limits,
         }
     }
 }
@@ -889,9 +899,7 @@ impl AdaptiveFeature for ProviderAdmissionFeature {
         ctx: &'a mut RegistrationContext<'_>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let concurrency = Arc::new(ProviderConcurrency::new(
-                crate::config::SingleFlightLimits::default(),
-            ));
+            let concurrency = Arc::new(ProviderConcurrency::new(self.limits.clone()));
             // Lowest priority makes admission the outermost execution boundary
             // while preserving the normal intercept chain inside it.
             let priority = i32::MIN;
@@ -916,13 +924,18 @@ impl AdaptiveFeature for ProviderAdmissionFeature {
 }
 
 impl ResponseCacheFeature {
-    fn new(config: ResponseCacheConfig, runtime_id: Uuid) -> Self {
+    fn new(
+        config: ResponseCacheConfig,
+        provider_admission: crate::config::SingleFlightLimits,
+        runtime_id: Uuid,
+    ) -> Self {
         Self {
             name: format!("adaptive_{runtime_id}_response_cache_llm_execution"),
             stream_name: format!("adaptive_{runtime_id}_response_cache_llm_stream_execution"),
             tool_name: format!("adaptive_{runtime_id}_response_cache_tool_execution"),
             priority: config.priority,
             config,
+            provider_admission,
         }
     }
 }
@@ -943,7 +956,7 @@ impl AdaptiveFeature for ResponseCacheFeature {
                          managed calls will run live under bounded provider admission: {error}"
                     );
                     let concurrency =
-                        Arc::new(ProviderConcurrency::new(self.config.singleflight.clone()));
+                        Arc::new(ProviderConcurrency::new(self.provider_admission.clone()));
                     let priority = i32::MIN;
                     ctx.register_llm_execution_intercept(
                         &self.name,
@@ -965,7 +978,7 @@ impl AdaptiveFeature for ResponseCacheFeature {
                 Err(error) => return Err(error),
             };
             let config = Arc::new(self.config.clone());
-            let concurrency = Arc::new(ProviderConcurrency::new(config.singleflight.clone()));
+            let concurrency = Arc::new(ProviderConcurrency::new(self.provider_admission.clone()));
             ctx.register_llm_execution_intercept(
                 &self.name,
                 self.priority,

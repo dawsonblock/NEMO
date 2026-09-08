@@ -560,4 +560,20 @@ describe('adaptive helpers', () => {
     });
     assert.ok(invalid.diagnostics.some(({ code }) => code === 'response_cache.invalid_singleflight_limit'));
   });
+
+  it('serializes independent provider-admission limits', () => {
+    const spec = adaptive.ComponentSpec({
+      version: 1,
+      providerAdmission: {
+        maxGlobalProviderConcurrency: 8,
+        maxPendingProviderRequests: 16,
+        providerAdmissionTimeoutMs: 2500,
+      },
+    });
+    assert.deepEqual(spec.config.provider_admission, {
+      max_global_provider_concurrency: 8,
+      max_pending_provider_requests: 16,
+      provider_admission_timeout_ms: 2500,
+    });
+  });
 });

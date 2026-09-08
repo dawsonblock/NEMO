@@ -268,9 +268,16 @@ function toResponseCachePluginConfig(config) {
 }
 
 function toPluginConfig(config) {
-  const { responseCache, ...rest } = config;
-  if (responseCache === undefined) return config;
-  return { ...rest, response_cache: toResponseCachePluginConfig(responseCache) };
+  const { responseCache, providerAdmission, ...rest } = config;
+  if (responseCache === undefined && providerAdmission === undefined) return config;
+  const serialized = { ...rest };
+  if (responseCache !== undefined) {
+    serialized.response_cache = toResponseCachePluginConfig(responseCache);
+  }
+  if (providerAdmission !== undefined) {
+    serialized.provider_admission = mapPluginFields(providerAdmission, SINGLE_FLIGHT_PLUGIN_FIELDS);
+  }
+  return serialized;
 }
 
 class AdaptiveRuntime extends lib.AdaptiveRuntime {

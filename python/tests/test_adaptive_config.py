@@ -226,6 +226,26 @@ class TestDynamicConfigContract:
 
         assert config.to_dict()["key_strategy"] == "logical"
 
+    def test_provider_admission_serializes_independently_from_response_cache(self):
+        config = AdaptiveConfig(
+            provider_admission=SingleFlightLimits(
+                max_global_provider_concurrency=8,
+                max_pending_provider_requests=16,
+                provider_admission_timeout_ms=2500,
+            )
+        )
+        assert config.to_dict()["provider_admission"] == {
+            "max_active_keys": 4096,
+            "max_waiters_per_key": 256,
+            "max_global_provider_concurrency": 8,
+            "max_provider_concurrency": 128,
+            "max_model_concurrency": 64,
+            "max_global_waiters": 32768,
+            "max_pending_provider_requests": 16,
+            "max_pending_provider_per_provider": 512,
+            "provider_admission_timeout_ms": 2500,
+        }
+
     def test_response_cache_default_preserves_positional_policy_argument(self):
         policy = ConfigPolicy(unknown_field="error")
         config = AdaptiveConfig(1, None, None, None, None, None, None, policy)

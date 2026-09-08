@@ -10,7 +10,7 @@ use std::sync::{Arc, Once};
 use crate::acg::profile::{BlockStabilityScore, StabilityClass};
 use crate::acg::prompt_ir::SpanId;
 use crate::acg::stability::StabilityAnalysisResult;
-use crate::config::{BackendSpec, StateConfig};
+use crate::config::{BackendSpec, SingleFlightLimits, StateConfig};
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
 use crate::response_cache::config::ToolCacheConfig;
 use crate::trie::accumulator::AccumulatorState;
@@ -1080,6 +1080,7 @@ async fn response_cache_feature_registers_llm_stream_and_enabled_tool_intercepts
             }),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let execution_name = feature.name.clone();
@@ -1110,7 +1111,8 @@ async fn response_cache_feature_propagates_invalid_store_configuration() {
         ..ResponseCacheConfig::default()
     };
     config.backend.kind = "unsupported-store".into();
-    let mut feature = ResponseCacheFeature::new(config, Uuid::now_v7());
+    let mut feature =
+        ResponseCacheFeature::new(config, SingleFlightLimits::default(), Uuid::now_v7());
     let mut runtime = AdaptiveRuntime::new(AdaptiveConfig::default())
         .await
         .unwrap();
@@ -1139,6 +1141,7 @@ async fn response_cache_feature_cleans_up_when_llm_registration_conflicts() {
             namespace: "response-cache-execution-conflict".into(),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let name = feature.name.clone();
@@ -1169,6 +1172,7 @@ async fn response_cache_feature_cleans_up_when_stream_registration_conflicts() {
             namespace: "response-cache-stream-conflict".into(),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let execution_name = feature.name.clone();
@@ -1209,6 +1213,7 @@ async fn response_cache_feature_cleans_up_when_tool_registration_conflicts() {
             }),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let execution_name = feature.name.clone();

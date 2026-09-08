@@ -40,6 +40,9 @@ pub struct AdaptiveConfig {
     /// the adaptive plugin installs the response-cache execution intercept(s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_cache: Option<ResponseCacheConfig>,
+    /// Always-on provider admission limits, independent of response caching.
+    #[serde(default)]
+    pub provider_admission: SingleFlightLimits,
     /// Adaptive-local unsupported-config policy.
     #[serde(default)]
     pub policy: ConfigPolicy,
@@ -56,6 +59,7 @@ impl Default for AdaptiveConfig {
             tool_parallelism: None,
             acg: None,
             response_cache: None,
+            provider_admission: SingleFlightLimits::default(),
             policy: ConfigPolicy::default(),
         }
     }
@@ -364,6 +368,12 @@ nemo_relay::editor_config! {
             optional: true,
             nested: AcgComponentConfig,
             default: AcgComponentConfig,
+        },
+        provider_admission => {
+            label: "provider_admission",
+            kind: Section,
+            nested: SingleFlightLimits,
+            default: SingleFlightLimits,
         },
         response_cache => {
             label: "response_cache",

@@ -191,6 +191,27 @@ func TestResponseCacheConfigReachesTypedSurface(t *testing.T) {
 	assertResponseCacheValidation(t, rc)
 }
 
+func TestAdaptiveConfigCarriesIndependentProviderAdmission(t *testing.T) {
+	config := NewAdaptiveConfig()
+	if config.ProviderAdmission == nil {
+		t.Fatal("provider admission defaults must be present")
+	}
+	config.ProviderAdmission.MaxGlobalProviderConcurrency = uint64Ptr(8)
+	config.ProviderAdmission.MaxPendingProviderRequests = uint64Ptr(16)
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal adaptive config: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal adaptive config: %v", err)
+	}
+	section, ok := decoded["provider_admission"].(map[string]any)
+	if !ok || section["max_global_provider_concurrency"] != float64(8) || section["max_pending_provider_requests"] != float64(16) {
+		t.Fatalf("provider admission fields not preserved: %#v", decoded["provider_admission"])
+	}
+}
+
 func assertResponseCacheConstructorDefaults(t *testing.T, config ResponseCacheConfig) {
 	t.Helper()
 	if config.TTLSeconds == nil || *config.TTLSeconds != 3600 {

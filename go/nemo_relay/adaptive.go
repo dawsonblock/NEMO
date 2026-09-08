@@ -10,15 +10,16 @@ const AdaptivePluginKind = "adaptive"
 
 // AdaptiveConfig is the canonical Go shape for the adaptive plugin config document.
 type AdaptiveConfig struct {
-	Version         uint32                 `json:"version,omitempty"`
-	AgentID         string                 `json:"agent_id,omitempty"`
-	State           *AdaptiveStateConfig   `json:"state,omitempty"`
-	Telemetry       *TelemetryConfig       `json:"telemetry,omitempty"`
-	AdaptiveHints   *AdaptiveHintsConfig   `json:"adaptive_hints,omitempty"`
-	ToolParallelism *ToolParallelismConfig `json:"tool_parallelism,omitempty"`
-	Acg             *AcgConfig             `json:"acg,omitempty"`
-	ResponseCache   *ResponseCacheConfig   `json:"response_cache,omitempty"`
-	Policy          *ConfigPolicy          `json:"policy,omitempty"`
+	Version           uint32                 `json:"version,omitempty"`
+	AgentID           string                 `json:"agent_id,omitempty"`
+	State             *AdaptiveStateConfig   `json:"state,omitempty"`
+	Telemetry         *TelemetryConfig       `json:"telemetry,omitempty"`
+	AdaptiveHints     *AdaptiveHintsConfig   `json:"adaptive_hints,omitempty"`
+	ToolParallelism   *ToolParallelismConfig `json:"tool_parallelism,omitempty"`
+	Acg               *AcgConfig             `json:"acg,omitempty"`
+	ResponseCache     *ResponseCacheConfig   `json:"response_cache,omitempty"`
+	ProviderAdmission *SingleFlightLimits    `json:"provider_admission,omitempty"`
+	Policy            *ConfigPolicy          `json:"policy,omitempty"`
 }
 
 // AdaptiveStateConfig selects the adaptive state backend.
@@ -177,7 +178,8 @@ type AdaptiveComponentSpec struct {
 
 // NewAdaptiveConfig returns a default adaptive config with version 1.
 func NewAdaptiveConfig() AdaptiveConfig {
-	return AdaptiveConfig{Version: 1}
+	providerAdmission := NewSingleFlightLimits()
+	return AdaptiveConfig{Version: 1, ProviderAdmission: &providerAdmission}
 }
 
 // NewInMemoryAdaptiveBackend returns an in-memory adaptive backend spec.

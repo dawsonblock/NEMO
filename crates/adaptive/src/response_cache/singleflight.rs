@@ -298,6 +298,18 @@ impl ProviderConcurrency {
         model: Option<&str>,
     ) -> Option<ProviderPermits> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Do not let a new request consume capacity that an older eligible
+        // waiter is already entitled to. The caller will enqueue behind that
+        // waiter, and schedule_pending() will grant both atomically whenever
+        // capacity permits. Ineligible waiters for saturated providers are
+        // intentionally skipped so unrelated providers still make progress.
+        if state
+            .queue
+            .iter()
+            .any(|pending| self.can_admit(&state, pending))
+        {
+            return None;
+        }
         if !self.can_admit_parts(&state, provider, model) {
             return None;
         }

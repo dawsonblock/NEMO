@@ -497,6 +497,7 @@ class AdaptiveConfig:
         acg: Adaptive Cache Governor settings.
         policy: Unsupported-config policy applied within the adaptive config.
         response_cache: Opt-in LLM response and tool-result cache settings.
+        provider_admission: Always-on provider concurrency and pending-work limits.
 
     Behavior:
         This document configures only the adaptive component. Plugins are
@@ -512,6 +513,7 @@ class AdaptiveConfig:
     acg: AcgConfig | None = None
     policy: ConfigPolicy = field(default_factory=ConfigPolicy)
     response_cache: ResponseCacheConfig | None = None
+    provider_admission: SingleFlightLimits = field(default_factory=SingleFlightLimits)
 
     def to_dict(self) -> JsonObject:
         """Serialize this adaptive config to the canonical JSON object shape."""
@@ -524,6 +526,7 @@ class AdaptiveConfig:
             "tool_parallelism": _normalize(self.tool_parallelism),
             "acg": _normalize(self.acg),
             "response_cache": _normalize(self.response_cache),
+            "provider_admission": _normalize(self.provider_admission),
             "policy": self.policy.to_dict(),
         }
 
