@@ -29,4 +29,15 @@ pub mod unstable {
         /// Remote isolated worker.
         RemoteIsolated,
     }
+
+    /// Adapter boundary for acquiring an execution environment.
+    pub trait IsolationProvider {
+        /// Backend-specific handle returned to the caller.
+        type Handle;
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Acquire an environment for the requested trust tier.
+        fn acquire(&self, tier: TrustTier) -> Result<Self::Handle, Self::Error>;
+    }
 }

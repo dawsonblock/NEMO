@@ -28,4 +28,13 @@ pub mod unstable {
         /// Fresh human or external-system approval is required.
         RequireApproval,
     }
+
+    /// Adapter boundary for outbound trust-boundary inspection.
+    pub trait DlpProvider {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Inspect a payload immediately before external dispatch.
+        fn inspect(&self, payload: &Json) -> Result<DlpDecision, Self::Error>;
+    }
 }

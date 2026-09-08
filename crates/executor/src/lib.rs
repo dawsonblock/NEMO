@@ -26,4 +26,24 @@ pub mod unstable {
         /// Absolute deadline represented as Unix milliseconds.
         pub deadline_unix_ms: u64,
     }
+
+    /// Adapter boundary for execution backends owned by another subsystem.
+    ///
+    /// Implementations may target Function Hooks, Effect Fabric, or a worker
+    /// broker. This crate does not provide retries, persistence, or authority.
+    pub trait ExecutionBackend {
+        /// Backend-specific request type.
+        type Request;
+        /// Backend-specific result type.
+        type Output;
+        /// Backend-specific failure type.
+        type Error;
+
+        /// Dispatch one already-authorized execution identity.
+        fn execute(
+            &self,
+            identity: &ExecutionIdentity,
+            request: &Self::Request,
+        ) -> Result<Self::Output, Self::Error>;
+    }
 }

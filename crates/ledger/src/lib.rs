@@ -41,4 +41,53 @@ pub mod unstable {
         /// Recovery cannot prove whether the action occurred.
         PossiblyExecuted,
     }
+
+    /// Minimal authoritative event written by an external effect journal.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct JournalRecord {
+        /// Stable execution identity.
+        pub execution_id: String,
+        /// State after this event.
+        pub state: ExecutionState,
+        /// Digest of the event payload, never the raw sensitive payload.
+        pub payload_digest: String,
+    }
+
+    /// Adapter boundary for durable effect history.
+    pub trait EffectJournal {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Append one tamper-evident state record.
+        fn append(&self, record: &JournalRecord) -> Result<(), Self::Error>;
+    }
+
+    /// Adapter boundary for durable action state and transitions.
+    pub trait ActionStore {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Load the current state for an execution, if one exists.
+        fn load_state(&self, execution_id: &str) -> Result<Option<ExecutionState>, Self::Error>;
+
+        /// Apply one state transition under the backend's concurrency policy.
+        fn transition(
+            &self,
+            execution_id: &str,
+            expected: Option<ExecutionState>,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error>;
+    }
+
+    /// Adapter boundary for authoritative receipts.
+    pub trait ReceiptStore {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Persist a receipt digest for an execution.
+        fn store(&self, execution_id: &str, receipt_digest: &str) -> Result<(), Self::Error>;
+
+        /// Retrieve the persisted receipt digest, if one exists.
+        fn load(&self, execution_id: &str) -> Result<Option<String>, Self::Error>;
+    }
 }

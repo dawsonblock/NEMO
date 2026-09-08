@@ -40,6 +40,8 @@ pub(crate) enum CliError {
     Upstream(#[from] reqwest::Error),
     #[error("{0}")]
     ProviderFailure(UpstreamFailure),
+    #[error("runtime temporarily overloaded: {0}")]
+    Overloaded(String),
     #[error("http error: {0}")]
     Http(#[from] http::Error),
     #[error("io error: {0}")]
@@ -76,6 +78,7 @@ impl CliError {
             Self::Unauthorized(_) => "unauthorized",
             Self::Upstream(_) => "upstream",
             Self::ProviderFailure(_) => "provider_failure",
+            Self::Overloaded(_) => "overloaded",
             Self::Http(_) => "http",
             Self::Io(_) => "io",
             Self::Install(_) => "install",
@@ -131,6 +134,7 @@ impl IntoResponse for CliError {
                 .status
                 .and_then(|status| StatusCode::from_u16(status).ok())
                 .unwrap_or(StatusCode::BAD_GATEWAY),
+            (false, Self::Overloaded(_)) => StatusCode::SERVICE_UNAVAILABLE,
             (
                 false,
                 Self::Http(_)

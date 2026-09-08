@@ -403,6 +403,9 @@ fn response_cache_recognizes_share_scope_and_singleflight_limits() {
                 "max_global_provider_concurrency": 4,
                 "max_provider_concurrency": 5,
                 "max_model_concurrency": 6,
+                "max_pending_provider_requests": 8,
+                "max_pending_provider_per_provider": 7,
+                "provider_admission_timeout_ms": 1000,
                 "unexpected": true
             }
         },

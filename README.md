@@ -8,17 +8,17 @@ SPDX-License-Identifier: Apache-2.0
 **Observable execution boundaries for AI agents.**
 
 [![License](https://img.shields.io/github/license/dawsonblock/NEMO)](LICENSE)
-[![Development line](https://img.shields.io/badge/development-0.9.1--rc.2-blue)](RELEASING.md)
+[![Development line](https://img.shields.io/badge/development-0.9.1--rc.3-blue)](RELEASING.md)
 [![Rust](https://img.shields.io/badge/Rust-1.96.1-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-24.x-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 
 NeMo Relay is a multi-language runtime boundary for applications that call
 LLMs, tools, agents, and plugins. It gives those calls one consistent model for
 scope lineage, middleware, lifecycle events, callbacks, and observability while
 leaving orchestration and provider ownership in the application.
 
-> **Status:** This checkout is a hardened `0.9.1-rc.2` development line. The
+> **Status:** This checkout is a hardened `0.9.1-rc.3` development line. The
 > checked-in qualification snapshot is provenance-bound but `INCONCLUSIVE`/`DEV`;
 > it is not a production or release certificate. See
 > [Qualification](#qualification) before promoting a build.
@@ -87,10 +87,10 @@ uv add "nemo-relay[langchain,langgraph,deepagents]"
 
 ### Node.js
 
-Node.js 24 or newer is required.
+Node.js 24.16.0 is the pinned build runtime. Run `nvm use` to select it.
 
 ```bash
-npm install nemo-relay-node@0.9.1-rc.2
+npm install nemo-relay-node@0.9.1-rc.3
 ```
 
 ### Rust
@@ -220,7 +220,7 @@ not hostile-code sandboxes, and telemetry is not a durable audit ledger.
 | --- | --- | --- |
 | Rust runtime | Supported | Rust 1.96.1 in this checkout; source of truth for runtime semantics. |
 | Python binding | Supported | Python 3.11+; PyO3 extension plus Python wrappers. |
-| Node.js binding | Supported | Node.js 24+; N-API binding with TypeScript declarations. |
+| Node.js binding | Supported | Node.js 24.x; N-API binding with TypeScript declarations. |
 | Relay CLI | Supported | Python 3.11+ or packaged binary; hooks, gateway, and observability. |
 | Go binding | Experimental | Go 1.21+; source-first binding over the C FFI. |
 | Raw C FFI | Experimental | C ABI for downstream bindings. |
@@ -247,7 +247,7 @@ scripts/           Build, test, docs, and qualification wrappers
 
 ## Build and test from source
 
-Prerequisites are Rust 1.96.1, Python 3.11+, Node.js 24+, Go 1.21+, `uv`, and
+Prerequisites are Rust 1.96.1, Python 3.11+, Node.js 24.x, Go 1.21+, `uv`, and
 `just`. The reproducible environment is defined in `.devcontainer/`; its
 current Go image is newer than the minimum supported version.
 
@@ -265,6 +265,15 @@ just test-go
 For documentation changes, run `just docs` (or `just docs-linkcheck` for a
 link-only check). The Rust test recipe uses `cargo-nextest`; install the
 repository-pinned development tools before running the full matrix.
+
+The Node-first Correct-Once integration is available at
+`integrations/correct-once`. It binds PURE and READ capabilities to Function
+Hooks and MUTATION capabilities to Effect Fabric with signed, argument-bound
+`coap3` grants. Run its focused contract suite with:
+
+```bash
+npm test --workspace=nemo-relay-correct-once
+```
 
 For a bounded local diagnostic:
 
@@ -295,7 +304,7 @@ packager, then bind the archive digest into the qualification record:
 
 ```bash
 python3 scripts/qualification/package_release.py
-NEMO_RELAY_RELEASE_ARCHIVE=release/artifacts/NEMO-0.9.1-rc.2-source.zip \
+NEMO_RELAY_RELEASE_ARCHIVE=release/artifacts/NEMO-0.9.1-rc.3-source.zip \
   scripts/qualification/run.sh provenance
 ```
 

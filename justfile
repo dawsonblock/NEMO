@@ -1637,6 +1637,10 @@ test-all: test-rust test-python test-python-langchain test-go test-node test-ope
 qualification mode="full":
     scripts/qualification/run.sh "{{ mode }}"
 
+# Verify source, lockfile, Git, and archive digests against qualification evidence.
+provenance-check:
+    python3 scripts/qualification/provenance_check.py
+
 # [version] or --set ref_name=<version>
 set-version version="":
     #!/usr/bin/env bash

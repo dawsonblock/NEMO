@@ -59,13 +59,17 @@ export interface AcgConfig {
   stability_thresholds?: AcgStabilityThresholds;
 }
 
-/** Limits that bound cache-miss coalescing and provider work. */
+/** Limits that bound cache-miss coalescing and runtime provider work. */
 export interface SingleFlightLimits {
   maxActiveKeys?: number;
   maxWaitersPerKey?: number;
   maxGlobalProviderConcurrency?: number;
   maxProviderConcurrency?: number;
   maxModelConcurrency?: number;
+  maxGlobalWaiters?: number;
+  maxPendingProviderRequests?: number;
+  maxPendingProviderPerProvider?: number;
+  providerAdmissionTimeoutMs?: number;
 }
 
 /** Opt-in LLM response and tool-result cache settings. */
@@ -176,11 +180,14 @@ export interface Config {
   tool_parallelism?: ToolParallelismConfig;
   acg?: AcgConfig;
   responseCache?: ResponseCacheConfig;
+  /** Always-on provider concurrency and pending-work limits. */
+  providerAdmission?: SingleFlightLimits;
   policy?: ConfigPolicy;
 }
 
-type AdaptivePluginConfig = Omit<Config, 'responseCache'> & {
+type AdaptivePluginConfig = Omit<Config, 'responseCache' | 'providerAdmission'> & {
   response_cache?: ResponseCachePluginConfig;
+  provider_admission?: SingleFlightPluginConfig;
 };
 
 /** Top-level adaptive component wrapper with fixed kind `adaptive`. */
