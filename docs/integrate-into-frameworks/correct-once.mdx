@@ -28,6 +28,13 @@ Run its tests with:
 npm test --workspace=nemo-relay-correct-once
 ```
 
+Capability schemas are enforced before a grant is created. Registration rejects
+inconsistent execution classes, and `critical` is reserved for
+approval-required mutations with an explicit Correct-Once server/tool route.
+Idempotency keys are request-bound: reusing a key for a different capability,
+action, or argument digest fails with a conflict. The runtime subject is fixed
+when the integration is created and cannot be supplied by an individual call.
+
 Use a separate approval authority for critical grants. Do not send the approval
 signing secret to the NEMO runtime or to a worker handling the external effect.
 The integration records Effect Fabric receipts and supports idempotent replay of

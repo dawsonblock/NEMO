@@ -10,3 +10,4 @@ export * from './src/gateway.mjs';
 export * from './src/grants.mjs';
 export * from './src/nemo.mjs';
 export * from './src/registry.mjs';
+export * from './src/schema.mjs';

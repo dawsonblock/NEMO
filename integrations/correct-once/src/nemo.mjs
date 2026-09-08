@@ -4,6 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import { issueGrant } from './grants.mjs';
 import { CapabilityError } from './errors.mjs';
+import { sha256Domain } from './canonical.mjs';
 
 const MARKER = '__nemo_relay_correct_once_v1';
 
@@ -19,14 +20,20 @@ export function createNemoCorrectOnceRuntime({
     throw new TypeError('nemo, registry, functionHooks, and effectFabric are required');
 
   async function execute(capabilityId, args, options = {}) {
+    if (Object.prototype.hasOwnProperty.call(options, 'subject') && options.subject !== subject) {
+      throw new CapabilityError('IDENTITY_OVERRIDE', 'runtime identity is immutable for this execution context');
+    }
     const capability = registry.get(capabilityId);
+    registry.validateArguments(capabilityId, args);
     const policyVersion = options.policyVersion ?? 'nemo-local-v1';
     const admission = registry.admit(capabilityId, policyVersion);
-    const finalActionId = options.actionId ?? randomUUID();
     const finalIdempotencyKey = options.idempotencyKey ?? randomUUID();
+    const finalActionId =
+      options.actionId ??
+      sha256Domain('nemo/action/v1', { subject, capabilityId, idempotencyKey: finalIdempotencyKey });
     const context = {
       ...options,
-      subject: options.subject ?? subject,
+      subject,
       actionId: finalActionId,
       idempotencyKey: finalIdempotencyKey,
       policyVersion,
@@ -35,7 +42,7 @@ export function createNemoCorrectOnceRuntime({
         options.grant ??
         issueGrant(
           {
-            subject: options.subject ?? subject,
+            subject,
             capabilityId,
             executionClass: capability.executionClass,
             admissionId: admission.admissionId,
@@ -50,7 +57,7 @@ export function createNemoCorrectOnceRuntime({
         ).token,
       approvalToken: options.approvalToken,
     };
-    if (capability.capabilityClass === 'pure' || capability.capabilityClass === 'read')
+    if (capability.executionClass === 'pure' || capability.executionClass === 'read')
       return functionHooks.execute(capabilityId, args, context);
     return effectFabric.execute(capabilityId, args, context);
   }
@@ -73,6 +80,7 @@ export function createNemoCorrectOnceRuntime({
       if (name !== toolName) return args;
       if (Object.prototype.hasOwnProperty.call(args, MARKER))
         throw new CapabilityError('MARKER_COLLISION', 'reserved capability marker is present in tool arguments');
+      registry.validateArguments(capabilityId, args);
       const admission = registry.admit(capabilityId, policyVersion);
       const finalActionId = actionId ?? randomUUID();
       const finalIdempotencyKey = idempotencyKey ?? randomUUID();
@@ -110,14 +118,17 @@ export function createNemoCorrectOnceRuntime({
       const cleanArgs = { ...args };
       delete cleanArgs[MARKER];
       const context = { ...marker, subject, grant: marker.grant };
-      if (capability.capabilityClass === 'pure' || capability.capabilityClass === 'read') {
+      if (capability.executionClass === 'pure' || capability.executionClass === 'read') {
         const routed = await functionHooks.execute(capabilityId, cleanArgs, {
           ...context,
           handler: (value) => next(value),
         });
         return routed.result;
       }
-      const routed = await effectFabric.execute(capabilityId, cleanArgs, context);
+      const routed = await effectFabric.execute(capabilityId, cleanArgs, {
+        ...context,
+        handler: (value) => next(value),
+      });
       return { result: routed };
     });
     return () => {

@@ -16,6 +16,14 @@ action ID, idempotency key, and the SHA-256 digest of the canonical arguments.
 Changing any of those values fails closed before a handler or external effect
 runs.
 
+Registered JSON schemas are validated before admission grants are issued.
+Capability and execution classes are checked for consistency at registration;
+`critical` is only valid for an approval-required mutation with an explicit
+Correct-Once server/tool route. Idempotency keys are bound to the subject,
+capability, action, and argument digest; conflicting reuse returns an explicit
+conflict instead of replaying another operation's receipt. Runtime identity is
+installed when the integration is created and cannot be overridden per call.
+
 ## Reference capabilities
 
 The package includes four local capabilities for qualification:

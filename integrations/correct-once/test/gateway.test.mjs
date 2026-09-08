@@ -32,6 +32,7 @@ test('Correct-Once client calls the authenticated Effect Fabric tool endpoint', 
   assert.deepEqual(result, { receipt: 'ok' });
   assert.equal(observed.url, 'http://127.0.0.1:8765/gateway/tool-call');
   assert.equal(observed.options.headers.authorization, 'Bearer gateway-token');
+  assert.equal(observed.body.action_id, 'action-1');
   assert.equal(observed.body.approval_token, 'coap1.approval');
   assert.equal(observed.body.semantic_metadata.nemo_grant, 'coap2.grant');
 });

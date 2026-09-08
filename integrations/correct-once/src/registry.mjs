@@ -3,13 +3,16 @@
 
 import { digestCapability, sha256Domain } from './canonical.mjs';
 import { CapabilityError } from './errors.mjs';
+import { compileSchema } from './schema.mjs';
 
 const VALID_CLASSES = new Set(['pure', 'read', 'mutation']);
+const VALID_EXECUTION_CLASSES = new Set(['pure', 'read', 'mutation', 'critical']);
 
 export class CapabilityRegistry {
   #entries = new Map();
   #admissions = new Map();
   #revoked = new Set();
+  #validators = new Map();
 
   register(definition) {
     const required = ['id', 'capabilityClass', 'operation'];
@@ -24,10 +27,21 @@ export class CapabilityRegistry {
     if (this.#entries.has(definition.id)) {
       throw new CapabilityError('CAPABILITY_EXISTS', `capability already registered: ${definition.id}`);
     }
+    const executionClass = definition.executionClass ?? definition.capabilityClass;
+    if (!VALID_EXECUTION_CLASSES.has(executionClass)) {
+      throw new CapabilityError('INVALID_CAPABILITY', `unsupported execution class: ${executionClass}`);
+    }
+    const compatible =
+      (definition.capabilityClass === 'pure' && executionClass === 'pure') ||
+      (definition.capabilityClass === 'read' && executionClass === 'read') ||
+      (definition.capabilityClass === 'mutation' && (executionClass === 'mutation' || executionClass === 'critical'));
+    if (!compatible) {
+      throw new CapabilityError('INVALID_CAPABILITY', 'capability and execution classes are inconsistent');
+    }
     const normalized = {
       id: definition.id,
       capabilityClass: definition.capabilityClass,
-      executionClass: definition.executionClass ?? definition.capabilityClass,
+      executionClass,
       operation: definition.operation,
       server: definition.server ?? null,
       tool: definition.tool ?? null,
@@ -36,9 +50,17 @@ export class CapabilityRegistry {
       schema: definition.schema ?? { type: 'object' },
       resourceFields: [...(definition.resourceFields ?? [])],
     };
+    if (executionClass === 'critical' && definition.approvalRequired !== true) {
+      throw new CapabilityError('INVALID_CAPABILITY', 'critical capabilities must require approval');
+    }
+    if (executionClass === 'critical' && (!normalized.server || !normalized.tool)) {
+      throw new CapabilityError('INVALID_CAPABILITY', 'critical capabilities require server and tool bindings');
+    }
+    const validator = compileSchema(normalized.schema);
     const registrationDigest = digestCapability(normalized);
     const entry = Object.freeze({ ...normalized, registrationDigest });
     this.#entries.set(entry.id, entry);
+    this.#validators.set(entry.id, validator);
     return entry;
   }
 
@@ -70,6 +92,13 @@ export class CapabilityRegistry {
     });
     this.#admissions.set(admissionId, admission);
     return admission;
+  }
+
+  validateArguments(id, args) {
+    const entry = this.get(id);
+    const validator = this.#validators.get(entry.id);
+    if (!validator) throw new CapabilityError('SCHEMA_UNAVAILABLE', `schema validator is unavailable: ${id}`);
+    validator.validate(args);
   }
 
   verifyAdmission(admissionId, capabilityId, registrationDigest, policyVersion) {

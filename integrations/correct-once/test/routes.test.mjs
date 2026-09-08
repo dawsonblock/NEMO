@@ -59,6 +59,91 @@ test('registry revocation invalidates the admission before execution', async () 
   );
 });
 
+test('schemas are enforced before grants or handlers run', async () => {
+  const registry = new CapabilityRegistry();
+  const capability = registry.register({
+    id: 'read.schema',
+    capabilityClass: 'read',
+    operation: 'read.schema',
+    schema: { type: 'object', required: ['mustExist'] },
+  });
+  const functionHooks = new FunctionHooksBridge({
+    registry,
+    signingSecret: secret,
+    handlers: new Map([[capability.id, async () => ({ shouldNotRun: true })]]),
+  });
+  const effectFabric = new EffectFabricBridge({ registry, signingSecret: secret });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks,
+    effectFabric,
+    signingSecret: secret,
+  });
+  await assert.rejects(() => runtime.execute(capability.id, {}), /missing required property mustExist/);
+});
+
+test('inconsistent capability and execution classes are rejected at registration', () => {
+  const registry = new CapabilityRegistry();
+  assert.throws(
+    () =>
+      registry.register({ id: 'pure.critical', capabilityClass: 'pure', executionClass: 'critical', operation: 'x' }),
+    /classes are inconsistent/,
+  );
+});
+
+test('idempotency keys reject conflicting capability or argument reuse', async () => {
+  const registry = new CapabilityRegistry();
+  const first = registry.register({ id: 'mutation.first', capabilityClass: 'mutation', operation: 'mutation.first' });
+  const second = registry.register({
+    id: 'mutation.second',
+    capabilityClass: 'mutation',
+    operation: 'mutation.second',
+  });
+  let calls = 0;
+  const functionHooks = new FunctionHooksBridge({ registry, signingSecret: secret });
+  const effectFabric = new EffectFabricBridge({
+    registry,
+    signingSecret: secret,
+    handlers: new Map([
+      [
+        first.id,
+        async () => {
+          calls += 1;
+          return { from: 'first' };
+        },
+      ],
+      [
+        second.id,
+        async () => {
+          calls += 1;
+          return { from: 'second' };
+        },
+      ],
+    ]),
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks,
+    effectFabric,
+    signingSecret: secret,
+  });
+  const result = await runtime.execute(first.id, { value: 1 }, { idempotencyKey: 'shared' });
+  const replay = await runtime.execute(first.id, { value: 1 }, { idempotencyKey: 'shared' });
+  assert.equal(replay.replayed, true);
+  await assert.rejects(
+    () => runtime.execute(second.id, { value: 1 }, { idempotencyKey: 'shared' }),
+    /idempotency key is bound to a different request/,
+  );
+  await assert.rejects(
+    () => runtime.execute(first.id, { value: 2 }, { idempotencyKey: 'shared' }),
+    /idempotency key is bound to a different request/,
+  );
+  assert.equal(calls, 1);
+  assert.equal(result.result.from, 'first');
+});
+
 test('critical mutation binds the grant and native approval to the Correct-Once Gateway request', async () => {
   let observed;
   const gateway = createCorrectOnceGatewayClient({
@@ -78,6 +163,7 @@ test('critical mutation binds the grant and native approval to the Correct-Once 
     capabilityClass: 'mutation',
     executionClass: 'critical',
     operation: 'mutation.critical',
+    approvalRequired: true,
     server: 'local-filesystem',
     tool: 'delete',
   });
@@ -159,4 +245,36 @@ test('NEMO tool installation routes marked calls and rejects marker collisions',
   const result = await execution(marked, async (args) => ({ result: { echoed: args } }));
   assert.deepEqual(result, { result: { echoed: { value: 1 } } });
   assert.throws(() => request('digest', { [runtime.marker]: true }), /reserved capability marker/);
+});
+
+test('installed mutation tools wrap the real NEMO callback through Effect Fabric', async () => {
+  const requestInterceptors = new Map();
+  const executionInterceptors = new Map();
+  const nemo = {
+    registerToolRequestIntercept: (name, _priority, _breakChain, callback) => requestInterceptors.set(name, callback),
+    deregisterToolRequestIntercept: (name) => requestInterceptors.delete(name),
+    registerToolExecutionIntercept: (name, _priority, callback) => executionInterceptors.set(name, callback),
+    deregisterToolExecutionIntercept: (name) => executionInterceptors.delete(name),
+  };
+  const registry = new CapabilityRegistry();
+  const capability = registry.register({
+    id: 'mutation.installed',
+    capabilityClass: 'mutation',
+    operation: 'mutation.installed',
+  });
+  const functionHooks = new FunctionHooksBridge({ registry, signingSecret: secret });
+  const effectFabric = new EffectFabricBridge({ registry, signingSecret: secret });
+  const runtime = createNemoCorrectOnceRuntime({ nemo, registry, functionHooks, effectFabric, signingSecret: secret });
+  runtime.installTool({ toolName: 'write', capabilityId: capability.id });
+  const request = [...requestInterceptors.values()][0];
+  const execution = [...executionInterceptors.values()][0];
+  const marked = request('write', { value: 1 });
+  let nextCalls = 0;
+  const result = await execution(marked, async (args) => {
+    nextCalls += 1;
+    return { result: { accepted: args } };
+  });
+  assert.equal(result.result.route, 'effect-fabric');
+  assert.deepEqual(result.result.result, { result: { accepted: { value: 1 } } });
+  assert.equal(nextCalls, 1);
 });

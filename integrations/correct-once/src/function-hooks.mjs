@@ -13,9 +13,10 @@ export class FunctionHooksBridge {
 
   async execute(capabilityId, args, context) {
     const capability = this.registry.get(capabilityId);
-    if (capability.capabilityClass !== 'pure' && capability.capabilityClass !== 'read') {
+    if (capability.executionClass !== 'pure' && capability.executionClass !== 'read') {
       throw new CapabilityError('WRONG_ROUTE', 'PURE and READ capabilities must use Function Hooks');
     }
+    this.registry.validateArguments(capabilityId, args);
     const admission = this.registry.verifyAdmission(
       context.admissionId,
       capability.id,
