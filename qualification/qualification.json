@@ -60,19 +60,19 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "eab2aae879ad3f2fdebda67de8d69fc09aea750f5a4d3fcff4db58fca290a920",
-    "source_archive_sha256": "9a4aa5af76688f927c39f7b9b0986594a3d21e0618484b0772a01b5d2528a759",
-    "release_archive_sha256": "9a4aa5af76688f927c39f7b9b0986594a3d21e0618484b0772a01b5d2528a759",
+    "source_tree_sha256": "68f1249eaa61681c4ea3a0ef660a0035a0f875f83afd4096a67b1a925902bb0b",
+    "source_archive_sha256": "9f37811bcd7af062f49562712e9c8539ef0dc6d0339f12945af41cfd55e2999a",
+    "release_archive_sha256": "9f37811bcd7af062f49562712e9c8539ef0dc6d0339f12945af41cfd55e2999a",
     "environment_sha256": "4fd791fc929649182d4b47de1be18245aca6ce772decd4c27312db3dfa33128b",
     "lockfiles": {
-      "Cargo.lock": "sha256:b11b471a1e6de70fa39d3d33a51d491fc932947699309dd0fec77ea0aa4bd06b",
+      "Cargo.lock": "sha256:09be7d195a86daa466e34d7eb612f865a103056976f99cfbcb31ca46345dbc62",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
       "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
     },
     "git": {
-      "commit": "f354634ed28c83c0422bc19f21c7275b21eea30b",
-      "tree": "636fac3ed3a97db51959aec59b3bcd6069bbc209",
-      "source_tree_sha256": "eab2aae879ad3f2fdebda67de8d69fc09aea750f5a4d3fcff4db58fca290a920",
+      "commit": "993e6190728f3d54ab9beef7a2b990db284d1db4",
+      "tree": "18d936ef0578c18a446abd99eb886d47d3a66518",
+      "source_tree_sha256": "68f1249eaa61681c4ea3a0ef660a0035a0f875f83afd4096a67b1a925902bb0b",
       "status": []
     }
   },
