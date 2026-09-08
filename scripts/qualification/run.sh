@@ -238,7 +238,11 @@ manifest = {
     "git": {
         "commit": (git_output(["rev-parse", "HEAD"]) or "").strip() or None,
         "tree": (git_output(["rev-parse", "HEAD^{tree}"]) or "").strip() or None,
-        "status": (git_output(["status", "--short"]) or "").splitlines(),
+        "status": [
+            line
+            for line in (git_output(["status", "--short"]) or "").splitlines()
+            if "qualification/" not in line and "release/artifacts/" not in line
+        ],
     },
 }
 (out / "source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -256,7 +260,9 @@ PY
 
 git_commit="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
 git_tree="$(git -C "${repo_root}" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-git_dirty="$(git -C "${repo_root}" status --short 2>/dev/null || true)"
+# Generated evidence is intentionally excluded from the cleanliness signal;
+# source and release inputs remain visible to the qualification record.
+git_dirty="$(git -C "${repo_root}" status --short 2>/dev/null | grep -v 'qualification/' | grep -v 'release/artifacts/' || true)"
 {
     printf 'commit=%s\n' "${git_commit:-unavailable}"
     printf 'tree=%s\n' "${git_tree:-unavailable}"
