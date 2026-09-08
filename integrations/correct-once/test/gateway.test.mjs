@@ -60,3 +60,47 @@ test('transport failure is surfaced as reconciliation required', async () => {
     (error) => error.code === 'RECONCILIATION_REQUIRED' && error.details.outcome === 'unknown',
   );
 });
+
+test('gateway 5xx responses are treated as ambiguous effects', async () => {
+  const client = createCorrectOnceGatewayClient({
+    baseUrl: 'http://127.0.0.1:8765',
+    token: 'gateway-token',
+    fetchImpl: async () => new Response(JSON.stringify({ error: 'upstream failed' }), { status: 503 }),
+  });
+  await assert.rejects(
+    () =>
+      client.execute({
+        subject: 'alice',
+        server: 'filesystem',
+        tool: 'delete',
+        args: {},
+        actionId: 'a',
+        idempotencyKey: 'i',
+        grant: 'coap3.g',
+        grantDigest: 'd',
+      }),
+    (error) => error.code === 'RECONCILIATION_REQUIRED' && error.details.status === 503,
+  );
+});
+
+test('successful gateway responses must contain a JSON receipt object', async () => {
+  const client = createCorrectOnceGatewayClient({
+    baseUrl: 'http://127.0.0.1:8765',
+    token: 'gateway-token',
+    fetchImpl: async () => new Response('not-json', { status: 200 }),
+  });
+  await assert.rejects(
+    () =>
+      client.execute({
+        subject: 'alice',
+        server: 'filesystem',
+        tool: 'delete',
+        args: {},
+        actionId: 'a',
+        idempotencyKey: 'i',
+        grant: 'coap3.g',
+        grantDigest: 'd',
+      }),
+    /invalid receipt/,
+  );
+});

@@ -269,7 +269,7 @@ repository-pinned development tools before running the full matrix.
 The Node-first Correct-Once integration is available at
 `integrations/correct-once`. It binds PURE and READ capabilities to Function
 Hooks and MUTATION capabilities to Effect Fabric with signed, argument-bound
-`coap2` grants. Run its focused contract suite with:
+`coap3` grants. Run its focused contract suite with:
 
 ```bash
 npm test --workspace=nemo-relay-correct-once

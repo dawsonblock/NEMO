@@ -33,10 +33,29 @@ export function createCorrectOnceGatewayClient({ baseUrl, token, fetchImpl = glo
       }
       const body = await response.json().catch(() => null);
       if (!response.ok) {
+        if (response.status === 408 || response.status >= 500) {
+          throw new CapabilityError(
+            'RECONCILIATION_REQUIRED',
+            `Correct-Once Gateway response is ambiguous (${response.status})`,
+            { outcome: 'unknown', retryable: false, status: response.status, body },
+          );
+        }
         throw new CapabilityError(
           response.status === 409 ? 'APPROVAL_REQUIRED' : 'GATEWAY_REJECTED',
           `Correct-Once Gateway rejected the effect (${response.status})`,
           { body },
+        );
+      }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        throw new CapabilityError('INVALID_GATEWAY_RECEIPT', 'Correct-Once Gateway returned an invalid receipt');
+      }
+      if (body.action_id !== undefined && body.action_id !== request.actionId) {
+        throw new CapabilityError('GATEWAY_RECEIPT_MISMATCH', 'Correct-Once receipt action does not match the request');
+      }
+      if (body.idempotency_key !== undefined && body.idempotency_key !== request.idempotencyKey) {
+        throw new CapabilityError(
+          'GATEWAY_RECEIPT_MISMATCH',
+          'Correct-Once receipt idempotency key does not match the request',
         );
       }
       return body;

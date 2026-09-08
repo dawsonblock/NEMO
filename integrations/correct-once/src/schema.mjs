@@ -107,7 +107,12 @@ function compileNode(schema, path) {
   validateKeywords(schema, path);
 
   const types = schema.type === undefined ? null : Array.isArray(schema.type) ? schema.type : [schema.type];
-  if (types && (!types.length || types.some((type) => typeof type !== 'string' || !TYPES.has(type)))) {
+  if (
+    types &&
+    (!types.length ||
+      types.some((type) => typeof type !== 'string' || !TYPES.has(type)) ||
+      new Set(types).size !== types.length)
+  ) {
     throw new CapabilityError('INVALID_SCHEMA', `${path}.type contains an unsupported type`);
   }
   const required = schema.required ?? [];
@@ -138,6 +143,25 @@ function compileNode(schema, path) {
   }
   if (schema.pattern !== undefined && typeof schema.pattern !== 'string') {
     throw new CapabilityError('INVALID_SCHEMA', `${path}.pattern must be a string`);
+  }
+  for (const keyword of ['minLength', 'maxLength', 'minItems', 'maxItems']) {
+    if (schema[keyword] !== undefined && (!Number.isSafeInteger(schema[keyword]) || schema[keyword] < 0)) {
+      throw new CapabilityError('INVALID_SCHEMA', `${path}.${keyword} must be a non-negative integer`);
+    }
+  }
+  if (schema.minLength !== undefined && schema.maxLength !== undefined && schema.minLength > schema.maxLength) {
+    throw new CapabilityError('INVALID_SCHEMA', `${path}.minLength cannot exceed maxLength`);
+  }
+  if (schema.minItems !== undefined && schema.maxItems !== undefined && schema.minItems > schema.maxItems) {
+    throw new CapabilityError('INVALID_SCHEMA', `${path}.minItems cannot exceed maxItems`);
+  }
+  for (const keyword of ['minimum', 'maximum']) {
+    if (schema[keyword] !== undefined && (typeof schema[keyword] !== 'number' || !Number.isFinite(schema[keyword]))) {
+      throw new CapabilityError('INVALID_SCHEMA', `${path}.${keyword} must be a finite number`);
+    }
+  }
+  if (schema.minimum !== undefined && schema.maximum !== undefined && schema.minimum > schema.maximum) {
+    throw new CapabilityError('INVALID_SCHEMA', `${path}.minimum cannot exceed maximum`);
   }
   let pattern = null;
   if (schema.pattern !== undefined) {

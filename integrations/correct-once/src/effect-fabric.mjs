@@ -105,7 +105,13 @@ export class EffectFabricBridge {
           result = await handler(args, { capability, grant, request });
         }
       } catch (error) {
-        await this.journal?.append?.({ state: 'FAILED', request, error: String(error) });
+        const state = error?.code === 'RECONCILIATION_REQUIRED' ? 'UNKNOWN' : 'FAILED';
+        await this.journal?.append?.({
+          state,
+          request,
+          error: String(error),
+          outcome: state === 'UNKNOWN' ? 'unknown' : 'failed',
+        });
         throw error;
       }
       const receipt = Object.freeze({

@@ -332,6 +332,29 @@ test('unsupported schema keywords fail closed at registration', () => {
   );
 });
 
+test('malformed supported schema constraints fail closed at registration', () => {
+  const registry = new CapabilityRegistry();
+  const cases = [
+    { maximum: 'not-a-number' },
+    { minLength: -1 },
+    { minItems: 'not-an-integer' },
+    { type: ['string', 'string'] },
+    { minimum: 10, maximum: 1 },
+  ];
+  for (const [index, constraint] of cases.entries()) {
+    assert.throws(
+      () =>
+        registry.register({
+          id: `read.malformed-schema-${index}`,
+          capabilityClass: 'read',
+          operation: `read.malformed-schema-${index}`,
+          schema: { type: 'object', ...constraint },
+        }),
+      /INVALID_SCHEMA|schema|must|unsupported type|cannot contain|cannot exceed/,
+    );
+  }
+});
+
 test('structured enum values use structural equality', () => {
   const registry = new CapabilityRegistry();
   const capability = registry.register({
@@ -342,6 +365,49 @@ test('structured enum values use structural equality', () => {
   });
   assert.doesNotThrow(() => registry.validateArguments(capability.id, { mode: 'safe' }));
   assert.throws(() => registry.validateArguments(capability.id, { mode: 'unsafe' }), /not in enum/);
+});
+
+test('ambiguous critical effects are journaled as UNKNOWN', async () => {
+  const entries = [];
+  const registry = new CapabilityRegistry();
+  const critical = registry.register({
+    id: 'mutation.unknown',
+    capabilityClass: 'mutation',
+    executionClass: 'critical',
+    operation: 'mutation.unknown',
+    approvalRequired: true,
+    server: 'gateway',
+    tool: 'send',
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks: new FunctionHooksBridge({ registry, signingSecret: secret }),
+    effectFabric: new EffectFabricBridge({
+      registry,
+      signingSecret: secret,
+      journal: { append: async (entry) => entries.push(entry) },
+      criticalGateway: {
+        execute: async () => {
+          throw new (class extends Error {
+            constructor() {
+              super('unknown');
+              this.code = 'RECONCILIATION_REQUIRED';
+            }
+          })();
+        },
+      },
+    }),
+    signingSecret: secret,
+  });
+  await assert.rejects(
+    () => runtime.execute(critical.id, {}, { approvalToken: 'approval', idempotencyKey: 'unknown-1' }),
+    /unknown/,
+  );
+  assert.deepEqual(
+    entries.map((entry) => entry.state),
+    ['PREPARED', 'UNKNOWN'],
+  );
 });
 
 test('NEMO tool installation routes marked calls and rejects marker collisions', async () => {

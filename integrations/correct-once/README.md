@@ -90,7 +90,7 @@ the Effect Fabric bridge’s `criticalGateway`. The gateway token belongs only t
 the runtime client; the approval signing secret remains with the approval
 authority.
 
-The integration carries its deterministic `coap2` capability grant in
+The integration carries its deterministic `coap3` capability grant in
 `semantic_metadata.nemo_grant` and sends the native Correct-Once `coap1`
 approval token separately as `approval_token`. This keeps capability/argument
 binding local to NEMO while preserving Correct-Once’s existing approval and
