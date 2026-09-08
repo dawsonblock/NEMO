@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "5c0cdeeac37c2c6a8556c0ef8d5321e031038048e7ce429e15c00fb7a44c86bc",
+  "root_digest": "7bc985f5bf14d8ce82e0a2abfe3ac21c1b8d01830e7c9dcd3be9687d89cc7ab3",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -236,7 +236,7 @@
     "crates/adaptive/tests/unit/trie/serialization_tests.rs": "435e8647b63c24533a296332c6bb6cb527fff167ad50d9e3496443b09744f485",
     "crates/adaptive/tests/unit/types_tests.rs": "82c8358069b93b4050431433b3428243137f5cec30ce7635fc9c7607284fc2e1",
     "crates/authority/Cargo.toml": "d3986b2beb4603e8572cd1e13e2db39bed6d392eac88c9627f03bd78075006a6",
-    "crates/authority/src/lib.rs": "65ac2867b637fa9ca4264ae2c9ddd9398f0ed24b6b88ac1735591f6a5aff2290",
+    "crates/authority/src/lib.rs": "3456173f24cd946b408e8d2bfe299fb6a70bb53208bc39887d78920a2ea4587d",
     "crates/cli/Cargo.toml": "5cd396295af27a860fd5c463f807ddcb1bcdaa32578f646394a790194e795b7b",
     "crates/cli/README.md": "5e7924c27e2d0d8567ef5714041c3772faf4a718b6b9bd85cbd7122d770ecf6c",
     "crates/cli/assets/pi-extension/index.ts": "db13831f33e71cf00503f37bada2534db840a48e63d0ec3de35d13742a253419",
@@ -573,9 +573,9 @@
     "crates/core/tests/unit/tool_api_tests.rs": "4e4b4dcc0258fb406d916fd331f1b078a73c5f922fc2557f6de962fa21096f5b",
     "crates/core/tests/unit/types_tests.rs": "bf34f75dc9047b85f3c748df8c2258b723c69ec4639347048cedf0f372b9a077",
     "crates/dlp/Cargo.toml": "639bbd51c88542b922eb350414f2b5aa80b390eb829de121e2d03b7ee1a2ec02",
-    "crates/dlp/src/lib.rs": "bc88184b1e0fbc9f3ec9f8288ad39a04726bd25ef355b7285800bf88d1cee143",
+    "crates/dlp/src/lib.rs": "ca5333feb10cb176865316d545f1f3e8b0d889ee9754db3bad2cbed3ca79de36",
     "crates/executor/Cargo.toml": "dbfe57870a439b9dc19c6012cc1f95f2acb661af32bd4c3027bf8b1d13702cfb",
-    "crates/executor/src/lib.rs": "d5d46636677224e334763d0f16072d5d4ee9dea4cdb0faa650a1f0ebb9764b8c",
+    "crates/executor/src/lib.rs": "53720fe12f1bd6d7ed14aecd2f2f8f02041395cad9992fcafb71f4cde57afd56",
     "crates/ffi/Cargo.toml": "fe156b14ab69d7f1f1df3d412e3883fd9223645a574fe155d9ac47cb85e0a718",
     "crates/ffi/README.md": "87656c7110ce20185ea5e974fe70cc3bd0a860724d37274112f83c84b24a80c4",
     "crates/ffi/build.rs": "026608192fc2961bf7e3ad47ba8480b9a89d6485c021631341257a9fc87e6cb2",
@@ -619,9 +619,9 @@
     "crates/ffi/tests/unit/callable_tests.rs": "a80397f26ad5789c5944688693a1edfa314cbe77729d601f8a02b672c1f07890",
     "crates/ffi/tests/unit/types_tests.rs": "e6631c0454ec809758cda99c441f1abf98bbe987e22307c232fd2374f7cad548",
     "crates/isolation/Cargo.toml": "72d54e18ad996f4f4db410d0c6e036b6fefd80e52979471d88eb0254a628b1c3",
-    "crates/isolation/src/lib.rs": "f135e49397b0e052b5dc954527efa4564eb6fb60c2bbf27c2109780fb40a3f29",
+    "crates/isolation/src/lib.rs": "b45435c2a9abbdcc74589111da41dd6bb09c791729d7821ac2968ac32657b724",
     "crates/ledger/Cargo.toml": "f7c6f6dc47b284f01ffd367b769dddf4a40e6be395cd77d79a9c3c45a4389f7b",
-    "crates/ledger/src/lib.rs": "24f5ddcb8f9ad48a17e43a6eac0f7b809b17b3046c6d95dd55121493b6fef044",
+    "crates/ledger/src/lib.rs": "7295b026e98f3681285a701658b816a39df8b39c486daa274a451d26e9fde17c",
     "crates/node/Cargo.toml": "7fcdb1fa79845584cacc805879f9a208a2844cae3635bd4cd8d67509dc91d341",
     "crates/node/README.md": "9d6f71fc2d176d3f04b67372b7c5c16731716bd490584556341101a78a32b63e",
     "crates/node/adaptive.d.ts": "721a53796be6dfddbd9d95d80d7a7fbd066083bed5e7595f6da1bea7a689cb8d",
@@ -1308,17 +1308,17 @@
     "coverage",
     "qualification"
   ],
-  "source_archive_sha256": "569f20f22dc140571961bf5dd2df5a555fc4d785c4e7c9b98fa59c69f083b2c7",
-  "release_archive_sha256": "569f20f22dc140571961bf5dd2df5a555fc4d785c4e7c9b98fa59c69f083b2c7",
+  "source_archive_sha256": "84dcdf695310801166e3d39cda55ade774eb6a690eea88f0ce3a952bf742fa74",
+  "release_archive_sha256": "84dcdf695310801166e3d39cda55ade774eb6a690eea88f0ce3a952bf742fa74",
   "lockfiles": {
     "Cargo.lock": "sha256:69c8701c1e3c62ef945e487ba0820e40949d878336f95e490551fd5af3337f55",
     "package-lock.json": "sha256:532646d54d6fa89d4b3cb3103e6f20b1ee205908cfd0107946ed50dce5037f22",
     "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
   },
   "git": {
-    "commit": "88981cb61ef4510ab416afd7d1c08f36f69c7d58",
-    "tree": "a83563fc1fddaad7521944a46ec2dafa89484628",
-    "source_tree_sha256": "5c0cdeeac37c2c6a8556c0ef8d5321e031038048e7ce429e15c00fb7a44c86bc",
+    "commit": "11a64a47c7fbff8c3729c74b78a9c7c43cd0bfbc",
+    "tree": "83cdec77e9415cfb3b15f2e4d347fabe0854dcc5",
+    "source_tree_sha256": "7bc985f5bf14d8ce82e0a2abfe3ac21c1b8d01830e7c9dcd3be9687d89cc7ab3",
     "status": []
   }
 }
