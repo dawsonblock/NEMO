@@ -39,6 +39,10 @@ export function digestArguments(value) {
   return sha256Domain('nemo/arguments/v1', value);
 }
 
+export function digestRoute(value) {
+  return sha256Domain('nemo/route/v1', value);
+}
+
 export function digestGrantClaims(value) {
   return sha256Domain('nemo/grant/v1', value);
 }

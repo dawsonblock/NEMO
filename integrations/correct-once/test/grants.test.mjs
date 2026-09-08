@@ -21,6 +21,7 @@ function setup() {
     registrationDigest: capability.registrationDigest,
     policyVersion: 'policy-v1',
     operation: capability.operation,
+    routeDigest: capability.routeDigest,
     actionId: 'action-1',
     idempotencyKey: 'idem-1',
     issuedAt: 100,
@@ -46,6 +47,21 @@ test('grant verifies the exact capability and arguments', () => {
     /arguments do not match/,
   );
   assert.equal(admission.registrationDigest, capability.registrationDigest);
+});
+
+test('grant binds the registered execution route', () => {
+  const { input, args } = setup();
+  const issued = issueGrant(input, args, { signingSecret: secret, now: 100 });
+  assert.throws(
+    () =>
+      verifyGrant(
+        issued.token,
+        args,
+        { ...input, routeDigest: `${input.routeDigest}x` },
+        { signingSecret: secret, now: 101 },
+      ),
+    /grant route does not match/,
+  );
 });
 
 test('invalid signatures and expired grants fail closed', () => {

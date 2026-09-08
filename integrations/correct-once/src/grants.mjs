@@ -5,7 +5,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { digestArguments, digestGrantClaims } from './canonical.mjs';
 import { CapabilityError } from './errors.mjs';
 
-const VERSION = 'coap2';
+const VERSION = 'coap3';
 
 function secretBytes(secret) {
   const value = Buffer.isBuffer(secret) ? secret : Buffer.from(String(secret ?? ''), 'utf8');
@@ -33,7 +33,7 @@ function claimsFor(input, args, now) {
     throw new CapabilityError('INVALID_GRANT', 'grant timestamps are invalid');
   }
   return {
-    v: 2,
+    v: 3,
     sub: input.subject,
     cap: input.capabilityId,
     cls: input.executionClass,
@@ -41,6 +41,7 @@ function claimsFor(input, args, now) {
     reg: input.registrationDigest,
     pol: input.policyVersion,
     op: input.operation,
+    route: input.routeDigest,
     act: input.actionId,
     idem: input.idempotencyKey,
     arg: digestArguments(args),
@@ -59,6 +60,7 @@ export function issueGrant(input, args, { signingSecret, now = Math.floor(Date.n
     'registrationDigest',
     'policyVersion',
     'operation',
+    'routeDigest',
     'actionId',
     'idempotencyKey',
   ]) {
@@ -93,7 +95,7 @@ export function verifyGrant(token, args, expected, { signingSecret, now = Math.f
   } catch {
     throw new CapabilityError('INVALID_GRANT', 'grant claims are not valid JSON');
   }
-  if (claims?.v !== 2 || claims.exp <= now || claims.iat > now + 30 || claims.exp <= claims.iat) {
+  if (claims?.v !== 3 || claims.exp <= now || claims.iat > now + 30 || claims.exp <= claims.iat) {
     throw new CapabilityError('GRANT_EXPIRED', 'grant is expired or has invalid timestamps');
   }
   const comparisons = {
@@ -104,6 +106,7 @@ export function verifyGrant(token, args, expected, { signingSecret, now = Math.f
     reg: expected.registrationDigest,
     pol: expected.policyVersion,
     op: expected.operation,
+    route: expected.routeDigest,
     act: expected.actionId,
     idem: expected.idempotencyKey,
   };

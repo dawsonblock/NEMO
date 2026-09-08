@@ -17,13 +17,17 @@ export interface CapabilityDefinition {
   readonly resourceFields?: readonly string[];
 }
 
-export interface CapabilityEntry extends Omit<CapabilityDefinition, 'description' | 'schema' | 'resourceFields' | 'executionClass' | 'server' | 'tool'> {
+export interface CapabilityEntry extends Omit<
+  CapabilityDefinition,
+  'description' | 'schema' | 'resourceFields' | 'executionClass' | 'server' | 'tool'
+> {
   readonly executionClass: CapabilityClass | 'critical';
   readonly server: string | null;
   readonly tool: string | null;
   readonly description: string;
   readonly schema: JsonValue;
   readonly resourceFields: readonly string[];
+  readonly routeDigest: string;
   readonly registrationDigest: string;
 }
 
@@ -42,11 +46,12 @@ export interface GrantContext {
   readonly registrationDigest: string;
   readonly policyVersion: string;
   readonly operation: string;
+  readonly routeDigest: string;
   readonly actionId: string;
   readonly idempotencyKey: string;
 }
 
-export type ExecutionOptions = Omit<Partial<GrantContext>, 'subject' | 'server' | 'tool'> & {
+export type ExecutionOptions = Omit<Partial<GrantContext>, 'subject' | 'server' | 'tool' | 'policyVersion'> & {
   grant?: string;
   approvalToken?: string;
   now?: number;
@@ -60,10 +65,20 @@ export interface GrantResult {
 
 export function canonicalize(value: JsonValue): string;
 export function digestArguments(value: JsonValue): string;
+export function digestRoute(value: JsonValue): string;
 export function digestCapability(value: JsonValue): string;
 export function digestGrantClaims(value: JsonValue): string;
-export function issueGrant(input: GrantContext, args: JsonValue, options: { signingSecret: string | Uint8Array; now?: number }): GrantResult;
-export function verifyGrant(token: string, args: JsonValue, expected: GrantContext, options: { signingSecret: string | Uint8Array; now?: number }): { claims: Readonly<Record<string, JsonValue>>; grantDigest: string };
+export function issueGrant(
+  input: GrantContext,
+  args: JsonValue,
+  options: { signingSecret: string | Uint8Array; now?: number },
+): GrantResult;
+export function verifyGrant(
+  token: string,
+  args: JsonValue,
+  expected: GrantContext,
+  options: { signingSecret: string | Uint8Array; now?: number },
+): { claims: Readonly<Record<string, JsonValue>>; grantDigest: string };
 export class CapabilityError extends Error {
   readonly code: string;
   readonly details: Readonly<Record<string, unknown>>;
@@ -78,22 +93,76 @@ export class CapabilityRegistry {
   revoke(id: string): void;
   admit(id: string, policyVersion?: string): CapabilityAdmission;
   validateArguments(id: string, args: JsonValue): void;
-  verifyAdmission(admissionId: string, capabilityId: string, registrationDigest: string, policyVersion: string): CapabilityAdmission;
+  verifyAdmission(
+    admissionId: string,
+    capabilityId: string,
+    registrationDigest: string,
+    policyVersion: string,
+  ): CapabilityAdmission;
   snapshot(): readonly CapabilityEntry[];
   snapshotDigest(): string;
 }
 
 export class FunctionHooksBridge {
-  constructor(options: { registry: CapabilityRegistry; signingSecret: string | Uint8Array; handlers?: ReadonlyMap<string, (args: JsonValue, context: unknown) => unknown> });
-  execute(capabilityId: string, args: JsonValue, context: GrantContext & { grant: string; subject: string; now?: number; handler?: (args: JsonValue) => unknown }): Promise<{ result: unknown; route: 'function-hooks'; grantDigest: string }>;
+  constructor(options: {
+    registry: CapabilityRegistry;
+    signingSecret: string | Uint8Array;
+    handlers?: ReadonlyMap<string, (args: JsonValue, context: unknown) => unknown>;
+  });
+  execute(
+    capabilityId: string,
+    args: JsonValue,
+    context: GrantContext & { grant: string; subject: string; now?: number; handler?: (args: JsonValue) => unknown },
+  ): Promise<{ result: unknown; route: 'function-hooks'; grantDigest: string }>;
 }
 
 export class EffectFabricBridge {
-  constructor(options: { registry: CapabilityRegistry; signingSecret: string | Uint8Array; handlers?: ReadonlyMap<string, (args: JsonValue, context: unknown) => unknown>; criticalGateway?: { execute(request: unknown): Promise<unknown> } | null; journal?: { append(entry: unknown): Promise<void> } | null });
-  execute(capabilityId: string, args: JsonValue, context: GrantContext & { grant: string; subject: string; transactionId?: string; now?: number; approvalToken?: string; handler?: (args: JsonValue) => unknown }): Promise<unknown>;
+  constructor(options: {
+    registry: CapabilityRegistry;
+    signingSecret: string | Uint8Array;
+    handlers?: ReadonlyMap<string, (args: JsonValue, context: unknown) => unknown>;
+    criticalGateway?: { execute(request: unknown): Promise<unknown> } | null;
+    journal?: { append(entry: unknown): Promise<void> } | null;
+  });
+  execute(
+    capabilityId: string,
+    args: JsonValue,
+    context: GrantContext & {
+      grant: string;
+      subject: string;
+      transactionId?: string;
+      now?: number;
+      approvalToken?: string;
+      handler?: (args: JsonValue) => unknown;
+    },
+  ): Promise<unknown>;
 }
 
 export const REFERENCE_CAPABILITIES: readonly CapabilityDefinition[];
-export function createReferenceHandlers(options: { root: string }): Map<string, (args: JsonValue, context?: unknown) => Promise<unknown>>;
-export function createCorrectOnceGatewayClient(options: { baseUrl: string; token: string; fetchImpl?: typeof fetch }): { execute(request: unknown): Promise<unknown> };
-export function createNemoCorrectOnceRuntime(options: { nemo: Record<string, (...args: unknown[]) => unknown>; registry: CapabilityRegistry; functionHooks: FunctionHooksBridge; effectFabric: EffectFabricBridge; signingSecret: string | Uint8Array; subject?: string }): { execute(capabilityId: string, args: JsonValue, options?: ExecutionOptions): Promise<unknown>; installTool(options: { toolName: string; capabilityId: string; priority?: number; actionId?: string; idempotencyKey?: string; approvalToken?: string; policyVersion?: string }): () => void; readonly marker: string };
+export function createReferenceHandlers(options: {
+  root: string;
+}): Map<string, (args: JsonValue, context?: unknown) => Promise<unknown>>;
+export function createCorrectOnceGatewayClient(options: { baseUrl: string; token: string; fetchImpl?: typeof fetch }): {
+  execute(request: unknown): Promise<unknown>;
+};
+export function createNemoCorrectOnceRuntime(options: {
+  nemo: Record<string, (...args: unknown[]) => unknown>;
+  registry: CapabilityRegistry;
+  functionHooks: FunctionHooksBridge;
+  effectFabric: EffectFabricBridge;
+  signingSecret: string | Uint8Array;
+  subject?: string;
+  policyVersion?: string;
+}): {
+  execute(capabilityId: string, args: JsonValue, options?: ExecutionOptions): Promise<unknown>;
+  installTool(options: {
+    toolName: string;
+    capabilityId: string;
+    priority?: number;
+    actionId?: string;
+    idempotencyKey?: string;
+    approvalToken?: string;
+    policyVersion?: string;
+  }): () => void;
+  readonly marker: string;
+};

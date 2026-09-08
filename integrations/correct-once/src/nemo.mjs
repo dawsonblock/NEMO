@@ -15,9 +15,12 @@ export function createNemoCorrectOnceRuntime({
   effectFabric,
   signingSecret,
   subject = 'local',
+  policyVersion = 'nemo-local-v1',
 }) {
   if (!nemo || !registry || !functionHooks || !effectFabric)
     throw new TypeError('nemo, registry, functionHooks, and effectFabric are required');
+  if (typeof policyVersion !== 'string' || policyVersion.length === 0)
+    throw new TypeError('policyVersion must be a non-empty string');
 
   async function execute(capabilityId, args, options = {}) {
     if (Object.prototype.hasOwnProperty.call(options, 'subject') && options.subject !== subject) {
@@ -29,9 +32,11 @@ export function createNemoCorrectOnceRuntime({
     ) {
       throw new CapabilityError('ROUTE_OVERRIDE', 'execution routes are fixed by the registered capability');
     }
+    if (Object.prototype.hasOwnProperty.call(options, 'policyVersion') && options.policyVersion !== policyVersion) {
+      throw new CapabilityError('POLICY_OVERRIDE', 'policy version is fixed by the trusted runtime context');
+    }
     const capability = registry.get(capabilityId);
     registry.validateArguments(capabilityId, args);
-    const policyVersion = options.policyVersion ?? 'nemo-local-v1';
     const admission = registry.admit(capabilityId, policyVersion);
     const finalIdempotencyKey = options.idempotencyKey ?? randomUUID();
     const finalActionId =
@@ -55,6 +60,7 @@ export function createNemoCorrectOnceRuntime({
             registrationDigest: capability.registrationDigest,
             policyVersion,
             operation: capability.operation,
+            routeDigest: capability.routeDigest,
             actionId: finalActionId,
             idempotencyKey: finalIdempotencyKey,
           },
@@ -75,10 +81,12 @@ export function createNemoCorrectOnceRuntime({
     actionId,
     idempotencyKey,
     approvalToken,
-    policyVersion = 'nemo-local-v1',
+    policyVersion: requestedPolicyVersion,
   }) {
     if (typeof toolName !== 'string' || typeof capabilityId !== 'string')
       throw new TypeError('toolName and capabilityId are required');
+    if (requestedPolicyVersion !== undefined && requestedPolicyVersion !== policyVersion)
+      throw new CapabilityError('POLICY_OVERRIDE', 'policy version is fixed by the trusted runtime context');
     const capability = registry.get(capabilityId);
     const requestName = `correct_once_request_${capabilityId}`;
     const executionName = `correct_once_execution_${capabilityId}`;
@@ -99,6 +107,7 @@ export function createNemoCorrectOnceRuntime({
           registrationDigest: capability.registrationDigest,
           policyVersion,
           operation: capability.operation,
+          routeDigest: capability.routeDigest,
           actionId: finalActionId,
           idempotencyKey: finalIdempotencyKey,
         },

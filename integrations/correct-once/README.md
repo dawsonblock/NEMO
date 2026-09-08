@@ -10,9 +10,10 @@ This package connects NEMO’s Node runtime to the Correct-Once execution bounda
 capabilities run through the Effect Fabric bridge. `CRITICAL` mutations require
 the authenticated Correct-Once Gateway.
 
-Every call requires a versioned `coap2` grant. The signed grant is bound to the
+Every call requires a versioned `coap3` grant. The signed grant is bound to the
 subject, capability, active registry admission, policy version, operation,
-action ID, idempotency key, and the SHA-256 digest of the canonical arguments.
+registered route, action ID, idempotency key, and the SHA-256 digest of the
+canonical arguments.
 Changing any of those values fails closed before a handler or external effect
 runs.
 

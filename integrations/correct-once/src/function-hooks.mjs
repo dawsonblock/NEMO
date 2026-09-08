@@ -34,6 +34,7 @@ export class FunctionHooksBridge {
         registrationDigest: capability.registrationDigest,
         policyVersion: context.policyVersion,
         operation: capability.operation,
+        routeDigest: capability.routeDigest,
         actionId: context.actionId,
         idempotencyKey: context.idempotencyKey,
       },

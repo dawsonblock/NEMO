@@ -187,7 +187,7 @@ test('critical mutation binds the grant and native approval to the Correct-Once 
   assert.equal(observed.body.server, 'local-filesystem');
   assert.equal(observed.body.tool, 'delete');
   assert.equal(observed.body.approval_token, 'coap1.approval');
-  assert.match(observed.body.semantic_metadata.nemo_grant, /^coap2\./);
+  assert.match(observed.body.semantic_metadata.nemo_grant, /^coap3\./);
   assert.match(observed.body.semantic_metadata.nemo_grant_digest, /^[0-9a-f]{64}$/);
 });
 
@@ -258,6 +258,31 @@ test('route overrides cannot redirect an admitted capability', async () => {
     /execution routes are fixed/,
   );
   assert.equal(observed, undefined);
+});
+
+test('policy version cannot be supplied by an execution caller', async () => {
+  const registry = new CapabilityRegistry();
+  const capability = registry.register({
+    id: 'read.policy-bound',
+    capabilityClass: 'read',
+    operation: 'read.policy-bound',
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks: new FunctionHooksBridge({
+      registry,
+      signingSecret: secret,
+      handlers: new Map([[capability.id, async () => ({ ok: true })]]),
+    }),
+    effectFabric: new EffectFabricBridge({ registry, signingSecret: secret }),
+    signingSecret: secret,
+    policyVersion: 'authority-v7',
+  });
+  await assert.rejects(
+    () => runtime.execute(capability.id, {}, { policyVersion: 'forged-v1' }),
+    /policy version is fixed/,
+  );
 });
 
 test('approval is reserved for critical capabilities', () => {

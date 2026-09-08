@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { digestCapability, sha256Domain } from './canonical.mjs';
+import { digestCapability, digestRoute, sha256Domain } from './canonical.mjs';
 import { CapabilityError } from './errors.mjs';
 import { cloneAndFreezeJson, compileSchema } from './schema.mjs';
 
@@ -45,6 +45,7 @@ export class CapabilityRegistry {
       operation: definition.operation,
       server: definition.server ?? null,
       tool: definition.tool ?? null,
+      routeDigest: digestRoute({ server: definition.server ?? null, tool: definition.tool ?? null }),
       description: definition.description ?? '',
       approvalRequired: definition.approvalRequired === true,
       schema: definition.schema ?? { type: 'object' },
