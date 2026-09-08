@@ -40,4 +40,29 @@ pub mod unstable {
         /// Acquire an environment for the requested trust tier.
         fn acquire(&self, tier: TrustTier) -> Result<Self::Handle, Self::Error>;
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct TestIsolation;
+
+        impl IsolationProvider for TestIsolation {
+            type Handle = &'static str;
+            type Error = std::convert::Infallible;
+
+            fn acquire(&self, tier: TrustTier) -> Result<Self::Handle, Self::Error> {
+                assert_eq!(tier, TrustTier::RemoteIsolated);
+                Ok("isolated-worker")
+            }
+        }
+
+        #[test]
+        fn external_isolation_provider_can_select_a_trust_tier() {
+            assert_eq!(
+                TestIsolation.acquire(TrustTier::RemoteIsolated).unwrap(),
+                "isolated-worker"
+            );
+        }
+    }
 }

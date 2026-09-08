@@ -48,11 +48,17 @@ worker-grpc = [
     "tokio/process",
     "tokio/rt-multi-thread",
 ]
+unstable-hardening = [
+    "dep:nemo-relay-authority",
+    "dep:nemo-relay-executor",
+]
 
 [dependencies]
 nemo-relay-types.workspace = true
 nemo-relay-plugin.workspace = true
 nemo-relay-worker-proto = { workspace = true, optional = true }
+nemo-relay-authority = { workspace = true, optional = true, features = ["unstable-hardening"] }
+nemo-relay-executor = { workspace = true, optional = true, features = ["unstable-hardening"] }
 uuid = { workspace = true, features = ["v7", "serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

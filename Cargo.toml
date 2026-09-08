@@ -14,7 +14,7 @@ members = [
     "crates/ledger",
     "crates/executor",
     "crates/isolation",
-    "crates/dlp",
+  "crates/dlp",
     "crates/cli",
     # Language Bindings
     "crates/python",
@@ -40,6 +40,11 @@ nemo-relay-adaptive = { version = "0.9.1-rc.4", path = "crates/adaptive" }
 nemo-relay-pii-redaction = { version = "0.9.1-rc.4", path = "crates/pii-redaction" }
 nemo-relay-ffi = { version = "0.9.1-rc.4", path = "crates/ffi" }
 nemo-relay-cli = { version = "0.9.1-rc.4", path = "crates/cli" }
+nemo-relay-authority = { version = "0.9.1-rc.4", path = "crates/authority" }
+nemo-relay-ledger = { version = "0.9.1-rc.4", path = "crates/ledger" }
+nemo-relay-executor = { version = "0.9.1-rc.4", path = "crates/executor" }
+nemo-relay-isolation = { version = "0.9.1-rc.4", path = "crates/isolation" }
+nemo-relay-dlp = { version = "0.9.1-rc.4", path = "crates/dlp" }
 opentelemetry = { version = "0.32", default-features = false }
 opentelemetry-semantic-conventions = { version = "0.32.1", default-features = false, features = ["semconv_experimental"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false }

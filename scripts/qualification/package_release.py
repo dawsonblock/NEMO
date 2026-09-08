@@ -36,7 +36,13 @@ EXCLUDED_ROOTS = {
     ".uv-cache",
     ".pytest_cache",
     ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "build",
+    "dist",
 }
+EXCLUDED_NAMES = {"__pycache__", ".coverage"}
+EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
@@ -57,7 +63,11 @@ def workspace_version(root: pathlib.Path) -> str:
 def is_excluded(relative: pathlib.Path) -> bool:
     if not relative.parts:
         return False
-    return relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX
+    if relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX:
+        return True
+    if any(part in EXCLUDED_NAMES for part in relative.parts):
+        return True
+    return relative.suffix in EXCLUDED_SUFFIXES
 
 
 def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:

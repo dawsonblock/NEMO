@@ -37,4 +37,29 @@ pub mod unstable {
         /// Inspect a payload immediately before external dispatch.
         fn inspect(&self, payload: &Json) -> Result<DlpDecision, Self::Error>;
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        struct TestDlp;
+
+        impl DlpProvider for TestDlp {
+            type Error = std::convert::Infallible;
+
+            fn inspect(&self, payload: &Json) -> Result<DlpDecision, Self::Error> {
+                assert_eq!(payload, &json!({"safe": true}));
+                Ok(DlpDecision::Allow)
+            }
+        }
+
+        #[test]
+        fn external_dlp_provider_inspects_the_actual_payload() {
+            assert_eq!(
+                TestDlp.inspect(&json!({"safe": true})).unwrap(),
+                DlpDecision::Allow
+            );
+        }
+    }
 }

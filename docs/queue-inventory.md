@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 This inventory records the asynchronous buffers that can retain runtime work.
 Every production queue has an explicit bound and an overflow policy. The
 capacity values are deliberately conservative starting points for the
-`0.9.1-rc.3` stabilization line; pressure qualification should tune them with
+`0.9.1-rc.4` stabilization line; pressure qualification should tune them with
 measured event sizes and service latency.
 
 | Queue | Capacity | Overflow behavior | Shutdown behavior |

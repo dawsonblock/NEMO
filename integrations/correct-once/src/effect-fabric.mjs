@@ -3,14 +3,14 @@
 
 import { randomUUID } from 'node:crypto';
 import { verifyGrant } from './grants.mjs';
-import { CapabilityError, classifyEffectError } from './errors.mjs';
+import { CapabilityError, classifyEffectError, EFFECT_STATES, normalizeEffectExecutionError } from './errors.mjs';
 import { digestArguments, sha256Domain } from './canonical.mjs';
 
 const JOURNAL_TRANSITIONS = Object.freeze({
-  PREPARED: new Set(['DISPATCHING']),
-  DISPATCHING: new Set(['COMMITTED', 'FAILED', 'UNKNOWN']),
-  UNKNOWN: new Set(['RECONCILING']),
-  RECONCILING: new Set(['COMMITTED', 'FAILED']),
+  [EFFECT_STATES.PREPARED]: new Set([EFFECT_STATES.DISPATCHING]),
+  [EFFECT_STATES.DISPATCHING]: new Set([EFFECT_STATES.COMMITTED, EFFECT_STATES.FAILED, EFFECT_STATES.UNKNOWN]),
+  [EFFECT_STATES.UNKNOWN]: new Set([EFFECT_STATES.RECONCILING]),
+  [EFFECT_STATES.RECONCILING]: new Set([EFFECT_STATES.COMMITTED, EFFECT_STATES.FAILED]),
 });
 
 export class EffectFabricBridge {
@@ -133,16 +133,18 @@ export class EffectFabricBridge {
           result = await handler(args, { capability, grant, request });
         }
       } catch (error) {
-        const classification = classifyEffectError(error);
+        const normalizedError = normalizeEffectExecutionError(error);
+        const classification = classifyEffectError(normalizedError);
         await this.appendJournal(request.actionId, classification.state, {
           request,
-          error: String(error),
+          error: String(normalizedError),
           outcome: classification.outcome,
           dispatchState: classification.dispatchState,
           outcomeCertainty: classification.outcomeCertainty,
         });
-        if (classification.state === 'UNKNOWN') this.uncertain.set(context.idempotencyKey, { fingerprint, error });
-        throw error;
+        if (classification.state === 'UNKNOWN')
+          this.uncertain.set(context.idempotencyKey, { fingerprint, error: normalizedError });
+        throw normalizedError;
       }
       const receipt = Object.freeze({
         route: 'effect-fabric',

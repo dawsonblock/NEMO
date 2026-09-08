@@ -12,6 +12,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import argparse
 from typing import Any
 
 
@@ -36,18 +37,22 @@ def excluded(relative: pathlib.Path) -> bool:
     )
 
 
-def source_files() -> list[pathlib.Path]:
-    result = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        cwd=ROOT,
-        check=True,
-        stdout=subprocess.PIPE,
-    )
-    paths = {
-        pathlib.Path(raw.decode())
-        for raw in result.stdout.split(b"\0")
-        if raw
-    }
+def source_files(manifest_paths: set[str] | None = None) -> list[pathlib.Path]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        paths = {
+            pathlib.Path(raw.decode())
+            for raw in result.stdout.split(b"\0")
+            if raw
+        }
+    except (OSError, subprocess.CalledProcessError):
+        paths = {pathlib.Path(name) for name in (manifest_paths or set())}
     return sorted(
         (
             relative
@@ -73,9 +78,17 @@ def tree_digest(hashes: dict[str, str]) -> str:
 
 
 def git_output(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=ROOT, check=True, text=True, stdout=subprocess.PIPE
-    ).stdout.strip()
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
 
 
 def report_failure(messages: list[str]) -> int:
@@ -104,7 +117,28 @@ def verify_archive(recorded: Any, label: str, discrepancies: list[str]) -> None:
 
 
 def main() -> int:
-    manifest_path = ROOT / "qualification" / "source-manifest.json"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=pathlib.Path,
+        default=None,
+        help="source tree root; defaults to the repository containing this script",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=pathlib.Path,
+        default=None,
+        help="source manifest path; defaults to qualification/source-manifest.json",
+    )
+    args = parser.parse_args()
+    global ROOT
+    if args.root is not None:
+        ROOT = args.root.resolve()
+    manifest_path = args.manifest or pathlib.Path(
+        os.environ.get("NEMO_RELAY_SOURCE_MANIFEST", ROOT / "qualification" / "source-manifest.json")
+    )
+    if not manifest_path.is_absolute():
+        manifest_path = ROOT / manifest_path
     if not manifest_path.is_file():
         return report_failure([f"missing qualification manifest: {manifest_path}"])
     try:
@@ -112,8 +146,8 @@ def main() -> int:
     except json.JSONDecodeError as error:
         return report_failure([f"invalid qualification manifest: {error}"])
 
-    actual = file_hashes(source_files())
     expected = manifest.get("files", {})
+    actual = file_hashes(source_files(set(expected)))
     discrepancies: list[str] = []
     missing = sorted(set(expected) - set(actual))
     added = sorted(set(actual) - set(expected))
@@ -138,7 +172,7 @@ def main() -> int:
 
     recorded_git = manifest.get("git") or {}
     current_commit = git_output("rev-parse", "HEAD")
-    if recorded_git.get("commit") and recorded_git["commit"] != current_commit:
+    if current_commit and recorded_git.get("commit") and recorded_git["commit"] != current_commit:
         try:
             changed_since = git_output("diff", "--name-only", f"{recorded_git['commit']}..HEAD").splitlines()
         except subprocess.CalledProcessError:
@@ -153,11 +187,13 @@ def main() -> int:
             discrepancies.append("Git source tree digest differs from qualification manifest")
     elif recorded_git.get("tree") and recorded_git["tree"] != git_output("rev-parse", "HEAD^{tree}"):
         discrepancies.append("Git tree differs from qualification manifest")
-    dirty = [
-        line
-        for line in git_output("status", "--short").splitlines()
-        if "qualification/" not in line and "release/artifacts/" not in line
-    ]
+    dirty = []
+    if current_commit:
+        dirty = [
+            line
+            for line in git_output("status", "--short").splitlines()
+            if "qualification/" not in line and "release/artifacts/" not in line
+        ]
     if dirty:
         discrepancies.append(f"working tree is dirty: {', '.join(dirty[:5])}")
 

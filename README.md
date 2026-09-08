@@ -89,6 +89,15 @@ Malformed or mismatched gateway receipts are treated as
 bridge records `PREPARED → DISPATCHING → COMMITTED|FAILED|UNKNOWN`; durable
 state and reconciliation remain Effect Fabric responsibilities.
 
+### Kernel adapter wiring
+
+The opt-in Rust `unstable-hardening` feature exposes the contract-driven
+`BackendRouter`. It selects Function Hooks for `PURE`/`READ` and requires an
+`AuthorityProvider` before dispatching `MUTATION`/`CRITICAL` work to an
+`ExecutionBackend`. Correct-Once and Effect Fabric implementations plug into
+those contracts; Relay does not import their policy, database, or provider
+internals.
+
 ## Start here
 
 | Goal                          | Guide                                                                                              |

@@ -84,6 +84,24 @@ export class CapabilityError extends Error {
   readonly details: Readonly<Record<string, unknown>>;
   constructor(code: string, message: string, details?: Record<string, unknown>);
 }
+export class EffectExecutionError extends CapabilityError {
+  readonly dispatchState: string;
+  readonly outcomeCertainty: string;
+  readonly providerRequestId: string | null;
+  readonly retryable: boolean;
+  readonly reconciliationRequired: boolean;
+  constructor(
+    code: string,
+    message: string,
+    details?: Record<string, unknown> & {
+      dispatchState?: string;
+      outcomeCertainty?: string;
+      providerRequestId?: string | null;
+      retryable?: boolean;
+      reconciliationRequired?: boolean;
+    },
+  );
+}
 export const DISPATCH_STATES: Readonly<{
   NOT_DISPATCHED: 'NOT_DISPATCHED';
   DISPATCH_ATTEMPTED: 'DISPATCH_ATTEMPTED';
@@ -94,12 +112,24 @@ export const OUTCOME_CERTAINTIES: Readonly<{
   CONFIRMED_SUCCESS: 'CONFIRMED_SUCCESS';
   UNKNOWN: 'UNKNOWN';
 }>;
+export const EFFECT_STATES: Readonly<{
+  PROPOSED: 'PROPOSED';
+  AUTHORIZED: 'AUTHORIZED';
+  PREPARED: 'PREPARED';
+  DISPATCHING: 'DISPATCHING';
+  COMMITTED: 'COMMITTED';
+  FAILED: 'FAILED';
+  UNKNOWN: 'UNKNOWN';
+  RECONCILING: 'RECONCILING';
+  CANCELLED: 'CANCELLED';
+}>;
 export function classifyEffectError(error: unknown): {
   readonly state: 'FAILED' | 'UNKNOWN';
   readonly outcome: 'failed' | 'unknown';
   readonly dispatchState: string;
   readonly outcomeCertainty: string;
 };
+export function normalizeEffectExecutionError(error: unknown, defaults?: Record<string, unknown>): EffectExecutionError;
 export function fail(code: string, message: string, details?: Record<string, unknown>): never;
 export function compileSchema(schema: JsonValue): { validate(value: JsonValue): void };
 

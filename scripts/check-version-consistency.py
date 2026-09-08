@@ -86,12 +86,14 @@ def node_check(expected: str) -> Check:
     node = json_file(ROOT / "crates/node/package.json")
     openclaw = json_file(ROOT / "integrations/openclaw/package.json")
     pi = json_file(ROOT / "integrations/pi/package.json")
+    correct_once = json_file(ROOT / "integrations/correct-once/package.json")
     example = json_file(ROOT / "examples/language-binding-plugin/node/package.json")
     lock = json_file(ROOT / "package-lock.json")["packages"]
     errors.extend(equal(node.get("version"), expected, "crates/node/package.json"))
     errors.extend(equal(openclaw.get("version"), expected, "integrations/openclaw/package.json"))
     errors.extend(equal(openclaw.get("dependencies", {}).get("nemo-relay-node"), expected, "OpenClaw node dependency"))
     errors.extend(equal(pi.get("version"), expected, "integrations/pi/package.json"))
+    errors.extend(equal(correct_once.get("version"), expected, "integrations/correct-once/package.json"))
     errors.extend(
         equal(
             example.get("dependencies", {}).get("nemo-relay-node"),
@@ -169,25 +171,45 @@ def qualification_check(expected: str) -> Check:
 
 
 def documentation_check(expected: str) -> Check:
-    stale = "0.9.1-rc." + "1"
-    stale_badge = stale.replace("-rc.", "--rc.")
+    version_pattern = re.compile(r"(?<![0-9])0\.9\.1-rc\.\d+(?![0-9])")
+    expected_badge = expected.replace("-rc.", "--rc.")
     allowed = {
         ROOT / "FORK_PROVENANCE.md",
+        ROOT / "docs/runtime-global-state.md",
         ROOT / "release/provenance.json",
     }
     errors: list[str] = []
     for path in ROOT.rglob("*"):
-        if not path.is_file() or path in allowed or any(
-            part in {".git", ".venv", ".uv-cache", "target", "node_modules", "qualification"}
-            for part in path.parts
+        if (
+            not path.is_file()
+            or path in allowed
+            or path.suffix in {".lock", ".zip", ".jsonl"}
+            or any(
+                part in {
+                    ".git",
+                    ".venv",
+                    ".uv-cache",
+                    "target",
+                    "node_modules",
+                    "qualification",
+                    "release",
+                }
+                for part in path.parts
+            )
         ):
             continue
         try:
             text = path.read_text()
         except UnicodeDecodeError:
             continue
-        if stale in text or stale_badge in text:
-            errors.append(f"stale current release reference in {path.relative_to(ROOT)}")
+        versions = set(version_pattern.findall(text))
+        versions.discard(expected)
+        versions.discard(expected_badge)
+        if versions:
+            errors.append(
+                f"stale current release reference(s) in {path.relative_to(ROOT)}: "
+                + ", ".join(sorted(versions))
+            )
     return Check("Current-version references", tuple(errors))
 
 

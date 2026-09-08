@@ -1,6 +1,6 @@
 {
   "name": "nemo-relay-correct-once",
-  "version": "0.9.1-rc.3",
+  "version": "0.9.1-rc.4",
   "private": true,
   "type": "module",
   "description": "NEMO capability routing and Correct-Once grant integration.",

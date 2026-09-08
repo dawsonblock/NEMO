@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Apache-2.0
 
-import { CapabilityError } from './errors.mjs';
+import { CapabilityError, EffectExecutionError } from './errors.mjs';
 
 function ambiguousReceipt(message, details = {}) {
-  return new CapabilityError('RECONCILIATION_REQUIRED', message, {
+  return new EffectExecutionError('RECONCILIATION_REQUIRED', message, {
     outcome: 'unknown',
     retryable: false,
     dispatchState: 'DISPATCH_ATTEMPTED',
@@ -35,7 +35,7 @@ export function createCorrectOnceGatewayClient({ baseUrl, token, fetchImpl = glo
           }),
         });
       } catch (error) {
-        throw new CapabilityError(
+        throw new EffectExecutionError(
           'RECONCILIATION_REQUIRED',
           'Correct-Once transport failed after dispatch may have occurred',
           {
@@ -50,7 +50,7 @@ export function createCorrectOnceGatewayClient({ baseUrl, token, fetchImpl = glo
       const body = await response.json().catch(() => null);
       if (!response.ok) {
         if (response.status === 408 || response.status >= 500) {
-          throw new CapabilityError(
+          throw new EffectExecutionError(
             'RECONCILIATION_REQUIRED',
             `Correct-Once Gateway response is ambiguous (${response.status})`,
             {
