@@ -4,6 +4,21 @@
 import { CapabilityError } from './errors.mjs';
 
 const TYPES = new Set(['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']);
+const SUPPORTED_KEYWORDS = new Set([
+  'type',
+  'required',
+  'properties',
+  'additionalProperties',
+  'items',
+  'enum',
+  'pattern',
+  'minLength',
+  'maxLength',
+  'minimum',
+  'maximum',
+  'minItems',
+  'maxItems',
+]);
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -36,12 +51,60 @@ function schemaFailure(path, message) {
   throw new CapabilityError('SCHEMA_VIOLATION', `${path}: ${message}`);
 }
 
+function deepCloneFreeze(value, path = '$') {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value))
+      throw new CapabilityError('INVALID_SCHEMA', `${path}: non-finite numbers are not supported`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const clone = value.map((item, index) => deepCloneFreeze(item, `${path}[${index}]`));
+    return Object.freeze(clone);
+  }
+  if (!isPlainObject(value)) {
+    throw new CapabilityError('INVALID_SCHEMA', `${path}: only JSON values are supported`);
+  }
+  const clone = {};
+  for (const [key, child] of Object.entries(value)) clone[key] = deepCloneFreeze(child, `${path}.${key}`);
+  return Object.freeze(clone);
+}
+
+function equalJson(left, right) {
+  if (left === right) return true;
+  if (typeof left !== typeof right || left === null || right === null) return false;
+  if (Array.isArray(left)) {
+    return (
+      Array.isArray(right) && left.length === right.length && left.every((item, index) => equalJson(item, right[index]))
+    );
+  }
+  if (typeof left === 'object') {
+    if (!isPlainObject(left) || !isPlainObject(right)) return false;
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && equalJson(left[key], right[key]))
+    );
+  }
+  return false;
+}
+
+function validateKeywords(schema, path) {
+  for (const key of Object.keys(schema)) {
+    if (!SUPPORTED_KEYWORDS.has(key)) {
+      throw new CapabilityError('INVALID_SCHEMA', `${path}.${key}: unsupported schema keyword`);
+    }
+  }
+}
+
 function compileNode(schema, path) {
   if (schema === true) return () => {};
   if (schema === false) return () => schemaFailure(path, 'value is not permitted');
   if (!isPlainObject(schema)) {
     throw new CapabilityError('INVALID_SCHEMA', `${path}: schema must be an object or boolean`);
   }
+  validateKeywords(schema, path);
 
   const types = schema.type === undefined ? null : Array.isArray(schema.type) ? schema.type : [schema.type];
   if (types && (!types.length || types.some((type) => typeof type !== 'string' || !TYPES.has(type)))) {
@@ -91,7 +154,7 @@ function compileNode(schema, path) {
     if (types && !types.some((type) => matchesType(value, type))) {
       schemaFailure(valuePath, `expected ${types.join(' or ')}`);
     }
-    if (enumValues && !enumValues.some((candidate) => Object.is(candidate, value))) {
+    if (enumValues && !enumValues.some((candidate) => equalJson(candidate, value))) {
       schemaFailure(valuePath, 'value is not in enum');
     }
     if (typeof value === 'string') {
@@ -131,10 +194,15 @@ function compileNode(schema, path) {
 }
 
 export function compileSchema(schema) {
-  const validate = compileNode(schema, '$');
+  const immutableSchema = deepCloneFreeze(schema);
+  const validate = compileNode(immutableSchema, '$');
   return Object.freeze({
     validate(value) {
       validate(value, '$');
     },
   });
+}
+
+export function cloneAndFreezeJson(value) {
+  return deepCloneFreeze(value);
 }

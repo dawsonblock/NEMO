@@ -23,6 +23,17 @@ Correct-Once server/tool route. Idempotency keys are bound to the subject,
 capability, action, and argument digest; conflicting reuse returns an explicit
 conflict instead of replaying another operation's receipt. Runtime identity is
 installed when the integration is created and cannot be overridden per call.
+Approval is reserved for `critical` capabilities; an approval flag on an
+ordinary mutation is rejected rather than treated as an unverified string.
+
+Capability descriptors and their schemas are deep-cloned and frozen at
+registration. The digest and compiled validator therefore describe the same
+immutable descriptor, even if the caller later mutates its original object.
+Schemas use the package's restricted JSON-schema profile (object/array/string
+types, properties, required fields, enums, bounds, patterns, and additional
+properties). Unsupported keywords fail registration; they are never silently
+ignored. Registered `server` and `tool` routes are execution-bound and cannot be
+overridden by per-call options.
 
 ## Reference capabilities
 

@@ -3,7 +3,7 @@
 
 import { digestCapability, sha256Domain } from './canonical.mjs';
 import { CapabilityError } from './errors.mjs';
-import { compileSchema } from './schema.mjs';
+import { cloneAndFreezeJson, compileSchema } from './schema.mjs';
 
 const VALID_CLASSES = new Set(['pure', 'read', 'mutation']);
 const VALID_EXECUTION_CLASSES = new Set(['pure', 'read', 'mutation', 'critical']);
@@ -50,15 +50,19 @@ export class CapabilityRegistry {
       schema: definition.schema ?? { type: 'object' },
       resourceFields: [...(definition.resourceFields ?? [])],
     };
-    if (executionClass === 'critical' && definition.approvalRequired !== true) {
-      throw new CapabilityError('INVALID_CAPABILITY', 'critical capabilities must require approval');
+    if (normalized.approvalRequired !== (executionClass === 'critical')) {
+      throw new CapabilityError(
+        'INVALID_CAPABILITY',
+        'approval is reserved for critical capabilities; critical capabilities must require approval',
+      );
     }
     if (executionClass === 'critical' && (!normalized.server || !normalized.tool)) {
       throw new CapabilityError('INVALID_CAPABILITY', 'critical capabilities require server and tool bindings');
     }
-    const validator = compileSchema(normalized.schema);
-    const registrationDigest = digestCapability(normalized);
-    const entry = Object.freeze({ ...normalized, registrationDigest });
+    const immutable = cloneAndFreezeJson(normalized);
+    const validator = compileSchema(immutable.schema);
+    const registrationDigest = digestCapability(immutable);
+    const entry = Object.freeze({ ...immutable, registrationDigest });
     this.#entries.set(entry.id, entry);
     this.#validators.set(entry.id, validator);
     return entry;

@@ -23,6 +23,12 @@ export function createNemoCorrectOnceRuntime({
     if (Object.prototype.hasOwnProperty.call(options, 'subject') && options.subject !== subject) {
       throw new CapabilityError('IDENTITY_OVERRIDE', 'runtime identity is immutable for this execution context');
     }
+    if (
+      Object.prototype.hasOwnProperty.call(options, 'server') ||
+      Object.prototype.hasOwnProperty.call(options, 'tool')
+    ) {
+      throw new CapabilityError('ROUTE_OVERRIDE', 'execution routes are fixed by the registered capability');
+    }
     const capability = registry.get(capabilityId);
     registry.validateArguments(capabilityId, args);
     const policyVersion = options.policyVersion ?? 'nemo-local-v1';

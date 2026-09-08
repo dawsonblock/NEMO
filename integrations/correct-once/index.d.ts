@@ -46,6 +46,12 @@ export interface GrantContext {
   readonly idempotencyKey: string;
 }
 
+export type ExecutionOptions = Omit<Partial<GrantContext>, 'subject' | 'server' | 'tool'> & {
+  grant?: string;
+  approvalToken?: string;
+  now?: number;
+};
+
 export interface GrantResult {
   readonly token: string;
   readonly claims: Readonly<Record<string, JsonValue>>;
@@ -90,4 +96,4 @@ export class EffectFabricBridge {
 export const REFERENCE_CAPABILITIES: readonly CapabilityDefinition[];
 export function createReferenceHandlers(options: { root: string }): Map<string, (args: JsonValue, context?: unknown) => Promise<unknown>>;
 export function createCorrectOnceGatewayClient(options: { baseUrl: string; token: string; fetchImpl?: typeof fetch }): { execute(request: unknown): Promise<unknown> };
-export function createNemoCorrectOnceRuntime(options: { nemo: Record<string, (...args: unknown[]) => unknown>; registry: CapabilityRegistry; functionHooks: FunctionHooksBridge; effectFabric: EffectFabricBridge; signingSecret: string | Uint8Array; subject?: string }): { execute(capabilityId: string, args: JsonValue, options?: Omit<Partial<GrantContext>, 'subject'> & { grant?: string; approvalToken?: string; now?: number }): Promise<unknown>; installTool(options: { toolName: string; capabilityId: string; priority?: number; actionId?: string; idempotencyKey?: string; approvalToken?: string; policyVersion?: string }): () => void; readonly marker: string };
+export function createNemoCorrectOnceRuntime(options: { nemo: Record<string, (...args: unknown[]) => unknown>; registry: CapabilityRegistry; functionHooks: FunctionHooksBridge; effectFabric: EffectFabricBridge; signingSecret: string | Uint8Array; subject?: string }): { execute(capabilityId: string, args: JsonValue, options?: ExecutionOptions): Promise<unknown>; installTool(options: { toolName: string; capabilityId: string; priority?: number; actionId?: string; idempotencyKey?: string; approvalToken?: string; policyVersion?: string }): () => void; readonly marker: string };

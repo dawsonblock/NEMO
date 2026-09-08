@@ -224,6 +224,101 @@ test('approval-required mutations fail before contacting the gateway without app
   assert.equal(calls, 0);
 });
 
+test('route overrides cannot redirect an admitted capability', async () => {
+  let observed;
+  const registry = new CapabilityRegistry();
+  const critical = registry.register({
+    id: 'mutation.route-bound',
+    capabilityClass: 'mutation',
+    executionClass: 'critical',
+    operation: 'mutation.route-bound',
+    approvalRequired: true,
+    server: 'approved-server',
+    tool: 'approved-tool',
+  });
+  const runtime = createNemoCorrectOnceRuntime({
+    nemo: {},
+    registry,
+    functionHooks: new FunctionHooksBridge({ registry, signingSecret: secret }),
+    effectFabric: new EffectFabricBridge({
+      registry,
+      signingSecret: secret,
+      criticalGateway: {
+        execute: async (request) => {
+          observed = request;
+          return { ok: true };
+        },
+      },
+    }),
+    signingSecret: secret,
+    subject: 'alice',
+  });
+  await assert.rejects(
+    () => runtime.execute(critical.id, {}, { server: 'evil-server', tool: 'evil-tool', approvalToken: 'approval' }),
+    /execution routes are fixed/,
+  );
+  assert.equal(observed, undefined);
+});
+
+test('approval is reserved for critical capabilities', () => {
+  const registry = new CapabilityRegistry();
+  assert.throws(
+    () =>
+      registry.register({
+        id: 'mutation.ambiguous-approval',
+        capabilityClass: 'mutation',
+        executionClass: 'mutation',
+        operation: 'mutation.ambiguous-approval',
+        approvalRequired: true,
+      }),
+    /approval is reserved for critical/,
+  );
+});
+
+test('capability schemas are immutable after registration', () => {
+  const registry = new CapabilityRegistry();
+  const schema = { type: 'object', required: ['name'], properties: { mode: { enum: ['safe'] } } };
+  const capability = registry.register({
+    id: 'read.immutable-schema',
+    capabilityClass: 'read',
+    operation: 'read.immutable-schema',
+    schema,
+  });
+  schema.required.length = 0;
+  schema.properties.mode.enum.push('unsafe');
+  assert.throws(() => registry.validateArguments(capability.id, {}), /missing required property name/);
+  assert.throws(() => registry.validateArguments(capability.id, { name: 'x', mode: 'unsafe' }), /not in enum/);
+  assert.throws(() => {
+    capability.schema.required.push('other');
+  }, /read only|object is not extensible/);
+});
+
+test('unsupported schema keywords fail closed at registration', () => {
+  const registry = new CapabilityRegistry();
+  assert.throws(
+    () =>
+      registry.register({
+        id: 'read.unsupported-schema',
+        capabilityClass: 'read',
+        operation: 'read.unsupported-schema',
+        schema: { type: 'object', properties: { mode: { const: 'safe' } } },
+      }),
+    /unsupported schema keyword/,
+  );
+});
+
+test('structured enum values use structural equality', () => {
+  const registry = new CapabilityRegistry();
+  const capability = registry.register({
+    id: 'read.structured-enum',
+    capabilityClass: 'read',
+    operation: 'read.structured-enum',
+    schema: { enum: [{ mode: 'safe' }] },
+  });
+  assert.doesNotThrow(() => registry.validateArguments(capability.id, { mode: 'safe' }));
+  assert.throws(() => registry.validateArguments(capability.id, { mode: 'unsafe' }), /not in enum/);
+});
+
 test('NEMO tool installation routes marked calls and rejects marker collisions', async () => {
   const requestInterceptors = new Map();
   const executionInterceptors = new Map();
