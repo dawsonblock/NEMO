@@ -60,9 +60,9 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "9be4e78a61937bd14f762c869ffc8528ab4ce1501482e574e12946a91691a602",
-    "source_archive_sha256": "e18e625f3e801ba6504da885abcc9824790ab912bfcdc8e3f3e080cf7c6bd9e0",
-    "release_archive_sha256": "e18e625f3e801ba6504da885abcc9824790ab912bfcdc8e3f3e080cf7c6bd9e0",
+    "source_tree_sha256": "7eb65ba910ea25d1b9e3009fbd6544a05c21aceabefbafcc9d04b30b85f8b267",
+    "source_archive_sha256": "01f6a117575691e6aed26f6930c7ef27456c4ddcd7c90d79009a185d290b7958",
+    "release_archive_sha256": "01f6a117575691e6aed26f6930c7ef27456c4ddcd7c90d79009a185d290b7958",
     "environment_sha256": "4fd791fc929649182d4b47de1be18245aca6ce772decd4c27312db3dfa33128b",
     "lockfiles": {
       "Cargo.lock": "sha256:e69e7c43ebc7a23f5d76d92cd0a716935e4428d9960142bbfc82815a4a5e8588",
@@ -70,8 +70,8 @@
       "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
     },
     "git": {
-      "commit": "8009d2e38c593f6b6a0bc96f661c095cba8efba1",
-      "tree": "10aeabbcfe3078c137eac6ffcf430ceaf127a45d",
+      "commit": "d4fb270c318834424b9daa0a7dab9a8952f9e197",
+      "tree": "337a684bc5c98be934f5f18e6b659a4884b6ba55",
       "status": []
     }
   },
