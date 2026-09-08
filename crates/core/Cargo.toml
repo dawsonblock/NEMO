@@ -79,6 +79,7 @@ tracing = { version = "0.1", default-features = false, features = ["std", "log"]
 libloading = "0.8"
 semver = "1"
 sha2 = "0.11"
+serde_json_canonicalizer = "0.3"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls", "grpc-tonic", "tls-ring", "tls-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "rustls-tls-native-roots", "stream"] }
 tonic = { version = "0.14.1", default-features = false }

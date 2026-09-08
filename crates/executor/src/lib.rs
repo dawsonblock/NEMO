@@ -93,7 +93,11 @@ pub mod unstable {
         pub deadline_unix_ms: u64,
     }
 
-    /// One invocation crossing the kernel/backend boundary.
+    /// One already-bound invocation crossing the kernel/backend boundary.
+    ///
+    /// This is a backend wire contract, not a harness-facing request type.
+    /// The Relay kernel constructs it only after resolving immutable capability
+    /// metadata and validating the unbound invocation.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct ExecutionRequest {
         /// Bound identity and capability metadata.

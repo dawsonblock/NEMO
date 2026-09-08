@@ -51,7 +51,7 @@ flowchart LR
 - Immutable capability registration and restricted schema enforcement
 - Runtime identity and execution-class pinning
 - Admission and bounded provider execution
-- Exact argument, route, and grant binding
+- Exact argument and route binding; signed grant binding in the Correct-Once integration
 - Scopes, middleware, interceptors, lifecycle events, and telemetry
 - Backend selection between fast execution and consequential effects
 
@@ -70,8 +70,10 @@ qualified implementations are connected.
 ## Capability routing
 
 Capabilities are registered with an immutable descriptor, input schema,
-execution class, and route. The caller cannot downgrade the class, replace the
-identity, redirect the route, or alter the arguments after a grant is issued.
+execution class, and route. The Rust kernel accepts only a capability ID and
+arguments from a harness, then resolves the registered class, identity, route,
+admission, policy values, and argument digest itself. The caller cannot
+downgrade the class, replace the identity, or redirect the route.
 
 | Class      | Runtime path                          | Typical examples                                      |
 | ---------- | ------------------------------------- | ----------------------------------------------------- |
@@ -82,7 +84,9 @@ identity, redirect the route, or alter the arguments after a grant is issued.
 
 The Node Correct-Once integration uses signed `coap3` grants bound to the
 subject, capability, admission, policy version, operation, registered route,
-action ID, idempotency key, and canonical argument digest.
+action ID, idempotency key, and canonical argument digest. Rust kernel adapters
+do not issue or verify external Correct-Once grants themselves; they pass the
+trusted, bound identity to the external authority adapter.
 
 Malformed or mismatched gateway receipts are treated as
 `RECONCILIATION_REQUIRED`, never as ordinary retryable failures. The reference
@@ -91,11 +95,17 @@ state and reconciliation remain Effect Fabric responsibilities.
 
 ### Kernel adapter wiring
 
-The opt-in Rust `unstable-hardening` feature exposes the contract-driven
-`BackendRouter`. It selects Function Hooks for `PURE`/`READ` and requires an
-`AuthorityProvider` before dispatching `MUTATION`/`CRITICAL` work to an
-`ExecutionBackend`. Correct-Once and Effect Fabric implementations plug into
-those contracts; Relay does not import their policy, database, or provider
+The opt-in Rust `unstable-hardening` feature exposes `Kernel::invoke` as the
+capability entry point. A harness submits only a capability ID, arguments, and
+optional trace context. The kernel resolves the immutable registration,
+validates the schema, binds runtime identity and canonical argument digest, and
+creates an opaque request for its internal `BackendRouter`. The router selects
+Function Hooks for `PURE`/`READ` and requires an `AuthorityProvider` before
+dispatching `MUTATION`/`CRITICAL` work to an `ExecutionBackend`.
+
+`BackendRouter` is deliberately a post-binding component, not a public
+harness entry point. Correct-Once and Effect Fabric implementations plug into
+the contracts; Relay does not import their policy, database, or provider
 internals.
 
 ## Start here
@@ -229,7 +239,7 @@ event format; ATIF, OpenTelemetry, and OpenInference outputs are projections.
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity           | Runtime subject cannot be overridden per call.                                                                                              |
 | Schema             | Registered restricted-schema descriptors are cloned, frozen, and validated before grants. Unsupported or malformed constraints fail closed. |
-| Grant binding      | Arguments, execution class, route, admission, policy version, action, and idempotency are signed together.                                  |
+| Grant binding      | The Correct-Once integration signs arguments, execution class, route, admission, policy version, action, and idempotency together.          |
 | Critical receipts  | Missing, malformed, mismatched, or ambiguous gateway receipts become `UNKNOWN` and require reconciliation.                                  |
 | Effect lifecycle   | Reference journaling enforces `PREPARED → DISPATCHING → COMMITTED / FAILED / UNKNOWN`.                                                      |
 | Provider admission | Rust adaptive admission bounds active work and pending work, preserves stream permits, and schedules eligible waiters under one state lock. |
