@@ -151,7 +151,7 @@ test('critical mutation binds the grant and native approval to the Correct-Once 
     token: 'gateway-token',
     fetchImpl: async (url, options) => {
       observed = { url: String(url), body: JSON.parse(options.body) };
-      return new Response(JSON.stringify({ effect: 'committed' }), {
+      return new Response(JSON.stringify({ effect: 'committed', action_id: 'action-1', idempotency_key: 'idem-1' }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -182,7 +182,7 @@ test('critical mutation binds the grant and native approval to the Correct-Once 
     { relativePath: 'nested/value.txt', expectedDigest: 'digest', reason: 'approved test' },
     { approvalToken: 'coap1.approval', actionId: 'action-1', idempotencyKey: 'idem-1' },
   );
-  assert.deepEqual(result.result, { effect: 'committed' });
+  assert.deepEqual(result.result, { effect: 'committed', action_id: 'action-1', idempotency_key: 'idem-1' });
   assert.equal(observed.url, 'http://127.0.0.1:8765/gateway/tool-call');
   assert.equal(observed.body.server, 'local-filesystem');
   assert.equal(observed.body.tool, 'delete');

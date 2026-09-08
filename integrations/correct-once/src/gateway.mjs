@@ -49,10 +49,16 @@ export function createCorrectOnceGatewayClient({ baseUrl, token, fetchImpl = glo
       if (body === null || typeof body !== 'object' || Array.isArray(body)) {
         throw new CapabilityError('INVALID_GATEWAY_RECEIPT', 'Correct-Once Gateway returned an invalid receipt');
       }
-      if (body.action_id !== undefined && body.action_id !== request.actionId) {
+      if (typeof body.action_id !== 'string' || typeof body.idempotency_key !== 'string') {
+        throw new CapabilityError(
+          'INVALID_GATEWAY_RECEIPT',
+          'Correct-Once Gateway receipt must bind action_id and idempotency_key',
+        );
+      }
+      if (body.action_id !== request.actionId) {
         throw new CapabilityError('GATEWAY_RECEIPT_MISMATCH', 'Correct-Once receipt action does not match the request');
       }
-      if (body.idempotency_key !== undefined && body.idempotency_key !== request.idempotencyKey) {
+      if (body.idempotency_key !== request.idempotencyKey) {
         throw new CapabilityError(
           'GATEWAY_RECEIPT_MISMATCH',
           'Correct-Once receipt idempotency key does not match the request',

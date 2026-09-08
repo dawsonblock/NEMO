@@ -12,7 +12,7 @@ test('Correct-Once client calls the authenticated Effect Fabric tool endpoint', 
     token: 'gateway-token',
     fetchImpl: async (url, options) => {
       observed = { url: String(url), options, body: JSON.parse(options.body) };
-      return new Response(JSON.stringify({ receipt: 'ok' }), {
+      return new Response(JSON.stringify({ receipt: 'ok', action_id: 'action-1', idempotency_key: 'idem-1' }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -29,7 +29,7 @@ test('Correct-Once client calls the authenticated Effect Fabric tool endpoint', 
     grant: 'coap3.grant',
     grantDigest: 'digest',
   });
-  assert.deepEqual(result, { receipt: 'ok' });
+  assert.deepEqual(result, { receipt: 'ok', action_id: 'action-1', idempotency_key: 'idem-1' });
   assert.equal(observed.url, 'http://127.0.0.1:8765/gateway/tool-call');
   assert.equal(observed.options.headers.authorization, 'Bearer gateway-token');
   assert.equal(observed.body.action_id, 'action-1');
@@ -102,5 +102,27 @@ test('successful gateway responses must contain a JSON receipt object', async ()
         grantDigest: 'd',
       }),
     /invalid receipt/,
+  );
+});
+
+test('successful gateway responses must bind action and idempotency claims', async () => {
+  const client = createCorrectOnceGatewayClient({
+    baseUrl: 'http://127.0.0.1:8765',
+    token: 'gateway-token',
+    fetchImpl: async () => new Response(JSON.stringify({ receipt: 'ok' }), { status: 200 }),
+  });
+  await assert.rejects(
+    () =>
+      client.execute({
+        subject: 'alice',
+        server: 'filesystem',
+        tool: 'delete',
+        args: {},
+        actionId: 'a',
+        idempotencyKey: 'i',
+        grant: 'coap3.g',
+        grantDigest: 'd',
+      }),
+    (error) => error.code === 'INVALID_GATEWAY_RECEIPT',
   );
 });
