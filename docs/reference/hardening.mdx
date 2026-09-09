@@ -57,6 +57,29 @@ contract skeletons. They define package boundaries and invariants for later
 releases; they do not authorize actions, persist an evidence ledger, sandbox
 workers, or enforce outbound DLP in this release.
 
+## Experimental effect-state contracts
+
+The opt-in kernel contracts use one consequential-effect vocabulary:
+`PROPOSED`, `AUTHORIZED`, `PREPARED`, `DISPATCHING`, `COMMITTED`, `FAILED`,
+`UNKNOWN`, `RECONCILING`, and `CANCELLED`. An external `ActionStore` claims an
+idempotency key in `PROPOSED`; a verified authority grant is bound before the
+kernel advances the action to `AUTHORIZED` and `PREPARED`.
+
+`COMMITTED` is only written after an external execution backend returns a
+receipt that binds the action, idempotency key, runtime identity, capability
+generation, admission, policy, route, arguments, and grant. If dispatch may
+have crossed the provider boundary, or if durable receipt/state persistence
+cannot prove a terminal result, the kernel records `UNKNOWN` and returns a
+typed reconciliation-required outcome.
+
+Retry policy is deliberately conservative: `FAILED` after confirmed
+pre-dispatch failure may be evaluated for a new attempt by the external effect
+system; `UNKNOWN` must never be automatically re-dispatched. An external
+reconciliation provider must resolve it with evidence to `COMMITTED`,
+`FAILED`, or remain `UNKNOWN`. NeMo Relay defines these contracts only; Effect
+Fabric or another external implementation owns durable storage, dispatch, and
+reconciliation.
+
 The built-in `nemo_guardrails` component remains available for compatibility and
 is formally deprecated. New deployments should use current guardrail and
 intercept APIs; removal is deferred to the next breaking release with a

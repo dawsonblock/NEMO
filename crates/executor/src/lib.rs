@@ -154,6 +154,25 @@ pub mod unstable {
         pub message: String,
     }
 
+    /// Classify a backend error without losing dispatch certainty.
+    ///
+    /// Any unknown result after an attempted or confirmed dispatch is durable
+    /// `UNKNOWN`; only a confirmed failure before dispatch is safely `FAILED`.
+    pub const fn state_for_error(error: &EffectExecutionError) -> ExecutionState {
+        match (error.dispatch_state, error.outcome_certainty) {
+            (DispatchState::NotDispatched, OutcomeCertainty::ConfirmedFailure) => {
+                ExecutionState::Failed
+            }
+            (_, OutcomeCertainty::Unknown) => ExecutionState::Unknown,
+            (DispatchState::DispatchAttempted | DispatchState::DispatchConfirmed, _) => {
+                ExecutionState::Unknown
+            }
+            (DispatchState::NotDispatched, OutcomeCertainty::ConfirmedSuccess) => {
+                ExecutionState::Committed
+            }
+        }
+    }
+
     impl std::fmt::Display for EffectExecutionError {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(formatter, "{}: {}", self.code, self.message)
@@ -280,6 +299,39 @@ pub mod unstable {
     mod tests {
         use super::*;
         use serde_json::json;
+
+        #[test]
+        fn unknown_after_any_dispatch_is_never_downgraded_to_failure() {
+            for dispatch_state in [
+                DispatchState::DispatchAttempted,
+                DispatchState::DispatchConfirmed,
+            ] {
+                let error = EffectExecutionError {
+                    code: "ambiguous".into(),
+                    dispatch_state,
+                    outcome_certainty: OutcomeCertainty::Unknown,
+                    provider_request_id: None,
+                    retryable: false,
+                    reconciliation_required: true,
+                    message: "unknown".into(),
+                };
+                assert_eq!(state_for_error(&error), ExecutionState::Unknown);
+            }
+        }
+
+        #[test]
+        fn confirmed_failure_before_dispatch_is_failed() {
+            let error = EffectExecutionError {
+                code: "validation".into(),
+                dispatch_state: DispatchState::NotDispatched,
+                outcome_certainty: OutcomeCertainty::ConfirmedFailure,
+                provider_request_id: None,
+                retryable: false,
+                reconciliation_required: false,
+                message: "rejected before dispatch".into(),
+            };
+            assert_eq!(state_for_error(&error), ExecutionState::Failed);
+        }
 
         struct TestBackend;
 

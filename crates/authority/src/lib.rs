@@ -75,8 +75,12 @@ pub mod unstable {
         pub action_id: String,
         /// Idempotency identity authorized by the grant.
         pub idempotency_key: String,
+        /// Tenant/organization authorized by the grant.
+        pub tenant_id: String,
         /// Principal authorized to execute the action.
         pub principal_id: String,
+        /// Runtime admission authorized by the grant.
+        pub admission_id: String,
         /// Capability authorized by the grant.
         pub capability_id: String,
         /// Registered capability generation authorized by the grant.
@@ -104,7 +108,9 @@ pub mod unstable {
         pub fn binds(&self, request: &AuthorityRequest) -> bool {
             self.action_id == request.action_id
                 && self.idempotency_key == request.idempotency_key
+                && self.tenant_id == request.tenant_id
                 && self.principal_id == request.principal_id
+                && self.admission_id == request.admission_id
                 && self.capability_id == request.capability_id
                 && self.capability_generation == request.capability_generation
                 && self.registration_digest == request.registration_digest
@@ -274,7 +280,9 @@ pub mod unstable {
                 digest: "digest".into(),
                 action_id: request.action_id.clone(),
                 idempotency_key: request.idempotency_key.clone(),
+                tenant_id: request.tenant_id.clone(),
                 principal_id: request.principal_id.clone(),
+                admission_id: request.admission_id.clone(),
                 capability_id: request.capability_id.clone(),
                 capability_generation: request.capability_generation,
                 registration_digest: request.registration_digest.clone(),
@@ -349,6 +357,21 @@ pub mod unstable {
                 adapter.decide(&request_from_identity(&identity())).unwrap(),
                 AuthorityDecision::RequireApproval
             );
+        }
+
+        #[test]
+        fn grants_bind_tenant_and_admission_as_well_as_capability_claims() {
+            let request = request_from_identity(&identity());
+            let valid = grant(&request);
+            assert!(valid.binds(&request));
+
+            let mut wrong_tenant = valid.clone();
+            wrong_tenant.tenant_id = "other-tenant".into();
+            assert!(!wrong_tenant.binds(&request));
+
+            let mut wrong_admission = valid;
+            wrong_admission.admission_id = "other-admission".into();
+            assert!(!wrong_admission.binds(&request));
         }
     }
 }

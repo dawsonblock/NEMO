@@ -38,6 +38,34 @@ pub mod unstable {
         Cancelled,
     }
 
+    /// Return whether a consequential-effect state transition is legal.
+    ///
+    /// This table is shared by in-memory test adapters and durable Effect
+    /// Fabric implementations so an adapter cannot accidentally skip the
+    /// authorization or preparation boundary.
+    pub const fn is_valid_transition(
+        current: Option<ExecutionState>,
+        next: ExecutionState,
+    ) -> bool {
+        matches!(
+            (current, next),
+            (None, ExecutionState::Proposed)
+                | (Some(ExecutionState::Proposed), ExecutionState::Authorized)
+                | (Some(ExecutionState::Proposed), ExecutionState::Cancelled)
+                | (Some(ExecutionState::Authorized), ExecutionState::Prepared)
+                | (Some(ExecutionState::Authorized), ExecutionState::Cancelled)
+                | (Some(ExecutionState::Prepared), ExecutionState::Dispatching)
+                | (Some(ExecutionState::Prepared), ExecutionState::Cancelled)
+                | (Some(ExecutionState::Dispatching), ExecutionState::Committed)
+                | (Some(ExecutionState::Dispatching), ExecutionState::Failed)
+                | (Some(ExecutionState::Dispatching), ExecutionState::Unknown)
+                | (Some(ExecutionState::Unknown), ExecutionState::Reconciling)
+                | (Some(ExecutionState::Reconciling), ExecutionState::Committed)
+                | (Some(ExecutionState::Reconciling), ExecutionState::Failed)
+                | (Some(ExecutionState::Reconciling), ExecutionState::Unknown)
+        )
+    }
+
     /// Minimal authoritative event written by an external effect journal.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct JournalRecord {
@@ -60,12 +88,45 @@ pub mod unstable {
         pub fingerprint: String,
         /// Execution identity bound to the action.
         pub execution_id: String,
+        /// Optional tenant/organization binding.
+        pub tenant_id: Option<String>,
+        /// Host-authenticated principal binding.
+        pub principal_id: String,
+        /// Runtime instance binding.
+        pub runtime_id: String,
         /// Capability identity bound to the action.
         pub capability_id: String,
+        /// Capability registration generation.
+        pub capability_generation: u64,
+        /// Immutable registration digest.
+        pub registration_digest: String,
+        /// Registered execution class.
+        pub execution_class: String,
+        /// Registered operation.
+        pub operation: String,
         /// Registered route digest.
         pub route_digest: String,
         /// Canonical argument digest.
         pub args_digest: String,
+        /// Runtime admission identifier.
+        pub admission_id: String,
+        /// Policy version and epoch used for this action.
+        pub policy_version: String,
+        /// Policy epoch used for this action.
+        pub policy_epoch: String,
+        /// Grant/approval bindings once authorization completes.
+        pub grant_digest: Option<String>,
+        /// Approval artifact reference once authorization completes.
+        pub approval_reference: Option<String>,
+    }
+
+    /// Durable action identity and current lifecycle state.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ActionRecord {
+        /// Immutable action identity claimed before authorization.
+        pub preparation: ActionPreparation,
+        /// Current lifecycle state.
+        pub state: ExecutionState,
     }
 
     /// Result of atomically claiming an action/idempotency key.
@@ -93,8 +154,14 @@ pub mod unstable {
         pub grant_digest: String,
         /// Principal identity.
         pub principal_id: String,
+        /// Tenant/organization identity.
+        pub tenant_id: Option<String>,
+        /// Runtime instance identity.
+        pub runtime_id: String,
         /// Capability identity.
         pub capability_id: String,
+        /// Capability registration generation.
+        pub capability_generation: u64,
         /// Registration digest.
         pub registration_digest: String,
         /// Operation name.
@@ -105,6 +172,12 @@ pub mod unstable {
         pub args_digest: String,
         /// Registered route digest.
         pub route_digest: String,
+        /// Runtime admission identity.
+        pub admission_id: String,
+        /// Policy version and epoch used for this action.
+        pub policy_version: String,
+        /// Policy epoch used for this action.
+        pub policy_epoch: String,
         /// Provider request identifier.
         pub provider_request_id: Option<String>,
         /// Terminal effect state.
@@ -132,13 +205,39 @@ pub mod unstable {
         type Error;
 
         /// Atomically claim an action and its idempotency key before dispatch.
-        fn prepare_action(
+        fn claim_action(
             &self,
             action: &ActionPreparation,
         ) -> Result<PrepareActionResult, Self::Error>;
 
+        /// Backwards-compatible name for adapters migrating from the old
+        /// pre-authorization preparation contract.
+        #[deprecated(note = "use claim_action; claims begin in PROPOSED state")]
+        fn prepare_action(
+            &self,
+            action: &ActionPreparation,
+        ) -> Result<PrepareActionResult, Self::Error> {
+            self.claim_action(action)
+        }
+
+        /// Load the complete durable action identity and current state.
+        fn load_action(&self, action_id: &str) -> Result<Option<ActionRecord>, Self::Error>;
+
         /// Load the current state for an action, if one exists.
-        fn load_state(&self, action_id: &str) -> Result<Option<ExecutionState>, Self::Error>;
+        fn load_state(&self, action_id: &str) -> Result<Option<ExecutionState>, Self::Error> {
+            Ok(self.load_action(action_id)?.map(|record| record.state))
+        }
+
+        /// Attach the verified grant and approval references to a claimed
+        /// action before it enters `AUTHORIZED` state.
+        fn bind_authorization(
+            &self,
+            _action_id: &str,
+            _grant_digest: &str,
+            _approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
 
         /// Apply one state transition under the backend's concurrency policy.
         fn transition(
@@ -165,6 +264,35 @@ pub mod unstable {
     mod tests {
         use super::*;
 
+        #[test]
+        fn consequential_state_machine_rejects_skipped_boundaries() {
+            assert!(is_valid_transition(None, ExecutionState::Proposed));
+            assert!(is_valid_transition(
+                Some(ExecutionState::Proposed),
+                ExecutionState::Authorized
+            ));
+            assert!(is_valid_transition(
+                Some(ExecutionState::Authorized),
+                ExecutionState::Prepared
+            ));
+            assert!(is_valid_transition(
+                Some(ExecutionState::Prepared),
+                ExecutionState::Dispatching
+            ));
+            assert!(is_valid_transition(
+                Some(ExecutionState::Dispatching),
+                ExecutionState::Unknown
+            ));
+            assert!(!is_valid_transition(
+                Some(ExecutionState::Proposed),
+                ExecutionState::Committed
+            ));
+            assert!(!is_valid_transition(
+                Some(ExecutionState::Prepared),
+                ExecutionState::Committed
+            ));
+        }
+
         struct TestJournal;
 
         impl EffectJournal for TestJournal {
@@ -181,12 +309,16 @@ pub mod unstable {
         impl ActionStore for TestActionStore {
             type Error = std::convert::Infallible;
 
-            fn prepare_action(
+            fn claim_action(
                 &self,
                 action: &ActionPreparation,
             ) -> Result<PrepareActionResult, Self::Error> {
                 assert_eq!(action.idempotency_key, "idempotency");
                 Ok(PrepareActionResult::NewAction)
+            }
+
+            fn load_action(&self, _action_id: &str) -> Result<Option<ActionRecord>, Self::Error> {
+                Ok(None)
             }
 
             fn load_state(
@@ -225,12 +357,18 @@ pub mod unstable {
                     idempotency_key: "idempotency".into(),
                     grant_digest: "grant".into(),
                     principal_id: "alice".into(),
+                    tenant_id: Some("tenant".into()),
+                    runtime_id: "runtime".into(),
                     capability_id: "capability".into(),
+                    capability_generation: 1,
                     registration_digest: "registration".into(),
                     operation: "operation".into(),
                     execution_class: "MUTATION".into(),
                     args_digest: "args".into(),
                     route_digest: "route".into(),
+                    admission_id: "admission".into(),
+                    policy_version: "policy".into(),
+                    policy_epoch: "epoch".into(),
                     provider_request_id: None,
                     final_state: ExecutionState::Committed,
                     started_at_unix_ms: 1,
@@ -256,14 +394,26 @@ pub mod unstable {
             );
             assert_eq!(
                 TestActionStore
-                    .prepare_action(&ActionPreparation {
+                    .claim_action(&ActionPreparation {
                         action_id: "action".into(),
                         idempotency_key: "idempotency".into(),
                         fingerprint: "fingerprint".into(),
                         execution_id: "execution".into(),
+                        tenant_id: None,
+                        principal_id: "alice".into(),
+                        runtime_id: "runtime".into(),
                         capability_id: "capability".into(),
+                        capability_generation: 1,
+                        registration_digest: "registration".into(),
+                        execution_class: "MUTATION".into(),
+                        operation: "operation".into(),
                         route_digest: "route".into(),
                         args_digest: "args".into(),
+                        admission_id: "admission".into(),
+                        policy_version: "policy".into(),
+                        policy_epoch: "epoch".into(),
+                        grant_digest: None,
+                        approval_reference: None,
                     })
                     .unwrap(),
                 PrepareActionResult::NewAction
