@@ -19,6 +19,25 @@ pub(super) struct ProcessTree {
 pub(super) async fn spawn(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<(tokio::process::Child, ProcessTree)> {
+    // Tokio installs process-wide handlers for the signals below. An exec'ed child would inherit
+    // ignored dispositions for some of them (notably SIGQUIT on macOS), making forwarded
+    // termination ineffective. Restore the default dispositions in the post-fork child before
+    // exec so Relay remains the only signal consumer.
+    #[cfg(unix)]
+    {
+        // SAFETY: `pre_exec` runs in the forked child before exec. `libc::signal` is async-signal
+        // safe and only changes dispositions for the child process.
+        unsafe {
+            command.pre_exec(|| {
+                for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                    if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
     // Register before spawning so a signal cannot terminate Relay in the interval between child
     // creation and supervision. Tokio retains the OS handlers process-wide, which is appropriate:
     // a transparent run exits immediately after this child finishes.
@@ -121,6 +140,10 @@ impl ProcessTree {
         // SAFETY: The child was spawned with `process_group(0)`, so its PID is the process-group
         // ID. A negative PID targets the complete group and does not dereference memory.
         if unsafe { libc::kill(-self.process_group, libc::SIGKILL) } == 0 {
+            // Keep a direct-child kill in the successful group-kill path as well. On macOS a
+            // process may leave its group while handling a terminating signal; the explicit
+            // direct kill preserves the guarantee that the child Tokio is waiting on is gone.
+            let _ = child.start_kill();
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
