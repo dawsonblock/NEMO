@@ -60,26 +60,26 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "12a3b8442fc589ae06779fa3e9756b64232b5a8ae243508a819cdec71c90d018",
-    "source_archive_sha256": "82e0cd9841c1f18acb9cf0d96d780c12ac6721a132a8df5fefcd1a8983a92d05",
-    "release_archive_sha256": "82e0cd9841c1f18acb9cf0d96d780c12ac6721a132a8df5fefcd1a8983a92d05",
-    "environment_sha256": "4fd791fc929649182d4b47de1be18245aca6ce772decd4c27312db3dfa33128b",
+    "source_tree_sha256": "dd87d44fd10ae8a8ac17346fe426137009af85d1d59139149312c2a1d4fa72bd",
+    "source_archive_sha256": "0c292471d693ddf58a859f7a36473f35b05a1b483a939805be032810d4745b13",
+    "release_archive_sha256": "0c292471d693ddf58a859f7a36473f35b05a1b483a939805be032810d4745b13",
+    "environment_sha256": "3df3c8bc5dac9ad45562ccecbe4b4d0890a491112251fa84fec0cf84b0ef58d5",
     "lockfiles": {
       "Cargo.lock": "sha256:5cc45155ec25aee61f24414593c16f05900828d8d2a674a15dcaaaaf1b320b89",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
-      "uv.lock": "sha256:88a0f82afcf0618529962d7c811c64f54ce1b026d66d31a66f28ffb5e3ac7c6d"
+      "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "a3445c29a80d53c1d582bd07781db3c49bdf40be",
-      "tree": "15256a5bdc9f9f3703de65107e49e850d8fb1f77",
-      "source_tree_sha256": "12a3b8442fc589ae06779fa3e9756b64232b5a8ae243508a819cdec71c90d018",
+      "commit": "c26d01ef32f3b0b3b07e12dc99c2dfd116dd7bbf",
+      "tree": "05e84269470720856160337202a5a8656a152511",
+      "source_tree_sha256": "dd87d44fd10ae8a8ac17346fe426137009af85d1d59139149312c2a1d4fa72bd",
       "status": []
     }
   },
   "notes": [
     "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
-    "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons.",
+    "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
     "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result."
   ]
 }
