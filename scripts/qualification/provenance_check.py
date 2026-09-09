@@ -27,14 +27,22 @@ EXCLUDED_ROOTS = {
     ".uv-cache",
     ".pytest_cache",
     ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "build",
+    "dist",
 }
 GENERATED_PREFIX = ("release", "artifacts")
 
 
 def excluded(relative: pathlib.Path) -> bool:
-    return bool(relative.parts) and (
-        relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX
-    )
+    if not relative.parts:
+        return False
+    if relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX:
+        return True
+    if "__pycache__" in relative.parts or relative.name == ".coverage":
+        return True
+    return relative.suffix in {".pyc", ".pyo"}
 
 
 def source_files(manifest_paths: set[str] | None = None) -> list[pathlib.Path]:

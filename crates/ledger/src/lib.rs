@@ -130,13 +130,14 @@ pub mod unstable {
     }
 
     /// Result of atomically claiming an action/idempotency key.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum PrepareActionResult {
         /// No prior action used this idempotency key.
         NewAction,
-        /// The exact same action is already known and may be observed/replayed.
-        ExistingSameAction,
+        /// The exact same action is already known and may be observed,
+        /// resumed, reconciled, or replayed without redispatching it.
+        ExistingSameAction(Box<ActionRecord>),
         /// The key is already bound to different effect identity.
         IdempotencyConflict,
     }
@@ -228,16 +229,20 @@ pub mod unstable {
             Ok(self.load_action(action_id)?.map(|record| record.state))
         }
 
-        /// Attach the verified grant and approval references to a claimed
-        /// action before it enters `AUTHORIZED` state.
-        fn bind_authorization(
+        /// Atomically attach the verified grant and approval references while
+        /// transitioning a claimed action from `PROPOSED` to `AUTHORIZED`.
+        ///
+        /// Implementations must persist both the evidence binding and state in
+        /// one durable operation. A default no-op would permit an executor to
+        /// claim authorization without retaining the evidence that justified
+        /// it.
+        fn authorize_action(
             &self,
-            _action_id: &str,
-            _grant_digest: &str,
-            _approval_reference: Option<&str>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error>;
 
         /// Apply one state transition under the backend's concurrency policy.
         fn transition(
@@ -326,6 +331,20 @@ pub mod unstable {
                 _execution_id: &str,
             ) -> Result<Option<ExecutionState>, Self::Error> {
                 Ok(Some(ExecutionState::Prepared))
+            }
+
+            fn authorize_action(
+                &self,
+                action_id: &str,
+                expected: ExecutionState,
+                grant_digest: &str,
+                approval_reference: Option<&str>,
+            ) -> Result<(), Self::Error> {
+                assert_eq!(action_id, "execution");
+                assert_eq!(expected, ExecutionState::Proposed);
+                assert_eq!(grant_digest, "grant");
+                assert_eq!(approval_reference, Some("approval"));
+                Ok(())
             }
 
             fn transition(
@@ -425,6 +444,14 @@ pub mod unstable {
                     ExecutionState::Dispatching,
                 )
                 .expect("transition should compile");
+            TestActionStore
+                .authorize_action(
+                    "execution",
+                    ExecutionState::Proposed,
+                    "grant",
+                    Some("approval"),
+                )
+                .expect("authorization binding should compile");
             assert_eq!(
                 TestReceiptStore
                     .load("action")

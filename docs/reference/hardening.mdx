@@ -72,6 +72,15 @@ have crossed the provider boundary, or if durable receipt/state persistence
 cannot prove a terminal result, the kernel records `UNKNOWN` and returns a
 typed reconciliation-required outcome.
 
+`MUTATION` and `CRITICAL` invocations require a stable caller `request_id`.
+The kernel scopes that retry identity to the authenticated tenant and
+principal, claims one durable logical action, and returns that real action ID
+on every pending, unknown, or recovery-required outcome. Retrying the same
+request therefore resumes or observes the original action rather than
+silently creating another dispatch. A stale `DISPATCHING` action can be
+recovered only from a fully bound persisted receipt; otherwise it becomes
+`UNKNOWN` and must be reconciled.
+
 Retry policy is deliberately conservative: `FAILED` after confirmed
 pre-dispatch failure may be evaluated for a new attempt by the external effect
 system; `UNKNOWN` must never be automatically re-dispatched. An external

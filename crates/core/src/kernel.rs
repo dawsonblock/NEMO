@@ -17,8 +17,8 @@ use nemo_relay_executor::unstable::{
     ExecutionResult, ReconciliationProvider, ReconciliationResult, RuntimeIdentity,
 };
 use nemo_relay_ledger::unstable::{
-    ActionPreparation, ActionStore, ExecutionState, PrepareActionResult, ReceiptRecord,
-    ReceiptStore, is_valid_transition,
+    ActionPreparation, ActionRecord, ActionStore, ExecutionState, PrepareActionResult,
+    ReceiptRecord, ReceiptStore, is_valid_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -66,9 +66,17 @@ pub enum KernelError {
     /// An action store failed while claiming or transitioning an effect.
     #[error("action store failed: {0}")]
     ActionStore(String),
-    /// The action store already owns this exact logical action.
-    #[error("action is already prepared: {0}")]
-    ActionAlreadyPrepared(String),
+    /// Consequential work requires a stable caller retry identity.
+    #[error("consequential capability invocations require request_id")]
+    RequestIdRequired,
+    /// A claimed action remains safely resumable before external dispatch.
+    #[error("action remains pending before dispatch: {action:?}: {cause}")]
+    ActionPending {
+        /// Durable action identity and recovery guidance.
+        action: Box<ActionStatus>,
+        /// Authority or persistence failure that left the action pending.
+        cause: String,
+    },
     /// The idempotency key is bound to a different logical action.
     #[error("idempotency key conflicts with an existing action")]
     IdempotencyConflict,
@@ -81,12 +89,34 @@ pub enum KernelError {
     /// The external receipt store rejected a receipt.
     #[error("receipt store failed: {0}")]
     ReceiptStore(String),
+    /// An effect definitely failed after the kernel claimed its logical action.
+    #[error("effect failed after durable action claim: {action:?}: {cause}")]
+    EffectFailed {
+        /// Durable action identity and terminal state.
+        action: Box<ActionStatus>,
+        /// Typed backend diagnostic.
+        cause: String,
+    },
     /// A consequential effect may have crossed the external boundary.
-    #[error("effect outcome is unknown and requires reconciliation: {0}")]
-    EffectUnknown(String),
+    #[error("effect outcome is unknown and requires reconciliation: {action:?}: {cause}")]
+    EffectUnknown {
+        /// Durable action identity and reconciliation guidance.
+        action: Box<ActionStatus>,
+        /// Backend, transport, receipt, or reconciliation failure.
+        cause: String,
+    },
     /// Durable state could not be advanced after evidence was persisted.
-    #[error("durable effect state requires recovery: {0}")]
-    StateRecoveryRequired(String),
+    #[error(
+        "durable effect state requires recovery toward {intended_state:?}: {action:?}: {cause}"
+    )]
+    StateRecoveryRequired {
+        /// Durable action identity and recovery guidance.
+        action: Box<ActionStatus>,
+        /// State that could not be durably recorded.
+        intended_state: ExecutionState,
+        /// Underlying persistence failure.
+        cause: String,
+    },
     /// The kernel attempted to skip a lifecycle boundary.
     #[error("invalid effect state transition: {expected:?} -> {next:?}")]
     InvalidStateTransition {
@@ -125,6 +155,27 @@ pub struct InvocationRequest {
     /// Optional caller retry identity. It is only an idempotency key; all
     /// security-sensitive fields remain kernel-derived.
     pub request_id: Option<String>,
+}
+
+/// Public recovery handle for one consequential logical action.
+///
+/// This is deliberately returned instead of an ephemeral attempt identifier so
+/// a harness can retry, observe, or reconcile the durable action actually
+/// claimed by the action store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionStatus {
+    /// Canonical durable action identifier.
+    pub action_id: String,
+    /// Kernel-scoped idempotency identity.
+    pub idempotency_key: String,
+    /// Last known durable lifecycle state.
+    pub state: ExecutionState,
+    /// Whether the kernel can safely resume this action without dispatching.
+    pub safe_to_retry: bool,
+    /// Whether provider evidence must be reconciled before another dispatch.
+    pub reconciliation_required: bool,
+    /// Persisted receipt when the action is already committed.
+    pub receipt: Option<ReceiptRecord>,
 }
 
 /// Immutable data registered for a capability before any harness invocation.
@@ -259,6 +310,17 @@ impl BoundExecutionRequest {
         self.request.identity.approval_reference = Some(approval_reference);
     }
 
+    fn rebind_to_claimed_action(&mut self, action: &ActionRecord) {
+        let identity = &mut self.request.identity;
+        identity.action_id = action.preparation.action_id.clone();
+        identity.execution_id = action.preparation.execution_id.clone();
+        identity.invocation_id = action.preparation.execution_id.clone();
+        identity.idempotency_key = action.preparation.idempotency_key.clone();
+        identity.grant_digest = None;
+        identity.approval_reference = None;
+        self.request.grant = None;
+    }
+
     fn action_preparation(&self) -> ActionPreparation {
         let identity = &self.request.identity;
         let capability = &identity.capability;
@@ -337,6 +399,8 @@ pub enum InvocationOutcome {
     Completed(ExecutionResult),
     /// The exact bound action awaits external approval before it can execute.
     PendingApproval(PendingAction),
+    /// An existing logical action was returned without redispatching it.
+    ExistingAction(ActionStatus),
 }
 
 enum AuthorizationOutcome {
@@ -508,17 +572,20 @@ impl<A, F, E, S, R> Kernel<A, F, E, S, R> {
         let args_digest = sha256_hex(&canonical);
         let execution_id = Uuid::now_v7().to_string();
         let action_id = Uuid::now_v7().to_string();
-        let idempotency_key = invocation
-            .request_id
-            .clone()
-            .unwrap_or_else(|| action_id.clone());
+        let definition = &registered.definition;
+        let idempotency_key = match definition.execution_class {
+            ExecutionClass::Mutation | ExecutionClass::Critical => invocation
+                .request_id
+                .as_deref()
+                .map(|request_id| scoped_idempotency_key(&self.runtime, request_id))
+                .ok_or(KernelError::RequestIdRequired)?,
+            ExecutionClass::Pure | ExecutionClass::Read => action_id.clone(),
+        };
         let deadline_unix_ms = chrono::Utc::now()
             .timestamp_millis()
             .saturating_add(30_000)
             .try_into()
             .unwrap_or(u64::MAX);
-        let definition = &registered.definition;
-
         Ok(BoundExecutionRequest {
             request: ExecutionRequest {
                 identity: ExecutionIdentity {
@@ -571,10 +638,96 @@ where
                 .capability
                 .execution_class,
             ExecutionClass::Mutation | ExecutionClass::Critical
-        ) {
-            self.claim_action(&request)?;
+        ) && let Some(existing) = self.claim_action(&request)?
+        {
+            return self.resume_existing_action(&mut request, existing);
         }
         self.authorize_and_execute(&mut request)
+    }
+
+    /// Recover a stale `DISPATCHING` action after a process restart.
+    ///
+    /// A receipt already persisted by Effect Fabric proves commitment. Without
+    /// that evidence the action becomes `UNKNOWN`; the kernel never dispatches
+    /// it again merely because the previous process disappeared.
+    pub fn recover(&self, action_id: &str) -> Result<ActionStatus, KernelError> {
+        let action = self
+            .action_store
+            .load_action(action_id)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?
+            .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
+        if action.state != ExecutionState::Dispatching {
+            if action.state == ExecutionState::Committed {
+                let receipt = self.receipt_store.load(action_id).map_err(|error| {
+                    self.state_recovery_required(
+                        &action.preparation,
+                        ExecutionState::Committed,
+                        error.to_string(),
+                    )
+                })?;
+                return match receipt {
+                    Some(receipt)
+                        if receipt.final_state == ExecutionState::Committed
+                            && self.receipt_matches_action(&receipt, &action.preparation) =>
+                    {
+                        Ok(self.action_status(&action, Some(receipt)))
+                    }
+                    _ => Err(self.state_recovery_required(
+                        &action.preparation,
+                        ExecutionState::Committed,
+                        "committed action has no valid persisted receipt".into(),
+                    )),
+                };
+            }
+            return Ok(self.action_status(&action, None));
+        }
+        if let Some(receipt) = self.receipt_store.load(action_id).map_err(|error| {
+            self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Unknown,
+                error.to_string(),
+            )
+        })? {
+            if receipt.final_state != ExecutionState::Committed
+                || !self.receipt_matches_action(&receipt, &action.preparation)
+            {
+                return Err(self.state_recovery_required(
+                    &action.preparation,
+                    ExecutionState::Unknown,
+                    "persisted receipt does not bind to stale dispatching action".into(),
+                ));
+            }
+            self.transition_action(
+                &action,
+                ExecutionState::Dispatching,
+                ExecutionState::Committed,
+            )
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &action.preparation,
+                    ExecutionState::Committed,
+                    error.to_string(),
+                )
+            })?;
+            return Ok(self.action_status_with_state(
+                &action.preparation,
+                ExecutionState::Committed,
+                Some(receipt),
+            ));
+        }
+        self.transition_action(
+            &action,
+            ExecutionState::Dispatching,
+            ExecutionState::Unknown,
+        )
+        .map_err(|error| {
+            self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Unknown,
+                error.to_string(),
+            )
+        })?;
+        Ok(self.action_status_with_state(&action.preparation, ExecutionState::Unknown, None))
     }
 
     /// Resume an exact pending action with its authority-issued approval.
@@ -599,58 +752,59 @@ where
             .action_store
             .load_action(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?;
-        if action.as_ref().map(|record| record.state) != Some(ExecutionState::Unknown) {
+        let action = action.ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
+        if action.state != ExecutionState::Unknown {
             return Err(KernelError::ActionNotUnknown(action_id.to_owned()));
         }
-        self.action_store
-            .transition(
-                action_id,
-                Some(ExecutionState::Unknown),
-                ExecutionState::Reconciling,
+        self.transition_action(
+            &action,
+            ExecutionState::Unknown,
+            ExecutionState::Reconciling,
+        )
+        .map_err(|error| {
+            self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Unknown,
+                error.to_string(),
             )
-            .map_err(|error| KernelError::ActionStore(error.to_string()))?;
+        })?;
         let result = match self.router.reconcile(action_id) {
             Ok(result) => result,
-            Err(error) => {
-                let _ = self.action_store.transition(
-                    action_id,
-                    Some(ExecutionState::Reconciling),
-                    ExecutionState::Unknown,
-                );
-                return Err(KernelError::EffectUnknown(error.to_string()));
-            }
+            Err(error) => return Err(self.reconciliation_unknown(&action, error.to_string())),
         };
         if !matches!(
             result.state,
             ExecutionState::Committed | ExecutionState::Failed | ExecutionState::Unknown
         ) {
-            return Err(KernelError::ReconciliationInvalidState(result.state));
+            return Err(self.reconciliation_unknown(
+                &action,
+                format!("reconciliation returned invalid state: {:?}", result.state),
+            ));
+        }
+        if result.state == ExecutionState::Committed && result.receipt.is_none() {
+            return Err(self.reconciliation_unknown(
+                &action,
+                "reconciliation cannot commit without an authoritative receipt".into(),
+            ));
         }
         if let Some(receipt) = result.receipt.as_ref() {
-            let action = action.as_ref().expect("UNKNOWN action was loaded");
             if receipt.action_id != action_id
                 || receipt.final_state != result.state
                 || !self.receipt_matches_action(receipt, &action.preparation)
             {
-                let _ = self.action_store.transition(
-                    action_id,
-                    Some(ExecutionState::Reconciling),
-                    ExecutionState::Unknown,
-                );
-                return Err(KernelError::ReceiptBindingFailure);
+                return Err(self.reconciliation_unknown(
+                    &action,
+                    "reconciled receipt does not bind to the original action".into(),
+                ));
             }
             if let Err(error) = self.receipt_store.store(receipt) {
-                let _ = self.action_store.transition(
-                    action_id,
-                    Some(ExecutionState::Reconciling),
-                    ExecutionState::Unknown,
-                );
-                return Err(KernelError::ReceiptStore(error.to_string()));
+                return Err(self.reconciliation_unknown(&action, error.to_string()));
             }
         }
-        self.action_store
-            .transition(action_id, Some(ExecutionState::Reconciling), result.state)
-            .map_err(|error| KernelError::ActionStore(error.to_string()))?;
+        self.transition_action(&action, ExecutionState::Reconciling, result.state)
+            .map_err(|error| {
+                self.state_recovery_required(&action.preparation, result.state, error.to_string())
+            })?;
         Ok(result)
     }
 
@@ -658,7 +812,11 @@ where
         &self,
         request: &mut BoundExecutionRequest,
     ) -> Result<InvocationOutcome, KernelError> {
-        match self.router.authorize_bound(request)? {
+        let authorization = match self.router.authorize_bound(request) {
+            Ok(authorization) => authorization,
+            Err(error) => return Err(self.pending_after_authority_error(request, error)),
+        };
+        match authorization {
             AuthorizationOutcome::FastPath => Ok(InvocationOutcome::Completed(
                 self.router.execute_bound(request)?,
             )),
@@ -666,27 +824,31 @@ where
                 request.attach_grant(*grant);
                 let identity = &request.backend_request().identity;
                 self.action_store
-                    .bind_authorization(
+                    .authorize_action(
                         &identity.action_id,
+                        ExecutionState::Proposed,
                         identity.grant_digest.as_deref().unwrap_or_default(),
                         identity.approval_reference.as_deref(),
                     )
-                    .map_err(|error| KernelError::ActionStore(error.to_string()))?;
-                self.transition(
-                    request,
-                    ExecutionState::Proposed,
-                    ExecutionState::Authorized,
-                )?;
+                    .map_err(|error| {
+                        self.pending_after_authority_failure(request, error.to_string())
+                    })?;
                 self.transition(
                     request,
                     ExecutionState::Authorized,
                     ExecutionState::Prepared,
-                )?;
+                )
+                .map_err(|error| {
+                    self.pending_after_state_failure(request, ExecutionState::Authorized, error)
+                })?;
                 self.transition(
                     request,
                     ExecutionState::Prepared,
                     ExecutionState::Dispatching,
-                )?;
+                )
+                .map_err(|error| {
+                    self.pending_after_state_failure(request, ExecutionState::Prepared, error)
+                })?;
                 Ok(InvocationOutcome::Completed(self.execute_effect(request)?))
             }
             AuthorizationOutcome::PendingApproval => {
@@ -697,16 +859,109 @@ where
         }
     }
 
-    fn claim_action(&self, request: &BoundExecutionRequest) -> Result<(), KernelError> {
+    fn resume_existing_action(
+        &self,
+        request: &mut BoundExecutionRequest,
+        action: ActionRecord,
+    ) -> Result<InvocationOutcome, KernelError> {
+        if action.state == ExecutionState::Proposed {
+            request.rebind_to_claimed_action(&action);
+            return self.authorize_and_execute(request);
+        }
+        let receipt = if action.state == ExecutionState::Committed {
+            let receipt = self
+                .receipt_store
+                .load(&action.preparation.action_id)
+                .map_err(|error| {
+                    self.state_recovery_required(
+                        &action.preparation,
+                        ExecutionState::Committed,
+                        error.to_string(),
+                    )
+                })?;
+            match receipt {
+                Some(receipt)
+                    if receipt.final_state == ExecutionState::Committed
+                        && self.receipt_matches_action(&receipt, &action.preparation) =>
+                {
+                    Some(receipt)
+                }
+                _ => {
+                    return Err(self.state_recovery_required(
+                        &action.preparation,
+                        ExecutionState::Committed,
+                        "committed action has no valid persisted receipt".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(InvocationOutcome::ExistingAction(
+            self.action_status(&action, receipt),
+        ))
+    }
+
+    fn pending_after_authority_error(
+        &self,
+        request: &BoundExecutionRequest,
+        error: KernelError,
+    ) -> KernelError {
+        match request
+            .backend_request()
+            .identity
+            .capability
+            .execution_class
+        {
+            ExecutionClass::Mutation | ExecutionClass::Critical => {
+                self.pending_after_authority_failure(request, error.to_string())
+            }
+            ExecutionClass::Pure | ExecutionClass::Read => error,
+        }
+    }
+
+    fn pending_after_authority_failure(
+        &self,
+        request: &BoundExecutionRequest,
+        cause: String,
+    ) -> KernelError {
+        KernelError::ActionPending {
+            action: Box::new(self.action_status_with_state(
+                &request.action_preparation(),
+                ExecutionState::Proposed,
+                None,
+            )),
+            cause,
+        }
+    }
+
+    fn pending_after_state_failure(
+        &self,
+        request: &BoundExecutionRequest,
+        state: ExecutionState,
+        error: KernelError,
+    ) -> KernelError {
+        KernelError::ActionPending {
+            action: Box::new(self.action_status_with_state(
+                &request.action_preparation(),
+                state,
+                None,
+            )),
+            cause: error.to_string(),
+        }
+    }
+
+    fn claim_action(
+        &self,
+        request: &BoundExecutionRequest,
+    ) -> Result<Option<ActionRecord>, KernelError> {
         match self
             .action_store
             .claim_action(&request.action_preparation())
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
         {
-            PrepareActionResult::NewAction => Ok(()),
-            PrepareActionResult::ExistingSameAction => Err(KernelError::ActionAlreadyPrepared(
-                request.backend_request().identity.action_id.clone(),
-            )),
+            PrepareActionResult::NewAction => Ok(None),
+            PrepareActionResult::ExistingSameAction(action) => Ok(Some(*action)),
             PrepareActionResult::IdempotencyConflict => Err(KernelError::IdempotencyConflict),
         }
     }
@@ -719,33 +974,48 @@ where
             Ok(result) => result,
             Err(error) => {
                 let state = nemo_relay_executor::unstable::state_for_error(&error);
-                self.transition_from_dispatching(request, state)?;
                 if state == ExecutionState::Unknown {
-                    return Err(KernelError::EffectUnknown(error.to_string()));
+                    return Err(self.unknown_after_dispatching(request, error.to_string()));
                 }
-                return Err(KernelError::EffectBackend(error));
+                self.transition_from_dispatching(request, state)?;
+                return Err(KernelError::EffectFailed {
+                    action: Box::new(self.action_status_with_state(
+                        &request.action_preparation(),
+                        ExecutionState::Failed,
+                        None,
+                    )),
+                    cause: error.to_string(),
+                });
             }
         };
         let receipt = match result.receipt.as_ref() {
             Some(receipt) => receipt,
             None => {
-                self.transition_from_dispatching(request, ExecutionState::Unknown)?;
-                return Err(KernelError::ReceiptMissing);
+                return Err(
+                    self.unknown_after_dispatching(request, "effect result omitted receipt".into())
+                );
             }
         };
         if self
             .verify_receipt(request.backend_request(), receipt, &result)
             .is_err()
         {
-            self.transition_from_dispatching(request, ExecutionState::Unknown)?;
-            return Err(KernelError::ReceiptBindingFailure);
+            return Err(self.unknown_after_dispatching(
+                request,
+                "effect receipt does not bind to the execution identity".into(),
+            ));
         }
         if let Err(error) = self.receipt_store.store(receipt) {
-            self.transition_from_dispatching(request, ExecutionState::Unknown)?;
-            return Err(KernelError::ReceiptStore(error.to_string()));
+            return Err(self.unknown_after_dispatching(request, error.to_string()));
         }
         self.transition_from_dispatching(request, ExecutionState::Committed)
-            .map_err(|error| KernelError::StateRecoveryRequired(error.to_string()))?;
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &request.action_preparation(),
+                    ExecutionState::Committed,
+                    error.to_string(),
+                )
+            })?;
         Ok(result)
     }
 
@@ -773,11 +1043,102 @@ where
         next: ExecutionState,
     ) -> Result<(), KernelError> {
         self.transition(request, ExecutionState::Dispatching, next)
+            .map_err(|error| {
+                self.state_recovery_required(&request.action_preparation(), next, error.to_string())
+            })
+    }
+
+    fn transition_action(
+        &self,
+        action: &ActionRecord,
+        expected: ExecutionState,
+        next: ExecutionState,
+    ) -> Result<(), KernelError> {
+        if !is_valid_transition(Some(expected), next) {
+            return Err(KernelError::InvalidStateTransition { expected, next });
+        }
+        self.action_store
+            .transition(&action.preparation.action_id, Some(expected), next)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))
+    }
+
+    fn unknown_after_dispatching(
+        &self,
+        request: &BoundExecutionRequest,
+        cause: String,
+    ) -> KernelError {
+        match self.transition_from_dispatching(request, ExecutionState::Unknown) {
+            Ok(()) => KernelError::EffectUnknown {
+                action: Box::new(self.action_status_with_state(
+                    &request.action_preparation(),
+                    ExecutionState::Unknown,
+                    None,
+                )),
+                cause,
+            },
+            Err(error) => error,
+        }
+    }
+
+    fn reconciliation_unknown(&self, action: &ActionRecord, cause: String) -> KernelError {
+        match self.transition_action(action, ExecutionState::Reconciling, ExecutionState::Unknown) {
+            Ok(()) => KernelError::EffectUnknown {
+                action: Box::new(self.action_status_with_state(
+                    &action.preparation,
+                    ExecutionState::Unknown,
+                    None,
+                )),
+                cause,
+            },
+            Err(error) => self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Unknown,
+                error.to_string(),
+            ),
+        }
+    }
+
+    fn state_recovery_required(
+        &self,
+        action: &ActionPreparation,
+        intended_state: ExecutionState,
+        cause: String,
+    ) -> KernelError {
+        KernelError::StateRecoveryRequired {
+            action: Box::new(self.action_status_with_state(action, intended_state, None)),
+            intended_state,
+            cause,
+        }
+    }
+
+    fn action_status(&self, action: &ActionRecord, receipt: Option<ReceiptRecord>) -> ActionStatus {
+        self.action_status_with_state(&action.preparation, action.state, receipt)
+    }
+
+    fn action_status_with_state(
+        &self,
+        action: &ActionPreparation,
+        state: ExecutionState,
+        receipt: Option<ReceiptRecord>,
+    ) -> ActionStatus {
+        ActionStatus {
+            action_id: action.action_id.clone(),
+            idempotency_key: action.idempotency_key.clone(),
+            state,
+            safe_to_retry: state == ExecutionState::Proposed,
+            reconciliation_required: matches!(
+                state,
+                ExecutionState::Unknown | ExecutionState::Reconciling
+            ),
+            receipt,
+        }
     }
 
     fn receipt_matches_action(&self, receipt: &ReceiptRecord, action: &ActionPreparation) -> bool {
         receipt.action_id == action.action_id
             && receipt.idempotency_key == action.idempotency_key
+            && receipt.grant_digest == action.grant_digest.as_deref().unwrap_or_default()
+            && receipt.principal_id == action.principal_id
             && receipt.capability_id == action.capability_id
             && receipt.capability_generation == action.capability_generation
             && receipt.registration_digest == action.registration_digest
@@ -836,6 +1197,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn scoped_idempotency_key(runtime: &RuntimeIdentity, request_id: &str) -> String {
+    let namespace = serde_json::json!({
+        "tenant_id": runtime.tenant_id,
+        "principal_id": runtime.principal_id,
+        "request_id": request_id,
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&namespace)
+        .expect("kernel-owned idempotency namespace must canonicalize");
+    sha256_hex(&bytes)
 }
 
 fn execution_class_name(class: ExecutionClass) -> &'static str {
@@ -940,6 +1312,11 @@ mod tests {
         prepare_calls: Arc<AtomicUsize>,
         states: Arc<Mutex<HashMap<String, ExecutionState>>>,
         records: Arc<Mutex<HashMap<String, ActionRecord>>>,
+        /// Inject a persistence failure only when trying to record an
+        /// ambiguous post-dispatch outcome. Earlier lifecycle boundaries must
+        /// remain writable so this test double can exercise the exact crash
+        /// window that matters.
+        fail_unknown_transition: Arc<Mutex<Option<String>>>,
     }
 
     impl ActionStore for TestActionStore {
@@ -959,7 +1336,7 @@ mod tests {
                 .find(|record| record.preparation.idempotency_key == action.idempotency_key)
             {
                 return Ok(if existing.preparation.fingerprint == action.fingerprint {
-                    PrepareActionResult::ExistingSameAction
+                    PrepareActionResult::ExistingSameAction(Box::new(existing.clone()))
                 } else {
                     PrepareActionResult::IdempotencyConflict
                 });
@@ -1033,6 +1410,16 @@ mod tests {
             expected: Option<ExecutionState>,
             next: ExecutionState,
         ) -> Result<(), Self::Error> {
+            if expected == Some(ExecutionState::Dispatching)
+                && next == ExecutionState::Unknown
+                && let Some(error) = self
+                    .fail_unknown_transition
+                    .lock()
+                    .map_err(|_| "test action transition failure lock poisoned".to_owned())?
+                    .clone()
+            {
+                return Err(error);
+            }
             let mut states = self
                 .states
                 .lock()
@@ -1041,17 +1428,18 @@ mod tests {
                 return Err("unexpected state transition".into());
             }
             states.insert(action_id.to_owned(), next);
-            if let Ok(mut records) = self.records.lock() {
-                if let Some(record) = records.get_mut(action_id) {
-                    record.state = next;
-                }
+            if let Ok(mut records) = self.records.lock()
+                && let Some(record) = records.get_mut(action_id)
+            {
+                record.state = next;
             }
             Ok(())
         }
 
-        fn bind_authorization(
+        fn authorize_action(
             &self,
             action_id: &str,
+            expected: ExecutionState,
             grant_digest: &str,
             approval_reference: Option<&str>,
         ) -> Result<(), Self::Error> {
@@ -1059,10 +1447,20 @@ mod tests {
                 .records
                 .lock()
                 .map_err(|_| "test action record lock poisoned".to_owned())?;
-            if let Some(record) = records.get_mut(action_id) {
-                record.preparation.grant_digest = Some(grant_digest.to_owned());
-                record.preparation.approval_reference = approval_reference.map(ToOwned::to_owned);
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action authorization binding".to_owned())?;
+            if record.state != expected {
+                return Err("unexpected authorization state".into());
             }
+            record.preparation.grant_digest = Some(grant_digest.to_owned());
+            record.preparation.approval_reference = approval_reference.map(ToOwned::to_owned);
+            record.state = ExecutionState::Authorized;
+            drop(records);
+            self.states
+                .lock()
+                .map_err(|_| "test action state lock poisoned".to_owned())?
+                .insert(action_id.to_owned(), ExecutionState::Authorized);
             Ok(())
         }
     }
@@ -1070,12 +1468,21 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestReceiptStore {
         receipts: Arc<Mutex<Vec<ReceiptRecord>>>,
+        fail_store: Arc<Mutex<Option<String>>>,
     }
 
     impl ReceiptStore for TestReceiptStore {
         type Error = String;
 
         fn store(&self, receipt: &ReceiptRecord) -> Result<(), Self::Error> {
+            if let Some(error) = self
+                .fail_store
+                .lock()
+                .map_err(|_| "test receipt failure lock poisoned".to_owned())?
+                .clone()
+            {
+                return Err(error);
+            }
             self.receipts
                 .lock()
                 .map_err(|_| "test receipt lock poisoned".to_owned())?
@@ -1099,6 +1506,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<ExecutionRequest>>>,
         effect_error: Arc<Mutex<Option<EffectExecutionError>>>,
+        reconciliation_result: Arc<Mutex<Option<ReconciliationResult>>>,
+        reconciliation_error: Arc<Mutex<Option<EffectExecutionError>>>,
     }
 
     impl ExecutionBackend for TestBackend {
@@ -1115,15 +1524,14 @@ mod tests {
                 request.identity.capability.execution_class,
                 ExecutionClass::Mutation | ExecutionClass::Critical
             );
-            if consequential {
-                if let Some(error) = self
+            if consequential
+                && let Some(error) = self
                     .effect_error
                     .lock()
                     .expect("test effect error lock should not be poisoned")
                     .clone()
-                {
-                    return Err(error);
-                }
+            {
+                return Err(error);
             }
             let receipt = consequential.then(|| receipt(request));
             Ok(ExecutionResult {
@@ -1139,6 +1547,22 @@ mod tests {
 
     impl ReconciliationProvider for TestBackend {
         fn reconcile(&self, action_id: &str) -> Result<ReconciliationResult, EffectExecutionError> {
+            if let Some(error) = self
+                .reconciliation_error
+                .lock()
+                .expect("test reconciliation error lock should not be poisoned")
+                .clone()
+            {
+                return Err(error);
+            }
+            if let Some(result) = self
+                .reconciliation_result
+                .lock()
+                .expect("test reconciliation result lock should not be poisoned")
+                .clone()
+            {
+                return Ok(result);
+            }
             if let Some(request) = self
                 .requests
                 .lock()
@@ -1259,7 +1683,7 @@ mod tests {
             capability_id: "capability.test".into(),
             args: json!({"value": 1}),
             trace_id: Some("trace-1".into()),
-            request_id: None,
+            request_id: Some("test-request".into()),
         }
     }
 
@@ -1354,10 +1778,12 @@ mod tests {
             actions.clone(),
             receipts,
         );
-        assert!(matches!(
-            restarted.begin(&request),
-            Err(KernelError::ActionAlreadyPrepared(_))
-        ));
+        let existing = match restarted.begin(&request) {
+            Ok(InvocationOutcome::ExistingAction(existing)) => existing,
+            _ => panic!("expected the original completed action"),
+        };
+        assert_eq!(existing.state, ExecutionState::Committed);
+        assert!(existing.receipt.is_some());
         assert_eq!(second_effect.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1394,18 +1820,10 @@ mod tests {
             reconciliation_required: true,
             message: "provider response was lost".into(),
         });
-        assert!(matches!(
-            kernel.begin(&invocation()),
-            Err(KernelError::EffectUnknown(_))
-        ));
-        let action_id = actions
-            .records
-            .lock()
-            .unwrap()
-            .keys()
-            .next()
-            .cloned()
-            .expect("ambiguous action must be durable");
+        let action_id = match kernel.begin(&invocation()) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected structured unknown effect outcome"),
+        };
         assert_eq!(
             actions.load_state(&action_id).unwrap(),
             Some(ExecutionState::Unknown)
@@ -1424,13 +1842,43 @@ mod tests {
     }
 
     #[test]
+    fn retry_of_an_unknown_action_returns_its_reconciliation_handle_without_redispatch() {
+        let (kernel, _authority, _function, effect, _actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let request = invocation_with_request_id("unknown-retry");
+        let action_id = match kernel.begin(&request) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown effect"),
+        };
+        let existing = match kernel.begin(&request) {
+            Ok(InvocationOutcome::ExistingAction(status)) => status,
+            _ => panic!("retry must return the existing unknown action"),
+        };
+        assert_eq!(existing.action_id, action_id);
+        assert_eq!(existing.state, ExecutionState::Unknown);
+        assert!(existing.reconciliation_required);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn mismatched_grants_never_reach_effect_execution() {
         let (kernel, _authority, _function, effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::MismatchedGrant);
-        assert!(matches!(
-            kernel.begin(&invocation()),
-            Err(KernelError::GrantVerificationFailed(_))
-        ));
+        let pending = match kernel.begin(&invocation()) {
+            Err(KernelError::ActionPending { action, .. }) => action,
+            _ => panic!("a grant verification failure should preserve the proposed action"),
+        };
+        assert_eq!(pending.state, ExecutionState::Proposed);
+        assert!(pending.safe_to_retry);
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 1);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert!(receipts.receipts.lock().unwrap().is_empty());
@@ -1446,6 +1894,9 @@ mod tests {
         {
             InvocationOutcome::PendingApproval(pending) => pending,
             InvocationOutcome::Completed(_) => panic!("critical action should await approval"),
+            InvocationOutcome::ExistingAction(_) => {
+                panic!("first critical action should not already exist")
+            }
         };
         let action_id = pending.action_id().to_owned();
         let idempotency_key = pending.idempotency_key().to_owned();
@@ -1478,7 +1929,7 @@ mod tests {
             capability_id: "capability.test".into(),
             args: json!({}),
             trace_id: None,
-            request_id: None,
+            request_id: Some("test-request".into()),
         };
         assert!(matches!(
             kernel.begin(&invalid),
@@ -1488,6 +1939,322 @@ mod tests {
         assert_eq!(function.calls.load(Ordering::SeqCst), 0);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn consequential_actions_require_a_stable_request_id() {
+        let (kernel, authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        let request = InvocationRequest {
+            request_id: None,
+            ..invocation()
+        };
+        assert!(matches!(
+            kernel.begin(&request),
+            Err(KernelError::RequestIdRequired)
+        ));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn proposed_action_resumes_with_its_original_action_identity() {
+        let (kernel, _authority, _function, _effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::MismatchedGrant);
+        let request = invocation_with_request_id("resume-proposed");
+        let original = match kernel.begin(&request) {
+            Err(KernelError::ActionPending { action, .. }) => action,
+            _ => panic!("grant failure should leave a resumable proposed action"),
+        };
+        let resumed_effect = TestBackend::default();
+        let resumed = Kernel::new(
+            runtime(),
+            registry(ExecutionClass::Mutation),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::Allow,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                resumed_effect.clone(),
+            ),
+            actions,
+            receipts,
+        );
+        assert!(matches!(
+            resumed.begin(&request),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        assert_eq!(resumed_effect.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resumed_effect.requests.lock().unwrap()[0]
+                .identity
+                .action_id,
+            original.action_id
+        );
+    }
+
+    #[test]
+    fn post_dispatch_receipt_failure_returns_a_reconciliation_handle() {
+        let (kernel, _authority, _function, effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *receipts.fail_store.lock().unwrap() = Some("receipt disk unavailable".into());
+        let action = match kernel.begin(&invocation()) {
+            Err(KernelError::EffectUnknown { action, .. }) => action,
+            _ => panic!("receipt persistence failure must remain unknown"),
+        };
+        assert_eq!(action.state, ExecutionState::Unknown);
+        assert!(action.reconciliation_required);
+        assert!(!action.safe_to_retry);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            actions.load_state(&action.action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+    }
+
+    #[test]
+    fn confirmed_pre_dispatch_failure_returns_the_durable_action_status() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "PROVIDER_REJECTED_BEFORE_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::NotDispatched,
+            outcome_certainty: OutcomeCertainty::ConfirmedFailure,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: false,
+            message: "provider rejected validation".into(),
+        });
+        let action = match kernel.begin(&invocation()) {
+            Err(KernelError::EffectFailed { action, .. }) => action,
+            _ => panic!("terminal effect failure must expose the real action"),
+        };
+        assert_eq!(action.state, ExecutionState::Failed);
+        assert!(!action.safe_to_retry);
+        assert!(!action.reconciliation_required);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            actions.load_state(&action.action_id).unwrap(),
+            Some(ExecutionState::Failed)
+        );
+    }
+
+    #[test]
+    fn failed_unknown_persistence_returns_state_recovery_with_real_action_id() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: Some("provider-unknown-2".into()),
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        *actions.fail_unknown_transition.lock().unwrap() = Some("action store unavailable".into());
+        let recovery = match kernel.begin(&invocation()) {
+            Err(KernelError::StateRecoveryRequired {
+                action,
+                intended_state,
+                ..
+            }) => (action, intended_state),
+            _ => panic!("unknown persistence failure must preserve recovery semantics"),
+        };
+        assert_eq!(recovery.0.state, ExecutionState::Unknown);
+        assert_eq!(recovery.1, ExecutionState::Unknown);
+        assert!(!recovery.0.safe_to_retry);
+    }
+
+    #[test]
+    fn reconciliation_cannot_commit_without_a_bound_receipt() {
+        let (kernel, _authority, _function, effect, _actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation()) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown effect"),
+        };
+        *effect.reconciliation_result.lock().unwrap() = Some(ReconciliationResult {
+            state: ExecutionState::Committed,
+            receipt: None,
+        });
+        let error = kernel
+            .reconcile(&action_id)
+            .expect_err("reconciliation must require a receipt to commit");
+        assert!(matches!(error, KernelError::EffectUnknown { .. }));
+    }
+
+    #[test]
+    fn reconciliation_receipts_bind_the_original_principal_and_grant() {
+        let (kernel, _authority, _function, effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation()) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown effect"),
+        };
+        let request = effect.requests.lock().unwrap()[0].clone();
+        let mut wrong_principal = receipt(&request);
+        wrong_principal.principal_id = "mallory".into();
+        *effect.reconciliation_result.lock().unwrap() = Some(ReconciliationResult {
+            state: ExecutionState::Committed,
+            receipt: Some(wrong_principal),
+        });
+        assert!(matches!(
+            kernel.reconcile(&action_id),
+            Err(KernelError::EffectUnknown { .. })
+        ));
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+
+        let mut wrong_grant = receipt(&request);
+        wrong_grant.grant_digest = "wrong-grant".into();
+        *effect.reconciliation_result.lock().unwrap() = Some(ReconciliationResult {
+            state: ExecutionState::Committed,
+            receipt: Some(wrong_grant),
+        });
+        assert!(matches!(
+            kernel.reconcile(&action_id),
+            Err(KernelError::EffectUnknown { .. })
+        ));
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+        assert!(receipts.receipts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_repairs_stale_dispatching_state_from_persisted_receipt() {
+        let (kernel, _authority, _function, _effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        assert!(matches!(
+            kernel.begin(&invocation()),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        let action_id = actions
+            .records
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        actions
+            .states
+            .lock()
+            .unwrap()
+            .insert(action_id.clone(), ExecutionState::Dispatching);
+        actions
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&action_id)
+            .unwrap()
+            .state = ExecutionState::Dispatching;
+        let status = kernel
+            .recover(&action_id)
+            .expect("receipt should repair state");
+        assert_eq!(status.state, ExecutionState::Committed);
+        assert!(status.receipt.is_some());
+        assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovery_marks_stale_dispatching_without_a_receipt_unknown() {
+        let (kernel, _authority, _function, _effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        assert!(matches!(
+            kernel.begin(&invocation()),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        let action_id = actions
+            .records
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        receipts.receipts.lock().unwrap().clear();
+        actions
+            .states
+            .lock()
+            .unwrap()
+            .insert(action_id.clone(), ExecutionState::Dispatching);
+        actions
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&action_id)
+            .unwrap()
+            .state = ExecutionState::Dispatching;
+
+        let status = kernel
+            .recover(&action_id)
+            .expect("missing receipt must become unknown, not redispatch");
+        assert_eq!(status.state, ExecutionState::Unknown);
+        assert!(status.reconciliation_required);
+        assert!(!status.safe_to_retry);
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+    }
+
+    #[test]
+    fn scoped_idempotency_does_not_cross_tenant_boundaries() {
+        let (first, _authority, _function, first_effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        let request = invocation_with_request_id("shared-client-request-id");
+        assert!(matches!(
+            first.begin(&request),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        let second_effect = TestBackend::default();
+        let mut second_runtime = runtime();
+        second_runtime.tenant_id = Some("other-tenant".into());
+        let second = Kernel::new(
+            second_runtime,
+            registry(ExecutionClass::Mutation),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::Allow,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                second_effect.clone(),
+            ),
+            actions,
+            receipts,
+        );
+        assert!(matches!(
+            second.begin(&request),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        assert_eq!(first_effect.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_effect.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

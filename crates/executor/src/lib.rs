@@ -156,8 +156,10 @@ pub mod unstable {
 
     /// Classify a backend error without losing dispatch certainty.
     ///
-    /// Any unknown result after an attempted or confirmed dispatch is durable
-    /// `UNKNOWN`; only a confirmed failure before dispatch is safely `FAILED`.
+    /// Any result after an attempted or confirmed dispatch is durable
+    /// `UNKNOWN` unless the backend returned a successful [`ExecutionResult`]
+    /// with a receipt. `ConfirmedSuccess` on an error is therefore treated as
+    /// an invalid backend result and fails closed as `UNKNOWN`.
     pub const fn state_for_error(error: &EffectExecutionError) -> ExecutionState {
         match (error.dispatch_state, error.outcome_certainty) {
             (DispatchState::NotDispatched, OutcomeCertainty::ConfirmedFailure) => {
@@ -168,7 +170,7 @@ pub mod unstable {
                 ExecutionState::Unknown
             }
             (DispatchState::NotDispatched, OutcomeCertainty::ConfirmedSuccess) => {
-                ExecutionState::Committed
+                ExecutionState::Unknown
             }
         }
     }
@@ -331,6 +333,20 @@ pub mod unstable {
                 message: "rejected before dispatch".into(),
             };
             assert_eq!(state_for_error(&error), ExecutionState::Failed);
+        }
+
+        #[test]
+        fn success_reported_as_an_error_never_commits_without_a_receipt() {
+            let error = EffectExecutionError {
+                code: "INVALID_SUCCESS_ERROR".into(),
+                dispatch_state: DispatchState::NotDispatched,
+                outcome_certainty: OutcomeCertainty::ConfirmedSuccess,
+                provider_request_id: None,
+                retryable: false,
+                reconciliation_required: true,
+                message: "success must be an execution result".into(),
+            };
+            assert_eq!(state_for_error(&error), ExecutionState::Unknown);
         }
 
         struct TestBackend;
