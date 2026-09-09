@@ -120,6 +120,32 @@ pub mod unstable {
         pub approval_reference: Option<String>,
     }
 
+    /// Fenced ownership of a dispatch or reconciliation attempt.
+    ///
+    /// Effect Fabric persists this alongside the action. A new owner may take
+    /// the lease only after its expiry, and every terminal transition carries
+    /// the same owner/generation pair. This prevents a recovery worker from
+    /// rewriting the state of a live dispatcher.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ActionLease {
+        /// Opaque executor or recovery-worker identity.
+        pub owner_id: String,
+        /// Monotonic generation used as the fencing token.
+        pub generation: u64,
+        /// Unix timestamp in milliseconds after which another owner may claim recovery.
+        pub expires_at_unix_ms: u64,
+    }
+
+    /// Result of attempting to claim a fenced action lease.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum LeaseClaim {
+        /// The caller owns the returned lease.
+        Acquired(ActionLease),
+        /// A live owner still holds the returned lease.
+        Held(ActionLease),
+    }
+
     /// Durable action identity and current lifecycle state.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ActionRecord {
@@ -127,6 +153,8 @@ pub mod unstable {
         pub preparation: ActionPreparation,
         /// Current lifecycle state.
         pub state: ExecutionState,
+        /// Current dispatch or reconciliation ownership, if any.
+        pub lease: Option<ActionLease>,
     }
 
     /// Result of atomically claiming an action/idempotency key.
@@ -244,6 +272,43 @@ pub mod unstable {
             approval_reference: Option<&str>,
         ) -> Result<(), Self::Error>;
 
+        /// Refresh the exact grant/approval artifact for an already-authorized
+        /// or prepared action without changing its lifecycle state.
+        ///
+        /// A restarted kernel never reconstructs a grant token from a digest;
+        /// it asks Correct-Once for a new grant bound to the same action and
+        /// persists its new digest before resuming pre-dispatch work.
+        fn refresh_authorization(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error>;
+
+        /// Atomically claim a lease for dispatch or reconciliation.
+        ///
+        /// The store must return [`LeaseClaim::Held`] while a different lease
+        /// remains unexpired. Once expired, it assigns a strictly higher
+        /// generation to the new owner.
+        fn claim_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            owner_id: &str,
+            now_unix_ms: u64,
+            lease_duration_ms: u64,
+        ) -> Result<LeaseClaim, Self::Error>;
+
+        /// Apply a fenced state transition under a currently owned lease.
+        fn transition_with_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error>;
+
         /// Apply one state transition under the backend's concurrency policy.
         fn transition(
             &self,
@@ -344,6 +409,54 @@ pub mod unstable {
                 assert_eq!(expected, ExecutionState::Proposed);
                 assert_eq!(grant_digest, "grant");
                 assert_eq!(approval_reference, Some("approval"));
+                Ok(())
+            }
+
+            fn refresh_authorization(
+                &self,
+                action_id: &str,
+                expected: ExecutionState,
+                grant_digest: &str,
+                approval_reference: Option<&str>,
+            ) -> Result<(), Self::Error> {
+                assert_eq!(action_id, "execution");
+                assert_eq!(expected, ExecutionState::Authorized);
+                assert_eq!(grant_digest, "grant");
+                assert_eq!(approval_reference, Some("approval"));
+                Ok(())
+            }
+
+            fn claim_lease(
+                &self,
+                action_id: &str,
+                expected: ExecutionState,
+                owner_id: &str,
+                now_unix_ms: u64,
+                lease_duration_ms: u64,
+            ) -> Result<LeaseClaim, Self::Error> {
+                assert_eq!(action_id, "execution");
+                assert_eq!(expected, ExecutionState::Prepared);
+                assert_eq!(owner_id, "owner");
+                assert_eq!(now_unix_ms, 1);
+                assert_eq!(lease_duration_ms, 2);
+                Ok(LeaseClaim::Acquired(ActionLease {
+                    owner_id: owner_id.into(),
+                    generation: 1,
+                    expires_at_unix_ms: 3,
+                }))
+            }
+
+            fn transition_with_lease(
+                &self,
+                action_id: &str,
+                expected: ExecutionState,
+                lease: &ActionLease,
+                next: ExecutionState,
+            ) -> Result<(), Self::Error> {
+                assert_eq!(action_id, "execution");
+                assert_eq!(expected, ExecutionState::Prepared);
+                assert_eq!(lease.owner_id, "owner");
+                assert_eq!(next, ExecutionState::Dispatching);
                 Ok(())
             }
 
@@ -452,6 +565,29 @@ pub mod unstable {
                     Some("approval"),
                 )
                 .expect("authorization binding should compile");
+            TestActionStore
+                .refresh_authorization(
+                    "execution",
+                    ExecutionState::Authorized,
+                    "grant",
+                    Some("approval"),
+                )
+                .expect("authorization refresh should compile");
+            let lease = match TestActionStore
+                .claim_lease("execution", ExecutionState::Prepared, "owner", 1, 2)
+                .expect("lease claim should compile")
+            {
+                LeaseClaim::Acquired(lease) => lease,
+                LeaseClaim::Held(_) => panic!("test lease must be acquired"),
+            };
+            TestActionStore
+                .transition_with_lease(
+                    "execution",
+                    ExecutionState::Prepared,
+                    &lease,
+                    ExecutionState::Dispatching,
+                )
+                .expect("fenced transition should compile");
             assert_eq!(
                 TestReceiptStore
                     .load("action")

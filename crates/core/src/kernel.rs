@@ -17,8 +17,8 @@ use nemo_relay_executor::unstable::{
     ExecutionResult, ReconciliationProvider, ReconciliationResult, RuntimeIdentity,
 };
 use nemo_relay_ledger::unstable::{
-    ActionPreparation, ActionRecord, ActionStore, ExecutionState, PrepareActionResult,
-    ReceiptRecord, ReceiptStore, is_valid_transition,
+    ActionLease, ActionPreparation, ActionRecord, ActionStore, ExecutionState, LeaseClaim,
+    PrepareActionResult, ReceiptRecord, ReceiptStore, is_valid_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -51,18 +51,9 @@ pub enum KernelError {
     /// A cryptographically valid authority artifact did not bind to the action.
     #[error("authority grant does not bind to the exact execution request")]
     GrantBindingFailure,
-    /// The authority provider denied the request.
-    #[error("authority denied the capability invocation")]
-    AuthorityDenied,
     /// A fresh approval is required before the effect can proceed.
     #[error("authority requires approval")]
     ApprovalRequired,
-    /// The authority deferred the request to another policy boundary.
-    #[error("authority deferred the capability invocation")]
-    AuthorityDeferred,
-    /// The authority requested changes that must be materialized as a new grant.
-    #[error("authority modification requires a new normalized execution request")]
-    AuthorityModificationRequired,
     /// An action store failed while claiming or transitioning an effect.
     #[error("action store failed: {0}")]
     ActionStore(String),
@@ -70,12 +61,28 @@ pub enum KernelError {
     #[error("consequential capability invocations require request_id")]
     RequestIdRequired,
     /// A claimed action remains safely resumable before external dispatch.
-    #[error("action remains pending before dispatch: {action:?}: {cause}")]
+    #[error("action remains pending before dispatch: {action:?}: {cause:?}")]
     ActionPending {
         /// Durable action identity and recovery guidance.
         action: Box<ActionStatus>,
         /// Authority or persistence failure that left the action pending.
-        cause: String,
+        cause: ActionPendingCause,
+    },
+    /// Authority rejected an action before it crossed an external boundary.
+    #[error("authority rejected action: {action:?}: {cause:?}")]
+    ActionRejected {
+        /// Durable action identity, now terminally cancelled.
+        action: Box<ActionStatus>,
+        /// Machine-readable rejection reason.
+        cause: ActionRejectionCause,
+    },
+    /// Authority requested a normalized replacement invocation.
+    #[error("authority requires a new normalized invocation: {action:?}")]
+    ActionModificationRequired {
+        /// Durable original action, now terminally cancelled.
+        action: Box<ActionStatus>,
+        /// Authority-owned constraints for the replacement invocation.
+        modification: Json,
     },
     /// The idempotency key is bound to a different logical action.
     #[error("idempotency key conflicts with an existing action")]
@@ -117,6 +124,14 @@ pub enum KernelError {
         /// Underlying persistence failure.
         cause: String,
     },
+    /// A terminal action claimed `COMMITTED` without its required receipt evidence.
+    #[error("durable action evidence is internally inconsistent: {action:?}: {cause}")]
+    EvidenceIntegrityFailure {
+        /// Durable action identity requiring operator repair.
+        action: Box<ActionStatus>,
+        /// Missing or mismatched evidence detail.
+        cause: String,
+    },
     /// The kernel attempted to skip a lifecycle boundary.
     #[error("invalid effect state transition: {expected:?} -> {next:?}")]
     InvalidStateTransition {
@@ -137,6 +152,30 @@ pub enum KernelError {
     /// The effect backend returned a structured dispatch outcome.
     #[error("effect backend failed: {0}")]
     EffectBackend(#[from] nemo_relay_executor::unstable::EffectExecutionError),
+}
+
+/// Structured cause for a pre-dispatch action that may safely be resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionPendingCause {
+    /// Correct-Once could not be reached or complete evaluation.
+    AuthorityUnavailable(String),
+    /// Correct-Once intentionally deferred the decision.
+    AuthorityDeferred,
+    /// Another worker still holds the action lease.
+    LeaseHeld,
+    /// A local state write failed before dispatch.
+    StatePersistenceFailure(String),
+}
+
+/// Structured terminal reason for an action cancelled before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionRejectionCause {
+    /// Correct-Once explicitly denied the exact action.
+    AuthorityDenied,
+    /// A grant could not be verified.
+    GrantVerificationFailed(String),
+    /// A verified grant did not bind the exact action.
+    GrantBindingFailure,
 }
 
 /// The only invocation data accepted from an agent harness.
@@ -168,14 +207,42 @@ pub struct ActionStatus {
     pub action_id: String,
     /// Kernel-scoped idempotency identity.
     pub idempotency_key: String,
-    /// Last known durable lifecycle state.
+    /// Last observed durable lifecycle state. This is never an unpersisted
+    /// intended transition.
     pub state: ExecutionState,
+    /// Lifecycle state the kernel attempted but could not confirm persisted.
+    pub intended_state: Option<ExecutionState>,
+    /// The safe protocol action for this durable state.
+    pub next_action: ActionNextStep,
     /// Whether the kernel can safely resume this action without dispatching.
     pub safe_to_retry: bool,
     /// Whether provider evidence must be reconciled before another dispatch.
     pub reconciliation_required: bool,
     /// Persisted receipt when the action is already committed.
     pub receipt: Option<ReceiptRecord>,
+}
+
+/// State-specific protocol guidance returned to a harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionNextStep {
+    /// Re-submit the same bound invocation to retry authority evaluation.
+    RetryAuthority,
+    /// Re-submit the same bound invocation to resume work before dispatch.
+    ResumePreDispatch,
+    /// Supply an approval reference through the durable approval resume API.
+    AwaitApproval,
+    /// A live dispatch or reconciliation lease is still held by another worker.
+    WaitForOwner,
+    /// Invoke recovery after a dispatch lease expires.
+    Recover,
+    /// Invoke provider reconciliation.
+    Reconcile,
+    /// Return the verified committed receipt without redispatching.
+    ReturnReceipt,
+    /// The action is terminal and cannot be retried under its identity.
+    Terminal,
+    /// The durable record and its evidence need repair rather than dispatch.
+    RepairEvidence,
 }
 
 /// Immutable data registered for a capability before any harness invocation.
@@ -367,9 +434,11 @@ impl BoundExecutionRequest {
 
 /// Opaque continuation returned when authority approval is required.
 ///
-/// The handle retains the exact bound action in memory. Durable Effect Fabric
-/// implementations retain the corresponding `ActionPreparation` externally;
-/// this kernel contract deliberately does not claim restart recovery itself.
+/// The in-process convenience handle for an approval wait.
+///
+/// Durable callers should prefer [`Kernel::resume_approval`] with the action
+/// identifier and the original invocation, so a process restart does not lose
+/// the continuation identity.
 pub struct PendingAction {
     request: BoundExecutionRequest,
 }
@@ -407,6 +476,9 @@ enum AuthorizationOutcome {
     FastPath,
     Granted(Box<VerifiedGrant>),
     PendingApproval,
+    Denied,
+    Deferred,
+    Modify(Json),
 }
 
 /// Deterministic backend router owned by the Relay kernel.
@@ -473,10 +545,12 @@ where
                         }
                         Ok(AuthorizationOutcome::Granted(Box::new(grant)))
                     }
-                    AuthorityDecision::Deny => Err(KernelError::AuthorityDenied),
+                    AuthorityDecision::Deny => Ok(AuthorizationOutcome::Denied),
                     AuthorityDecision::RequireApproval => Ok(AuthorizationOutcome::PendingApproval),
-                    AuthorityDecision::Defer => Err(KernelError::AuthorityDeferred),
-                    AuthorityDecision::Modify(_) => Err(KernelError::AuthorityModificationRequired),
+                    AuthorityDecision::Defer => Ok(AuthorizationOutcome::Deferred),
+                    AuthorityDecision::Modify(modification) => {
+                        Ok(AuthorizationOutcome::Modify(modification))
+                    }
                 }
             }
         }
@@ -642,25 +716,27 @@ where
         {
             return self.resume_existing_action(&mut request, existing);
         }
-        self.authorize_and_execute(&mut request)
+        self.authorize_and_execute(&mut request, ExecutionState::Proposed)
     }
 
-    /// Recover a stale `DISPATCHING` action after a process restart.
+    /// Recover an action only after its dispatch/reconciliation lease expires.
     ///
-    /// A receipt already persisted by Effect Fabric proves commitment. Without
-    /// that evidence the action becomes `UNKNOWN`; the kernel never dispatches
-    /// it again merely because the previous process disappeared.
+    /// Recovery never redispatches. It either repairs a state from persisted
+    /// evidence or records `UNKNOWN` for provider reconciliation.
     pub fn recover(&self, action_id: &str) -> Result<ActionStatus, KernelError> {
         let action = self
             .action_store
             .load_action(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
             .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
-        if action.state != ExecutionState::Dispatching {
+        if action.state != ExecutionState::Dispatching
+            && action.state != ExecutionState::Reconciling
+        {
             if action.state == ExecutionState::Committed {
                 let receipt = self.receipt_store.load(action_id).map_err(|error| {
                     self.state_recovery_required(
                         &action.preparation,
+                        ExecutionState::Committed,
                         ExecutionState::Committed,
                         error.to_string(),
                     )
@@ -672,18 +748,43 @@ where
                     {
                         Ok(self.action_status(&action, Some(receipt)))
                     }
-                    _ => Err(self.state_recovery_required(
-                        &action.preparation,
-                        ExecutionState::Committed,
-                        "committed action has no valid persisted receipt".into(),
-                    )),
+                    _ => Err(KernelError::EvidenceIntegrityFailure {
+                        action: Box::new(self.action_status(&action, None)),
+                        cause: "committed action has no valid persisted receipt".into(),
+                    }),
                 };
             }
             return Ok(self.action_status(&action, None));
         }
+        let lease = match self.claim_lease(&action, action.state, "recovery")? {
+            Some(lease) => lease,
+            None => return Ok(self.action_status(&action, None)),
+        };
+        if action.state == ExecutionState::Reconciling {
+            self.transition_action_with_lease(
+                &action,
+                ExecutionState::Reconciling,
+                &lease,
+                ExecutionState::Unknown,
+            )
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &action.preparation,
+                    ExecutionState::Reconciling,
+                    ExecutionState::Unknown,
+                    error.to_string(),
+                )
+            })?;
+            return Ok(self.action_status_with_state(
+                &action.preparation,
+                ExecutionState::Unknown,
+                None,
+            ));
+        }
         if let Some(receipt) = self.receipt_store.load(action_id).map_err(|error| {
             self.state_recovery_required(
                 &action.preparation,
+                ExecutionState::Dispatching,
                 ExecutionState::Unknown,
                 error.to_string(),
             )
@@ -693,18 +794,21 @@ where
             {
                 return Err(self.state_recovery_required(
                     &action.preparation,
+                    ExecutionState::Dispatching,
                     ExecutionState::Unknown,
                     "persisted receipt does not bind to stale dispatching action".into(),
                 ));
             }
-            self.transition_action(
+            self.transition_action_with_lease(
                 &action,
                 ExecutionState::Dispatching,
+                &lease,
                 ExecutionState::Committed,
             )
             .map_err(|error| {
                 self.state_recovery_required(
                     &action.preparation,
+                    ExecutionState::Dispatching,
                     ExecutionState::Committed,
                     error.to_string(),
                 )
@@ -715,14 +819,16 @@ where
                 Some(receipt),
             ));
         }
-        self.transition_action(
+        self.transition_action_with_lease(
             &action,
             ExecutionState::Dispatching,
+            &lease,
             ExecutionState::Unknown,
         )
         .map_err(|error| {
             self.state_recovery_required(
                 &action.preparation,
+                ExecutionState::Dispatching,
                 ExecutionState::Unknown,
                 error.to_string(),
             )
@@ -743,7 +849,44 @@ where
         pending
             .request
             .attach_approval(continuation.approval_reference);
-        self.authorize_and_execute(&mut pending.request)
+        self.authorize_and_execute(&mut pending.request, ExecutionState::Proposed)
+    }
+
+    /// Resume an approval wait after restart using the durable action identity.
+    ///
+    /// The caller resubmits the original invocation so the kernel can recompute
+    /// and compare every bound digest. NEMO never stores raw arguments merely
+    /// to reconstruct a pending approval; Effect Fabric owns durable payload
+    /// retention when that is required.
+    pub fn resume_approval(
+        &self,
+        action_id: &str,
+        invocation: &InvocationRequest,
+        continuation: ApprovalContinuation,
+    ) -> Result<InvocationOutcome, KernelError> {
+        let action = self
+            .action_store
+            .load_action(action_id)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?
+            .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
+        if !matches!(
+            action.state,
+            ExecutionState::Proposed | ExecutionState::Authorized | ExecutionState::Prepared
+        ) {
+            return Ok(InvocationOutcome::ExistingAction(
+                self.action_status(&action, None),
+            ));
+        }
+        let mut request = self.bind(invocation)?;
+        let candidate = request.action_preparation();
+        if candidate.idempotency_key != action.preparation.idempotency_key
+            || candidate.fingerprint != action.preparation.fingerprint
+        {
+            return Err(KernelError::GrantBindingFailure);
+        }
+        request.rebind_to_claimed_action(&action);
+        request.attach_approval(continuation.approval_reference);
+        self.authorize_and_execute(&mut request, action.state)
     }
 
     /// Reconcile one external action already recorded as `UNKNOWN`.
@@ -756,21 +899,34 @@ where
         if action.state != ExecutionState::Unknown {
             return Err(KernelError::ActionNotUnknown(action_id.to_owned()));
         }
-        self.transition_action(
+        let lease = match self.claim_lease(&action, ExecutionState::Unknown, "reconcile")? {
+            Some(lease) => lease,
+            None => {
+                return Err(KernelError::ActionPending {
+                    action: Box::new(self.action_status(&action, None)),
+                    cause: ActionPendingCause::LeaseHeld,
+                });
+            }
+        };
+        self.transition_action_with_lease(
             &action,
             ExecutionState::Unknown,
+            &lease,
             ExecutionState::Reconciling,
         )
         .map_err(|error| {
             self.state_recovery_required(
                 &action.preparation,
                 ExecutionState::Unknown,
+                ExecutionState::Unknown,
                 error.to_string(),
             )
         })?;
         let result = match self.router.reconcile(action_id) {
             Ok(result) => result,
-            Err(error) => return Err(self.reconciliation_unknown(&action, error.to_string())),
+            Err(error) => {
+                return Err(self.reconciliation_unknown(&action, &lease, error.to_string()));
+            }
         };
         if !matches!(
             result.state,
@@ -778,13 +934,19 @@ where
         ) {
             return Err(self.reconciliation_unknown(
                 &action,
+                &lease,
                 format!("reconciliation returned invalid state: {:?}", result.state),
             ));
         }
-        if result.state == ExecutionState::Committed && result.receipt.is_none() {
+        if matches!(
+            result.state,
+            ExecutionState::Committed | ExecutionState::Failed
+        ) && result.receipt.is_none()
+        {
             return Err(self.reconciliation_unknown(
                 &action,
-                "reconciliation cannot commit without an authoritative receipt".into(),
+                &lease,
+                "reconciliation terminal result requires authoritative evidence".into(),
             ));
         }
         if let Some(receipt) = result.receipt.as_ref() {
@@ -794,27 +956,39 @@ where
             {
                 return Err(self.reconciliation_unknown(
                     &action,
+                    &lease,
                     "reconciled receipt does not bind to the original action".into(),
                 ));
             }
             if let Err(error) = self.receipt_store.store(receipt) {
-                return Err(self.reconciliation_unknown(&action, error.to_string()));
+                return Err(self.reconciliation_unknown(&action, &lease, error.to_string()));
             }
         }
-        self.transition_action(&action, ExecutionState::Reconciling, result.state)
-            .map_err(|error| {
-                self.state_recovery_required(&action.preparation, result.state, error.to_string())
-            })?;
+        self.transition_action_with_lease(
+            &action,
+            ExecutionState::Reconciling,
+            &lease,
+            result.state,
+        )
+        .map_err(|error| {
+            self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Reconciling,
+                result.state,
+                error.to_string(),
+            )
+        })?;
         Ok(result)
     }
 
     fn authorize_and_execute(
         &self,
         request: &mut BoundExecutionRequest,
+        current_state: ExecutionState,
     ) -> Result<InvocationOutcome, KernelError> {
         let authorization = match self.router.authorize_bound(request) {
             Ok(authorization) => authorization,
-            Err(error) => return Err(self.pending_after_authority_error(request, error)),
+            Err(error) => return Err(self.handle_authority_error(request, current_state, error)),
         };
         match authorization {
             AuthorizationOutcome::FastPath => Ok(InvocationOutcome::Completed(
@@ -823,38 +997,100 @@ where
             AuthorizationOutcome::Granted(grant) => {
                 request.attach_grant(*grant);
                 let identity = &request.backend_request().identity;
-                self.action_store
-                    .authorize_action(
-                        &identity.action_id,
-                        ExecutionState::Proposed,
-                        identity.grant_digest.as_deref().unwrap_or_default(),
-                        identity.approval_reference.as_deref(),
+                let mut state = current_state;
+                if state == ExecutionState::Proposed {
+                    self.action_store
+                        .authorize_action(
+                            &identity.action_id,
+                            ExecutionState::Proposed,
+                            identity.grant_digest.as_deref().unwrap_or_default(),
+                            identity.approval_reference.as_deref(),
+                        )
+                        .map_err(|error| {
+                            self.pending_after_authority_failure(
+                                request,
+                                ExecutionState::Proposed,
+                                ActionPendingCause::StatePersistenceFailure(error.to_string()),
+                            )
+                        })?;
+                    state = ExecutionState::Authorized;
+                } else if matches!(state, ExecutionState::Authorized | ExecutionState::Prepared) {
+                    self.action_store
+                        .refresh_authorization(
+                            &identity.action_id,
+                            state,
+                            identity.grant_digest.as_deref().unwrap_or_default(),
+                            identity.approval_reference.as_deref(),
+                        )
+                        .map_err(|error| {
+                            self.pending_after_authority_failure(
+                                request,
+                                state,
+                                ActionPendingCause::StatePersistenceFailure(error.to_string()),
+                            )
+                        })?;
+                }
+                if state == ExecutionState::Authorized {
+                    self.transition(
+                        request,
+                        ExecutionState::Authorized,
+                        ExecutionState::Prepared,
                     )
                     .map_err(|error| {
-                        self.pending_after_authority_failure(request, error.to_string())
+                        self.pending_after_state_failure(request, ExecutionState::Authorized, error)
                     })?;
-                self.transition(
+                    state = ExecutionState::Prepared;
+                }
+                if state != ExecutionState::Prepared {
+                    return Err(self.pending_after_state_failure(
+                        request,
+                        state,
+                        KernelError::InvalidStateTransition {
+                            expected: state,
+                            next: ExecutionState::Prepared,
+                        },
+                    ));
+                }
+                let lease = match self.claim_lease_for_request(request, ExecutionState::Prepared)? {
+                    Some(lease) => lease,
+                    None => {
+                        return Err(self.pending_after_authority_failure(
+                            request,
+                            ExecutionState::Prepared,
+                            ActionPendingCause::LeaseHeld,
+                        ));
+                    }
+                };
+                self.transition_with_lease(
                     request,
-                    ExecutionState::Authorized,
                     ExecutionState::Prepared,
-                )
-                .map_err(|error| {
-                    self.pending_after_state_failure(request, ExecutionState::Authorized, error)
-                })?;
-                self.transition(
-                    request,
-                    ExecutionState::Prepared,
+                    &lease,
                     ExecutionState::Dispatching,
                 )
                 .map_err(|error| {
                     self.pending_after_state_failure(request, ExecutionState::Prepared, error)
                 })?;
-                Ok(InvocationOutcome::Completed(self.execute_effect(request)?))
+                Ok(InvocationOutcome::Completed(
+                    self.execute_effect(request, &lease)?,
+                ))
             }
             AuthorizationOutcome::PendingApproval => {
                 Ok(InvocationOutcome::PendingApproval(PendingAction {
                     request: request.clone(),
                 }))
+            }
+            AuthorizationOutcome::Denied => self.cancel_rejected_action(
+                request,
+                current_state,
+                ActionRejectionCause::AuthorityDenied,
+            ),
+            AuthorizationOutcome::Deferred => Err(self.pending_after_authority_failure(
+                request,
+                current_state,
+                ActionPendingCause::AuthorityDeferred,
+            )),
+            AuthorizationOutcome::Modify(modification) => {
+                self.cancel_modified_action(request, current_state, modification)
             }
         }
     }
@@ -864,9 +1100,12 @@ where
         request: &mut BoundExecutionRequest,
         action: ActionRecord,
     ) -> Result<InvocationOutcome, KernelError> {
-        if action.state == ExecutionState::Proposed {
+        if matches!(
+            action.state,
+            ExecutionState::Proposed | ExecutionState::Authorized | ExecutionState::Prepared
+        ) {
             request.rebind_to_claimed_action(&action);
-            return self.authorize_and_execute(request);
+            return self.authorize_and_execute(request, action.state);
         }
         let receipt = if action.state == ExecutionState::Committed {
             let receipt = self
@@ -875,6 +1114,7 @@ where
                 .map_err(|error| {
                     self.state_recovery_required(
                         &action.preparation,
+                        ExecutionState::Committed,
                         ExecutionState::Committed,
                         error.to_string(),
                     )
@@ -887,11 +1127,10 @@ where
                     Some(receipt)
                 }
                 _ => {
-                    return Err(self.state_recovery_required(
-                        &action.preparation,
-                        ExecutionState::Committed,
-                        "committed action has no valid persisted receipt".into(),
-                    ));
+                    return Err(KernelError::EvidenceIntegrityFailure {
+                        action: Box::new(self.action_status(&action, None)),
+                        cause: "committed action has no valid persisted receipt".into(),
+                    });
                 }
             }
         } else {
@@ -902,9 +1141,10 @@ where
         ))
     }
 
-    fn pending_after_authority_error(
+    fn handle_authority_error(
         &self,
         request: &BoundExecutionRequest,
+        state: ExecutionState,
         error: KernelError,
     ) -> KernelError {
         match request
@@ -913,9 +1153,28 @@ where
             .capability
             .execution_class
         {
-            ExecutionClass::Mutation | ExecutionClass::Critical => {
-                self.pending_after_authority_failure(request, error.to_string())
-            }
+            ExecutionClass::Mutation | ExecutionClass::Critical => match error {
+                KernelError::AuthorityUnavailable(cause) => self.pending_after_authority_failure(
+                    request,
+                    state,
+                    ActionPendingCause::AuthorityUnavailable(cause),
+                ),
+                KernelError::GrantVerificationFailed(cause) => self.cancel_after_authority_error(
+                    request,
+                    state,
+                    ActionRejectionCause::GrantVerificationFailed(cause),
+                ),
+                KernelError::GrantBindingFailure => self.cancel_after_authority_error(
+                    request,
+                    state,
+                    ActionRejectionCause::GrantBindingFailure,
+                ),
+                other => self.pending_after_authority_failure(
+                    request,
+                    state,
+                    ActionPendingCause::AuthorityUnavailable(other.to_string()),
+                ),
+            },
             ExecutionClass::Pure | ExecutionClass::Read => error,
         }
     }
@@ -923,12 +1182,13 @@ where
     fn pending_after_authority_failure(
         &self,
         request: &BoundExecutionRequest,
-        cause: String,
+        state: ExecutionState,
+        cause: ActionPendingCause,
     ) -> KernelError {
         KernelError::ActionPending {
             action: Box::new(self.action_status_with_state(
                 &request.action_preparation(),
-                ExecutionState::Proposed,
+                state,
                 None,
             )),
             cause,
@@ -947,7 +1207,7 @@ where
                 state,
                 None,
             )),
-            cause: error.to_string(),
+            cause: ActionPendingCause::StatePersistenceFailure(error.to_string()),
         }
     }
 
@@ -966,18 +1226,67 @@ where
         }
     }
 
+    fn cancel_rejected_action(
+        &self,
+        request: &BoundExecutionRequest,
+        state: ExecutionState,
+        cause: ActionRejectionCause,
+    ) -> Result<InvocationOutcome, KernelError> {
+        self.transition(request, state, ExecutionState::Cancelled)
+            .map_err(|error| self.pending_after_state_failure(request, state, error))?;
+        Err(KernelError::ActionRejected {
+            action: Box::new(self.action_status_with_state(
+                &request.action_preparation(),
+                ExecutionState::Cancelled,
+                None,
+            )),
+            cause,
+        })
+    }
+
+    fn cancel_after_authority_error(
+        &self,
+        request: &BoundExecutionRequest,
+        state: ExecutionState,
+        cause: ActionRejectionCause,
+    ) -> KernelError {
+        match self.cancel_rejected_action(request, state, cause) {
+            Err(error) => error,
+            Ok(_) => unreachable!("rejected action cannot complete"),
+        }
+    }
+
+    fn cancel_modified_action(
+        &self,
+        request: &BoundExecutionRequest,
+        state: ExecutionState,
+        modification: Json,
+    ) -> Result<InvocationOutcome, KernelError> {
+        self.transition(request, state, ExecutionState::Cancelled)
+            .map_err(|error| self.pending_after_state_failure(request, state, error))?;
+        Err(KernelError::ActionModificationRequired {
+            action: Box::new(self.action_status_with_state(
+                &request.action_preparation(),
+                ExecutionState::Cancelled,
+                None,
+            )),
+            modification,
+        })
+    }
+
     fn execute_effect(
         &self,
         request: &BoundExecutionRequest,
+        lease: &ActionLease,
     ) -> Result<ExecutionResult, KernelError> {
         let result = match self.router.execute_effect_bound(request) {
             Ok(result) => result,
             Err(error) => {
                 let state = nemo_relay_executor::unstable::state_for_error(&error);
                 if state == ExecutionState::Unknown {
-                    return Err(self.unknown_after_dispatching(request, error.to_string()));
+                    return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
                 }
-                self.transition_from_dispatching(request, state)?;
+                self.transition_from_dispatching(request, lease, state)?;
                 return Err(KernelError::EffectFailed {
                     action: Box::new(self.action_status_with_state(
                         &request.action_preparation(),
@@ -991,9 +1300,11 @@ where
         let receipt = match result.receipt.as_ref() {
             Some(receipt) => receipt,
             None => {
-                return Err(
-                    self.unknown_after_dispatching(request, "effect result omitted receipt".into())
-                );
+                return Err(self.unknown_after_dispatching(
+                    request,
+                    lease,
+                    "effect result omitted receipt".into(),
+                ));
             }
         };
         if self
@@ -1002,16 +1313,18 @@ where
         {
             return Err(self.unknown_after_dispatching(
                 request,
+                lease,
                 "effect receipt does not bind to the execution identity".into(),
             ));
         }
         if let Err(error) = self.receipt_store.store(receipt) {
-            return Err(self.unknown_after_dispatching(request, error.to_string()));
+            return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
         }
-        self.transition_from_dispatching(request, ExecutionState::Committed)
+        self.transition_from_dispatching(request, lease, ExecutionState::Committed)
             .map_err(|error| {
                 self.state_recovery_required(
                     &request.action_preparation(),
+                    ExecutionState::Dispatching,
                     ExecutionState::Committed,
                     error.to_string(),
                 )
@@ -1040,34 +1353,62 @@ where
     fn transition_from_dispatching(
         &self,
         request: &BoundExecutionRequest,
+        lease: &ActionLease,
         next: ExecutionState,
     ) -> Result<(), KernelError> {
-        self.transition(request, ExecutionState::Dispatching, next)
+        self.transition_with_lease(request, ExecutionState::Dispatching, lease, next)
             .map_err(|error| {
-                self.state_recovery_required(&request.action_preparation(), next, error.to_string())
+                self.state_recovery_required(
+                    &request.action_preparation(),
+                    ExecutionState::Dispatching,
+                    next,
+                    error.to_string(),
+                )
             })
     }
 
-    fn transition_action(
+    fn transition_with_lease(
         &self,
-        action: &ActionRecord,
+        request: &BoundExecutionRequest,
         expected: ExecutionState,
+        lease: &ActionLease,
         next: ExecutionState,
     ) -> Result<(), KernelError> {
         if !is_valid_transition(Some(expected), next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
         self.action_store
-            .transition(&action.preparation.action_id, Some(expected), next)
+            .transition_with_lease(
+                &request.backend_request().identity.action_id,
+                expected,
+                lease,
+                next,
+            )
+            .map_err(|error| KernelError::ActionStore(error.to_string()))
+    }
+
+    fn transition_action_with_lease(
+        &self,
+        action: &ActionRecord,
+        expected: ExecutionState,
+        lease: &ActionLease,
+        next: ExecutionState,
+    ) -> Result<(), KernelError> {
+        if !is_valid_transition(Some(expected), next) {
+            return Err(KernelError::InvalidStateTransition { expected, next });
+        }
+        self.action_store
+            .transition_with_lease(&action.preparation.action_id, expected, lease, next)
             .map_err(|error| KernelError::ActionStore(error.to_string()))
     }
 
     fn unknown_after_dispatching(
         &self,
         request: &BoundExecutionRequest,
+        lease: &ActionLease,
         cause: String,
     ) -> KernelError {
-        match self.transition_from_dispatching(request, ExecutionState::Unknown) {
+        match self.transition_from_dispatching(request, lease, ExecutionState::Unknown) {
             Ok(()) => KernelError::EffectUnknown {
                 action: Box::new(self.action_status_with_state(
                     &request.action_preparation(),
@@ -1080,8 +1421,18 @@ where
         }
     }
 
-    fn reconciliation_unknown(&self, action: &ActionRecord, cause: String) -> KernelError {
-        match self.transition_action(action, ExecutionState::Reconciling, ExecutionState::Unknown) {
+    fn reconciliation_unknown(
+        &self,
+        action: &ActionRecord,
+        lease: &ActionLease,
+        cause: String,
+    ) -> KernelError {
+        match self.transition_action_with_lease(
+            action,
+            ExecutionState::Reconciling,
+            lease,
+            ExecutionState::Unknown,
+        ) {
             Ok(()) => KernelError::EffectUnknown {
                 action: Box::new(self.action_status_with_state(
                     &action.preparation,
@@ -1092,6 +1443,7 @@ where
             },
             Err(error) => self.state_recovery_required(
                 &action.preparation,
+                ExecutionState::Reconciling,
                 ExecutionState::Unknown,
                 error.to_string(),
             ),
@@ -1101,13 +1453,46 @@ where
     fn state_recovery_required(
         &self,
         action: &ActionPreparation,
+        observed_state: ExecutionState,
         intended_state: ExecutionState,
         cause: String,
     ) -> KernelError {
         KernelError::StateRecoveryRequired {
-            action: Box::new(self.action_status_with_state(action, intended_state, None)),
+            action: Box::new(self.action_status_recovery(action, observed_state, intended_state)),
             intended_state,
             cause,
+        }
+    }
+
+    fn claim_lease_for_request(
+        &self,
+        request: &BoundExecutionRequest,
+        expected: ExecutionState,
+    ) -> Result<Option<ActionLease>, KernelError> {
+        let action = ActionRecord {
+            preparation: request.action_preparation(),
+            state: expected,
+            lease: None,
+        };
+        self.claim_lease(&action, expected, "execute")
+    }
+
+    /// Return `None` when another unexpired owner holds the lease.
+    fn claim_lease(
+        &self,
+        action: &ActionRecord,
+        expected: ExecutionState,
+        purpose: &str,
+    ) -> Result<Option<ActionLease>, KernelError> {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let owner = format!("{}:{purpose}:{}", self.runtime.runtime_id, Uuid::now_v7());
+        match self
+            .action_store
+            .claim_lease(&action.preparation.action_id, expected, &owner, now, 30_000)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?
+        {
+            LeaseClaim::Acquired(lease) => Ok(Some(lease)),
+            LeaseClaim::Held(_) => Ok(None),
         }
     }
 
@@ -1125,12 +1510,27 @@ where
             action_id: action.action_id.clone(),
             idempotency_key: action.idempotency_key.clone(),
             state,
-            safe_to_retry: state == ExecutionState::Proposed,
-            reconciliation_required: matches!(
+            intended_state: None,
+            next_action: action_next_step(state),
+            safe_to_retry: matches!(
                 state,
-                ExecutionState::Unknown | ExecutionState::Reconciling
+                ExecutionState::Proposed | ExecutionState::Authorized | ExecutionState::Prepared
             ),
+            reconciliation_required: state == ExecutionState::Unknown,
             receipt,
+        }
+    }
+
+    fn action_status_recovery(
+        &self,
+        action: &ActionPreparation,
+        observed_state: ExecutionState,
+        intended_state: ExecutionState,
+    ) -> ActionStatus {
+        ActionStatus {
+            intended_state: Some(intended_state),
+            next_action: ActionNextStep::RepairEvidence,
+            ..self.action_status_with_state(action, observed_state, None)
         }
     }
 
@@ -1210,6 +1610,18 @@ fn scoped_idempotency_key(runtime: &RuntimeIdentity, request_id: &str) -> String
     sha256_hex(&bytes)
 }
 
+fn action_next_step(state: ExecutionState) -> ActionNextStep {
+    match state {
+        ExecutionState::Proposed => ActionNextStep::RetryAuthority,
+        ExecutionState::Authorized | ExecutionState::Prepared => ActionNextStep::ResumePreDispatch,
+        ExecutionState::Dispatching => ActionNextStep::Recover,
+        ExecutionState::Unknown => ActionNextStep::Reconcile,
+        ExecutionState::Reconciling => ActionNextStep::WaitForOwner,
+        ExecutionState::Committed => ActionNextStep::ReturnReceipt,
+        ExecutionState::Failed | ExecutionState::Cancelled => ActionNextStep::Terminal,
+    }
+}
+
 fn execution_class_name(class: ExecutionClass) -> &'static str {
     match class {
         ExecutionClass::Pure => "PURE",
@@ -1237,6 +1649,9 @@ mod tests {
         Allow,
         ApproveOnContinuation,
         MismatchedGrant,
+        Deny,
+        Defer,
+        Modify,
     }
 
     #[derive(Clone)]
@@ -1281,6 +1696,9 @@ mod tests {
                     grant.route_digest = "wrong-route".into();
                     AuthorityDecision::Allow(Box::new(grant))
                 }
+                Decision::Deny => AuthorityDecision::Deny,
+                Decision::Defer => AuthorityDecision::Defer,
+                Decision::Modify => AuthorityDecision::Modify(json!({"max_value": 1})),
             })
         }
     }
@@ -1346,6 +1764,7 @@ mod tests {
                 ActionRecord {
                     preparation: action.clone(),
                     state: ExecutionState::Proposed,
+                    lease: None,
                 },
             );
             self.states
@@ -1391,6 +1810,7 @@ mod tests {
                                 approval_reference: None,
                             },
                             state,
+                            lease: None,
                         })
                 }))
         }
@@ -1461,6 +1881,104 @@ mod tests {
                 .lock()
                 .map_err(|_| "test action state lock poisoned".to_owned())?
                 .insert(action_id.to_owned(), ExecutionState::Authorized);
+            Ok(())
+        }
+
+        fn refresh_authorization(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action authorization refresh".to_owned())?;
+            if record.state != expected {
+                return Err("unexpected authorization refresh state".into());
+            }
+            record.preparation.grant_digest = Some(grant_digest.to_owned());
+            record.preparation.approval_reference = approval_reference.map(ToOwned::to_owned);
+            Ok(())
+        }
+
+        fn claim_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            owner_id: &str,
+            now_unix_ms: u64,
+            lease_duration_ms: u64,
+        ) -> Result<LeaseClaim, Self::Error> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action lease".to_owned())?;
+            if record.state != expected {
+                return Err("unexpected lease state".into());
+            }
+            if let Some(lease) = record.lease.as_ref()
+                && lease.owner_id != owner_id
+                && lease.expires_at_unix_ms > now_unix_ms
+            {
+                return Ok(LeaseClaim::Held(lease.clone()));
+            }
+            let generation = record
+                .lease
+                .as_ref()
+                .map_or(1, |lease| lease.generation.saturating_add(1));
+            let lease = ActionLease {
+                owner_id: owner_id.to_owned(),
+                generation,
+                expires_at_unix_ms: now_unix_ms.saturating_add(lease_duration_ms),
+            };
+            record.lease = Some(lease.clone());
+            Ok(LeaseClaim::Acquired(lease))
+        }
+
+        fn transition_with_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error> {
+            if expected == ExecutionState::Dispatching
+                && next == ExecutionState::Unknown
+                && let Some(error) = self
+                    .fail_unknown_transition
+                    .lock()
+                    .map_err(|_| "test action transition failure lock poisoned".to_owned())?
+                    .clone()
+            {
+                return Err(error);
+            }
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action fenced transition".to_owned())?;
+            if record.state != expected || record.lease.as_ref() != Some(lease) {
+                return Err("stale or unexpected action lease".into());
+            }
+            record.state = next;
+            if next != ExecutionState::Dispatching && next != ExecutionState::Reconciling {
+                record.lease = None;
+            }
+            drop(records);
+            self.states
+                .lock()
+                .map_err(|_| "test action state lock poisoned".to_owned())?
+                .insert(action_id.to_owned(), next);
             Ok(())
         }
     }
@@ -1870,15 +2388,18 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_grants_never_reach_effect_execution() {
+    fn mismatched_grants_cancel_the_pre_dispatch_action() {
         let (kernel, _authority, _function, effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::MismatchedGrant);
-        let pending = match kernel.begin(&invocation()) {
-            Err(KernelError::ActionPending { action, .. }) => action,
-            _ => panic!("a grant verification failure should preserve the proposed action"),
+        let rejected = match kernel.begin(&invocation()) {
+            Err(KernelError::ActionRejected { action, cause }) => (action, cause),
+            _ => panic!("a grant verification failure should cancel the proposed action"),
         };
-        assert_eq!(pending.state, ExecutionState::Proposed);
-        assert!(pending.safe_to_retry);
+        assert_eq!(rejected.0.state, ExecutionState::Cancelled);
+        assert!(matches!(
+            rejected.1,
+            ActionRejectionCause::GrantVerificationFailed(_)
+        ));
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 1);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert!(receipts.receipts.lock().unwrap().is_empty());
@@ -1919,6 +2440,147 @@ mod tests {
         );
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn durable_approval_resume_rebinds_the_original_action_after_restart() {
+        let (kernel, _authority, _function, _effect, actions, receipts) =
+            kernel(ExecutionClass::Critical, Decision::ApproveOnContinuation);
+        let request = invocation_with_request_id("durable-approval-resume");
+        let action_id = match kernel.begin(&request).expect("approval should be pending") {
+            InvocationOutcome::PendingApproval(pending) => pending.action_id().to_owned(),
+            _ => panic!("critical action should await approval"),
+        };
+        let resumed_effect = TestBackend::default();
+        let resumed = Kernel::new(
+            runtime(),
+            registry(ExecutionClass::Critical),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::ApproveOnContinuation,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                resumed_effect.clone(),
+            ),
+            actions,
+            receipts,
+        );
+        assert!(matches!(
+            resumed.resume_approval(
+                &action_id,
+                &request,
+                ApprovalContinuation {
+                    approval_reference: "approval-after-restart".into(),
+                },
+            ),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        assert_eq!(resumed_effect.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resumed_effect.requests.lock().unwrap()[0]
+                .identity
+                .action_id,
+            action_id
+        );
+    }
+
+    #[test]
+    fn authorized_and_prepared_actions_resume_without_a_new_action_identity() {
+        for state in [ExecutionState::Authorized, ExecutionState::Prepared] {
+            let (kernel, _authority, _function, effect, actions, _receipts) =
+                kernel(ExecutionClass::Mutation, Decision::Allow);
+            let request = invocation_with_request_id(match state {
+                ExecutionState::Authorized => "resume-authorized",
+                ExecutionState::Prepared => "resume-prepared",
+                _ => unreachable!(),
+            });
+            let bound = kernel.bind(&request).expect("request should bind");
+            let action_id = bound.backend_request().identity.action_id.clone();
+            actions
+                .claim_action(&bound.action_preparation())
+                .expect("action should claim");
+            {
+                let mut records = actions.records.lock().unwrap();
+                let record = records.get_mut(&action_id).unwrap();
+                record.state = state;
+                record.preparation.grant_digest = Some("prior-grant".into());
+            }
+            actions
+                .states
+                .lock()
+                .unwrap()
+                .insert(action_id.clone(), state);
+            assert!(matches!(
+                kernel.begin(&request),
+                Ok(InvocationOutcome::Completed(_))
+            ));
+            assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                effect.requests.lock().unwrap()[0].identity.action_id,
+                action_id
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_denial_and_modification_cancel_the_original_action() {
+        let (denied, _authority, _function, denied_effect, denied_actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Deny);
+        let denied_status = match denied.begin(&invocation()) {
+            Err(KernelError::ActionRejected { action, cause }) => {
+                assert_eq!(cause, ActionRejectionCause::AuthorityDenied);
+                action
+            }
+            _ => panic!("explicit denial must cancel the action"),
+        };
+        assert_eq!(denied_status.state, ExecutionState::Cancelled);
+        assert_eq!(denied_status.next_action, ActionNextStep::Terminal);
+        assert_eq!(
+            denied_actions.load_state(&denied_status.action_id).unwrap(),
+            Some(ExecutionState::Cancelled)
+        );
+        assert_eq!(denied_effect.calls.load(Ordering::SeqCst), 0);
+
+        let (modified, _authority, _function, modified_effect, modified_actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Modify);
+        let modified_status = match modified.begin(&invocation_with_request_id("modified")) {
+            Err(KernelError::ActionModificationRequired {
+                action,
+                modification,
+            }) => {
+                assert_eq!(modification, json!({"max_value": 1}));
+                action
+            }
+            _ => panic!("authority modification must cancel the original action"),
+        };
+        assert_eq!(modified_status.state, ExecutionState::Cancelled);
+        assert_eq!(
+            modified_actions
+                .load_state(&modified_status.action_id)
+                .unwrap(),
+            Some(ExecutionState::Cancelled)
+        );
+        assert_eq!(modified_effect.calls.load(Ordering::SeqCst), 0);
+
+        let (deferred, _authority, _function, deferred_effect, deferred_actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Defer);
+        let deferred_status = match deferred.begin(&invocation_with_request_id("deferred")) {
+            Err(KernelError::ActionPending { action, cause }) => {
+                assert_eq!(cause, ActionPendingCause::AuthorityDeferred);
+                action
+            }
+            _ => panic!("authority defer should remain resumable"),
+        };
+        assert_eq!(deferred_status.state, ExecutionState::Proposed);
+        assert_eq!(deferred_status.next_action, ActionNextStep::RetryAuthority);
+        assert_eq!(
+            deferred_actions
+                .load_state(&deferred_status.action_id)
+                .unwrap(),
+            Some(ExecutionState::Proposed)
+        );
+        assert_eq!(deferred_effect.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1964,8 +2626,8 @@ mod tests {
             kernel(ExecutionClass::Mutation, Decision::MismatchedGrant);
         let request = invocation_with_request_id("resume-proposed");
         let original = match kernel.begin(&request) {
-            Err(KernelError::ActionPending { action, .. }) => action,
-            _ => panic!("grant failure should leave a resumable proposed action"),
+            Err(KernelError::ActionRejected { action, .. }) => action,
+            _ => panic!("grant failure should cancel the action"),
         };
         let resumed_effect = TestBackend::default();
         let resumed = Kernel::new(
@@ -1982,17 +2644,13 @@ mod tests {
             actions,
             receipts,
         );
-        assert!(matches!(
-            resumed.begin(&request),
-            Ok(InvocationOutcome::Completed(_))
-        ));
-        assert_eq!(resumed_effect.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            resumed_effect.requests.lock().unwrap()[0]
-                .identity
-                .action_id,
-            original.action_id
-        );
+        let existing = match resumed.begin(&request) {
+            Ok(InvocationOutcome::ExistingAction(existing)) => existing,
+            _ => panic!("cancelled actions must not be re-authorized"),
+        };
+        assert_eq!(existing.action_id, original.action_id);
+        assert_eq!(existing.state, ExecutionState::Cancelled);
+        assert_eq!(resumed_effect.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2063,7 +2721,9 @@ mod tests {
             }) => (action, intended_state),
             _ => panic!("unknown persistence failure must preserve recovery semantics"),
         };
-        assert_eq!(recovery.0.state, ExecutionState::Unknown);
+        assert_eq!(recovery.0.state, ExecutionState::Dispatching);
+        assert_eq!(recovery.0.intended_state, Some(ExecutionState::Unknown));
+        assert_eq!(recovery.0.next_action, ActionNextStep::RepairEvidence);
         assert_eq!(recovery.1, ExecutionState::Unknown);
         assert!(!recovery.0.safe_to_retry);
     }
@@ -2093,6 +2753,37 @@ mod tests {
             .reconcile(&action_id)
             .expect_err("reconciliation must require a receipt to commit");
         assert!(matches!(error, KernelError::EffectUnknown { .. }));
+    }
+
+    #[test]
+    fn reconciliation_cannot_fail_without_authoritative_evidence() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("failed-evidence")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown effect"),
+        };
+        *effect.reconciliation_result.lock().unwrap() = Some(ReconciliationResult {
+            state: ExecutionState::Failed,
+            receipt: None,
+        });
+        assert!(matches!(
+            kernel.reconcile(&action_id),
+            Err(KernelError::EffectUnknown { .. })
+        ));
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
     }
 
     #[test]
@@ -2224,6 +2915,65 @@ mod tests {
     }
 
     #[test]
+    fn recovery_and_reconciliation_respect_live_leases_then_recover_stale_owners() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("lease-fence")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown effect"),
+        };
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let live = actions
+            .claim_lease(
+                &action_id,
+                ExecutionState::Unknown,
+                "live-owner",
+                now,
+                60_000,
+            )
+            .expect("test lease claim should succeed");
+        assert!(matches!(live, LeaseClaim::Acquired(_)));
+        let pending = kernel
+            .reconcile(&action_id)
+            .expect_err("live reconciliation owner must fence a second worker");
+        assert!(matches!(
+            pending,
+            KernelError::ActionPending {
+                cause: ActionPendingCause::LeaseHeld,
+                ..
+            }
+        ));
+        {
+            let mut records = actions.records.lock().unwrap();
+            records.get_mut(&action_id).unwrap().lease = Some(ActionLease {
+                owner_id: "dead-owner".into(),
+                generation: 1,
+                expires_at_unix_ms: now.saturating_sub(1),
+            });
+            records.get_mut(&action_id).unwrap().state = ExecutionState::Reconciling;
+        }
+        actions
+            .states
+            .lock()
+            .unwrap()
+            .insert(action_id.clone(), ExecutionState::Reconciling);
+        let recovered = kernel
+            .recover(&action_id)
+            .expect("expired reconciliation lease should recover to unknown");
+        assert_eq!(recovered.state, ExecutionState::Unknown);
+        assert_eq!(recovered.next_action, ActionNextStep::Reconcile);
+    }
+
+    #[test]
     fn scoped_idempotency_does_not_cross_tenant_boundaries() {
         let (first, _authority, _function, first_effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
@@ -2259,19 +3009,27 @@ mod tests {
 
     #[test]
     fn unknown_actions_reconcile_through_external_effect_fabric() {
-        let (kernel, _authority, _function, _effect, actions, receipts) =
-            kernel(ExecutionClass::Critical, Decision::Allow);
-        actions
-            .states
-            .lock()
-            .unwrap()
-            .insert("unknown-action".into(), ExecutionState::Unknown);
+        let (kernel, _authority, _function, effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("external-reconcile")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown action"),
+        };
         let result = kernel
-            .reconcile("unknown-action")
+            .reconcile(&action_id)
             .expect("unknown action should reconcile");
         assert_eq!(result.state, ExecutionState::Committed);
         assert_eq!(
-            actions.load_state("unknown-action").unwrap(),
+            actions.load_state(&action_id).unwrap(),
             Some(ExecutionState::Committed)
         );
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);

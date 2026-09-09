@@ -52,18 +52,21 @@ they do not become a test failure or an implicit pass. A report with any
 `NOT_RUN` or `INCONCLUSIVE` check remains `DEV`/`INCONCLUSIVE` and is not a
 release certificate.
 
-The authority, ledger, executor, isolation, and DLP crates are disabled
-contract skeletons. They define package boundaries and invariants for later
-releases; they do not authorize actions, persist an evidence ledger, sandbox
-workers, or enforce outbound DLP in this release.
+The authority, ledger, and executor crates provide experimental kernel
+contracts and adapter boundaries. Production authority enforcement, durable
+action/receipt storage, isolation enforcement, and outbound DLP remain
+external and unconfigured in this development release.
 
 ## Experimental effect-state contracts
 
 The opt-in kernel contracts use one consequential-effect vocabulary:
 `PROPOSED`, `AUTHORIZED`, `PREPARED`, `DISPATCHING`, `COMMITTED`, `FAILED`,
 `UNKNOWN`, `RECONCILING`, and `CANCELLED`. An external `ActionStore` claims an
-idempotency key in `PROPOSED`; a verified authority grant is bound before the
-kernel advances the action to `AUTHORIZED` and `PREPARED`.
+idempotency key in `PROPOSED`; a verified authority grant is bound atomically
+with `PROPOSED → AUTHORIZED`, then the kernel advances the action to
+`PREPARED`. Restarted `AUTHORIZED` and `PREPARED` actions can obtain a fresh
+grant for the same immutable action before continuing; raw arguments are not
+reconstructed from the kernel's action record.
 
 `COMMITTED` is only written after an external execution backend returns a
 receipt that binds the action, idempotency key, runtime identity, capability
@@ -72,22 +75,35 @@ have crossed the provider boundary, or if durable receipt/state persistence
 cannot prove a terminal result, the kernel records `UNKNOWN` and returns a
 typed reconciliation-required outcome.
 
+`COMMITTED` and reconciliation-derived `FAILED` both require authoritative
+persisted evidence. An `ActionStatus` distinguishes its last observed durable
+state from an intended state that could not be persisted, and exposes a
+state-specific next action such as retrying authority, resuming pre-dispatch
+work, recovering, reconciling, or returning a receipt. It never presents an
+unpersisted intended state as durable fact.
+
 `MUTATION` and `CRITICAL` invocations require a stable caller `request_id`.
 The kernel scopes that retry identity to the authenticated tenant and
 principal, claims one durable logical action, and returns that real action ID
 on every pending, unknown, or recovery-required outcome. Retrying the same
 request therefore resumes or observes the original action rather than
-silently creating another dispatch. A stale `DISPATCHING` action can be
-recovered only from a fully bound persisted receipt; otherwise it becomes
-`UNKNOWN` and must be reconciled.
+silently creating another dispatch. Dispatch and reconciliation transitions
+require a fenced external `ActionLease` containing an owner, generation, and
+expiry. A recovery worker can take over only after that lease expires, so it
+cannot turn a live dispatch into spurious ambiguity. A stale `DISPATCHING`
+action can be recovered only from a fully bound persisted receipt; otherwise
+it becomes `UNKNOWN` and must be reconciled. A stale `RECONCILING` action
+returns to `UNKNOWN` under the same fencing rule.
 
 Retry policy is deliberately conservative: `FAILED` after confirmed
 pre-dispatch failure may be evaluated for a new attempt by the external effect
 system; `UNKNOWN` must never be automatically re-dispatched. An external
 reconciliation provider must resolve it with evidence to `COMMITTED`,
-`FAILED`, or remain `UNKNOWN`. NeMo Relay defines these contracts only; Effect
-Fabric or another external implementation owns durable storage, dispatch, and
-reconciliation.
+`FAILED`, or remain `UNKNOWN`. Explicit authority denial cancels the claimed
+action; authority modification cancels it and returns structured constraints
+for a new invocation with a new identity. NeMo Relay defines these contracts
+only; Effect Fabric or another external implementation owns durable storage,
+dispatch, leases, and reconciliation.
 
 The built-in `nemo_guardrails` component remains available for compatibility and
 is formally deprecated. New deployments should use current guardrail and
