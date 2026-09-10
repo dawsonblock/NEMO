@@ -31,6 +31,8 @@ pub mod unstable {
         pub principal_id: String,
         /// Runtime identity and deployment binding.
         pub runtime: RuntimeIdentity,
+        /// Canonical digest binding runtime, environment, and session provenance.
+        pub runtime_binding_digest: String,
         /// Requested capability identifier.
         pub capability_id: String,
         /// Capability registration generation.
@@ -80,6 +82,8 @@ pub mod unstable {
         pub tenant_id: String,
         /// Principal authorized to execute the action.
         pub principal_id: String,
+        /// Canonical runtime, environment, and session binding digest.
+        pub runtime_binding_digest: String,
         /// Runtime admission authorized by the grant.
         pub admission_id: String,
         /// Capability authorized by the grant.
@@ -111,6 +115,7 @@ pub mod unstable {
                 && self.idempotency_key == request.idempotency_key
                 && self.tenant_id == request.tenant_id
                 && self.principal_id == request.principal_id
+                && self.runtime_binding_digest == request.runtime_binding_digest
                 && self.admission_id == request.admission_id
                 && self.capability_id == request.capability_id
                 && self.capability_generation == request.capability_generation
@@ -228,6 +233,7 @@ pub mod unstable {
             tenant_id: identity.runtime.tenant_id.clone().unwrap_or_default(),
             principal_id: identity.runtime.principal_id.clone(),
             runtime: identity.runtime.clone(),
+            runtime_binding_digest: identity.runtime_binding_digest.clone(),
             capability_id: identity.capability.capability_id.clone(),
             capability_generation: identity.capability.capability_generation,
             registration_digest: identity.capability.registration_digest.clone(),
@@ -283,6 +289,7 @@ pub mod unstable {
                 idempotency_key: request.idempotency_key.clone(),
                 tenant_id: request.tenant_id.clone(),
                 principal_id: request.principal_id.clone(),
+                runtime_binding_digest: request.runtime_binding_digest.clone(),
                 admission_id: request.admission_id.clone(),
                 capability_id: request.capability_id.clone(),
                 capability_generation: request.capability_generation,
@@ -310,6 +317,7 @@ pub mod unstable {
                     environment: "test".into(),
                     session_id: None,
                 },
+                runtime_binding_digest: "runtime-binding".into(),
                 capability: CapabilityIdentity {
                     capability_id: "test.capability".into(),
                     capability_generation: 1,

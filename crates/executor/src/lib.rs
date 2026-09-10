@@ -76,6 +76,8 @@ pub mod unstable {
         pub idempotency_key: String,
         /// Host-authenticated runtime identity.
         pub runtime: RuntimeIdentity,
+        /// Canonical digest binding runtime, environment, and session provenance.
+        pub runtime_binding_digest: String,
         /// Immutable registered capability identity.
         pub capability: CapabilityIdentity,
         /// Runtime admission identifier.
@@ -215,6 +217,10 @@ pub mod unstable {
     /// broker. This crate does not provide retries, persistence, or authority.
     pub trait ExecutionBackend: Send + Sync {
         /// Dispatch one already-authorized execution identity.
+        ///
+        /// Implementations must honor `request.identity.deadline_unix_ms`.
+        /// The kernel sizes that deadline beneath the ActionStore lease policy
+        /// so a conforming backend cannot remain live after its lease expires.
         fn execute(
             &self,
             request: &ExecutionRequest,
@@ -379,6 +385,7 @@ pub mod unstable {
                         environment: "test".into(),
                         session_id: None,
                     },
+                    runtime_binding_digest: "runtime-binding".into(),
                     capability: CapabilityIdentity {
                         capability_id: "capability".into(),
                         capability_generation: 1,

@@ -18,8 +18,9 @@ use nemo_relay_executor::unstable::{
 };
 use nemo_relay_ledger::unstable::{
     ActionLease, ActionPreparation, ActionRecord, ActionStore, ExecutionState, FinalizeResult,
-    LeaseAcquireResult, LeaseStatus, PrepareActionResult, ReceiptConflict, ReceiptRecord,
-    ReceiptStore, is_valid_transition,
+    LeaseAcquireResult, LeaseConfiguration, LeaseReleaseResult, LeaseRenewResult, LeaseStatus,
+    PreDispatchFailureEvidence, PrepareActionResult, ReceiptConflict, ReceiptRecord, ReceiptStore,
+    TerminalEvidence, is_valid_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -100,6 +101,14 @@ pub enum KernelError {
     /// Immutable receipt finalization found contradictory terminal evidence.
     #[error("receipt finalization conflicts with existing evidence: {0:?}")]
     ReceiptFinalizationConflict(ReceiptConflict),
+    /// Contradictory terminal evidence requires operator evidence repair.
+    #[error("terminal evidence is contradictory: {action:?}: {conflict:?}")]
+    EvidenceIntegrityConflict {
+        /// Durable action status with repair-only guidance.
+        action: Box<ActionStatus>,
+        /// Persisted conflicting evidence identities.
+        conflict: ReceiptConflict,
+    },
     /// The store rejected the kernel's bounded lease configuration request.
     #[error("store rejected configured lease duration: {0}")]
     LeaseConfiguration(String),
@@ -227,6 +236,8 @@ pub struct ActionStatus {
     pub reconciliation_required: bool,
     /// Persisted receipt when the action is already committed.
     pub receipt: Option<ReceiptRecord>,
+    /// Whether `state` was freshly loaded from durable action storage.
+    pub durable_state_confirmed: bool,
 }
 
 /// Evidence-aware outcome of a recovery attempt.
@@ -428,6 +439,7 @@ impl BoundExecutionRequest {
             "tenant_id": identity.runtime.tenant_id,
             "principal_id": identity.runtime.principal_id,
             "runtime_id": identity.runtime.runtime_id,
+            "runtime_binding_digest": identity.runtime_binding_digest,
             "capability_id": capability.capability_id,
             "capability_generation": capability.capability_generation,
             "registration_digest": capability.registration_digest,
@@ -449,6 +461,7 @@ impl BoundExecutionRequest {
             tenant_id: identity.runtime.tenant_id.clone(),
             principal_id: identity.runtime.principal_id.clone(),
             runtime_id: identity.runtime.runtime_id.clone(),
+            runtime_binding_digest: identity.runtime_binding_digest.clone(),
             capability_id: capability.capability_id.clone(),
             capability_generation: capability.capability_generation,
             registration_digest: capability.registration_digest.clone(),
@@ -474,6 +487,7 @@ impl BoundExecutionRequest {
 /// the continuation identity.
 pub struct PendingAction {
     request: BoundExecutionRequest,
+    state: ExecutionState,
 }
 
 impl PendingAction {
@@ -485,6 +499,22 @@ impl PendingAction {
     /// Return the stable idempotency identity for this logical action.
     pub fn idempotency_key(&self) -> &str {
         &self.request.request.identity.idempotency_key
+    }
+
+    /// Return durable approval-wait guidance for the original action.
+    pub fn status(&self) -> ActionStatus {
+        let preparation = self.request.action_preparation();
+        ActionStatus {
+            action_id: preparation.action_id,
+            idempotency_key: preparation.idempotency_key,
+            state: self.state,
+            intended_state: None,
+            next_action: ActionNextStep::AwaitApproval,
+            safe_to_retry: false,
+            reconciliation_required: false,
+            receipt: None,
+            durable_state_confirmed: true,
+        }
     }
 }
 
@@ -690,7 +720,7 @@ impl<A, F, E, S, R> Kernel<A, F, E, S, R> {
         };
         let deadline_unix_ms = chrono::Utc::now()
             .timestamp_millis()
-            .saturating_add(30_000)
+            .saturating_add(29_000)
             .try_into()
             .unwrap_or(u64::MAX);
         Ok(BoundExecutionRequest {
@@ -704,6 +734,7 @@ impl<A, F, E, S, R> Kernel<A, F, E, S, R> {
                     // durable implementation and recovery semantics.
                     idempotency_key,
                     runtime: self.runtime.clone(),
+                    runtime_binding_digest: runtime_binding_digest(&self.runtime),
                     capability: definition.identity(),
                     admission_id: definition.admission_id.clone(),
                     policy_version: definition.policy_version.clone(),
@@ -799,6 +830,29 @@ where
                 ));
             }
         };
+        let conflicts = self
+            .receipt_store
+            .load_conflicts(action_id)
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &action.preparation,
+                    action.state,
+                    ExecutionState::Unknown,
+                    error.to_string(),
+                )
+            })?;
+        if !conflicts.is_empty() {
+            self.release_lease(&action, action.state, &lease)?;
+            return Ok(RecoveryDecision::ContradictoryEvidence {
+                action: self.action_status_with_next_action(
+                    &action.preparation,
+                    action.state,
+                    ActionNextStep::RepairEvidence,
+                    None,
+                ),
+                cause: "immutable receipt conflict requires evidence repair".into(),
+            });
+        }
         let receipt = self.receipt_store.load(action_id).map_err(|error| {
             self.state_recovery_required(
                 &action.preparation,
@@ -815,19 +869,21 @@ where
             {
                 self.release_lease(&action, action.state, &lease)?;
                 return Ok(RecoveryDecision::ContradictoryEvidence {
-                    action: self.action_status(&action, None),
+                    action: self.action_status_with_next_action(
+                        &action.preparation,
+                        action.state,
+                        ActionNextStep::RepairEvidence,
+                        None,
+                    ),
                     cause: "persisted terminal receipt does not bind to the action".into(),
                 });
             }
-            self.transition_action_with_lease(&action, action.state, &lease, receipt.final_state)
-                .map_err(|error| {
-                    self.state_recovery_required(
-                        &action.preparation,
-                        action.state,
-                        receipt.final_state,
-                        error.to_string(),
-                    )
-                })?;
+            self.finalize_action_from_evidence(
+                &action.preparation,
+                action.state,
+                &lease,
+                &TerminalEvidence::Receipt(receipt.identity()),
+            )?;
             let status = self.action_status_with_state(
                 &action.preparation,
                 receipt.final_state,
@@ -876,7 +932,7 @@ where
         pending
             .request
             .attach_approval(continuation.approval_reference);
-        self.authorize_and_execute(&mut pending.request, ExecutionState::Proposed)
+        self.authorize_and_execute(&mut pending.request, pending.state)
     }
 
     /// Resume an approval wait after restart using the durable action identity.
@@ -988,20 +1044,33 @@ where
                 ));
             }
             if let Err(error) = self.finalize_receipt(receipt) {
-                return Err(self.reconciliation_unknown(&action, &lease, error.to_string()));
+                return Err(match error {
+                    KernelError::ReceiptFinalizationConflict(conflict) => {
+                        self.evidence_conflict_after_reconciling(&action, &lease, conflict)
+                    }
+                    other => self.reconciliation_unknown(&action, &lease, other.to_string()),
+                });
             }
+            self.finalize_action_from_evidence(
+                &action.preparation,
+                ExecutionState::Reconciling,
+                &lease,
+                &TerminalEvidence::Receipt(receipt.identity()),
+            )?;
+            return Ok(result);
         }
+        debug_assert_eq!(result.state, ExecutionState::Unknown);
         self.transition_action_with_lease(
             &action,
             ExecutionState::Reconciling,
             &lease,
-            result.state,
+            ExecutionState::Unknown,
         )
         .map_err(|error| {
             self.state_recovery_required(
                 &action.preparation,
                 ExecutionState::Reconciling,
-                result.state,
+                ExecutionState::Unknown,
                 error.to_string(),
             )
         })?;
@@ -1102,6 +1171,7 @@ where
                         },
                     ));
                 }
+                let lease_configuration = self.ensure_lease_covers_deadline(request)?;
                 let lease = match self.claim_lease_for_request(request, ExecutionState::Prepared)? {
                     Some(lease) => lease,
                     None => {
@@ -1125,6 +1195,7 @@ where
                 .map_err(|error| {
                     self.pending_after_state_failure(request, ExecutionState::Prepared, error)
                 })?;
+                let lease = self.renew_dispatch_lease(request, &lease, lease_configuration)?;
                 Ok(InvocationOutcome::Completed(
                     self.execute_effect(request, &lease)?,
                 ))
@@ -1132,6 +1203,7 @@ where
             AuthorizationOutcome::PendingApproval => {
                 Ok(InvocationOutcome::PendingApproval(PendingAction {
                     request: request.clone(),
+                    state: current_state,
                 }))
             }
             AuthorizationOutcome::Denied => self.cancel_rejected_action(
@@ -1341,7 +1413,9 @@ where
                 if state == ExecutionState::Unknown {
                     return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
                 }
-                self.transition_from_dispatching(request, lease, state)?;
+                let evidence =
+                    TerminalEvidence::PreDispatchFailure(pre_dispatch_failure_evidence(&error));
+                self.finalize_from_dispatching(request, lease, &evidence)?;
                 return Err(KernelError::EffectFailed {
                     action: Box::new(self.action_status_with_state(
                         &request.action_preparation(),
@@ -1373,17 +1447,18 @@ where
             ));
         }
         if let Err(error) = self.finalize_receipt(receipt) {
-            return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
+            return Err(match error {
+                KernelError::ReceiptFinalizationConflict(conflict) => {
+                    self.evidence_conflict_after_dispatching(request, lease, conflict)
+                }
+                other => self.unknown_after_dispatching(request, lease, other.to_string()),
+            });
         }
-        self.transition_from_dispatching(request, lease, ExecutionState::Committed)
-            .map_err(|error| {
-                self.state_recovery_required(
-                    &request.action_preparation(),
-                    ExecutionState::Dispatching,
-                    ExecutionState::Committed,
-                    error.to_string(),
-                )
-            })?;
+        self.finalize_from_dispatching(
+            request,
+            lease,
+            &TerminalEvidence::Receipt(receipt.identity()),
+        )?;
         Ok(result)
     }
 
@@ -1426,12 +1501,46 @@ where
         lease: &ActionLease,
         next: ExecutionState,
     ) -> Result<(), KernelError> {
+        debug_assert_eq!(next, ExecutionState::Unknown);
         self.transition_with_lease(request, ExecutionState::Dispatching, lease, next)
             .map_err(|error| {
                 self.state_recovery_required(
                     &request.action_preparation(),
                     ExecutionState::Dispatching,
                     next,
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn finalize_from_dispatching(
+        &self,
+        request: &BoundExecutionRequest,
+        lease: &ActionLease,
+        evidence: &TerminalEvidence,
+    ) -> Result<(), KernelError> {
+        self.finalize_action_from_evidence(
+            &request.action_preparation(),
+            ExecutionState::Dispatching,
+            lease,
+            evidence,
+        )
+    }
+
+    fn finalize_action_from_evidence(
+        &self,
+        action: &ActionPreparation,
+        expected: ExecutionState,
+        lease: &ActionLease,
+        evidence: &TerminalEvidence,
+    ) -> Result<(), KernelError> {
+        self.action_store
+            .finalize_from_evidence(&action.action_id, expected, lease, evidence)
+            .map_err(|error| {
+                self.state_recovery_required(
+                    action,
+                    expected,
+                    evidence.terminal_state(),
                     error.to_string(),
                 )
             })
@@ -1520,6 +1629,56 @@ where
         }
     }
 
+    fn evidence_conflict_after_dispatching(
+        &self,
+        request: &BoundExecutionRequest,
+        lease: &ActionLease,
+        conflict: ReceiptConflict,
+    ) -> KernelError {
+        match self.transition_from_dispatching(request, lease, ExecutionState::Unknown) {
+            Ok(()) => KernelError::EvidenceIntegrityConflict {
+                action: Box::new(self.action_status_with_next_action(
+                    &request.action_preparation(),
+                    ExecutionState::Unknown,
+                    ActionNextStep::RepairEvidence,
+                    None,
+                )),
+                conflict,
+            },
+            Err(error) => error,
+        }
+    }
+
+    fn evidence_conflict_after_reconciling(
+        &self,
+        action: &ActionRecord,
+        lease: &ActionLease,
+        conflict: ReceiptConflict,
+    ) -> KernelError {
+        match self.transition_action_with_lease(
+            action,
+            ExecutionState::Reconciling,
+            lease,
+            ExecutionState::Unknown,
+        ) {
+            Ok(()) => KernelError::EvidenceIntegrityConflict {
+                action: Box::new(self.action_status_with_next_action(
+                    &action.preparation,
+                    ExecutionState::Unknown,
+                    ActionNextStep::RepairEvidence,
+                    None,
+                )),
+                conflict,
+            },
+            Err(error) => self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Reconciling,
+                ExecutionState::Unknown,
+                error.to_string(),
+            ),
+        }
+    }
+
     fn state_recovery_required(
         &self,
         action: &ActionPreparation,
@@ -1527,8 +1686,19 @@ where
         intended_state: ExecutionState,
         cause: String,
     ) -> KernelError {
+        let status = match self.action_store.load_action(&action.action_id) {
+            Ok(Some(current)) => {
+                self.action_status_recovery(&current.preparation, current.state, intended_state)
+            }
+            Ok(None) | Err(_) => {
+                let mut status =
+                    self.action_status_recovery(action, observed_state, intended_state);
+                status.durable_state_confirmed = false;
+                status
+            }
+        };
         KernelError::StateRecoveryRequired {
-            action: Box::new(self.action_status_recovery(action, observed_state, intended_state)),
+            action: Box::new(status),
             intended_state,
             cause,
         }
@@ -1544,8 +1714,66 @@ where
             state: expected,
             lease: None,
             lease_generation: 0,
+            terminal_evidence: None,
         };
         self.claim_lease(&action, expected, "execute")
+    }
+
+    fn ensure_lease_covers_deadline(
+        &self,
+        request: &BoundExecutionRequest,
+    ) -> Result<LeaseConfiguration, KernelError> {
+        const LEASE_MARGIN_MS: u64 = 1_000;
+        let configuration = self
+            .action_store
+            .lease_configuration()
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let remaining = request
+            .backend_request()
+            .identity
+            .deadline_unix_ms
+            .saturating_sub(now);
+        if configuration.default_duration_ms < remaining.saturating_add(LEASE_MARGIN_MS) {
+            return Err(KernelError::LeaseConfiguration(format!(
+                "default lease {}ms cannot cover {}ms execution deadline plus {}ms margin",
+                configuration.default_duration_ms, remaining, LEASE_MARGIN_MS
+            )));
+        }
+        Ok(configuration)
+    }
+
+    fn renew_dispatch_lease(
+        &self,
+        request: &BoundExecutionRequest,
+        lease: &ActionLease,
+        configuration: LeaseConfiguration,
+    ) -> Result<ActionLease, KernelError> {
+        if !configuration.renewal_enabled {
+            return Ok(lease.clone());
+        }
+        match self
+            .action_store
+            .renew_lease(
+                &request.backend_request().identity.action_id,
+                ExecutionState::Dispatching,
+                lease,
+                None,
+            )
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?
+        {
+            LeaseRenewResult::Renewed(lease) => Ok(lease),
+            LeaseRenewResult::LeaseLost => Err(self.state_recovery_required(
+                &request.action_preparation(),
+                ExecutionState::Dispatching,
+                ExecutionState::Unknown,
+                "lease ownership changed before effect dispatch".into(),
+            )),
+            LeaseRenewResult::RenewalNotPermitted => Ok(lease.clone()),
+            LeaseRenewResult::DurationRejected(error) => {
+                Err(KernelError::LeaseConfiguration(format!("{error:?}")))
+            }
+        }
     }
 
     /// Return `None` when another unexpired owner holds the lease.
@@ -1583,10 +1811,19 @@ where
         expected: ExecutionState,
         lease: &ActionLease,
     ) -> Result<(), KernelError> {
-        self.action_store
+        match self
+            .action_store
             .release_lease(&action.preparation.action_id, expected, lease)
-            .map_err(|error| KernelError::ActionStore(error.to_string()))?;
-        Ok(())
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?
+        {
+            LeaseReleaseResult::Released => Ok(()),
+            LeaseReleaseResult::LeaseLost => Err(self.state_recovery_required(
+                &action.preparation,
+                expected,
+                expected,
+                "lease ownership changed before release".into(),
+            )),
+        }
     }
 
     fn recover_terminal_action(
@@ -1604,31 +1841,41 @@ where
                     error.to_string(),
                 )
             })?;
-        match (action.state, receipt) {
-            (ExecutionState::Committed, Some(receipt))
-                if receipt.final_state == ExecutionState::Committed
-                    && self.receipt_matches_action(&receipt, &action.preparation) =>
+        match (action.state, &action.terminal_evidence, receipt) {
+            (
+                ExecutionState::Committed,
+                Some(TerminalEvidence::Receipt(evidence)),
+                Some(receipt),
+            ) if receipt.final_state == ExecutionState::Committed
+                && self.receipt_matches_action(&receipt, &action.preparation)
+                && evidence == &receipt.identity() =>
             {
                 Ok(RecoveryDecision::RecoverCommitted(
                     self.action_status(action, Some(receipt)),
                 ))
             }
-            (ExecutionState::Failed, Some(receipt))
+            (ExecutionState::Failed, Some(TerminalEvidence::Receipt(evidence)), Some(receipt))
                 if receipt.final_state == ExecutionState::Failed
-                    && self.receipt_matches_action(&receipt, &action.preparation) =>
+                    && self.receipt_matches_action(&receipt, &action.preparation)
+                    && evidence == &receipt.identity() =>
             {
                 Ok(RecoveryDecision::RecoverFailed(
                     self.action_status(action, Some(receipt)),
                 ))
             }
-            (ExecutionState::Failed, None) => Ok(RecoveryDecision::RecoverFailed(
-                self.action_status(action, None),
-            )),
-            (_, receipt) => Ok(RecoveryDecision::ContradictoryEvidence {
-                action: self.action_status(action, None),
+            (ExecutionState::Failed, Some(TerminalEvidence::PreDispatchFailure(_)), None) => Ok(
+                RecoveryDecision::RecoverFailed(self.action_status(action, None)),
+            ),
+            (_, _, receipt) => Ok(RecoveryDecision::ContradictoryEvidence {
+                action: self.action_status_with_next_action(
+                    &action.preparation,
+                    action.state,
+                    ActionNextStep::RepairEvidence,
+                    None,
+                ),
                 cause: match receipt {
                     Some(_) => "terminal receipt does not match durable action state".into(),
-                    None => "committed action has no immutable terminal receipt".into(),
+                    None => "terminal action has no matching immutable evidence".into(),
                 },
             }),
         }
@@ -1656,6 +1903,7 @@ where
             ),
             reconciliation_required: state == ExecutionState::Unknown,
             receipt,
+            durable_state_confirmed: true,
         }
     }
 
@@ -1712,6 +1960,7 @@ where
             && receipt.route_digest == action.route_digest
             && receipt.tenant_id == action.tenant_id
             && receipt.runtime_id == action.runtime_id
+            && receipt.runtime_binding_digest == action.runtime_binding_digest
             && receipt.admission_id == action.admission_id
             && receipt.policy_version == action.policy_version
             && receipt.policy_epoch == action.policy_epoch
@@ -1737,6 +1986,7 @@ where
             || receipt.principal_id != identity.runtime.principal_id
             || receipt.tenant_id != identity.runtime.tenant_id
             || receipt.runtime_id != identity.runtime.runtime_id
+            || receipt.runtime_binding_digest != identity.runtime_binding_digest
             || receipt.capability_id != capability.capability_id
             || receipt.capability_generation != capability.capability_generation
             || receipt.registration_digest != capability.registration_digest
@@ -1761,6 +2011,34 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn runtime_binding_digest(runtime: &RuntimeIdentity) -> String {
+    let binding = serde_json::json!({
+        "runtime_id": runtime.runtime_id,
+        "environment": runtime.environment,
+        "session_id": runtime.session_id,
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&binding)
+        .expect("kernel-owned runtime binding must canonicalize");
+    sha256_hex(&bytes)
+}
+
+fn pre_dispatch_failure_evidence(
+    error: &nemo_relay_executor::unstable::EffectExecutionError,
+) -> PreDispatchFailureEvidence {
+    let evidence = serde_json::json!({
+        "code": error.code,
+        "dispatch_state": error.dispatch_state,
+        "outcome_certainty": error.outcome_certainty,
+        "message": error.message,
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&evidence)
+        .expect("kernel-owned failure evidence must canonicalize");
+    PreDispatchFailureEvidence {
+        code: error.code.clone(),
+        evidence_digest: sha256_hex(&bytes),
+    }
 }
 
 fn scoped_idempotency_key(runtime: &RuntimeIdentity, request_id: &str) -> String {
@@ -1800,7 +2078,9 @@ mod tests {
     use super::*;
     use nemo_relay_authority::unstable::AuthorityRequest;
     use nemo_relay_executor::unstable::{EffectExecutionError, OutcomeCertainty};
-    use nemo_relay_ledger::unstable::ActionRecord;
+    use nemo_relay_ledger::unstable::{
+        ActionRecord, InMemoryActionStore, InMemoryReceiptStore, ManualStoreClock,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{
@@ -1813,6 +2093,7 @@ mod tests {
         Allow,
         ApproveOnContinuation,
         MismatchedGrant,
+        MismatchedRuntimeBinding,
         Deny,
         Defer,
         Modify,
@@ -1860,6 +2141,11 @@ mod tests {
                     grant.route_digest = "wrong-route".into();
                     AuthorityDecision::Allow(Box::new(grant))
                 }
+                Decision::MismatchedRuntimeBinding => {
+                    let mut grant = grant(request);
+                    grant.runtime_binding_digest = "wrong-runtime-binding".into();
+                    AuthorityDecision::Allow(Box::new(grant))
+                }
                 Decision::Deny => AuthorityDecision::Deny,
                 Decision::Defer => AuthorityDecision::Defer,
                 Decision::Modify => AuthorityDecision::Modify(json!({"max_value": 1})),
@@ -1875,6 +2161,7 @@ mod tests {
             idempotency_key: request.idempotency_key.clone(),
             tenant_id: request.tenant_id.clone(),
             principal_id: request.principal_id.clone(),
+            runtime_binding_digest: request.runtime_binding_digest.clone(),
             admission_id: request.admission_id.clone(),
             capability_id: request.capability_id.clone(),
             capability_generation: request.capability_generation,
@@ -1892,13 +2179,18 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestActionStore {
         prepare_calls: Arc<AtomicUsize>,
+        renew_calls: Arc<AtomicUsize>,
         states: Arc<Mutex<HashMap<String, ExecutionState>>>,
         records: Arc<Mutex<HashMap<String, ActionRecord>>>,
+        lease_configuration: Arc<Mutex<LeaseConfiguration>>,
         /// Inject a persistence failure only when trying to record an
         /// ambiguous post-dispatch outcome. Earlier lifecycle boundaries must
         /// remain writable so this test double can exercise the exact crash
         /// window that matters.
         fail_unknown_transition: Arc<Mutex<Option<String>>>,
+        /// Simulates a competing writer that persisted `UNKNOWN` before this
+        /// worker learned its stale compare-and-set failed.
+        persist_unknown_then_fail: Arc<Mutex<Option<String>>>,
     }
 
     impl ActionStore for TestActionStore {
@@ -1930,6 +2222,7 @@ mod tests {
                     state: ExecutionState::Proposed,
                     lease: None,
                     lease_generation: 0,
+                    terminal_evidence: None,
                 },
             );
             self.states
@@ -1961,6 +2254,7 @@ mod tests {
                                 tenant_id: Some("tenant".into()),
                                 principal_id: "alice".into(),
                                 runtime_id: "runtime-1".into(),
+                                runtime_binding_digest: "runtime-binding".into(),
                                 capability_id: "capability.test".into(),
                                 capability_generation: 7,
                                 registration_digest: "registration-7".into(),
@@ -1977,6 +2271,7 @@ mod tests {
                             state,
                             lease: None,
                             lease_generation: 0,
+                            terminal_evidence: None,
                         })
                 }))
         }
@@ -2075,7 +2370,10 @@ mod tests {
         fn lease_configuration(
             &self,
         ) -> Result<nemo_relay_ledger::unstable::LeaseConfiguration, Self::Error> {
-            Ok(Default::default())
+            self.lease_configuration
+                .lock()
+                .map(|configuration| *configuration)
+                .map_err(|_| "test lease configuration lock poisoned".to_owned())
         }
 
         fn lease_status(
@@ -2145,6 +2443,7 @@ mod tests {
             lease: &ActionLease,
             requested_duration_ms: Option<u64>,
         ) -> Result<nemo_relay_ledger::unstable::LeaseRenewResult, Self::Error> {
+            self.renew_calls.fetch_add(1, Ordering::SeqCst);
             let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
             let mut records = self
                 .records
@@ -2217,6 +2516,23 @@ mod tests {
             if record.state != expected || record.lease.as_ref() != Some(lease) {
                 return Err("stale or unexpected action lease".into());
             }
+            if expected == ExecutionState::Dispatching
+                && next == ExecutionState::Unknown
+                && let Some(error) = self
+                    .persist_unknown_then_fail
+                    .lock()
+                    .map_err(|_| "test stale transition failure lock poisoned".to_owned())?
+                    .clone()
+            {
+                record.state = ExecutionState::Unknown;
+                record.lease = None;
+                drop(records);
+                self.states
+                    .lock()
+                    .map_err(|_| "test action state lock poisoned".to_owned())?
+                    .insert(action_id.to_owned(), ExecutionState::Unknown);
+                return Err(error);
+            }
             record.state = next;
             if next != ExecutionState::Dispatching && next != ExecutionState::Reconciling {
                 record.lease = None;
@@ -2228,12 +2544,43 @@ mod tests {
                 .insert(action_id.to_owned(), next);
             Ok(())
         }
+
+        fn finalize_from_evidence(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            evidence: &TerminalEvidence,
+        ) -> Result<(), Self::Error> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action terminal evidence".to_owned())?;
+            if record.state != expected || record.lease.as_ref() != Some(lease) {
+                return Err("stale or unexpected terminal evidence lease".into());
+            }
+            let terminal_state = evidence.terminal_state();
+            record.terminal_evidence = Some(evidence.clone());
+            record.state = terminal_state;
+            record.lease = None;
+            drop(records);
+            self.states
+                .lock()
+                .map_err(|_| "test action state lock poisoned".to_owned())?
+                .insert(action_id.to_owned(), terminal_state);
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]
     struct TestReceiptStore {
         receipts: Arc<Mutex<Vec<ReceiptRecord>>>,
+        conflicts: Arc<Mutex<HashMap<String, Vec<ReceiptConflict>>>>,
         fail_store: Arc<Mutex<Option<String>>>,
+        inject_finalization_conflict: Arc<AtomicUsize>,
     }
 
     impl ReceiptStore for TestReceiptStore {
@@ -2252,24 +2599,50 @@ mod tests {
                 .receipts
                 .lock()
                 .map_err(|_| "test receipt lock poisoned".to_owned())?;
+            if self
+                .inject_finalization_conflict
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+                && !receipts
+                    .iter()
+                    .any(|existing| existing.action_id == receipt.action_id)
+            {
+                let mut existing = receipt.clone();
+                existing.receipt_id = "conflicting-existing-receipt".into();
+                existing.evidence_digest = "conflicting-evidence".into();
+                receipts.push(existing);
+            }
             match receipts
                 .iter()
                 .find(|existing| existing.action_id == receipt.action_id)
+                .cloned()
             {
                 None => {
                     receipts.push(receipt.clone());
                     Ok(FinalizeResult::Finalized(receipt.clone()))
                 }
-                Some(existing) if existing == receipt => {
-                    Ok(FinalizeResult::AlreadyFinalized(existing.clone()))
+                Some(existing) if existing.identity() == receipt.identity() => {
+                    Ok(FinalizeResult::AlreadyFinalized(existing))
                 }
-                Some(existing) => Ok(FinalizeResult::FinalizationConflict(ReceiptConflict {
-                    action_id: receipt.action_id.clone(),
-                    existing_receipt_id: existing.receipt_id.clone(),
-                    attempted_receipt_id: receipt.receipt_id.clone(),
-                    existing_evidence_digest: existing.evidence_digest.clone(),
-                    attempted_evidence_digest: receipt.evidence_digest.clone(),
-                })),
+                Some(existing) => {
+                    let conflict = ReceiptConflict {
+                        action_id: receipt.action_id.clone(),
+                        existing_receipt_id: existing.receipt_id.clone(),
+                        attempted_receipt_id: receipt.receipt_id.clone(),
+                        existing: existing.identity(),
+                        attempted: receipt.identity(),
+                    };
+                    drop(receipts);
+                    self.conflicts
+                        .lock()
+                        .map_err(|_| "test receipt conflict lock poisoned".to_owned())?
+                        .entry(receipt.action_id.clone())
+                        .or_default()
+                        .push(conflict.clone());
+                    Ok(FinalizeResult::FinalizationConflict(conflict))
+                }
             }
         }
 
@@ -2281,6 +2654,16 @@ mod tests {
                 .iter()
                 .find(|receipt| receipt.action_id == action_id)
                 .cloned())
+        }
+
+        fn load_conflicts(&self, action_id: &str) -> Result<Vec<ReceiptConflict>, Self::Error> {
+            Ok(self
+                .conflicts
+                .lock()
+                .map_err(|_| "test receipt conflict lock poisoned".to_owned())?
+                .get(action_id)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -2369,6 +2752,7 @@ mod tests {
                     principal_id: "alice".into(),
                     tenant_id: Some("tenant".into()),
                     runtime_id: "runtime-1".into(),
+                    runtime_binding_digest: runtime_binding_digest(&runtime()),
                     capability_id: "capability.test".into(),
                     capability_generation: 7,
                     registration_digest: "registration-7".into(),
@@ -2400,6 +2784,7 @@ mod tests {
             principal_id: identity.runtime.principal_id.clone(),
             tenant_id: identity.runtime.tenant_id.clone(),
             runtime_id: identity.runtime.runtime_id.clone(),
+            runtime_binding_digest: identity.runtime_binding_digest.clone(),
             capability_id: capability.capability_id.clone(),
             capability_generation: capability.capability_generation,
             registration_digest: capability.registration_digest.clone(),
@@ -2532,10 +2917,62 @@ mod tests {
         ));
         assert_eq!(authority.calls.load(Ordering::SeqCst), 2);
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            actions.renew_calls.load(Ordering::SeqCst),
+            1,
+            "the kernel renews its fenced dispatch lease immediately before backend execution"
+        );
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
         let state = actions.states.lock().unwrap().values().copied().next();
         assert_eq!(state, Some(ExecutionState::Committed));
+    }
+
+    #[test]
+    fn kernel_runs_against_the_reference_effect_stores_as_one_contract() {
+        let authority = TestAuthority {
+            decision: Decision::Allow,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let effect = TestBackend::default();
+        let actions = InMemoryActionStore::with_clock(
+            ManualStoreClock::new(1_000),
+            LeaseConfiguration::default(),
+        );
+        let receipts = InMemoryReceiptStore::default();
+        let kernel = Kernel::new(
+            runtime(),
+            registry(ExecutionClass::Mutation),
+            BackendRouter::new(authority, TestBackend::default(), effect.clone()),
+            actions.clone(),
+            receipts.clone(),
+        );
+        assert!(matches!(
+            kernel.begin(&invocation_with_request_id("reference-store-kernel")),
+            Ok(InvocationOutcome::Completed(_))
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        let action = actions
+            .load_action(&effect.requests.lock().unwrap()[0].identity.action_id)
+            .unwrap()
+            .expect("reference action store retains the claimed action");
+        assert_eq!(action.state, ExecutionState::Committed);
+        assert!(matches!(
+            action.terminal_evidence,
+            Some(TerminalEvidence::Receipt(_))
+        ));
+        assert!(
+            receipts
+                .load(&action.preparation.action_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            receipts
+                .load_conflicts(&action.preparation.action_id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2671,6 +3108,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_environment_and_session_binding_are_grant_bound() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::MismatchedRuntimeBinding);
+        let action = match kernel.begin(&invocation_with_request_id("runtime-binding")) {
+            Err(KernelError::ActionRejected { action, cause }) => {
+                assert!(matches!(
+                    cause,
+                    ActionRejectionCause::GrantVerificationFailed(_)
+                ));
+                action
+            }
+            _ => panic!("a mismatched runtime binding must cancel before dispatch"),
+        };
+        assert_eq!(action.state, ExecutionState::Cancelled);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            actions.load_state(&action.action_id).unwrap(),
+            Some(ExecutionState::Cancelled)
+        );
+    }
+
+    #[test]
     fn approval_resume_preserves_the_same_bound_action() {
         let (kernel, _authority, _function, effect, actions, receipts) =
             kernel(ExecutionClass::Critical, Decision::ApproveOnContinuation);
@@ -2686,6 +3145,7 @@ mod tests {
         };
         let action_id = pending.action_id().to_owned();
         let idempotency_key = pending.idempotency_key().to_owned();
+        assert_eq!(pending.status().next_action, ActionNextStep::AwaitApproval);
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 1);
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
 
@@ -2994,6 +3454,86 @@ mod tests {
     }
 
     #[test]
+    fn stale_fencing_failure_reloads_the_actual_durable_state() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        *actions.persist_unknown_then_fail.lock().unwrap() = Some("stale compare-and-set".into());
+        let status = match kernel.begin(&invocation_with_request_id("stale-cas")) {
+            Err(KernelError::StateRecoveryRequired { action, .. }) => action,
+            _ => panic!("stale fencing loss must report recovery"),
+        };
+        assert_eq!(status.state, ExecutionState::Unknown);
+        assert!(status.durable_state_confirmed);
+        assert_eq!(status.intended_state, Some(ExecutionState::Unknown));
+        assert_eq!(
+            actions.load_state(&status.action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+    }
+
+    #[test]
+    fn unsafe_lease_configuration_blocks_dispatch_before_provider_execution() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *actions.lease_configuration.lock().unwrap() = LeaseConfiguration {
+            default_duration_ms: 1,
+            maximum_duration_ms: 1,
+            renewal_enabled: true,
+        };
+        assert!(matches!(
+            kernel.begin(&invocation_with_request_id("lease-too-short")),
+            Err(KernelError::LeaseConfiguration(_))
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            actions.states.lock().unwrap().values().copied().next(),
+            Some(ExecutionState::Prepared)
+        );
+    }
+
+    #[test]
+    fn receipt_conflict_stays_structured_and_blocks_evidence_recovery() {
+        let (kernel, _authority, _function, _effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        receipts
+            .inject_finalization_conflict
+            .store(1, Ordering::SeqCst);
+        let action = match kernel.begin(&invocation_with_request_id("receipt-conflict")) {
+            Err(KernelError::EvidenceIntegrityConflict { action, conflict }) => {
+                assert_eq!(conflict.existing.evidence_digest, "conflicting-evidence");
+                action
+            }
+            _ => panic!("receipt conflict must remain a structured integrity outcome"),
+        };
+        assert_eq!(action.state, ExecutionState::Unknown);
+        assert_eq!(action.next_action, ActionNextStep::RepairEvidence);
+        assert_eq!(
+            receipts.load_conflicts(&action.action_id).unwrap().len(),
+            1,
+            "conflict history remains available after the reporting worker returns"
+        );
+        let recovered = kernel.recover(&action.action_id).unwrap();
+        assert!(matches!(
+            recovered,
+            RecoveryDecision::ContradictoryEvidence { ref action, .. }
+                if action.next_action == ActionNextStep::RepairEvidence
+        ));
+        assert_eq!(
+            actions.load_state(&action.action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+    }
+
+    #[test]
     fn reconciliation_cannot_commit_without_a_bound_receipt() {
         let (kernel, _authority, _function, effect, _actions, _receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
@@ -3089,6 +3629,20 @@ mod tests {
         *effect.reconciliation_result.lock().unwrap() = Some(ReconciliationResult {
             state: ExecutionState::Committed,
             receipt: Some(wrong_grant),
+        });
+        assert!(matches!(
+            kernel.reconcile(&action_id),
+            Err(KernelError::EffectUnknown { .. })
+        ));
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+        let mut wrong_runtime_binding = receipt(&request);
+        wrong_runtime_binding.runtime_binding_digest = "wrong-runtime-binding".into();
+        *effect.reconciliation_result.lock().unwrap() = Some(ReconciliationResult {
+            state: ExecutionState::Committed,
+            receipt: Some(wrong_runtime_binding),
         });
         assert!(matches!(
             kernel.reconcile(&action_id),

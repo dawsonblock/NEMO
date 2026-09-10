@@ -59,17 +59,8 @@ pub mod unstable {
                 | (Some(ExecutionState::Authorized), ExecutionState::Cancelled)
                 | (Some(ExecutionState::Prepared), ExecutionState::Dispatching)
                 | (Some(ExecutionState::Prepared), ExecutionState::Cancelled)
-                | (Some(ExecutionState::Dispatching), ExecutionState::Committed)
-                | (Some(ExecutionState::Dispatching), ExecutionState::Failed)
                 | (Some(ExecutionState::Dispatching), ExecutionState::Unknown)
-                // Immutable terminal evidence can arrive after a conservative
-                // UNKNOWN transition. Recovery may repair from that evidence
-                // without asking the provider to execute or reconcile again.
-                | (Some(ExecutionState::Unknown), ExecutionState::Committed)
-                | (Some(ExecutionState::Unknown), ExecutionState::Failed)
                 | (Some(ExecutionState::Unknown), ExecutionState::Reconciling)
-                | (Some(ExecutionState::Reconciling), ExecutionState::Committed)
-                | (Some(ExecutionState::Reconciling), ExecutionState::Failed)
                 | (Some(ExecutionState::Reconciling), ExecutionState::Unknown)
         )
     }
@@ -102,6 +93,8 @@ pub mod unstable {
         pub principal_id: String,
         /// Runtime instance binding.
         pub runtime_id: String,
+        /// Digest binding runtime, environment, and session provenance.
+        pub runtime_binding_digest: String,
         /// Capability identity bound to the action.
         pub capability_id: String,
         /// Capability registration generation.
@@ -269,6 +262,8 @@ pub mod unstable {
         /// This counter is retained after a terminal or rollback transition so
         /// a later lease can never reuse an earlier fencing generation.
         pub lease_generation: u64,
+        /// Evidence that justified a terminal effect state, if any.
+        pub terminal_evidence: Option<TerminalEvidence>,
     }
 
     /// Result of atomically claiming an action/idempotency key.
@@ -301,6 +296,8 @@ pub mod unstable {
         pub tenant_id: Option<String>,
         /// Runtime instance identity.
         pub runtime_id: String,
+        /// Canonical runtime, environment, and session binding digest.
+        pub runtime_binding_digest: String,
         /// Capability identity.
         pub capability_id: String,
         /// Capability registration generation.
@@ -333,6 +330,112 @@ pub mod unstable {
         pub evidence_digest: String,
     }
 
+    /// Canonical identity of authoritative terminal receipt evidence.
+    ///
+    /// This deliberately excludes local receipt IDs and collection timestamps.
+    /// Re-reading identical provider evidence must be idempotent even when a
+    /// recovery worker assigns a different local receipt ID or observation time.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReceiptIdentity {
+        /// Action whose terminal evidence was observed.
+        pub action_id: String,
+        /// Idempotency identity bound to the action.
+        pub idempotency_key: String,
+        /// Verified grant binding.
+        pub grant_digest: String,
+        /// Authenticated principal binding.
+        pub principal_id: String,
+        /// Tenant binding.
+        pub tenant_id: Option<String>,
+        /// Runtime identity binding.
+        pub runtime_id: String,
+        /// Runtime environment/session binding.
+        pub runtime_binding_digest: String,
+        /// Capability and registration binding.
+        pub capability_id: String,
+        /// Capability registration generation.
+        pub capability_generation: u64,
+        /// Immutable registration digest.
+        pub registration_digest: String,
+        /// Bound provider operation.
+        pub operation: String,
+        /// Immutable execution classification.
+        pub execution_class: String,
+        /// Bound argument digest.
+        pub args_digest: String,
+        /// Bound route digest.
+        pub route_digest: String,
+        /// Runtime admission binding.
+        pub admission_id: String,
+        /// Authority policy binding.
+        pub policy_version: String,
+        /// Authority policy epoch binding.
+        pub policy_epoch: String,
+        /// Provider request identity, if exposed by the provider.
+        pub provider_request_id: Option<String>,
+        /// Terminal state proven by the evidence.
+        pub final_state: ExecutionState,
+        /// Digest of the authoritative provider evidence.
+        pub evidence_digest: String,
+    }
+
+    impl ReceiptRecord {
+        /// Return the immutable identity used for idempotent finalization.
+        pub fn identity(&self) -> ReceiptIdentity {
+            ReceiptIdentity {
+                action_id: self.action_id.clone(),
+                idempotency_key: self.idempotency_key.clone(),
+                grant_digest: self.grant_digest.clone(),
+                principal_id: self.principal_id.clone(),
+                tenant_id: self.tenant_id.clone(),
+                runtime_id: self.runtime_id.clone(),
+                runtime_binding_digest: self.runtime_binding_digest.clone(),
+                capability_id: self.capability_id.clone(),
+                capability_generation: self.capability_generation,
+                registration_digest: self.registration_digest.clone(),
+                operation: self.operation.clone(),
+                execution_class: self.execution_class.clone(),
+                args_digest: self.args_digest.clone(),
+                route_digest: self.route_digest.clone(),
+                admission_id: self.admission_id.clone(),
+                policy_version: self.policy_version.clone(),
+                policy_epoch: self.policy_epoch.clone(),
+                provider_request_id: self.provider_request_id.clone(),
+                final_state: self.final_state,
+                evidence_digest: self.evidence_digest.clone(),
+            }
+        }
+    }
+
+    /// Durable evidence authorizing a terminal effect-state transition.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum TerminalEvidence {
+        /// Provider or reconciliation evidence persisted as an immutable receipt.
+        Receipt(ReceiptIdentity),
+        /// A typed failure established before an external provider was contacted.
+        PreDispatchFailure(PreDispatchFailureEvidence),
+    }
+
+    impl TerminalEvidence {
+        /// Terminal state justified by this evidence.
+        pub const fn terminal_state(&self) -> ExecutionState {
+            match self {
+                Self::Receipt(receipt) => receipt.final_state,
+                Self::PreDispatchFailure(_) => ExecutionState::Failed,
+            }
+        }
+    }
+
+    /// Durable proof that dispatch never crossed the external effect boundary.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PreDispatchFailureEvidence {
+        /// Stable backend or policy error code.
+        pub code: String,
+        /// Digest of the bounded failure diagnostic.
+        pub evidence_digest: String,
+    }
+
     /// Immutable receipt conflict reported by an append-only receipt store.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReceiptConflict {
@@ -342,10 +445,10 @@ pub mod unstable {
         pub existing_receipt_id: String,
         /// Receipt identity supplied by the conflicting finalizer.
         pub attempted_receipt_id: String,
-        /// Previously persisted evidence digest.
-        pub existing_evidence_digest: String,
-        /// Attempted evidence digest.
-        pub attempted_evidence_digest: String,
+        /// Canonical identity of the previously finalized evidence.
+        pub existing: ReceiptIdentity,
+        /// Canonical identity of the attempted evidence.
+        pub attempted: ReceiptIdentity,
     }
 
     /// Result of attempting to append immutable terminal evidence.
@@ -358,24 +461,6 @@ pub mod unstable {
         AlreadyFinalized(ReceiptRecord),
         /// A materially different terminal receipt already exists for the action.
         FinalizationConflict(ReceiptConflict),
-    }
-
-    /// Typed evidence-aware decision produced by recovery.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum RecoveryDecision {
-        /// Immutable evidence proves the action committed.
-        RecoverCommitted,
-        /// Immutable evidence proves the action failed.
-        RecoverFailed,
-        /// A live owner still holds the action lease.
-        HeldByOther,
-        /// No terminal evidence exists after lease expiry; provider outcome is unknown.
-        RecoverUnknown,
-        /// No provider boundary was crossed and policy may resume preparation.
-        RecoverRetry,
-        /// State and evidence cannot both be true and require integrity handling.
-        ContradictoryEvidence,
     }
 
     /// Clock consumed by a store implementation, never supplied per operation.
@@ -558,6 +643,19 @@ pub mod unstable {
             next: ExecutionState,
         ) -> Result<(), Self::Error>;
 
+        /// Finalize a consequential action from explicit terminal evidence.
+        ///
+        /// Generic transitions must not manufacture `COMMITTED` or
+        /// externally meaningful `FAILED` states. Implementations persist the
+        /// evidence identity and fenced terminal transition together.
+        fn finalize_from_evidence(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            evidence: &TerminalEvidence,
+        ) -> Result<(), Self::Error>;
+
         /// Apply one state transition under the backend's concurrency policy.
         fn transition(
             &self,
@@ -582,6 +680,12 @@ pub mod unstable {
 
         /// Retrieve the persisted receipt, if one exists.
         fn load(&self, action_id: &str) -> Result<Option<ReceiptRecord>, Self::Error>;
+
+        /// Load conflicts observed while finalizing terminal evidence.
+        ///
+        /// A finalization conflict is durable forensic evidence, not merely a
+        /// response to the worker that discovered it.
+        fn load_conflicts(&self, action_id: &str) -> Result<Vec<ReceiptConflict>, Self::Error>;
     }
 
     /// Error emitted by the non-durable reference stores.
@@ -703,6 +807,7 @@ pub mod unstable {
                     state: ExecutionState::Proposed,
                     lease: None,
                     lease_generation: 0,
+                    terminal_evidence: None,
                 },
             );
             Ok(PrepareActionResult::NewAction)
@@ -910,6 +1015,42 @@ pub mod unstable {
             Ok(())
         }
 
+        fn finalize_from_evidence(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            evidence: &TerminalEvidence,
+        ) -> Result<(), Self::Error> {
+            let now = self.clock.now_unix_ms();
+            let mut records = self.records()?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if record.state != expected {
+                return Err(ReferenceStoreError::UnexpectedState {
+                    expected: Some(expected),
+                    actual: record.state,
+                });
+            }
+            if record.lease.as_ref() != Some(lease) || lease.expires_at_unix_ms <= now {
+                return Err(ReferenceStoreError::LeaseHeld(
+                    record.lease.clone().unwrap_or_else(|| lease.clone()),
+                ));
+            }
+            let next = evidence.terminal_state();
+            if !matches!(next, ExecutionState::Committed | ExecutionState::Failed) {
+                return Err(ReferenceStoreError::InvalidTransition {
+                    current: expected,
+                    next,
+                });
+            }
+            record.terminal_evidence = Some(evidence.clone());
+            record.state = next;
+            record.lease = None;
+            Ok(())
+        }
+
         fn transition(
             &self,
             action_id: &str,
@@ -953,6 +1094,7 @@ pub mod unstable {
     #[derive(Clone, Default)]
     pub struct InMemoryReceiptStore {
         receipts: Arc<Mutex<HashMap<String, ReceiptRecord>>>,
+        conflicts: Arc<Mutex<HashMap<String, Vec<ReceiptConflict>>>>,
     }
 
     impl ReceiptStore for InMemoryReceiptStore {
@@ -968,16 +1110,25 @@ pub mod unstable {
                     receipts.insert(receipt.action_id.clone(), receipt.clone());
                     Ok(FinalizeResult::Finalized(receipt.clone()))
                 }
-                Some(existing) if existing == receipt => {
+                Some(existing) if existing.identity() == receipt.identity() => {
                     Ok(FinalizeResult::AlreadyFinalized(existing.clone()))
                 }
-                Some(existing) => Ok(FinalizeResult::FinalizationConflict(ReceiptConflict {
-                    action_id: receipt.action_id.clone(),
-                    existing_receipt_id: existing.receipt_id.clone(),
-                    attempted_receipt_id: receipt.receipt_id.clone(),
-                    existing_evidence_digest: existing.evidence_digest.clone(),
-                    attempted_evidence_digest: receipt.evidence_digest.clone(),
-                })),
+                Some(existing) => {
+                    let conflict = ReceiptConflict {
+                        action_id: receipt.action_id.clone(),
+                        existing_receipt_id: existing.receipt_id.clone(),
+                        attempted_receipt_id: receipt.receipt_id.clone(),
+                        existing: existing.identity(),
+                        attempted: receipt.identity(),
+                    };
+                    self.conflicts
+                        .lock()
+                        .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                        .entry(receipt.action_id.clone())
+                        .or_default()
+                        .push(conflict.clone());
+                    Ok(FinalizeResult::FinalizationConflict(conflict))
+                }
             }
         }
 
@@ -988,6 +1139,16 @@ pub mod unstable {
                 .map_err(|_| ReferenceStoreError::LockPoisoned)?
                 .get(action_id)
                 .cloned())
+        }
+
+        fn load_conflicts(&self, action_id: &str) -> Result<Vec<ReceiptConflict>, Self::Error> {
+            Ok(self
+                .conflicts
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                .get(action_id)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -1021,6 +1182,14 @@ pub mod unstable {
             assert!(!is_valid_transition(
                 Some(ExecutionState::Prepared),
                 ExecutionState::Committed
+            ));
+            assert!(!is_valid_transition(
+                Some(ExecutionState::Dispatching),
+                ExecutionState::Committed
+            ));
+            assert!(!is_valid_transition(
+                Some(ExecutionState::Unknown),
+                ExecutionState::Failed
             ));
         }
 
@@ -1150,6 +1319,20 @@ pub mod unstable {
                 Ok(())
             }
 
+            fn finalize_from_evidence(
+                &self,
+                _action_id: &str,
+                _expected: ExecutionState,
+                _lease: &ActionLease,
+                evidence: &TerminalEvidence,
+            ) -> Result<(), Self::Error> {
+                assert!(matches!(
+                    evidence.terminal_state(),
+                    ExecutionState::Committed | ExecutionState::Failed
+                ));
+                Ok(())
+            }
+
             fn transition(
                 &self,
                 _execution_id: &str,
@@ -1181,6 +1364,7 @@ pub mod unstable {
                     principal_id: "alice".into(),
                     tenant_id: Some("tenant".into()),
                     runtime_id: "runtime".into(),
+                    runtime_binding_digest: "runtime-binding".into(),
                     capability_id: "capability".into(),
                     capability_generation: 1,
                     registration_digest: "registration".into(),
@@ -1197,6 +1381,13 @@ pub mod unstable {
                     finished_at_unix_ms: 2,
                     evidence_digest: "evidence".into(),
                 }))
+            }
+
+            fn load_conflicts(
+                &self,
+                _action_id: &str,
+            ) -> Result<Vec<ReceiptConflict>, Self::Error> {
+                Ok(Vec::new())
             }
         }
 
@@ -1224,6 +1415,7 @@ pub mod unstable {
                         tenant_id: None,
                         principal_id: "alice".into(),
                         runtime_id: "runtime".into(),
+                        runtime_binding_digest: "runtime-binding".into(),
                         capability_id: "capability".into(),
                         capability_generation: 1,
                         registration_digest: "registration".into(),
@@ -1298,6 +1490,7 @@ pub mod unstable {
                 tenant_id: Some("tenant".into()),
                 principal_id: "alice".into(),
                 runtime_id: "runtime".into(),
+                runtime_binding_digest: "runtime-binding".into(),
                 capability_id: "capability".into(),
                 capability_generation: 1,
                 registration_digest: "registration".into(),
@@ -1322,6 +1515,7 @@ pub mod unstable {
                 principal_id: "alice".into(),
                 tenant_id: Some("tenant".into()),
                 runtime_id: "runtime".into(),
+                runtime_binding_digest: "runtime-binding".into(),
                 capability_id: "capability".into(),
                 capability_generation: 1,
                 registration_digest: "registration".into(),
@@ -1470,10 +1664,15 @@ pub mod unstable {
                 store.finalize(&committed).unwrap(),
                 FinalizeResult::Finalized(_)
             ));
-            assert!(matches!(
-                store.finalize(&committed).unwrap(),
-                FinalizeResult::AlreadyFinalized(_)
-            ));
+            let mut replay = committed.clone();
+            replay.receipt_id = "recovered-receipt".into();
+            replay.started_at_unix_ms = 99;
+            replay.finished_at_unix_ms = 100;
+            assert_eq!(
+                store.finalize(&replay).unwrap(),
+                FinalizeResult::AlreadyFinalized(committed.clone()),
+                "local receipt identifiers and observation timestamps do not change provider evidence"
+            );
             assert!(matches!(
                 store
                     .finalize(&reference_receipt(ExecutionState::Failed, "evidence-b"))
@@ -1481,6 +1680,57 @@ pub mod unstable {
                 FinalizeResult::FinalizationConflict(_)
             ));
             assert_eq!(store.load("reference-action").unwrap(), Some(committed));
+            let conflicts = store.load_conflicts("reference-action").unwrap();
+            assert_eq!(
+                conflicts.len(),
+                1,
+                "conflicts are durable forensic evidence"
+            );
+            assert_eq!(conflicts[0].existing.evidence_digest, "evidence-a");
+            assert_eq!(conflicts[0].attempted.evidence_digest, "evidence-b");
+        }
+
+        #[test]
+        fn terminal_states_require_fenced_terminal_evidence() {
+            let (store, _clock) = prepared_reference_store();
+            let lease = match store
+                .claim_lease("reference-action", ExecutionState::Prepared, "owner", None)
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                result => panic!("unexpected lease result: {result:?}"),
+            };
+            store
+                .transition_with_lease(
+                    "reference-action",
+                    ExecutionState::Prepared,
+                    &lease,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            assert!(matches!(
+                store.transition_with_lease(
+                    "reference-action",
+                    ExecutionState::Dispatching,
+                    &lease,
+                    ExecutionState::Committed,
+                ),
+                Err(ReferenceStoreError::InvalidTransition { .. })
+            ));
+            let evidence = TerminalEvidence::Receipt(
+                reference_receipt(ExecutionState::Committed, "provider-evidence").identity(),
+            );
+            store
+                .finalize_from_evidence(
+                    "reference-action",
+                    ExecutionState::Dispatching,
+                    &lease,
+                    &evidence,
+                )
+                .unwrap();
+            let action = store.load_action("reference-action").unwrap().unwrap();
+            assert_eq!(action.state, ExecutionState::Committed);
+            assert_eq!(action.terminal_evidence, Some(evidence));
         }
 
         #[test]
