@@ -758,7 +758,7 @@ where
         }
         let lease = match self.claim_lease(&action, action.state, "recovery")? {
             Some(lease) => lease,
-            None => return Ok(self.action_status(&action, None)),
+            None => return Ok(self.action_status_wait_for_owner(&action, None)),
         };
         if action.state == ExecutionState::Reconciling {
             self.transition_action_with_lease(
@@ -903,7 +903,7 @@ where
             Some(lease) => lease,
             None => {
                 return Err(KernelError::ActionPending {
-                    action: Box::new(self.action_status(&action, None)),
+                    action: Box::new(self.action_status_wait_for_owner(&action, None)),
                     cause: ActionPendingCause::LeaseHeld,
                 });
             }
@@ -1054,11 +1054,15 @@ where
                 let lease = match self.claim_lease_for_request(request, ExecutionState::Prepared)? {
                     Some(lease) => lease,
                     None => {
-                        return Err(self.pending_after_authority_failure(
-                            request,
-                            ExecutionState::Prepared,
-                            ActionPendingCause::LeaseHeld,
-                        ));
+                        return Err(KernelError::ActionPending {
+                            action: Box::new(self.action_status_with_next_action(
+                                &request.action_preparation(),
+                                ExecutionState::Prepared,
+                                ActionNextStep::WaitForOwner,
+                                None,
+                            )),
+                            cause: ActionPendingCause::LeaseHeld,
+                        });
                     }
                 };
                 self.transition_with_lease(
@@ -1473,6 +1477,7 @@ where
             preparation: request.action_preparation(),
             state: expected,
             lease: None,
+            lease_generation: 0,
         };
         self.claim_lease(&action, expected, "execute")
     }
@@ -1531,6 +1536,32 @@ where
             intended_state: Some(intended_state),
             next_action: ActionNextStep::RepairEvidence,
             ..self.action_status_with_state(action, observed_state, None)
+        }
+    }
+
+    fn action_status_wait_for_owner(
+        &self,
+        action: &ActionRecord,
+        receipt: Option<ReceiptRecord>,
+    ) -> ActionStatus {
+        ActionStatus {
+            next_action: ActionNextStep::WaitForOwner,
+            safe_to_retry: false,
+            ..self.action_status(action, receipt)
+        }
+    }
+
+    fn action_status_with_next_action(
+        &self,
+        action: &ActionPreparation,
+        state: ExecutionState,
+        next_action: ActionNextStep,
+        receipt: Option<ReceiptRecord>,
+    ) -> ActionStatus {
+        ActionStatus {
+            next_action,
+            safe_to_retry: false,
+            ..self.action_status_with_state(action, state, receipt)
         }
     }
 
@@ -1765,6 +1796,7 @@ mod tests {
                     preparation: action.clone(),
                     state: ExecutionState::Proposed,
                     lease: None,
+                    lease_generation: 0,
                 },
             );
             self.states
@@ -1811,6 +1843,7 @@ mod tests {
                             },
                             state,
                             lease: None,
+                            lease_generation: 0,
                         })
                 }))
         }
@@ -1930,16 +1963,14 @@ mod tests {
             {
                 return Ok(LeaseClaim::Held(lease.clone()));
             }
-            let generation = record
-                .lease
-                .as_ref()
-                .map_or(1, |lease| lease.generation.saturating_add(1));
+            let generation = record.lease_generation.saturating_add(1);
             let lease = ActionLease {
                 owner_id: owner_id.to_owned(),
                 generation,
                 expires_at_unix_ms: now_unix_ms.saturating_add(lease_duration_ms),
             };
             record.lease = Some(lease.clone());
+            record.lease_generation = generation;
             Ok(LeaseClaim::Acquired(lease))
         }
 
@@ -2945,13 +2976,14 @@ mod tests {
         let pending = kernel
             .reconcile(&action_id)
             .expect_err("live reconciliation owner must fence a second worker");
-        assert!(matches!(
-            pending,
+        let pending_status = match pending {
             KernelError::ActionPending {
+                action,
                 cause: ActionPendingCause::LeaseHeld,
-                ..
-            }
-        ));
+            } => action,
+            _ => panic!("live lease must return a typed wait outcome"),
+        };
+        assert_eq!(pending_status.next_action, ActionNextStep::WaitForOwner);
         {
             let mut records = actions.records.lock().unwrap();
             records.get_mut(&action_id).unwrap().lease = Some(ActionLease {
@@ -2971,6 +3003,58 @@ mod tests {
             .expect("expired reconciliation lease should recover to unknown");
         assert_eq!(recovered.state, ExecutionState::Unknown);
         assert_eq!(recovered.next_action, ActionNextStep::Reconcile);
+    }
+
+    #[test]
+    fn lease_generation_remains_monotonic_after_a_lease_is_released() {
+        let (kernel, _authority, _function, _effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        let bound = kernel
+            .bind(&invocation_with_request_id("monotonic-lease"))
+            .expect("request should bind");
+        let action = bound.action_preparation();
+        actions.claim_action(&action).expect("action should claim");
+        {
+            let mut records = actions.records.lock().unwrap();
+            let record = records.get_mut(&action.action_id).unwrap();
+            record.state = ExecutionState::Prepared;
+        }
+        actions
+            .states
+            .lock()
+            .unwrap()
+            .insert(action.action_id.clone(), ExecutionState::Prepared);
+        let first = match actions
+            .claim_lease(&action.action_id, ExecutionState::Prepared, "first", 1, 10)
+            .expect("first lease should claim")
+        {
+            LeaseClaim::Acquired(lease) => lease,
+            LeaseClaim::Held(_) => panic!("first lease cannot be held"),
+        };
+        actions
+            .transition_with_lease(
+                &action.action_id,
+                ExecutionState::Prepared,
+                &first,
+                ExecutionState::Dispatching,
+            )
+            .expect("first fenced transition should apply");
+        actions
+            .transition_with_lease(
+                &action.action_id,
+                ExecutionState::Dispatching,
+                &first,
+                ExecutionState::Unknown,
+            )
+            .expect("terminal transition releases the first lease");
+        let second = match actions
+            .claim_lease(&action.action_id, ExecutionState::Unknown, "second", 20, 10)
+            .expect("second lease should claim")
+        {
+            LeaseClaim::Acquired(lease) => lease,
+            LeaseClaim::Held(_) => panic!("released lease cannot remain held"),
+        };
+        assert!(second.generation > first.generation);
     }
 
     #[test]

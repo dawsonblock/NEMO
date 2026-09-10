@@ -155,6 +155,11 @@ pub mod unstable {
         pub state: ExecutionState,
         /// Current dispatch or reconciliation ownership, if any.
         pub lease: Option<ActionLease>,
+        /// Highest lease generation ever issued for this action.
+        ///
+        /// This counter is retained after a terminal or rollback transition so
+        /// a later lease can never reuse an earlier fencing generation.
+        pub lease_generation: u64,
     }
 
     /// Result of atomically claiming an action/idempotency key.

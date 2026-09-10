@@ -93,7 +93,10 @@ expiry. A recovery worker can take over only after that lease expires, so it
 cannot turn a live dispatch into spurious ambiguity. A stale `DISPATCHING`
 action can be recovered only from a fully bound persisted receipt; otherwise
 it becomes `UNKNOWN` and must be reconciled. A stale `RECONCILING` action
-returns to `UNKNOWN` under the same fencing rule.
+returns to `UNKNOWN` under the same fencing rule. The action record retains
+the highest issued lease generation even after a lease is released, so a later
+owner cannot reuse a previous fencing token. While another lease is live, the
+kernel returns `WAIT_FOR_OWNER` rather than suggesting recovery or redispatch.
 
 Retry policy is deliberately conservative: `FAILED` after confirmed
 pre-dispatch failure may be evaluated for a new attempt by the external effect
