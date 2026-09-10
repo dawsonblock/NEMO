@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "b81f40c8a1387816a17647a13f467b78cdd74b5868daa41805aa48114434a478",
+  "root_digest": "84b913eec9580fadcd0f6ec49d3ea0de3d4759dd38ac2d208e8605a678097f87",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -465,7 +465,7 @@
     "crates/core/src/context/registries.rs": "11a9f411d370cfb8feeaf86e6131a0883fa245c403a6433faf177e29c2332989",
     "crates/core/src/error.rs": "bd6a0370ffc3f73c19d13eead8eed8449f61cc1dbc6d00195af84c3e5a98ff90",
     "crates/core/src/json.rs": "384a15923841c448d8db1a643383a3c1471cebe2bbfb2ed689e5243da84edcef",
-    "crates/core/src/kernel.rs": "24be5b0eb0361a9cccae8f59390391658277d05bbbeb28854a524534beef5253",
+    "crates/core/src/kernel.rs": "92cfb69fa984f247ee4f20fe62866de62c3c5b4ff2939d5e36dda2abd91f843a",
     "crates/core/src/lib.rs": "536660f4b6735c51466002bcfc08ed2571393b5d2f750792d7cc29a4d233eaa1",
     "crates/core/src/logging/config.rs": "f3695584854c360f34e558453d76c7c737854d603cf26c27ed0dfa5eeb933914",
     "crates/core/src/logging/format.rs": "41621187a4ba0cbacac859e214586ec56d409bf96b1d77f597c4b44ab6a5a599",
@@ -622,7 +622,7 @@
     "crates/isolation/Cargo.toml": "72d54e18ad996f4f4db410d0c6e036b6fefd80e52979471d88eb0254a628b1c3",
     "crates/isolation/src/lib.rs": "62d469d8a2a4bdf1dc1ebda5122cd9cdae2ab595c2b7375b20e6048f2af2cda4",
     "crates/ledger/Cargo.toml": "f7c6f6dc47b284f01ffd367b769dddf4a40e6be395cd77d79a9c3c45a4389f7b",
-    "crates/ledger/src/lib.rs": "656ac1f2548c6a99fbb62da2ab9ade1c6f47d1f14a0bf65c41784d294918c94c",
+    "crates/ledger/src/lib.rs": "e6040a45ca8bb77b3e5d92c2392bf9ae95b641e9597a748d5190048faea96e60",
     "crates/node/Cargo.toml": "7fcdb1fa79845584cacc805879f9a208a2844cae3635bd4cd8d67509dc91d341",
     "crates/node/README.md": "d99acaf3bf89aff377415a6e174c701d484fd435bccc1f8a6d46ef0dff08b1a7",
     "crates/node/adaptive.d.ts": "721a53796be6dfddbd9d95d80d7a7fbd066083bed5e7595f6da1bea7a689cb8d",
@@ -850,7 +850,7 @@
     "docs/reference/api/index.mdx": "e8f871cfa073d8cadddb8b24630c45c847222a0a3d0555a91a77d9bec1ae7b58",
     "docs/reference/atof-event-format.mdx": "65c2826a93a8339f4d11d1448bd17bdd89daec73c94bfb93f97a5f5a6b02f9e7",
     "docs/reference/event-sanitizers.mdx": "208dbf06f7001e585fdacabc5b8ec641a3322a0782f73c51b4077b276063f147",
-    "docs/reference/hardening.mdx": "d554337e0ef63e24537633f20260f6a8682e06e65aac900b4458dea5da036cbf",
+    "docs/reference/hardening.mdx": "48af30178cb7a3eb5a73df18a4ac34f18ebdc6ef461cb397bf34062ddcc8533b",
     "docs/reference/llm-request-intercept-outcomes.mdx": "5eb27460a378b6ed634e8866d1554cbcdd69f7f4facbaccbafd837f2b7ce8eae",
     "docs/reference/migration-guides.mdx": "91460a0d5d84a16d742a102df37d3fb025090c3897424e306c015149bc4f761e",
     "docs/reference/operational-logging.mdx": "5ea9963bf24b24dbac9bdf75b834c3b534e2fd853c50d448cfff4c4347eb1295",
@@ -1320,7 +1320,7 @@
     "build",
     "dist"
   ],
-  "source_archive_sha256": "6d4b020ee2c550492cc351850e025c4d860bb38795fd090257c0edc84ea6aaee",
+  "source_archive_sha256": "f8809b27db480ae2682392024164b6598ee86b7f15b1d6da09de0a46320d9242",
   "release_archive_sha256": null,
   "lockfiles": {
     "Cargo.lock": "sha256:5cc45155ec25aee61f24414593c16f05900828d8d2a674a15dcaaaaf1b320b89",
@@ -1328,9 +1328,9 @@
     "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
   },
   "git": {
-    "commit": "8b37efacf761237483f6c834c6aa63e7905c287e",
-    "tree": "07e1840f5295e257c0593427a7f67487ebac7747",
-    "source_tree_sha256": "b81f40c8a1387816a17647a13f467b78cdd74b5868daa41805aa48114434a478",
+    "commit": "f022654c893845118caac977c9ddc1c8f6510b9d",
+    "tree": "b8fea79b335987520ae9ef46c29e67d27a0a7b28",
+    "source_tree_sha256": "84b913eec9580fadcd0f6ec49d3ea0de3d4759dd38ac2d208e8605a678097f87",
     "status": []
   }
 }
