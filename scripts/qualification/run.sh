@@ -139,7 +139,15 @@ def excluded(relative):
         ".uv-cache",
         ".pytest_cache",
         ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "build",
+        "dist",
     }:
+        return True
+    if "__pycache__" in relative.parts or relative.name == ".coverage":
+        return True
+    if relative.suffix in {".pyc", ".pyo"}:
         return True
     # Deterministic release packages and their sidecar evidence are generated
     # outputs, not source inputs. Keep them out of the tree hash to avoid a
@@ -231,14 +239,22 @@ manifest = {
     "algorithm": "sha256",
     "root_digest": source_tree_sha256,
     "files": file_hashes,
-    "excluded_roots": [".git", "target", "node_modules", "coverage", "qualification"],
+    "excluded_roots": [
+        ".git", "target", "node_modules", "coverage", "qualification", ".venv",
+        ".uv-cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "build", "dist",
+    ],
     "source_archive_sha256": source_archive_sha256,
     "release_archive_sha256": release_archive_sha256,
     "lockfiles": locks,
     "git": {
         "commit": (git_output(["rev-parse", "HEAD"]) or "").strip() or None,
         "tree": (git_output(["rev-parse", "HEAD^{tree}"]) or "").strip() or None,
-        "status": (git_output(["status", "--short"]) or "").splitlines(),
+        "source_tree_sha256": source_tree_sha256,
+        "status": [
+            line
+            for line in (git_output(["status", "--short"]) or "").splitlines()
+            if "qualification/" not in line and "release/artifacts/" not in line
+        ],
     },
 }
 (out / "source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -256,7 +272,9 @@ PY
 
 git_commit="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
 git_tree="$(git -C "${repo_root}" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-git_dirty="$(git -C "${repo_root}" status --short 2>/dev/null || true)"
+# Generated evidence is intentionally excluded from the cleanliness signal;
+# source and release inputs remain visible to the qualification record.
+git_dirty="$(git -C "${repo_root}" status --short 2>/dev/null | grep -v 'qualification/' | grep -v 'release/artifacts/' || true)"
 {
     printf 'commit=%s\n' "${git_commit:-unavailable}"
     printf 'tree=%s\n' "${git_tree:-unavailable}"
@@ -408,7 +426,7 @@ report = {
     "notes": [
         "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
         "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
-        "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons.",
+        "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
         "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result.",
     ],
 }

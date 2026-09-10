@@ -40,6 +40,9 @@ pub struct AdaptiveConfig {
     /// the adaptive plugin installs the response-cache execution intercept(s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_cache: Option<ResponseCacheConfig>,
+    /// Always-on provider admission limits, independent of response caching.
+    #[serde(default)]
+    pub provider_admission: SingleFlightLimits,
     /// Adaptive-local unsupported-config policy.
     #[serde(default)]
     pub policy: ConfigPolicy,
@@ -56,6 +59,7 @@ impl Default for AdaptiveConfig {
             tool_parallelism: None,
             acg: None,
             response_cache: None,
+            provider_admission: SingleFlightLimits::default(),
             policy: ConfigPolicy::default(),
         }
     }
@@ -223,7 +227,7 @@ pub struct ResponseCacheConfig {
     /// Storage backend selection.
     pub backend: BackendConfig,
     /// Bounds process-local collapse of concurrent cache misses and live
-    /// provider work started by cache misses.
+    /// provider work admitted by the adaptive runtime.
     pub singleflight: SingleFlightLimits,
     /// Opt-in tool-result cache configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,12 +262,18 @@ pub struct SingleFlightLimits {
     pub max_waiters_per_key: usize,
     /// Maximum followers waiting across all active cache keys.
     pub max_global_waiters: usize,
-    /// Maximum concurrent provider calls started by this response-cache feature.
+    /// Maximum concurrent provider calls admitted by the adaptive runtime.
     pub max_global_provider_concurrency: usize,
     /// Maximum concurrent provider calls for one provider name.
     pub max_provider_concurrency: usize,
     /// Maximum concurrent provider calls for one provider/model pair.
     pub max_model_concurrency: usize,
+    /// Maximum provider operations waiting for coordinated admission.
+    pub max_pending_provider_requests: usize,
+    /// Maximum pending provider operations for one provider name.
+    pub max_pending_provider_per_provider: usize,
+    /// Maximum time a provider operation may wait for admission.
+    pub provider_admission_timeout_ms: u64,
 }
 
 impl Default for SingleFlightLimits {
@@ -275,6 +285,9 @@ impl Default for SingleFlightLimits {
             max_global_provider_concurrency: 512,
             max_provider_concurrency: 128,
             max_model_concurrency: 64,
+            max_pending_provider_requests: 2048,
+            max_pending_provider_per_provider: 512,
+            provider_admission_timeout_ms: 30_000,
         }
     }
 }
@@ -355,6 +368,12 @@ nemo_relay::editor_config! {
             optional: true,
             nested: AcgComponentConfig,
             default: AcgComponentConfig,
+        },
+        provider_admission => {
+            label: "provider_admission",
+            kind: Section,
+            nested: SingleFlightLimits,
+            default: SingleFlightLimits,
         },
         response_cache => {
             label: "response_cache",
@@ -568,6 +587,9 @@ nemo_relay::editor_config! {
         max_global_provider_concurrency => { label: "max_global_provider_concurrency", kind: Integer },
         max_provider_concurrency => { label: "max_provider_concurrency", kind: Integer },
         max_model_concurrency => { label: "max_model_concurrency", kind: Integer },
+        max_pending_provider_requests => { label: "max_pending_provider_requests", kind: Integer },
+        max_pending_provider_per_provider => { label: "max_pending_provider_per_provider", kind: Integer },
+        provider_admission_timeout_ms => { label: "provider_admission_timeout_ms", kind: Integer },
     }
 }
 

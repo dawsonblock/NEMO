@@ -1,0 +1,31 @@
+{
+  "name": "nemo-relay-correct-once",
+  "version": "0.9.1-rc.4",
+  "private": true,
+  "type": "module",
+  "description": "NEMO capability routing and Correct-Once grant integration.",
+  "main": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.mjs" },
+    "./canonical": "./src/canonical.mjs",
+    "./capabilities": "./src/capabilities.mjs",
+    "./effect-fabric": "./src/effect-fabric.mjs",
+    "./function-hooks": "./src/function-hooks.mjs",
+    "./grants": "./src/grants.mjs",
+    "./nemo": "./src/nemo.mjs",
+    "./registry": "./src/registry.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0 <25.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "format": "prettier --write \"*.mjs\" \"src/**/*.mjs\" \"test/**/*.mjs\"",
+    "format:check": "prettier --check \"*.mjs\" \"src/**/*.mjs\" \"test/**/*.mjs\""
+  },
+  "devDependencies": {
+    "prettier": "^3.8.2"
+  },
+  "license": "Apache-2.0"
+}

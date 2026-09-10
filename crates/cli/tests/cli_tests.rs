@@ -4639,6 +4639,7 @@ fn cli_transparent_run_forwards_non_tty_termination_to_the_agent_tree() {
         &agent,
         r#"#!/usr/bin/env python3
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -4646,6 +4647,12 @@ import time
 if sys.argv[1:] == ["--version"]:
     print("codex-cli 0.143.0")
     raise SystemExit(0)
+
+def terminate(signum, frame):
+    raise SystemExit(128 + signum)
+
+for forwarded_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+    signal.signal(forwarded_signal, terminate)
 
 descendant = subprocess.Popen(["sleep", "30"])
 pid_path = os.environ["NEMO_RELAY_TEST_AGENT_PIDS"]

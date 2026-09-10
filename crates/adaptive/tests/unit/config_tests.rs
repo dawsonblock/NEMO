@@ -47,6 +47,20 @@ fn test_typed_section_helpers_default() {
     );
     assert_eq!(response_cache.singleflight.max_provider_concurrency, 128);
     assert_eq!(response_cache.singleflight.max_model_concurrency, 64);
+    assert_eq!(
+        response_cache.singleflight.max_pending_provider_requests,
+        2048
+    );
+    assert_eq!(
+        response_cache
+            .singleflight
+            .max_pending_provider_per_provider,
+        512
+    );
+    assert_eq!(
+        response_cache.singleflight.provider_admission_timeout_ms,
+        30_000
+    );
 
     let tools = ToolCacheConfig::default();
     assert!(!tools.enabled);
@@ -197,6 +211,7 @@ fn test_adaptive_editor_schema_covers_canonical_options() {
             "adaptive_hints",
             "tool_parallelism",
             "acg",
+            "provider_admission",
             "response_cache",
             "policy",
         ]

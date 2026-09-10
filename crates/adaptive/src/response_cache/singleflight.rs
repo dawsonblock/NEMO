@@ -3,19 +3,21 @@
 
 //! Process-local collapse of concurrent identical cache misses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use nemo_relay::api::runtime::{LlmJsonStream, LlmStreamInner};
 use nemo_relay::error::{FlowError, Result as FlowResult};
 use serde_json::Value as Json;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, timeout};
 use tokio_stream::Stream;
 
 use crate::config::SingleFlightLimits;
@@ -44,6 +46,8 @@ pub(crate) struct SingleFlightStats {
     pub rejections: usize,
     /// Number of provider calls holding all concurrency permits.
     pub provider_active_requests: usize,
+    /// Number of provider operations waiting for coordinated admission.
+    pub provider_pending_requests: usize,
 }
 
 #[derive(Default)]
@@ -88,24 +92,69 @@ fn remove_completed_call<T>(
     }
 }
 
-/// Shared provider/model concurrency limits for cache-miss provider calls.
+struct PendingAdmission {
+    ticket: usize,
+    provider: String,
+    model: Option<String>,
+    grant: oneshot::Sender<ProviderPermits>,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    queue: VecDeque<PendingAdmission>,
+    pending_global: usize,
+    pending_provider: HashMap<String, usize>,
+    active_global: usize,
+    active_provider: HashMap<String, usize>,
+    active_model: HashMap<(String, String), usize>,
+}
+
+struct PendingAdmissionReservation {
+    controller: Arc<ProviderConcurrency>,
+    ticket: Option<usize>,
+}
+
+impl PendingAdmissionReservation {
+    fn disarm(&mut self) {
+        self.ticket = None;
+    }
+
+    fn cancel(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.controller.cancel_pending(ticket);
+        }
+    }
+}
+
+impl Drop for PendingAdmissionReservation {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Coordinated provider/model admission for live operations.
+///
+/// Admission is all-or-nothing: a request is queued before it receives any
+/// active capacity, then removed from the queue only when the global,
+/// provider, and model limits can all be satisfied. This avoids chained
+/// semaphore permit hoarding and bounds both active and pending work.
 pub(crate) struct ProviderConcurrency {
     limits: SingleFlightLimits,
-    global: Arc<Semaphore>,
-    providers: Mutex<HashMap<String, Weak<Semaphore>>>,
-    models: Mutex<HashMap<String, Weak<Semaphore>>>,
+    state: Mutex<AdmissionState>,
+    next_ticket: AtomicUsize,
     active_requests: AtomicUsize,
+    pending_requests: AtomicUsize,
 }
 
 impl ProviderConcurrency {
-    /// Create a limiter with the response-cache single-flight limits.
+    /// Create a coordinated limiter with provider-admission limits.
     pub(crate) fn new(limits: SingleFlightLimits) -> Self {
         Self {
-            global: Arc::new(Semaphore::new(limits.max_global_provider_concurrency)),
             limits,
-            providers: Mutex::new(HashMap::new()),
-            models: Mutex::new(HashMap::new()),
+            state: Mutex::new(AdmissionState::default()),
+            next_ticket: AtomicUsize::new(0),
             active_requests: AtomicUsize::new(0),
+            pending_requests: AtomicUsize::new(0),
         }
     }
 
@@ -114,44 +163,46 @@ impl ProviderConcurrency {
         provider: &str,
         model: Option<&str>,
     ) -> FlowResult<ProviderPermits> {
-        let global = acquire_permit(
-            Arc::clone(&self.global),
-            "singleflight.global_provider_concurrency",
-            self.limits.max_global_provider_concurrency,
-        )
-        .await?;
-        let provider_permit = acquire_permit(
-            scoped_semaphore(
-                &self.providers,
-                provider,
-                self.limits.max_provider_concurrency,
-            ),
-            "singleflight.provider_concurrency",
-            self.limits.max_provider_concurrency,
-        )
-        .await?;
-        let model_permit = match model {
-            Some(model) => Some(
-                acquire_permit(
-                    scoped_semaphore(
-                        &self.models,
-                        &format!("{provider}\u{1f}{model}"),
-                        self.limits.max_model_concurrency,
-                    ),
-                    "singleflight.model_concurrency",
-                    self.limits.max_model_concurrency,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-        self.active_requests.fetch_add(1, Ordering::Relaxed);
-        Ok(ProviderPermits {
-            _global: global,
-            _provider: provider_permit,
-            _model: model_permit,
-            limiter: Arc::clone(self),
-        })
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(
+                self.limits.provider_admission_timeout_ms,
+            ))
+            .unwrap_or_else(Instant::now);
+
+        // Admit immediately before consuming a pending slot. This preserves
+        // available capacity for unrelated providers even when another queue
+        // is saturated.
+        if let Some(permits) = self.try_admit_immediately(provider, model) {
+            return Ok(permits);
+        }
+
+        let (mut reservation, receiver) = self.enqueue(provider, model)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            reservation.cancel();
+            return Err(FlowError::Timeout {
+                resource: "provider_admission",
+            });
+        }
+
+        match timeout(remaining, receiver).await {
+            Ok(Ok(permits)) => {
+                reservation.disarm();
+                Ok(permits)
+            }
+            Ok(Err(_)) => {
+                reservation.cancel();
+                Err(FlowError::Internal(
+                    "provider admission scheduler stopped".into(),
+                ))
+            }
+            Err(_) => {
+                reservation.cancel();
+                Err(FlowError::Timeout {
+                    resource: "provider_admission",
+                })
+            }
+        }
     }
 
     /// Run a live provider operation while holding the global, provider, and
@@ -170,7 +221,8 @@ impl ProviderConcurrency {
     }
 
     /// Attach provider permits to a stream so they remain held until EOF,
-    /// terminalization, explicit close, or drop. Long-lived streaming calls
+    /// successful or failed close, or drop. Consumer terminalization alone
+    /// does not release the producer's capacity. Long-lived streaming calls
     /// therefore count against the same budgets as buffered calls.
     pub(crate) fn guard_stream(
         self: &Arc<Self>,
@@ -188,13 +240,217 @@ impl ProviderConcurrency {
     fn active_requests(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    fn pending_requests(&self) -> usize {
+        self.pending_requests.load(Ordering::Relaxed)
+    }
+
+    fn enqueue(
+        self: &Arc<Self>,
+        provider: &str,
+        model: Option<&str>,
+    ) -> FlowResult<(
+        PendingAdmissionReservation,
+        oneshot::Receiver<ProviderPermits>,
+    )> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.pending_global >= self.limits.max_pending_provider_requests {
+            return Err(FlowError::ResourceExhausted {
+                resource: "provider_admission.pending",
+                limit: self.limits.max_pending_provider_requests,
+            });
+        }
+        let provider_pending = state.pending_provider.get(provider).copied().unwrap_or(0);
+        if provider_pending >= self.limits.max_pending_provider_per_provider {
+            return Err(FlowError::ResourceExhausted {
+                resource: "provider_admission.pending_provider",
+                limit: self.limits.max_pending_provider_per_provider,
+            });
+        }
+
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let (grant, receiver) = oneshot::channel();
+        state.queue.push_back(PendingAdmission {
+            ticket,
+            provider: provider.to_string(),
+            model: model.map(str::to_string),
+            grant,
+        });
+        state.pending_global += 1;
+        *state
+            .pending_provider
+            .entry(provider.to_string())
+            .or_default() += 1;
+        self.pending_requests.fetch_add(1, Ordering::Relaxed);
+        let reservation = PendingAdmissionReservation {
+            controller: Arc::clone(self),
+            ticket: Some(ticket),
+        };
+        drop(state);
+        self.schedule_pending();
+        Ok((reservation, receiver))
+    }
+
+    fn try_admit_immediately(
+        self: &Arc<Self>,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Option<ProviderPermits> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Do not let a new request consume capacity that an older eligible
+        // waiter is already entitled to. The caller will enqueue behind that
+        // waiter, and schedule_pending() will grant both atomically whenever
+        // capacity permits. Ineligible waiters for saturated providers are
+        // intentionally skipped so unrelated providers still make progress.
+        if state
+            .queue
+            .iter()
+            .any(|pending| self.can_admit(&state, pending))
+        {
+            return None;
+        }
+        if !self.can_admit_parts(&state, provider, model) {
+            return None;
+        }
+        state.active_global += 1;
+        *state
+            .active_provider
+            .entry(provider.to_string())
+            .or_default() += 1;
+        if let Some(model) = model {
+            *state
+                .active_model
+                .entry((provider.to_string(), model.to_string()))
+                .or_default() += 1;
+        }
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        Some(ProviderPermits {
+            controller: Arc::clone(self),
+            provider: provider.to_string(),
+            model: model.map(str::to_string),
+        })
+    }
+
+    fn can_admit(&self, state: &AdmissionState, pending: &PendingAdmission) -> bool {
+        self.can_admit_parts(state, &pending.provider, pending.model.as_deref())
+    }
+
+    fn can_admit_parts(&self, state: &AdmissionState, provider: &str, model: Option<&str>) -> bool {
+        if state.active_global >= self.limits.max_global_provider_concurrency {
+            return false;
+        }
+        if state.active_provider.get(provider).copied().unwrap_or(0)
+            >= self.limits.max_provider_concurrency
+        {
+            return false;
+        }
+        model.is_none_or(|model| {
+            state
+                .active_model
+                .get(&(provider.to_string(), model.to_string()))
+                .copied()
+                .unwrap_or(0)
+                < self.limits.max_model_concurrency
+        })
+    }
+
+    fn cancel_pending(self: &Arc<Self>, ticket: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(index) = state
+            .queue
+            .iter()
+            .position(|pending| pending.ticket == ticket)
+        else {
+            return;
+        };
+        let pending = state.queue.remove(index).expect("pending admission index");
+        state.pending_global = state.pending_global.saturating_sub(1);
+        decrement_count(&mut state.pending_provider, &pending.provider);
+        self.pending_requests.fetch_sub(1, Ordering::Relaxed);
+        let grants = self.schedule_pending_locked(&mut state);
+        drop(state);
+        self.send_grants(grants);
+    }
+
+    fn release(self: &Arc<Self>, provider: &str, model: Option<&str>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active_global = state.active_global.saturating_sub(1);
+        decrement_count(&mut state.active_provider, &provider.to_string());
+        if let Some(model) = model {
+            decrement_count(
+                &mut state.active_model,
+                &(provider.to_string(), model.to_string()),
+            );
+        }
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        let grants = self.schedule_pending_locked(&mut state);
+        drop(state);
+        self.send_grants(grants);
+    }
+
+    /// Grant the oldest eligible pending requests without waking every waiter.
+    ///
+    /// The queue is scanned from the front so an eligible request cannot be
+    /// leapfrogged by a newer request. Requests for a saturated provider/model
+    /// may be skipped so unrelated providers continue making progress.
+    fn schedule_pending(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let grants = self.schedule_pending_locked(&mut state);
+        drop(state);
+        self.send_grants(grants);
+    }
+
+    fn schedule_pending_locked(
+        self: &Arc<Self>,
+        state: &mut AdmissionState,
+    ) -> Vec<(oneshot::Sender<ProviderPermits>, ProviderPermits)> {
+        let mut grants = Vec::new();
+        while let Some(index) = state
+            .queue
+            .iter()
+            .position(|pending| self.can_admit(state, pending))
+        {
+            let pending = state.queue.remove(index).expect("pending admission index");
+            state.pending_global = state.pending_global.saturating_sub(1);
+            decrement_count(&mut state.pending_provider, &pending.provider);
+            state.active_global += 1;
+            *state
+                .active_provider
+                .entry(pending.provider.clone())
+                .or_default() += 1;
+            if let Some(model) = &pending.model {
+                *state
+                    .active_model
+                    .entry((pending.provider.clone(), model.clone()))
+                    .or_default() += 1;
+            }
+            self.pending_requests.fetch_sub(1, Ordering::Relaxed);
+            self.active_requests.fetch_add(1, Ordering::Relaxed);
+            let permits = ProviderPermits {
+                controller: Arc::clone(self),
+                provider: pending.provider,
+                model: pending.model,
+            };
+            grants.push((pending.grant, permits));
+        }
+        grants
+    }
+
+    fn send_grants(&self, grants: Vec<(oneshot::Sender<ProviderPermits>, ProviderPermits)>) {
+        for (grant, permits) in grants {
+            if grant.send(permits).is_err() {
+                // A cancelled receiver drops the permit, returning capacity to
+                // the scheduler through ProviderPermits::drop.
+            }
+        }
+    }
 }
 
 pub(crate) struct ProviderPermits {
-    _global: OwnedSemaphorePermit,
-    _provider: OwnedSemaphorePermit,
-    _model: Option<OwnedSemaphorePermit>,
-    limiter: Arc<ProviderConcurrency>,
+    controller: Arc<ProviderConcurrency>,
+    provider: String,
+    model: Option<String>,
 }
 
 struct GuardedProviderStream {
@@ -218,7 +474,6 @@ impl Stream for GuardedProviderStream {
 impl LlmStreamInner for GuardedProviderStream {
     fn terminalize(self: Pin<&mut Self>) {
         let this = self.get_mut();
-        this.permits.take();
         Pin::new(&mut this.stream).terminalize();
     }
 
@@ -234,34 +489,21 @@ impl LlmStreamInner for GuardedProviderStream {
 
 impl Drop for ProviderPermits {
     fn drop(&mut self) {
-        self.limiter.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.controller
+            .release(&self.provider, self.model.as_deref());
     }
 }
 
-async fn acquire_permit(
-    semaphore: Arc<Semaphore>,
-    resource: &'static str,
-    limit: usize,
-) -> FlowResult<OwnedSemaphorePermit> {
-    semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| FlowError::ResourceExhausted { resource, limit })
-}
-
-fn scoped_semaphore(
-    entries: &Mutex<HashMap<String, Weak<Semaphore>>>,
-    key: &str,
-    limit: usize,
-) -> Arc<Semaphore> {
-    let mut entries = entries.lock().unwrap_or_else(|error| error.into_inner());
-    entries.retain(|_, semaphore| semaphore.strong_count() > 0);
-    if let Some(semaphore) = entries.get(key).and_then(Weak::upgrade) {
-        return semaphore;
+fn decrement_count<K>(counts: &mut HashMap<K, usize>, key: &K)
+where
+    K: Eq + std::hash::Hash,
+{
+    if let Some(count) = counts.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(key);
+        }
     }
-    let semaphore = Arc::new(Semaphore::new(limit));
-    entries.insert(key.to_string(), Arc::downgrade(&semaphore));
-    semaphore
 }
 
 /// A keyed set of live provider calls shared by concurrent cache misses.
@@ -456,6 +698,7 @@ where
             new_calls: self.counters.new_calls.load(Ordering::Relaxed),
             rejections: self.counters.rejections.load(Ordering::Relaxed),
             provider_active_requests: self.concurrency.active_requests(),
+            provider_pending_requests: self.concurrency.pending_requests(),
         }
     }
 }

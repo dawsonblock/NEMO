@@ -388,10 +388,14 @@ class SingleFlightLimits:
         max_active_keys: Maximum distinct cache misses executing or waiting for
             provider capacity at once.
         max_waiters_per_key: Maximum followers allowed to join one active miss.
-        max_global_provider_concurrency: Maximum provider calls across the
-            response-cache feature.
+        max_global_provider_concurrency: Maximum provider calls admitted by
+            the adaptive runtime.
         max_provider_concurrency: Maximum provider calls for one provider.
         max_model_concurrency: Maximum provider calls for one provider/model pair.
+        max_global_waiters: Maximum followers across all active cache keys.
+        max_pending_provider_requests: Maximum live provider calls waiting for admission.
+        max_pending_provider_per_provider: Maximum pending calls for one provider.
+        provider_admission_timeout_ms: Maximum time to wait for provider admission.
     """
 
     max_active_keys: int = 4096
@@ -399,6 +403,10 @@ class SingleFlightLimits:
     max_global_provider_concurrency: int = 512
     max_provider_concurrency: int = 128
     max_model_concurrency: int = 64
+    max_global_waiters: int = 32768
+    max_pending_provider_requests: int = 2048
+    max_pending_provider_per_provider: int = 512
+    provider_admission_timeout_ms: int = 30000
 
     def to_dict(self) -> JsonObject:
         """Serialize these limits to the canonical JSON object shape."""
@@ -409,6 +417,10 @@ class SingleFlightLimits:
                 "max_global_provider_concurrency": self.max_global_provider_concurrency,
                 "max_provider_concurrency": self.max_provider_concurrency,
                 "max_model_concurrency": self.max_model_concurrency,
+                "max_global_waiters": self.max_global_waiters,
+                "max_pending_provider_requests": self.max_pending_provider_requests,
+                "max_pending_provider_per_provider": self.max_pending_provider_per_provider,
+                "provider_admission_timeout_ms": self.provider_admission_timeout_ms,
             }
         )
 
@@ -485,6 +497,7 @@ class AdaptiveConfig:
         acg: Adaptive Cache Governor settings.
         policy: Unsupported-config policy applied within the adaptive config.
         response_cache: Opt-in LLM response and tool-result cache settings.
+        provider_admission: Always-on provider concurrency and pending-work limits.
 
     Behavior:
         This document configures only the adaptive component. Plugins are
@@ -500,6 +513,7 @@ class AdaptiveConfig:
     acg: AcgConfig | None = None
     policy: ConfigPolicy = field(default_factory=ConfigPolicy)
     response_cache: ResponseCacheConfig | None = None
+    provider_admission: SingleFlightLimits = field(default_factory=SingleFlightLimits)
 
     def to_dict(self) -> JsonObject:
         """Serialize this adaptive config to the canonical JSON object shape."""
@@ -512,6 +526,7 @@ class AdaptiveConfig:
             "tool_parallelism": _normalize(self.tool_parallelism),
             "acg": _normalize(self.acg),
             "response_cache": _normalize(self.response_cache),
+            "provider_admission": _normalize(self.provider_admission),
             "policy": self.policy.to_dict(),
         }
 

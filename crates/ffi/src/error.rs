@@ -123,6 +123,9 @@ impl From<&FlowError> for NemoRelayStatus {
             FlowError::ScopeStackEmpty => NemoRelayStatus::ScopeStackEmpty,
             FlowError::GuardrailRejected(_) => NemoRelayStatus::GuardrailRejected,
             FlowError::ResourceExhausted { .. } => NemoRelayStatus::ResourceExhausted,
+            // Admission timeouts are bounded overload, not runtime defects.
+            // Preserve the retryable capacity signal across the stable ABI.
+            FlowError::Timeout { .. } => NemoRelayStatus::ResourceExhausted,
             FlowError::Upstream(_)
             | FlowError::Internal(_)
             | FlowError::CallbackException { .. } => NemoRelayStatus::Internal,

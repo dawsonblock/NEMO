@@ -19,6 +19,9 @@ python/nemo_relay/_native*.pyd
 # Go
 go/nemo_relay/nemo_relay_test
 go/nemo_relay/nemo_relay_test.exe
+# Test observability events are written beside the Go binding when a test
+# intentionally enables an ATOF file sink.
+go/nemo_relay/nemo-relay-events-*.jsonl
 
 # Node.js (NAPI-RS)
 node_modules/

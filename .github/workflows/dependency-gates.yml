@@ -1,0 +1,273 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Dependency gates
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - 'hardening/**'
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NEMO_RELAY_CI_WORKSPACE: ${{ github.workspace }}
+  NEMO_RELAY_CI_WORKSPACE_TMP: ${{ github.workspace }}/tmp
+  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON_PREFERENCE: only-system
+
+jobs:
+  rust:
+    name: Rust dependency gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-dependency-gates-rust-${{ steps.ci-config.outputs.rust_version }}
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ github.workspace }}/uv.lock
+
+      - name: Install Rust test tools
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: cargo-llvm-cov@${{ steps.ci-config.outputs.cargo_llvm_cov_version }},cargo-nextest@${{ steps.ci-config.outputs.cargo_nextest_version }},just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: just --set ci true --set output_dir "${{ github.workspace }}" test-rust
+
+      - name: Run Rust documentation tests
+        run: cargo test --locked --workspace --doc
+
+  python:
+    name: Python dependency gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-dependency-gates-python-${{ steps.ci-config.outputs.rust_version }}
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ github.workspace }}/uv.lock
+
+      - name: Install Python test tools
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: cargo-llvm-cov@${{ steps.ci-config.outputs.cargo_llvm_cov_version }},cargo-nextest@${{ steps.ci-config.outputs.cargo_nextest_version }},just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Check Python lockfile
+        run: uv lock --check
+
+      - name: Run Python tests
+        run: just --set ci true --set output_dir "${{ github.workspace }}" test-python
+
+  go:
+    name: Go and FFI dependency gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-dependency-gates-go-${{ steps.ci-config.outputs.rust_version }}
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ steps.ci-config.outputs.go_version }}
+          cache: false
+
+      - name: Install Go test tools
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Run Go and FFI tests
+        run: just --set ci true --set output_dir "${{ github.workspace }}" test-go
+
+      - name: Vet Go bindings
+        working-directory: go/nemo_relay
+        run: go vet ./...
+
+  security:
+    name: Security dependency gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.ci-config.outputs.node_version }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Python and uv
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ github.workspace }}/uv.lock
+
+      - name: Install security tools
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: cargo-deny@${{ steps.ci-config.outputs.cargo_deny_version }},cargo-audit@0.22.2,cargo-about@${{ steps.ci-config.outputs.cargo_about_version }}
+
+      - name: Run cargo-deny
+        run: cargo deny check
+
+      - name: Run cargo-audit
+        run: cargo audit
+
+      - name: Verify Python lockfile
+        run: uv lock --check
+
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Audit production Node dependencies
+        id: npm-audit
+        run: |
+          set +e
+          npm audit --workspaces --omit=dev --audit-level=high --json > npm-audit.json
+          status=$?
+          cat npm-audit.json
+          exit "$status"
+
+      - name: Generate SPDX dependency inventory
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cargo about generate --config about.toml --format json --locked > sbom.json
+          python3 scripts/qualification/generate_spdx_sbom.py sbom.json sbom.spdx.json "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+
+      - name: Upload security evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-evidence-${{ github.run_id }}
+          path: |
+            npm-audit.json
+            sbom.spdx.json
+            sbom.json
+          if-no-files-found: error

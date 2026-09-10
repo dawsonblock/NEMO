@@ -74,6 +74,12 @@ fn test_status_from_error_maps_variants_and_sets_message() {
             NemoRelayStatus::ResourceExhausted,
         ),
         (
+            FlowError::Timeout {
+                resource: "provider_admission",
+            },
+            NemoRelayStatus::ResourceExhausted,
+        ),
+        (
             FlowError::Internal("boom".into()),
             NemoRelayStatus::Internal,
         ),

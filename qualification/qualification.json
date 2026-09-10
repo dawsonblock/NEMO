@@ -1,85 +1,85 @@
 {
   "schema_version": 2,
   "qualification_level": "E2_LOCAL",
-  "release_version": "0.9.1-rc.2",
-  "profile": "rust-postfix",
+  "release_version": "0.9.1-rc.4",
+  "profile": "manifest",
   "overall": "INCONCLUSIVE",
   "promotion": "DEV",
   "checks": {
-    "rust-format": "PASS",
-    "clippy": "PASS",
-    "rust-tests": "PASS",
-    "rust-doc-tests": "PASS",
-    "cargo-deny": "PASS",
-    "cargo-audit": "PASS",
+    "rust-format": "NOT_RUN",
+    "clippy": "NOT_RUN",
+    "rust-tests": "NOT_RUN",
+    "rust-doc-tests": "NOT_RUN",
+    "cargo-deny": "NOT_RUN",
+    "cargo-audit": "NOT_RUN",
     "python-tests": "NOT_RUN",
     "node-tests": "NOT_RUN",
     "go-tests": "NOT_RUN",
-    "sbom": "PASS"
+    "sbom": "NOT_RUN"
   },
   "check_details": {
     "rust-format": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "clippy": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "rust-tests": {
-      "status": "PASS",
-      "reason": "cargo nextest workspace run completed: 4642 tests passed"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "rust-doc-tests": {
-      "status": "PASS",
-      "reason": "workspace Rust doctests completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "cargo-deny": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "cargo-audit": {
-      "status": "PASS",
-      "reason": "command completed successfully"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "python-tests": {
       "status": "NOT_RUN",
-      "reason": "quick profile excludes Python binding tests"
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "node-tests": {
       "status": "NOT_RUN",
-      "reason": "quick profile excludes Node.js binding tests"
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "go-tests": {
       "status": "NOT_RUN",
-      "reason": "quick profile excludes Go binding tests"
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "sbom": {
-      "status": "PASS",
-      "reason": "cargo-about inventory converted to SPDX 2.3"
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
     }
   },
   "provenance": {
-    "source_tree_sha256": "9fcc845bb463b6494d6fc41f7bb547f33f83f0ce01e75802ffe315a7ea044fc2",
-    "source_archive_sha256": null,
-    "release_archive_sha256": "58b12064b0963e8caea2bb1161eadfe9772284e5116cd576aa38af9ebe021428",
-    "environment_sha256": "5d935f2a7d4a4386b06703c7eff769aecbc0960dcdbd6243621b0ceaf2754deb",
+    "source_tree_sha256": "c597316f63d2e9e912b31d4e1c3d49745b49ed33a1df95b556fb8a2ccf8143a7",
+    "source_archive_sha256": "aa8f5824ac0c9d5fd7f394c91f965f6ac6bc42edf0879a072da910ee5200b436",
+    "release_archive_sha256": "aa8f5824ac0c9d5fd7f394c91f965f6ac6bc42edf0879a072da910ee5200b436",
+    "environment_sha256": "3df3c8bc5dac9ad45562ccecbe4b4d0890a491112251fa84fec0cf84b0ef58d5",
     "lockfiles": {
-      "Cargo.lock": "sha256:e3e14948dbedd1913fb78b78021e779ea72c2038dcd02cd6ed4add74230e2e40",
-      "package-lock.json": "sha256:6ae290a30fd9347869c93e2fd9b5bd5ce3f9267c8589d9b45a8dca5c011f1e6c",
-      "uv.lock": "sha256:1f7d4cf0377d4bcb61764a6fc4e4f5af98feafde0a590b5ec7ff89407cc88a8a"
+      "Cargo.lock": "sha256:5cc45155ec25aee61f24414593c16f05900828d8d2a674a15dcaaaaf1b320b89",
+      "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
+      "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "aec591d32f3ae36368074632a2f990cb0ce86702",
-      "tree": "df9744dc541488c7918f2443feafddab06e89f8f",
+      "commit": "5ca099e6c4eaae276c127d192edb5240a1fcf539",
+      "tree": "a381ff49be019a2cb7d7c70739217d61bd6f9c63",
+      "source_tree_sha256": "c597316f63d2e9e912b31d4e1c3d49745b49ed33a1df95b556fb8a2ccf8143a7",
       "status": []
     }
   },
   "notes": [
     "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
-    "Authority, executor, isolation, ledger, and DLP crates are disabled contract skeletons.",
-    "Rust-focused post-fix evidence includes the full workspace nextest (4642/4642), workspace doctests, and rust-native-plugin example suite (10/10).",
+    "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
     "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result."
   ]
 }
