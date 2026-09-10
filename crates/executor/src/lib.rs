@@ -211,6 +211,15 @@ pub mod unstable {
         pub receipt: Option<ReceiptRecord>,
     }
 
+    /// Bounded request to reconcile one externally ambiguous logical action.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReconciliationRequest {
+        /// Stable durable action identity.
+        pub action_id: String,
+        /// Host deadline the provider must honor before its recovery lease ends.
+        pub deadline_unix_ms: u64,
+    }
+
     /// Adapter boundary for execution backends owned by another subsystem.
     ///
     /// Implementations may target Function Hooks, Effect Fabric, or a worker
@@ -234,7 +243,13 @@ pub mod unstable {
     /// the resulting shared effect state through its supplied contracts.
     pub trait ReconciliationProvider: Send + Sync {
         /// Reconcile one action previously marked `UNKNOWN`.
-        fn reconcile(&self, action_id: &str) -> Result<ReconciliationResult, EffectExecutionError>;
+        ///
+        /// Implementations must honor [`ReconciliationRequest::deadline_unix_ms`]
+        /// and must not issue an unbounded provider operation after the deadline.
+        fn reconcile(
+            &self,
+            request: &ReconciliationRequest,
+        ) -> Result<ReconciliationResult, EffectExecutionError>;
     }
 
     fn class_mismatch(expected: &str, actual: ExecutionClass) -> EffectExecutionError {

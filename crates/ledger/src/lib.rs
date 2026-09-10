@@ -13,6 +13,7 @@ pub const DURABILITY_ENABLED: bool = false;
 #[cfg(feature = "unstable-hardening")]
 pub mod unstable {
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,6 +63,72 @@ pub mod unstable {
                 | (Some(ExecutionState::Dispatching), ExecutionState::Unknown)
                 | (Some(ExecutionState::Unknown), ExecutionState::Reconciling)
                 | (Some(ExecutionState::Reconciling), ExecutionState::Unknown)
+        )
+    }
+
+    /// Return whether immutable terminal evidence may complete an action.
+    ///
+    /// Terminal state writes intentionally have a smaller domain than ordinary
+    /// lifecycle transitions. Stores must enforce this table themselves rather
+    /// than relying on a well-behaved kernel caller.
+    pub const fn is_valid_evidence_transition(
+        current: ExecutionState,
+        next: ExecutionState,
+        evidence: &TerminalEvidence,
+    ) -> bool {
+        matches!(
+            (current, next, evidence),
+            (
+                ExecutionState::Dispatching,
+                ExecutionState::Committed,
+                TerminalEvidence::Receipt(ReceiptIdentity {
+                    final_state: ExecutionState::Committed,
+                    ..
+                })
+            ) | (
+                ExecutionState::Dispatching,
+                ExecutionState::Failed,
+                TerminalEvidence::PreDispatchFailure(_)
+            ) | (
+                ExecutionState::Unknown,
+                ExecutionState::Committed,
+                TerminalEvidence::Receipt(ReceiptIdentity {
+                    final_state: ExecutionState::Committed,
+                    ..
+                })
+            ) | (
+                ExecutionState::Unknown,
+                ExecutionState::Failed,
+                TerminalEvidence::Receipt(ReceiptIdentity {
+                    final_state: ExecutionState::Failed,
+                    ..
+                })
+            ) | (
+                ExecutionState::Reconciling,
+                ExecutionState::Committed,
+                TerminalEvidence::Receipt(ReceiptIdentity {
+                    final_state: ExecutionState::Committed,
+                    ..
+                })
+            ) | (
+                ExecutionState::Reconciling,
+                ExecutionState::Failed,
+                TerminalEvidence::Receipt(ReceiptIdentity {
+                    final_state: ExecutionState::Failed,
+                    ..
+                })
+            )
+        )
+    }
+
+    /// Return whether a lifecycle state may be protected by a fenced lease.
+    pub const fn is_leaseable_state(state: ExecutionState) -> bool {
+        matches!(
+            state,
+            ExecutionState::Prepared
+                | ExecutionState::Dispatching
+                | ExecutionState::Unknown
+                | ExecutionState::Reconciling
         )
     }
 
@@ -330,6 +397,70 @@ pub mod unstable {
         pub evidence_digest: String,
     }
 
+    /// Immutable identity shared by every terminal evidence object for an action.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ActionEvidenceBinding {
+        /// Action whose evidence was observed.
+        pub action_id: String,
+        /// Idempotency identity bound to the action.
+        pub idempotency_key: String,
+        /// Verified grant binding.
+        pub grant_digest: String,
+        /// Authenticated principal binding.
+        pub principal_id: String,
+        /// Tenant binding.
+        pub tenant_id: Option<String>,
+        /// Runtime identity binding.
+        pub runtime_id: String,
+        /// Runtime environment/session binding.
+        pub runtime_binding_digest: String,
+        /// Capability identity.
+        pub capability_id: String,
+        /// Capability registration generation.
+        pub capability_generation: u64,
+        /// Immutable registration digest.
+        pub registration_digest: String,
+        /// Bound provider operation.
+        pub operation: String,
+        /// Immutable execution classification.
+        pub execution_class: String,
+        /// Bound argument digest.
+        pub args_digest: String,
+        /// Bound route digest.
+        pub route_digest: String,
+        /// Runtime admission binding.
+        pub admission_id: String,
+        /// Authority policy binding.
+        pub policy_version: String,
+        /// Authority policy epoch binding.
+        pub policy_epoch: String,
+    }
+
+    impl ActionEvidenceBinding {
+        /// Derive the immutable evidence binding from a durable action record.
+        pub fn from_action(action: &ActionPreparation) -> Self {
+            Self {
+                action_id: action.action_id.clone(),
+                idempotency_key: action.idempotency_key.clone(),
+                grant_digest: action.grant_digest.clone().unwrap_or_default(),
+                principal_id: action.principal_id.clone(),
+                tenant_id: action.tenant_id.clone(),
+                runtime_id: action.runtime_id.clone(),
+                runtime_binding_digest: action.runtime_binding_digest.clone(),
+                capability_id: action.capability_id.clone(),
+                capability_generation: action.capability_generation,
+                registration_digest: action.registration_digest.clone(),
+                operation: action.operation.clone(),
+                execution_class: action.execution_class.clone(),
+                args_digest: action.args_digest.clone(),
+                route_digest: action.route_digest.clone(),
+                admission_id: action.admission_id.clone(),
+                policy_version: action.policy_version.clone(),
+                policy_epoch: action.policy_epoch.clone(),
+            }
+        }
+    }
+
     /// Canonical identity of authoritative terminal receipt evidence.
     ///
     /// This deliberately excludes local receipt IDs and collection timestamps.
@@ -407,6 +538,31 @@ pub mod unstable {
         }
     }
 
+    impl ReceiptIdentity {
+        /// Return the action binding that receipt evidence must match.
+        pub fn action_binding(&self) -> ActionEvidenceBinding {
+            ActionEvidenceBinding {
+                action_id: self.action_id.clone(),
+                idempotency_key: self.idempotency_key.clone(),
+                grant_digest: self.grant_digest.clone(),
+                principal_id: self.principal_id.clone(),
+                tenant_id: self.tenant_id.clone(),
+                runtime_id: self.runtime_id.clone(),
+                runtime_binding_digest: self.runtime_binding_digest.clone(),
+                capability_id: self.capability_id.clone(),
+                capability_generation: self.capability_generation,
+                registration_digest: self.registration_digest.clone(),
+                operation: self.operation.clone(),
+                execution_class: self.execution_class.clone(),
+                args_digest: self.args_digest.clone(),
+                route_digest: self.route_digest.clone(),
+                admission_id: self.admission_id.clone(),
+                policy_version: self.policy_version.clone(),
+                policy_epoch: self.policy_epoch.clone(),
+            }
+        }
+    }
+
     /// Durable evidence authorizing a terminal effect-state transition.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -425,11 +581,22 @@ pub mod unstable {
                 Self::PreDispatchFailure(_) => ExecutionState::Failed,
             }
         }
+
+        /// Return whether this evidence binds the exact durable action identity.
+        pub fn binds_action(&self, action: &ActionPreparation) -> bool {
+            let binding = ActionEvidenceBinding::from_action(action);
+            match self {
+                Self::Receipt(receipt) => receipt.action_binding() == binding,
+                Self::PreDispatchFailure(failure) => failure.action_binding == binding,
+            }
+        }
     }
 
     /// Durable proof that dispatch never crossed the external effect boundary.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PreDispatchFailureEvidence {
+        /// Immutable identity of the action proven not to have dispatched.
+        pub action_binding: ActionEvidenceBinding,
         /// Stable backend or policy error code.
         pub code: String,
         /// Digest of the bounded failure diagnostic.
@@ -439,6 +606,8 @@ pub mod unstable {
     /// Immutable receipt conflict reported by an append-only receipt store.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReceiptConflict {
+        /// Canonical digest used to deduplicate identical contradiction records.
+        pub conflict_digest: String,
         /// Action whose evidence history conflicts.
         pub action_id: String,
         /// Previously persisted receipt identity.
@@ -451,6 +620,33 @@ pub mod unstable {
         pub attempted: ReceiptIdentity,
     }
 
+    impl ReceiptConflict {
+        /// Construct a canonically identified immutable evidence conflict.
+        pub fn new(existing: &ReceiptRecord, attempted: &ReceiptRecord) -> Self {
+            let existing_identity = existing.identity();
+            let attempted_identity = attempted.identity();
+            let canonical = serde_json::json!({
+                "action_id": attempted.action_id,
+                "existing": existing_identity,
+                "attempted": attempted_identity,
+            });
+            let bytes = serde_json_canonicalizer::to_vec(&canonical)
+                .expect("receipt conflict identity must canonicalize");
+            let conflict_digest = Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            Self {
+                conflict_digest,
+                action_id: attempted.action_id.clone(),
+                existing_receipt_id: existing.receipt_id.clone(),
+                attempted_receipt_id: attempted.receipt_id.clone(),
+                existing: existing_identity,
+                attempted: attempted_identity,
+            }
+        }
+    }
+
     /// Result of attempting to append immutable terminal evidence.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -461,6 +657,8 @@ pub mod unstable {
         AlreadyFinalized(ReceiptRecord),
         /// A materially different terminal receipt already exists for the action.
         FinalizationConflict(ReceiptConflict),
+        /// The same immutable conflict was already retained for operator repair.
+        ConflictAlreadyRecorded(ReceiptConflict),
     }
 
     /// Clock consumed by a store implementation, never supplied per operation.
@@ -707,6 +905,19 @@ pub mod unstable {
             /// Requested state.
             next: ExecutionState,
         },
+        /// A lease operation was requested for a state that cannot be leased.
+        InvalidLeaseState(ExecutionState),
+        /// Authorization may only atomically advance a newly claimed action.
+        InvalidAuthorizationState(ExecutionState),
+        /// A refreshed grant may not replace authorization outside pre-dispatch work.
+        InvalidAuthorizationRefreshState(ExecutionState),
+        /// Pre-dispatch authorization cannot be refreshed while another executor owns it.
+        AuthorizationLeaseHeld(ActionLease),
+        /// Immutable terminal evidence did not bind the target action.
+        EvidenceBindingMismatch {
+            /// Durable action identity.
+            action_id: String,
+        },
         /// An unfenced update attempted to bypass a live lease.
         LeaseHeld(ActionLease),
         /// The reference store lock was poisoned.
@@ -725,6 +936,27 @@ pub mod unstable {
                 }
                 Self::InvalidTransition { current, next } => {
                     write!(formatter, "invalid transition: {current:?} -> {next:?}")
+                }
+                Self::InvalidLeaseState(state) => {
+                    write!(formatter, "state is not leaseable: {state:?}")
+                }
+                Self::InvalidAuthorizationState(state) => {
+                    write!(formatter, "authorization requires PROPOSED, got {state:?}")
+                }
+                Self::InvalidAuthorizationRefreshState(state) => write!(
+                    formatter,
+                    "authorization refresh requires AUTHORIZED or PREPARED, got {state:?}"
+                ),
+                Self::AuthorizationLeaseHeld(lease) => write!(
+                    formatter,
+                    "authorization refresh blocked by live lease {} generation {}",
+                    lease.owner_id, lease.generation
+                ),
+                Self::EvidenceBindingMismatch { action_id } => {
+                    write!(
+                        formatter,
+                        "terminal evidence does not bind action: {action_id}"
+                    )
                 }
                 Self::LeaseHeld(lease) => write!(
                     formatter,
@@ -828,11 +1060,11 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
-            if record.state != expected {
-                return Err(ReferenceStoreError::UnexpectedState {
-                    expected: Some(expected),
-                    actual: record.state,
-                });
+            if expected != ExecutionState::Proposed {
+                return Err(ReferenceStoreError::InvalidAuthorizationState(expected));
+            }
+            if record.state != ExecutionState::Proposed {
+                return Err(ReferenceStoreError::InvalidAuthorizationState(record.state));
             }
             record.preparation.grant_digest = Some(grant_digest.to_owned());
             record.preparation.approval_reference = approval_reference.map(ToOwned::to_owned);
@@ -851,11 +1083,26 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if !matches!(
+                expected,
+                ExecutionState::Authorized | ExecutionState::Prepared
+            ) {
+                return Err(ReferenceStoreError::InvalidAuthorizationRefreshState(
+                    expected,
+                ));
+            }
             if record.state != expected {
                 return Err(ReferenceStoreError::UnexpectedState {
                     expected: Some(expected),
                     actual: record.state,
                 });
+            }
+            let now = self.clock.now_unix_ms();
+            if expected == ExecutionState::Prepared
+                && let Some(lease) = record.lease.as_ref()
+                && lease.expires_at_unix_ms > now
+            {
+                return Err(ReferenceStoreError::AuthorizationLeaseHeld(lease.clone()));
             }
             record.preparation.grant_digest = Some(grant_digest.to_owned());
             record.preparation.approval_reference = approval_reference.map(ToOwned::to_owned);
@@ -899,6 +1146,9 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if !is_leaseable_state(expected) {
+                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            }
             if record.state != expected {
                 return Err(ReferenceStoreError::UnexpectedState {
                     expected: Some(expected),
@@ -948,6 +1198,9 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if !is_leaseable_state(expected) {
+                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            }
             if record.state != expected
                 || record.lease.as_ref() != Some(lease)
                 || lease.expires_at_unix_ms <= now
@@ -972,6 +1225,9 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if !is_leaseable_state(expected) {
+                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            }
             if record.state != expected || record.lease.as_ref() != Some(lease) {
                 return Ok(LeaseReleaseResult::LeaseLost);
             }
@@ -991,6 +1247,9 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if !is_leaseable_state(expected) {
+                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            }
             if record.state != expected {
                 return Err(ReferenceStoreError::UnexpectedState {
                     expected: Some(expected),
@@ -1027,6 +1286,9 @@ pub mod unstable {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if !is_leaseable_state(expected) {
+                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            }
             if record.state != expected {
                 return Err(ReferenceStoreError::UnexpectedState {
                     expected: Some(expected),
@@ -1039,7 +1301,12 @@ pub mod unstable {
                 ));
             }
             let next = evidence.terminal_state();
-            if !matches!(next, ExecutionState::Committed | ExecutionState::Failed) {
+            if !evidence.binds_action(&record.preparation) {
+                return Err(ReferenceStoreError::EvidenceBindingMismatch {
+                    action_id: action_id.to_owned(),
+                });
+            }
+            if !is_valid_evidence_transition(expected, next, evidence) {
                 return Err(ReferenceStoreError::InvalidTransition {
                     current: expected,
                     next,
@@ -1114,20 +1381,21 @@ pub mod unstable {
                     Ok(FinalizeResult::AlreadyFinalized(existing.clone()))
                 }
                 Some(existing) => {
-                    let conflict = ReceiptConflict {
-                        action_id: receipt.action_id.clone(),
-                        existing_receipt_id: existing.receipt_id.clone(),
-                        attempted_receipt_id: receipt.receipt_id.clone(),
-                        existing: existing.identity(),
-                        attempted: receipt.identity(),
-                    };
-                    self.conflicts
+                    let conflict = ReceiptConflict::new(existing, receipt);
+                    let mut conflicts = self
+                        .conflicts
                         .lock()
-                        .map_err(|_| ReferenceStoreError::LockPoisoned)?
-                        .entry(receipt.action_id.clone())
-                        .or_default()
-                        .push(conflict.clone());
-                    Ok(FinalizeResult::FinalizationConflict(conflict))
+                        .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+                    let action_conflicts = conflicts.entry(receipt.action_id.clone()).or_default();
+                    if action_conflicts
+                        .iter()
+                        .any(|existing| existing.conflict_digest == conflict.conflict_digest)
+                    {
+                        Ok(FinalizeResult::ConflictAlreadyRecorded(conflict))
+                    } else {
+                        action_conflicts.push(conflict.clone());
+                        Ok(FinalizeResult::FinalizationConflict(conflict))
+                    }
                 }
             }
         }
@@ -1688,6 +1956,17 @@ pub mod unstable {
             );
             assert_eq!(conflicts[0].existing.evidence_digest, "evidence-a");
             assert_eq!(conflicts[0].attempted.evidence_digest, "evidence-b");
+            assert!(matches!(
+                store
+                    .finalize(&reference_receipt(ExecutionState::Failed, "evidence-b"))
+                    .unwrap(),
+                FinalizeResult::ConflictAlreadyRecorded(_)
+            ));
+            assert_eq!(
+                store.load_conflicts("reference-action").unwrap().len(),
+                1,
+                "repeated contradictions use their canonical conflict identity"
+            );
         }
 
         #[test]
@@ -1731,6 +2010,88 @@ pub mod unstable {
             let action = store.load_action("reference-action").unwrap().unwrap();
             assert_eq!(action.state, ExecutionState::Committed);
             assert_eq!(action.terminal_evidence, Some(evidence));
+        }
+
+        #[test]
+        fn evidence_finalization_rejects_wrong_source_state_or_action_binding() {
+            let (store, _clock) = prepared_reference_store();
+            let lease = match store
+                .claim_lease("reference-action", ExecutionState::Prepared, "owner", None)
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                result => panic!("unexpected lease result: {result:?}"),
+            };
+            let receipt = reference_receipt(ExecutionState::Committed, "provider-evidence");
+            assert!(matches!(
+                store.finalize_from_evidence(
+                    "reference-action",
+                    ExecutionState::Prepared,
+                    &lease,
+                    &TerminalEvidence::Receipt(receipt.identity()),
+                ),
+                Err(ReferenceStoreError::InvalidTransition { .. })
+            ));
+            store
+                .transition_with_lease(
+                    "reference-action",
+                    ExecutionState::Prepared,
+                    &lease,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            let mut mismatched = receipt.identity();
+            mismatched.principal_id = "mallory".into();
+            assert!(matches!(
+                store.finalize_from_evidence(
+                    "reference-action",
+                    ExecutionState::Dispatching,
+                    &lease,
+                    &TerminalEvidence::Receipt(mismatched),
+                ),
+                Err(ReferenceStoreError::EvidenceBindingMismatch { .. })
+            ));
+        }
+
+        #[test]
+        fn reference_store_rejects_authorization_and_lease_contract_misuse() {
+            let (store, _clock) = prepared_reference_store();
+            assert!(matches!(
+                store.authorize_action(
+                    "reference-action",
+                    ExecutionState::Authorized,
+                    "replacement-grant",
+                    None,
+                ),
+                Err(ReferenceStoreError::InvalidAuthorizationState(_))
+            ));
+            assert!(matches!(
+                store.claim_lease(
+                    "reference-action",
+                    ExecutionState::Authorized,
+                    "owner",
+                    None,
+                ),
+                Err(ReferenceStoreError::InvalidLeaseState(
+                    ExecutionState::Authorized
+                ))
+            ));
+            let lease = match store
+                .claim_lease("reference-action", ExecutionState::Prepared, "owner", None)
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                result => panic!("unexpected lease result: {result:?}"),
+            };
+            assert!(matches!(
+                store.refresh_authorization(
+                    "reference-action",
+                    ExecutionState::Prepared,
+                    "replacement-grant",
+                    None,
+                ),
+                Err(ReferenceStoreError::AuthorizationLeaseHeld(current)) if current == lease
+            ));
         }
 
         #[test]

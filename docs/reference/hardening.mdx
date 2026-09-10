@@ -110,13 +110,15 @@ only the exact current owner and fencing generation may renew a still-valid
 lease. An expired or replaced lease returns `LEASE_LOST`; it never gives a
 previous worker renewed authority.
 
-Before dispatch, the kernel verifies that the store's default lease duration
-covers the bound backend deadline plus a safety margin, then renews the exact
-fenced lease immediately before calling the backend. Backends must honor the
-kernel-owned deadline; a synchronous backend that cannot honor it is not a
-valid implementation of this contract. The runtime does not promise a
-background renewal daemon: long-running renewal policy remains owned by the
-external Effect Fabric implementation.
+Before dispatch or provider reconciliation, the kernel requests a lease long
+enough to cover the bounded backend deadline plus a safety margin. The store
+may reject that request when its maximum duration cannot cover the work. The
+kernel renews the exact fenced lease immediately before the provider call and
+passes the same deadline to the backend or reconciliation provider. Backends
+must honor that kernel-owned deadline; a synchronous backend that cannot honor
+it is not a valid implementation of this contract. The runtime does not
+promise a background renewal daemon: long-running renewal policy remains
+owned by the external Effect Fabric implementation.
 
 Lease operations return typed outcomes rather than boolean success:
 `ACQUIRED`, `EXPIRED_RECLAIMED`, `HELD_BY_OTHER`, `RENEWED`, and
@@ -128,17 +130,22 @@ evidence and recover; it is not evidence that a previous dispatch did nothing.
 includes the action/security/provider evidence bindings but excludes a local
 receipt ID and collection timestamps, so a recovery worker can replay the
 same provider evidence idempotently. A materially different finalization for
-the same action returns `FINALIZATION_CONFLICT`, records immutable conflict
-history, and must not overwrite the first receipt. This makes contradictory
-terminal evidence visible to the caller instead of silently rewriting action
-history. The generic state-transition API cannot write `COMMITTED` or
-externally meaningful `FAILED`; `ActionStore::finalize_from_evidence` persists
-the fenced terminal transition and its evidence identity together.
+the same action returns `FINALIZATION_CONFLICT`, records one canonical
+immutable conflict history entry, and must not overwrite the first receipt.
+Repeating that exact contradiction returns `CONFLICT_ALREADY_RECORDED` rather
+than multiplying forensic records. This makes contradictory terminal evidence
+visible to the caller instead of silently rewriting action history. The
+generic state-transition API cannot write `COMMITTED` or externally meaningful
+`FAILED`; `ActionStore::finalize_from_evidence` must verify the current state,
+fenced lease, immutable action binding, and evidence-authorized terminal
+transition in one operation.
 
-Recovery is evidence-aware. It distinguishes a live owner, fully bound success
-evidence, fully bound failure evidence, missing terminal evidence after lease
-expiry, and contradictory evidence. It may repair an action to `COMMITTED` or
-`FAILED` only from valid persisted evidence. Missing evidence remains
+Recovery is evidence-aware. It checks persisted conflicts and terminal
+evidence before calling a provider reconciler, then distinguishes a live
+owner, fully bound success evidence, fully bound failure evidence, missing
+terminal evidence after lease expiry, and contradictory evidence. It may
+repair an action to `COMMITTED` or `FAILED` only from valid persisted evidence.
+Missing evidence remains
 `UNKNOWN` (or becomes recoverable under the external effect policy); it is
 never translated into `FAILED` merely because a worker disappeared. The
 in-memory stores and deterministic clocks are reference implementations for

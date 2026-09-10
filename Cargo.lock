@@ -1876,6 +1876,9 @@ name = "nemo-relay-ledger"
 version = "0.9.1-rc.4"
 dependencies = [
  "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
 ]
 
 [[package]]

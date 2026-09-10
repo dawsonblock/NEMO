@@ -1222,6 +1222,13 @@ latency-benchmark *benchmark_args:
 test-latency-benchmark:
     uv run --locked python -m pytest scripts/latency_benchmark/tests
 
+# Compile and exercise the opt-in hardening ABI that the regular Rust suite does not enable.
+test-effect-contracts:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo test --locked -p nemo-relay-ledger --features unstable-hardening --lib
+    cargo test --locked -p nemo-relay --features unstable-hardening --lib kernel::tests
+
 # --set [output_dir=<path>] [ci=true|false]
 test-rust:
     #!/usr/bin/env bash
