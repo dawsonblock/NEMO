@@ -3,9 +3,10 @@
 
 //! Experimental authority boundary contracts.
 //!
-//! This crate is scaffolding only. It is not wired into managed execution and
-//! provides no security enforcement unless a future qualified implementation
-//! explicitly integrates it.
+//! This crate defines the authority-provider contract used by the optional
+//! kernel hardening path. It does not implement Correct-Once policy,
+//! cryptographic issuance, or production enforcement; those remain external
+//! responsibilities until a qualified adapter is configured.
 
 /// Whether this scaffold currently enforces runtime authority decisions.
 pub const ENFORCEMENT_ENABLED: bool = false;

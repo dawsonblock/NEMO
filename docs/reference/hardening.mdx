@@ -98,6 +98,38 @@ the highest issued lease generation even after a lease is released, so a later
 owner cannot reuse a previous fencing token. While another lease is live, the
 kernel returns `WAIT_FOR_OWNER` rather than suggesting recovery or redispatch.
 
+### Lease, receipt, and recovery contract
+
+The experimental `ActionStore` contract is the authority for lease time. A
+caller can request a bounded lease duration, but cannot supply `now`, an
+expiry, or any other authoritative timestamp. The store obtains time from its
+own clock and applies `LeaseConfiguration` (default duration, maximum
+duration, and whether renewal is enabled). A renewal is compare-and-swap-like:
+only the exact current owner and fencing generation may renew a still-valid
+lease. An expired or replaced lease returns `LEASE_LOST`; it never gives a
+previous worker renewed authority.
+
+Lease operations return typed outcomes rather than boolean success:
+`ACQUIRED`, `EXPIRED_RECLAIMED`, `HELD_BY_OTHER`, `RENEWED`, and
+`LEASE_LOST`. A `PREPARED` action with a live lease is not available for retry,
+cancellation, or a second executor. Lease expiry grants permission to examine
+evidence and recover; it is not evidence that a previous dispatch did nothing.
+
+`ReceiptStore::finalize` is append-only. Repeating identical terminal evidence
+returns the existing receipt idempotently. A materially different finalization
+for the same action returns `FINALIZATION_CONFLICT` and must not overwrite the
+first receipt. This makes contradictory terminal evidence visible to the
+caller instead of silently rewriting action history.
+
+Recovery is evidence-aware. It distinguishes a live owner, fully bound success
+evidence, fully bound failure evidence, missing terminal evidence after lease
+expiry, and contradictory evidence. It may repair an action to `COMMITTED` or
+`FAILED` only from valid persisted evidence. Missing evidence remains
+`UNKNOWN` (or becomes recoverable under the external effect policy); it is
+never translated into `FAILED` merely because a worker disappeared. The
+in-memory stores and deterministic clocks are reference implementations for
+these contract tests only. They do not enable production durability.
+
 Retry policy is deliberately conservative: `FAILED` after confirmed
 pre-dispatch failure may be evaluated for a new attempt by the external effect
 system; `UNKNOWN` must never be automatically re-dispatched. An external

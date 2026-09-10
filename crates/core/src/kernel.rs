@@ -17,8 +17,9 @@ use nemo_relay_executor::unstable::{
     ExecutionResult, ReconciliationProvider, ReconciliationResult, RuntimeIdentity,
 };
 use nemo_relay_ledger::unstable::{
-    ActionLease, ActionPreparation, ActionRecord, ActionStore, ExecutionState, LeaseClaim,
-    PrepareActionResult, ReceiptRecord, ReceiptStore, is_valid_transition,
+    ActionLease, ActionPreparation, ActionRecord, ActionStore, ExecutionState, FinalizeResult,
+    LeaseAcquireResult, LeaseStatus, PrepareActionResult, ReceiptConflict, ReceiptRecord,
+    ReceiptStore, is_valid_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -96,6 +97,12 @@ pub enum KernelError {
     /// The external receipt store rejected a receipt.
     #[error("receipt store failed: {0}")]
     ReceiptStore(String),
+    /// Immutable receipt finalization found contradictory terminal evidence.
+    #[error("receipt finalization conflicts with existing evidence: {0:?}")]
+    ReceiptFinalizationConflict(ReceiptConflict),
+    /// The store rejected the kernel's bounded lease configuration request.
+    #[error("store rejected configured lease duration: {0}")]
+    LeaseConfiguration(String),
     /// An effect definitely failed after the kernel claimed its logical action.
     #[error("effect failed after durable action claim: {action:?}: {cause}")]
     EffectFailed {
@@ -220,6 +227,32 @@ pub struct ActionStatus {
     pub reconciliation_required: bool,
     /// Persisted receipt when the action is already committed.
     pub receipt: Option<ReceiptRecord>,
+}
+
+/// Evidence-aware outcome of a recovery attempt.
+///
+/// Recovery never treats lease expiry as proof that no external effect ran.
+/// The terminal variants require a fully bound immutable receipt; the unknown
+/// variant requires provider reconciliation before a retry can be considered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryDecision {
+    /// Evidence proves the action committed and the durable state was repaired.
+    RecoverCommitted(ActionStatus),
+    /// Evidence proves the action failed and the durable state was repaired.
+    RecoverFailed(ActionStatus),
+    /// A valid owner still holds the action lease.
+    HeldByOther(ActionStatus),
+    /// Lease expiry left no terminal evidence; external outcome remains unknown.
+    RecoverUnknown(ActionStatus),
+    /// No dispatch occurred and the action may safely resume preparation.
+    RecoverRetry(ActionStatus),
+    /// State and terminal evidence contradict each other and need intervention.
+    ContradictoryEvidence {
+        /// Last known durable action identity and state.
+        action: ActionStatus,
+        /// Integrity diagnostic; callers must not retry based on this alone.
+        cause: String,
+    },
 }
 
 /// State-specific protocol guidance returned to a harness.
@@ -719,121 +752,115 @@ where
         self.authorize_and_execute(&mut request, ExecutionState::Proposed)
     }
 
-    /// Recover an action only after its dispatch/reconciliation lease expires.
+    /// Recover an action from immutable evidence without redispatching it.
     ///
-    /// Recovery never redispatches. It either repairs a state from persisted
-    /// evidence or records `UNKNOWN` for provider reconciliation.
-    pub fn recover(&self, action_id: &str) -> Result<ActionStatus, KernelError> {
+    /// Lease expiry permits recovery work; it is never evidence that the prior
+    /// worker did not cross the provider boundary.
+    pub fn recover(&self, action_id: &str) -> Result<RecoveryDecision, KernelError> {
         let action = self
             .action_store
             .load_action(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
             .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
-        if action.state != ExecutionState::Dispatching
-            && action.state != ExecutionState::Reconciling
-        {
-            if action.state == ExecutionState::Committed {
-                let receipt = self.receipt_store.load(action_id).map_err(|error| {
-                    self.state_recovery_required(
-                        &action.preparation,
-                        ExecutionState::Committed,
-                        ExecutionState::Committed,
-                        error.to_string(),
-                    )
-                })?;
-                return match receipt {
-                    Some(receipt)
-                        if receipt.final_state == ExecutionState::Committed
-                            && self.receipt_matches_action(&receipt, &action.preparation) =>
-                    {
-                        Ok(self.action_status(&action, Some(receipt)))
-                    }
-                    _ => Err(KernelError::EvidenceIntegrityFailure {
-                        action: Box::new(self.action_status(&action, None)),
-                        cause: "committed action has no valid persisted receipt".into(),
-                    }),
-                };
+
+        match action.state {
+            ExecutionState::Committed | ExecutionState::Failed => {
+                return self.recover_terminal_action(&action);
             }
-            return Ok(self.action_status(&action, None));
-        }
-        let lease = match self.claim_lease(&action, action.state, "recovery")? {
-            Some(lease) => lease,
-            None => return Ok(self.action_status_wait_for_owner(&action, None)),
-        };
-        if action.state == ExecutionState::Reconciling {
-            self.transition_action_with_lease(
-                &action,
-                ExecutionState::Reconciling,
-                &lease,
-                ExecutionState::Unknown,
-            )
-            .map_err(|error| {
-                self.state_recovery_required(
-                    &action.preparation,
-                    ExecutionState::Reconciling,
-                    ExecutionState::Unknown,
-                    error.to_string(),
-                )
-            })?;
-            return Ok(self.action_status_with_state(
-                &action.preparation,
-                ExecutionState::Unknown,
-                None,
-            ));
-        }
-        if let Some(receipt) = self.receipt_store.load(action_id).map_err(|error| {
-            self.state_recovery_required(
-                &action.preparation,
-                ExecutionState::Dispatching,
-                ExecutionState::Unknown,
-                error.to_string(),
-            )
-        })? {
-            if receipt.final_state != ExecutionState::Committed
-                || !self.receipt_matches_action(&receipt, &action.preparation)
-            {
-                return Err(self.state_recovery_required(
-                    &action.preparation,
-                    ExecutionState::Dispatching,
-                    ExecutionState::Unknown,
-                    "persisted receipt does not bind to stale dispatching action".into(),
+            ExecutionState::Proposed | ExecutionState::Authorized => {
+                return Ok(RecoveryDecision::RecoverRetry(
+                    self.action_status(&action, None),
                 ));
             }
-            self.transition_action_with_lease(
-                &action,
-                ExecutionState::Dispatching,
-                &lease,
-                ExecutionState::Committed,
-            )
-            .map_err(|error| {
-                self.state_recovery_required(
-                    &action.preparation,
-                    ExecutionState::Dispatching,
-                    ExecutionState::Committed,
-                    error.to_string(),
-                )
-            })?;
-            return Ok(self.action_status_with_state(
-                &action.preparation,
-                ExecutionState::Committed,
-                Some(receipt),
-            ));
+            ExecutionState::Prepared => {
+                return match self.lease_status(&action.preparation.action_id)? {
+                    LeaseStatus::HeldByOther(_) => Ok(RecoveryDecision::HeldByOther(
+                        self.action_status_wait_for_owner(&action, None),
+                    )),
+                    LeaseStatus::Available => Ok(RecoveryDecision::RecoverRetry(
+                        self.action_status(&action, None),
+                    )),
+                };
+            }
+            ExecutionState::Dispatching | ExecutionState::Reconciling | ExecutionState::Unknown => {
+            }
+            ExecutionState::Cancelled => {
+                return Ok(RecoveryDecision::RecoverFailed(
+                    self.action_status(&action, None),
+                ));
+            }
         }
-        self.transition_action_with_lease(
-            &action,
-            ExecutionState::Dispatching,
-            &lease,
-            ExecutionState::Unknown,
-        )
-        .map_err(|error| {
+
+        let lease = match self.claim_lease(&action, action.state, "recovery")? {
+            Some(lease) => lease,
+            None => {
+                return Ok(RecoveryDecision::HeldByOther(
+                    self.action_status_wait_for_owner(&action, None),
+                ));
+            }
+        };
+        let receipt = self.receipt_store.load(action_id).map_err(|error| {
             self.state_recovery_required(
                 &action.preparation,
-                ExecutionState::Dispatching,
+                action.state,
                 ExecutionState::Unknown,
                 error.to_string(),
             )
         })?;
-        Ok(self.action_status_with_state(&action.preparation, ExecutionState::Unknown, None))
+        if let Some(receipt) = receipt {
+            if !matches!(
+                receipt.final_state,
+                ExecutionState::Committed | ExecutionState::Failed
+            ) || !self.receipt_matches_action(&receipt, &action.preparation)
+            {
+                self.release_lease(&action, action.state, &lease)?;
+                return Ok(RecoveryDecision::ContradictoryEvidence {
+                    action: self.action_status(&action, None),
+                    cause: "persisted terminal receipt does not bind to the action".into(),
+                });
+            }
+            self.transition_action_with_lease(&action, action.state, &lease, receipt.final_state)
+                .map_err(|error| {
+                    self.state_recovery_required(
+                        &action.preparation,
+                        action.state,
+                        receipt.final_state,
+                        error.to_string(),
+                    )
+                })?;
+            let status = self.action_status_with_state(
+                &action.preparation,
+                receipt.final_state,
+                Some(receipt.clone()),
+            );
+            return Ok(match receipt.final_state {
+                ExecutionState::Committed => RecoveryDecision::RecoverCommitted(status),
+                ExecutionState::Failed => RecoveryDecision::RecoverFailed(status),
+                _ => unreachable!("terminal receipt states are checked above"),
+            });
+        }
+
+        if action.state != ExecutionState::Unknown {
+            self.transition_action_with_lease(
+                &action,
+                action.state,
+                &lease,
+                ExecutionState::Unknown,
+            )
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &action.preparation,
+                    action.state,
+                    ExecutionState::Unknown,
+                    error.to_string(),
+                )
+            })?;
+        } else {
+            self.release_lease(&action, ExecutionState::Unknown, &lease)?;
+        }
+        Ok(RecoveryDecision::RecoverUnknown(
+            self.action_status_with_state(&action.preparation, ExecutionState::Unknown, None),
+        ))
     }
 
     /// Resume an exact pending action with its authority-issued approval.
@@ -960,7 +987,7 @@ where
                     "reconciled receipt does not bind to the original action".into(),
                 ));
             }
-            if let Err(error) = self.receipt_store.store(receipt) {
+            if let Err(error) = self.finalize_receipt(receipt) {
                 return Err(self.reconciliation_unknown(&action, &lease, error.to_string()));
             }
         }
@@ -986,6 +1013,30 @@ where
         request: &mut BoundExecutionRequest,
         current_state: ExecutionState,
     ) -> Result<InvocationOutcome, KernelError> {
+        if current_state == ExecutionState::Prepared
+            && matches!(
+                request
+                    .backend_request()
+                    .identity
+                    .capability
+                    .execution_class,
+                ExecutionClass::Mutation | ExecutionClass::Critical
+            )
+            && matches!(
+                self.lease_status(&request.action_preparation().action_id)?,
+                LeaseStatus::HeldByOther(_)
+            )
+        {
+            return Err(KernelError::ActionPending {
+                action: Box::new(self.action_status_with_next_action(
+                    &request.action_preparation(),
+                    ExecutionState::Prepared,
+                    ActionNextStep::WaitForOwner,
+                    None,
+                )),
+                cause: ActionPendingCause::LeaseHeld,
+            });
+        }
         let authorization = match self.router.authorize_bound(request) {
             Ok(authorization) => authorization,
             Err(error) => return Err(self.handle_authority_error(request, current_state, error)),
@@ -1321,7 +1372,7 @@ where
                 "effect receipt does not bind to the execution identity".into(),
             ));
         }
-        if let Err(error) = self.receipt_store.store(receipt) {
+        if let Err(error) = self.finalize_receipt(receipt) {
             return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
         }
         self.transition_from_dispatching(request, lease, ExecutionState::Committed)
@@ -1352,6 +1403,21 @@ where
                 next,
             )
             .map_err(|error| KernelError::ActionStore(error.to_string()))
+    }
+
+    fn finalize_receipt(&self, receipt: &ReceiptRecord) -> Result<ReceiptRecord, KernelError> {
+        match self
+            .receipt_store
+            .finalize(receipt)
+            .map_err(|error| KernelError::ReceiptStore(error.to_string()))?
+        {
+            FinalizeResult::Finalized(receipt) | FinalizeResult::AlreadyFinalized(receipt) => {
+                Ok(receipt)
+            }
+            FinalizeResult::FinalizationConflict(conflict) => {
+                Err(KernelError::ReceiptFinalizationConflict(conflict))
+            }
+        }
     }
 
     fn transition_from_dispatching(
@@ -1489,15 +1555,82 @@ where
         expected: ExecutionState,
         purpose: &str,
     ) -> Result<Option<ActionLease>, KernelError> {
-        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let owner = format!("{}:{purpose}:{}", self.runtime.runtime_id, Uuid::now_v7());
         match self
             .action_store
-            .claim_lease(&action.preparation.action_id, expected, &owner, now, 30_000)
+            .claim_lease(&action.preparation.action_id, expected, &owner, None)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
         {
-            LeaseClaim::Acquired(lease) => Ok(Some(lease)),
-            LeaseClaim::Held(_) => Ok(None),
+            LeaseAcquireResult::Acquired(lease) | LeaseAcquireResult::ExpiredReclaimed(lease) => {
+                Ok(Some(lease))
+            }
+            LeaseAcquireResult::HeldByOther(_) => Ok(None),
+            LeaseAcquireResult::DurationRejected(error) => {
+                Err(KernelError::LeaseConfiguration(format!("{error:?}")))
+            }
+        }
+    }
+
+    fn lease_status(&self, action_id: &str) -> Result<LeaseStatus, KernelError> {
+        self.action_store
+            .lease_status(action_id)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))
+    }
+
+    fn release_lease(
+        &self,
+        action: &ActionRecord,
+        expected: ExecutionState,
+        lease: &ActionLease,
+    ) -> Result<(), KernelError> {
+        self.action_store
+            .release_lease(&action.preparation.action_id, expected, lease)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?;
+        Ok(())
+    }
+
+    fn recover_terminal_action(
+        &self,
+        action: &ActionRecord,
+    ) -> Result<RecoveryDecision, KernelError> {
+        let receipt = self
+            .receipt_store
+            .load(&action.preparation.action_id)
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &action.preparation,
+                    action.state,
+                    action.state,
+                    error.to_string(),
+                )
+            })?;
+        match (action.state, receipt) {
+            (ExecutionState::Committed, Some(receipt))
+                if receipt.final_state == ExecutionState::Committed
+                    && self.receipt_matches_action(&receipt, &action.preparation) =>
+            {
+                Ok(RecoveryDecision::RecoverCommitted(
+                    self.action_status(action, Some(receipt)),
+                ))
+            }
+            (ExecutionState::Failed, Some(receipt))
+                if receipt.final_state == ExecutionState::Failed
+                    && self.receipt_matches_action(&receipt, &action.preparation) =>
+            {
+                Ok(RecoveryDecision::RecoverFailed(
+                    self.action_status(action, Some(receipt)),
+                ))
+            }
+            (ExecutionState::Failed, None) => Ok(RecoveryDecision::RecoverFailed(
+                self.action_status(action, None),
+            )),
+            (_, receipt) => Ok(RecoveryDecision::ContradictoryEvidence {
+                action: self.action_status(action, None),
+                cause: match receipt {
+                    Some(_) => "terminal receipt does not match durable action state".into(),
+                    None => "committed action has no immutable terminal receipt".into(),
+                },
+            }),
         }
     }
 
@@ -1939,14 +2072,41 @@ mod tests {
             Ok(())
         }
 
+        fn lease_configuration(
+            &self,
+        ) -> Result<nemo_relay_ledger::unstable::LeaseConfiguration, Self::Error> {
+            Ok(Default::default())
+        }
+
+        fn lease_status(
+            &self,
+            action_id: &str,
+        ) -> Result<nemo_relay_ledger::unstable::LeaseStatus, Self::Error> {
+            let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get(action_id)
+                .ok_or_else(|| "unknown action lease status".to_owned())?;
+            Ok(match record.lease.as_ref() {
+                Some(lease) if lease.expires_at_unix_ms > now_unix_ms => {
+                    LeaseStatus::HeldByOther(lease.clone())
+                }
+                _ => LeaseStatus::Available,
+            })
+        }
+
         fn claim_lease(
             &self,
             action_id: &str,
             expected: ExecutionState,
             owner_id: &str,
-            now_unix_ms: u64,
-            lease_duration_ms: u64,
-        ) -> Result<LeaseClaim, Self::Error> {
+            requested_duration_ms: Option<u64>,
+        ) -> Result<LeaseAcquireResult, Self::Error> {
+            let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let lease_duration_ms = requested_duration_ms.unwrap_or(30_000);
             let mut records = self
                 .records
                 .lock()
@@ -1958,11 +2118,11 @@ mod tests {
                 return Err("unexpected lease state".into());
             }
             if let Some(lease) = record.lease.as_ref()
-                && lease.owner_id != owner_id
                 && lease.expires_at_unix_ms > now_unix_ms
             {
-                return Ok(LeaseClaim::Held(lease.clone()));
+                return Ok(LeaseAcquireResult::HeldByOther(lease.clone()));
             }
+            let reclaimed = record.lease.is_some();
             let generation = record.lease_generation.saturating_add(1);
             let lease = ActionLease {
                 owner_id: owner_id.to_owned(),
@@ -1971,7 +2131,63 @@ mod tests {
             };
             record.lease = Some(lease.clone());
             record.lease_generation = generation;
-            Ok(LeaseClaim::Acquired(lease))
+            Ok(if reclaimed {
+                LeaseAcquireResult::ExpiredReclaimed(lease)
+            } else {
+                LeaseAcquireResult::Acquired(lease)
+            })
+        }
+
+        fn renew_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            requested_duration_ms: Option<u64>,
+        ) -> Result<nemo_relay_ledger::unstable::LeaseRenewResult, Self::Error> {
+            let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action lease renewal".to_owned())?;
+            if record.state != expected
+                || record.lease.as_ref() != Some(lease)
+                || lease.expires_at_unix_ms <= now_unix_ms
+            {
+                return Ok(nemo_relay_ledger::unstable::LeaseRenewResult::LeaseLost);
+            }
+            let renewed = ActionLease {
+                expires_at_unix_ms: now_unix_ms
+                    .saturating_add(requested_duration_ms.unwrap_or(30_000)),
+                ..lease.clone()
+            };
+            record.lease = Some(renewed.clone());
+            Ok(nemo_relay_ledger::unstable::LeaseRenewResult::Renewed(
+                renewed,
+            ))
+        }
+
+        fn release_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+        ) -> Result<nemo_relay_ledger::unstable::LeaseReleaseResult, Self::Error> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "test action record lock poisoned".to_owned())?;
+            let record = records
+                .get_mut(action_id)
+                .ok_or_else(|| "unknown action lease release".to_owned())?;
+            if record.state != expected || record.lease.as_ref() != Some(lease) {
+                return Ok(nemo_relay_ledger::unstable::LeaseReleaseResult::LeaseLost);
+            }
+            record.lease = None;
+            Ok(nemo_relay_ledger::unstable::LeaseReleaseResult::Released)
         }
 
         fn transition_with_lease(
@@ -2023,7 +2239,7 @@ mod tests {
     impl ReceiptStore for TestReceiptStore {
         type Error = String;
 
-        fn store(&self, receipt: &ReceiptRecord) -> Result<(), Self::Error> {
+        fn finalize(&self, receipt: &ReceiptRecord) -> Result<FinalizeResult, Self::Error> {
             if let Some(error) = self
                 .fail_store
                 .lock()
@@ -2032,11 +2248,29 @@ mod tests {
             {
                 return Err(error);
             }
-            self.receipts
+            let mut receipts = self
+                .receipts
                 .lock()
-                .map_err(|_| "test receipt lock poisoned".to_owned())?
-                .push(receipt.clone());
-            Ok(())
+                .map_err(|_| "test receipt lock poisoned".to_owned())?;
+            match receipts
+                .iter()
+                .find(|existing| existing.action_id == receipt.action_id)
+            {
+                None => {
+                    receipts.push(receipt.clone());
+                    Ok(FinalizeResult::Finalized(receipt.clone()))
+                }
+                Some(existing) if existing == receipt => {
+                    Ok(FinalizeResult::AlreadyFinalized(existing.clone()))
+                }
+                Some(existing) => Ok(FinalizeResult::FinalizationConflict(ReceiptConflict {
+                    action_id: receipt.action_id.clone(),
+                    existing_receipt_id: existing.receipt_id.clone(),
+                    attempted_receipt_id: receipt.receipt_id.clone(),
+                    existing_evidence_digest: existing.evidence_digest.clone(),
+                    attempted_evidence_digest: receipt.evidence_digest.clone(),
+                })),
+            }
         }
 
         fn load(&self, action_id: &str) -> Result<Option<ReceiptRecord>, Self::Error> {
@@ -2895,9 +3129,13 @@ mod tests {
             .get_mut(&action_id)
             .unwrap()
             .state = ExecutionState::Dispatching;
-        let status = kernel
+        let decision = kernel
             .recover(&action_id)
             .expect("receipt should repair state");
+        let status = match decision {
+            RecoveryDecision::RecoverCommitted(status) => status,
+            other => panic!("expected committed recovery, got {other:?}"),
+        };
         assert_eq!(status.state, ExecutionState::Committed);
         assert!(status.receipt.is_some());
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
@@ -2933,15 +3171,173 @@ mod tests {
             .unwrap()
             .state = ExecutionState::Dispatching;
 
-        let status = kernel
+        let decision = kernel
             .recover(&action_id)
             .expect("missing receipt must become unknown, not redispatch");
+        let status = match decision {
+            RecoveryDecision::RecoverUnknown(status) => status,
+            other => panic!("expected unknown recovery, got {other:?}"),
+        };
         assert_eq!(status.state, ExecutionState::Unknown);
         assert!(status.reconciliation_required);
         assert!(!status.safe_to_retry);
         assert_eq!(
             actions.load_state(&action_id).unwrap(),
             Some(ExecutionState::Unknown)
+        );
+    }
+
+    #[test]
+    fn recovery_repairs_unknown_from_late_bound_terminal_evidence_without_reconciliation() {
+        let (kernel, _authority, _function, effect, _actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "RESPONSE_LOST".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("late-evidence")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown action"),
+        };
+        let request = effect.requests.lock().unwrap().last().cloned().unwrap();
+        receipts.finalize(&receipt(&request)).unwrap();
+
+        let recovered = kernel.recover(&action_id).unwrap();
+        match recovered {
+            RecoveryDecision::RecoverCommitted(status) => {
+                assert_eq!(status.state, ExecutionState::Committed);
+                assert!(status.receipt.is_some());
+            }
+            other => panic!("late committed evidence must repair locally: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_repairs_stale_reconciling_from_persisted_failure_evidence() {
+        let (kernel, _authority, _function, effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "RESPONSE_LOST".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("reconciling-evidence")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown action"),
+        };
+        let request = effect.requests.lock().unwrap().last().cloned().unwrap();
+        let mut failed = receipt(&request);
+        failed.final_state = ExecutionState::Failed;
+        failed.evidence_digest = "definite-provider-rejection".into();
+        receipts.finalize(&failed).unwrap();
+        actions
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&action_id)
+            .unwrap()
+            .state = ExecutionState::Reconciling;
+        actions
+            .states
+            .lock()
+            .unwrap()
+            .insert(action_id.clone(), ExecutionState::Reconciling);
+
+        let recovered = kernel.recover(&action_id).unwrap();
+        match recovered {
+            RecoveryDecision::RecoverFailed(status) => {
+                assert_eq!(status.state, ExecutionState::Failed);
+                assert_eq!(status.receipt, Some(failed));
+            }
+            other => panic!("late failed evidence must repair locally: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_reports_contradictory_evidence_without_rewriting_unknown_state() {
+        let (kernel, _authority, _function, effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "RESPONSE_LOST".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("contradictory-evidence")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown action"),
+        };
+        let request = effect.requests.lock().unwrap().last().cloned().unwrap();
+        let mut conflicting = receipt(&request);
+        conflicting.args_digest = "other-arguments".into();
+        receipts.finalize(&conflicting).unwrap();
+
+        assert!(matches!(
+            kernel.recover(&action_id).unwrap(),
+            RecoveryDecision::ContradictoryEvidence { .. }
+        ));
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown),
+            "contradictory evidence must not manufacture a terminal state"
+        );
+    }
+
+    #[test]
+    fn prepared_retry_waits_for_a_live_owner_before_authority_or_cancellation() {
+        let (kernel, authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Deny);
+        let invocation = invocation_with_request_id("prepared-live-owner");
+        let bound = kernel.bind(&invocation).unwrap();
+        let action = bound.action_preparation();
+        actions.claim_action(&action).unwrap();
+        {
+            let mut records = actions.records.lock().unwrap();
+            let record = records.get_mut(&action.action_id).unwrap();
+            record.state = ExecutionState::Prepared;
+            record.lease = Some(ActionLease {
+                owner_id: "active-dispatcher".into(),
+                generation: 1,
+                expires_at_unix_ms: chrono::Utc::now()
+                    .timestamp_millis()
+                    .max(0)
+                    .saturating_add(60_000) as u64,
+            });
+        }
+        actions
+            .states
+            .lock()
+            .unwrap()
+            .insert(action.action_id.clone(), ExecutionState::Prepared);
+
+        let result = match kernel.begin(&invocation) {
+            Err(error) => error,
+            Ok(_) => panic!("a live prepared lease must prevent a second invocation"),
+        };
+        assert!(matches!(
+            result,
+            KernelError::ActionPending {
+                cause: ActionPendingCause::LeaseHeld,
+                ..
+            }
+        ));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            actions.load_state(&action.action_id).unwrap(),
+            Some(ExecutionState::Prepared)
         );
     }
 
@@ -2962,17 +3358,15 @@ mod tests {
             Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
             _ => panic!("expected unknown effect"),
         };
-        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let live = actions
             .claim_lease(
                 &action_id,
                 ExecutionState::Unknown,
                 "live-owner",
-                now,
-                60_000,
+                Some(60_000),
             )
             .expect("test lease claim should succeed");
-        assert!(matches!(live, LeaseClaim::Acquired(_)));
+        assert!(matches!(live, LeaseAcquireResult::Acquired(_)));
         let pending = kernel
             .reconcile(&action_id)
             .expect_err("live reconciliation owner must fence a second worker");
@@ -2989,7 +3383,10 @@ mod tests {
             records.get_mut(&action_id).unwrap().lease = Some(ActionLease {
                 owner_id: "dead-owner".into(),
                 generation: 1,
-                expires_at_unix_ms: now.saturating_sub(1),
+                expires_at_unix_ms: chrono::Utc::now()
+                    .timestamp_millis()
+                    .max(0)
+                    .saturating_sub(1) as u64,
             });
             records.get_mut(&action_id).unwrap().state = ExecutionState::Reconciling;
         }
@@ -3001,6 +3398,10 @@ mod tests {
         let recovered = kernel
             .recover(&action_id)
             .expect("expired reconciliation lease should recover to unknown");
+        let recovered = match recovered {
+            RecoveryDecision::RecoverUnknown(status) => status,
+            other => panic!("expected unknown recovery, got {other:?}"),
+        };
         assert_eq!(recovered.state, ExecutionState::Unknown);
         assert_eq!(recovered.next_action, ActionNextStep::Reconcile);
     }
@@ -3025,11 +3426,16 @@ mod tests {
             .unwrap()
             .insert(action.action_id.clone(), ExecutionState::Prepared);
         let first = match actions
-            .claim_lease(&action.action_id, ExecutionState::Prepared, "first", 1, 10)
+            .claim_lease(
+                &action.action_id,
+                ExecutionState::Prepared,
+                "first",
+                Some(10),
+            )
             .expect("first lease should claim")
         {
-            LeaseClaim::Acquired(lease) => lease,
-            LeaseClaim::Held(_) => panic!("first lease cannot be held"),
+            LeaseAcquireResult::Acquired(lease) => lease,
+            other => panic!("first lease cannot be held: {other:?}"),
         };
         actions
             .transition_with_lease(
@@ -3048,11 +3454,16 @@ mod tests {
             )
             .expect("terminal transition releases the first lease");
         let second = match actions
-            .claim_lease(&action.action_id, ExecutionState::Unknown, "second", 20, 10)
+            .claim_lease(
+                &action.action_id,
+                ExecutionState::Unknown,
+                "second",
+                Some(10),
+            )
             .expect("second lease should claim")
         {
-            LeaseClaim::Acquired(lease) => lease,
-            LeaseClaim::Held(_) => panic!("released lease cannot remain held"),
+            LeaseAcquireResult::Acquired(lease) => lease,
+            other => panic!("released lease cannot remain held: {other:?}"),
         };
         assert!(second.generation > first.generation);
     }
