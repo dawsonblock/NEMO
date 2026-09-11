@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "90900b7b3e81ae234c9db4c37454d50c08eaaf445130ba7bce7a170ab5d56b51",
+  "root_digest": "73502e11cb325ffc20d1352d7fef63f7d31c1d7fcac7c8cebca76a418dfc5443",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -466,7 +466,7 @@
     "crates/core/src/context/registries.rs": "11a9f411d370cfb8feeaf86e6131a0883fa245c403a6433faf177e29c2332989",
     "crates/core/src/error.rs": "bd6a0370ffc3f73c19d13eead8eed8449f61cc1dbc6d00195af84c3e5a98ff90",
     "crates/core/src/json.rs": "384a15923841c448d8db1a643383a3c1471cebe2bbfb2ed689e5243da84edcef",
-    "crates/core/src/kernel.rs": "a202cb0f960e21aa333c61438ff45d8c7f359496e6d27a57666969c2c869445a",
+    "crates/core/src/kernel.rs": "219730b56647c244df432a45c9c1ba95dfa98675b454c2ad5e3cf0d732545e00",
     "crates/core/src/lib.rs": "536660f4b6735c51466002bcfc08ed2571393b5d2f750792d7cc29a4d233eaa1",
     "crates/core/src/logging/config.rs": "f3695584854c360f34e558453d76c7c737854d603cf26c27ed0dfa5eeb933914",
     "crates/core/src/logging/format.rs": "41621187a4ba0cbacac859e214586ec56d409bf96b1d77f597c4b44ab6a5a599",
@@ -1322,7 +1322,7 @@
     "build",
     "dist"
   ],
-  "source_archive_sha256": "42629f783b3d180953144bb948fb3f8e14133d48786de28b2773930e16483856",
+  "source_archive_sha256": "85502e78649fa2c5e69f88a11cf4a555b6070dd4681b3f1fae03b3e4750f8add",
   "release_archive_sha256": null,
   "lockfiles": {
     "Cargo.lock": "sha256:2be462e17c580021359a2f0032efcea2a487439e594ba9f1f653fd241e76d1a1",
@@ -1330,9 +1330,9 @@
     "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
   },
   "git": {
-    "commit": "75833822a741b6a5f4b1e51c816c102a1d577202",
-    "tree": "19305db48bca1f6c3e1d67359ea44da1784de591",
-    "source_tree_sha256": "90900b7b3e81ae234c9db4c37454d50c08eaaf445130ba7bce7a170ab5d56b51",
+    "commit": "b60db2d74ae978fcc196d93302f4cd0d9c5f0093",
+    "tree": "8f0ab0b0327a062a711290baf7cfbad99b9d8b35",
+    "source_tree_sha256": "73502e11cb325ffc20d1352d7fef63f7d31c1d7fcac7c8cebca76a418dfc5443",
     "status": []
   }
 }
