@@ -126,7 +126,8 @@ Lease operations return typed outcomes rather than boolean success:
 cancellation, or a second executor. Lease expiry grants permission to examine
 evidence and recover; it is not evidence that a previous dispatch did nothing.
 
-`ReceiptStore::finalize` is append-only. Receipt identity is canonical: it
+`ReceiptStore::finalize` is append-only and accepts only structurally complete
+`COMMITTED` or `FAILED` receipts with a non-empty evidence digest. Receipt identity is canonical: it
 includes the action/security/provider evidence bindings but excludes a local
 receipt ID and collection timestamps, so a recovery worker can replay the
 same provider evidence idempotently. A materially different finalization for
@@ -145,6 +146,19 @@ separate contracts: `authorize_action` alone may write
 lease may write dispatch, reconciliation, or uncertainty transitions. A
 missing, empty, or whitespace-only grant digest blocks authorization,
 preparation, and terminal-evidence construction.
+
+New `PROPOSED` claims must not carry a grant digest or approval reference;
+only `authorize_action` may attach them. An action-ID collision is a typed
+conflict and must never overwrite an existing durable action.
+
+For a real durable adapter, terminal receipt persistence and the fenced action
+transition are one `EffectStore::finalize_terminal_receipt` operation. The
+same contract provides an `EvidenceSnapshot` containing the primary receipt,
+all retained conflicts, and an implementation revision. This prevents callers
+from treating independent action and receipt writes or reads as a transaction.
+`InMemoryEffectStore` makes that ordering executable for tests only; PostgreSQL
+or another Effect Fabric backend must provide the atomic transaction before any
+production durability claim is made.
 
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live

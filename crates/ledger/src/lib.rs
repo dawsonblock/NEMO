@@ -391,8 +391,21 @@ pub mod unstable {
         /// The exact same action is already known and may be observed,
         /// resumed, reconciled, or replayed without redispatching it.
         ExistingSameAction(Box<ActionRecord>),
+        /// The supplied action identifier is already owned by a different
+        /// durable action. Stores must never overwrite that record.
+        ActionIdConflict(Box<ActionRecord>),
         /// The key is already bound to different effect identity.
         IdempotencyConflict,
+    }
+
+    /// Typed reason an action cannot enter the `PROPOSED` state.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum ClaimValidationError {
+        /// Authorization evidence may only be attached by `authorize_action`.
+        PrepopulatedGrantDigest,
+        /// Approval evidence may only be attached by `authorize_action`.
+        PrepopulatedApprovalReference,
     }
 
     /// Receipt evidence bound to the action that produced it.
@@ -446,6 +459,16 @@ pub mod unstable {
         pub evidence_digest: String,
     }
 
+    /// Typed structural validation failure for immutable receipt evidence.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum ReceiptValidationError {
+        /// Only an authoritative terminal state can occupy immutable evidence.
+        NonTerminalState(ExecutionState),
+        /// A security or evidence field was absent, empty, or whitespace-only.
+        EmptyField(&'static str),
+    }
+
     /// Immutable identity shared by every terminal evidence object for an action.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ActionEvidenceBinding {
@@ -492,6 +515,8 @@ pub mod unstable {
         MissingGrantDigest,
         /// Authorization persisted an empty or whitespace-only grant digest.
         EmptyGrantDigest,
+        /// A required immutable identity field was empty or whitespace-only.
+        EmptyField(&'static str),
     }
 
     impl std::fmt::Display for EvidenceBindingError {
@@ -499,6 +524,9 @@ pub mod unstable {
             match self {
                 Self::MissingGrantDigest => write!(formatter, "action has no grant digest"),
                 Self::EmptyGrantDigest => write!(formatter, "action grant digest is empty"),
+                Self::EmptyField(field) => {
+                    write!(formatter, "action evidence field is empty: {field}")
+                }
             }
         }
     }
@@ -517,7 +545,7 @@ pub mod unstable {
             if grant_digest.trim().is_empty() {
                 return Err(EvidenceBindingError::EmptyGrantDigest);
             }
-            Ok(Self {
+            let binding = Self {
                 action_id: action.action_id.clone(),
                 idempotency_key: action.idempotency_key.clone(),
                 grant_digest: grant_digest.to_owned(),
@@ -535,7 +563,43 @@ pub mod unstable {
                 admission_id: action.admission_id.clone(),
                 policy_version: action.policy_version.clone(),
                 policy_epoch: action.policy_epoch.clone(),
-            })
+            };
+            binding.validate()?;
+            Ok(binding)
+        }
+    }
+
+    impl ActionEvidenceBinding {
+        /// Reject structurally incomplete evidence identities before they can
+        /// be persisted or compared as authoritative proof.
+        pub fn validate(&self) -> Result<(), EvidenceBindingError> {
+            for (field, value) in [
+                ("action_id", self.action_id.as_str()),
+                ("idempotency_key", self.idempotency_key.as_str()),
+                ("principal_id", self.principal_id.as_str()),
+                ("runtime_id", self.runtime_id.as_str()),
+                (
+                    "runtime_binding_digest",
+                    self.runtime_binding_digest.as_str(),
+                ),
+                ("capability_id", self.capability_id.as_str()),
+                ("registration_digest", self.registration_digest.as_str()),
+                ("operation", self.operation.as_str()),
+                ("execution_class", self.execution_class.as_str()),
+                ("args_digest", self.args_digest.as_str()),
+                ("route_digest", self.route_digest.as_str()),
+                ("admission_id", self.admission_id.as_str()),
+                ("policy_version", self.policy_version.as_str()),
+                ("policy_epoch", self.policy_epoch.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(EvidenceBindingError::EmptyField(field));
+                }
+            }
+            if self.grant_digest.trim().is_empty() {
+                return Err(EvidenceBindingError::EmptyGrantDigest);
+            }
+            Ok(())
         }
     }
 
@@ -614,9 +678,61 @@ pub mod unstable {
                 evidence_digest: self.evidence_digest.clone(),
             }
         }
+
+        /// Validate that this record can be immutable terminal evidence.
+        pub fn validate_terminal(&self) -> Result<(), ReceiptValidationError> {
+            if !matches!(
+                self.final_state,
+                ExecutionState::Committed | ExecutionState::Failed
+            ) {
+                return Err(ReceiptValidationError::NonTerminalState(self.final_state));
+            }
+            for (field, value) in [
+                ("receipt_id", self.receipt_id.as_str()),
+                ("action_id", self.action_id.as_str()),
+                ("idempotency_key", self.idempotency_key.as_str()),
+                ("grant_digest", self.grant_digest.as_str()),
+                ("principal_id", self.principal_id.as_str()),
+                ("runtime_id", self.runtime_id.as_str()),
+                (
+                    "runtime_binding_digest",
+                    self.runtime_binding_digest.as_str(),
+                ),
+                ("capability_id", self.capability_id.as_str()),
+                ("registration_digest", self.registration_digest.as_str()),
+                ("operation", self.operation.as_str()),
+                ("execution_class", self.execution_class.as_str()),
+                ("args_digest", self.args_digest.as_str()),
+                ("route_digest", self.route_digest.as_str()),
+                ("admission_id", self.admission_id.as_str()),
+                ("policy_version", self.policy_version.as_str()),
+                ("policy_epoch", self.policy_epoch.as_str()),
+                ("evidence_digest", self.evidence_digest.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(ReceiptValidationError::EmptyField(field));
+                }
+            }
+            Ok(())
+        }
     }
 
     impl ReceiptIdentity {
+        /// Validate that a receipt identity can justify a terminal transition.
+        pub fn validate_terminal(&self) -> Result<(), EvidenceBindingError> {
+            if !matches!(
+                self.final_state,
+                ExecutionState::Committed | ExecutionState::Failed
+            ) {
+                return Err(EvidenceBindingError::EmptyField("terminal_receipt_state"));
+            }
+            self.action_binding().validate()?;
+            if self.evidence_digest.trim().is_empty() {
+                return Err(EvidenceBindingError::EmptyField("receipt_evidence_digest"));
+            }
+            Ok(())
+        }
+
         /// Return the action binding that receipt evidence must match.
         pub fn action_binding(&self) -> ActionEvidenceBinding {
             ActionEvidenceBinding {
@@ -667,8 +783,14 @@ pub mod unstable {
         ) -> Result<bool, EvidenceBindingError> {
             let binding = ActionEvidenceBinding::try_from(action)?;
             Ok(match self {
-                Self::Receipt(receipt) => receipt.action_binding() == binding,
-                Self::PreDispatchFailure(failure) => failure.action_binding == binding,
+                Self::Receipt(receipt) => {
+                    receipt.validate_terminal()?;
+                    receipt.action_binding() == binding
+                }
+                Self::PreDispatchFailure(failure) => {
+                    failure.validate()?;
+                    failure.action_binding == binding
+                }
             })
         }
     }
@@ -682,6 +804,21 @@ pub mod unstable {
         pub code: String,
         /// Digest of the bounded failure diagnostic.
         pub evidence_digest: String,
+    }
+
+    impl PreDispatchFailureEvidence {
+        /// Validate that failure evidence is meaningful before it is allowed to
+        /// prove a terminal `FAILED` state without a provider receipt.
+        pub fn validate(&self) -> Result<(), EvidenceBindingError> {
+            self.action_binding.validate()?;
+            if self.code.trim().is_empty() {
+                return Err(EvidenceBindingError::EmptyField("failure_code"));
+            }
+            if self.evidence_digest.trim().is_empty() {
+                return Err(EvidenceBindingError::EmptyField("failure_evidence_digest"));
+            }
+            Ok(())
+        }
     }
 
     /// Immutable receipt conflict reported by an append-only receipt store.
@@ -972,11 +1109,72 @@ pub mod unstable {
         fn load_conflicts(&self, action_id: &str) -> Result<Vec<ReceiptConflict>, Self::Error>;
     }
 
+    /// A coherent read of immutable evidence for one action.
+    ///
+    /// Durable implementations should produce this snapshot inside the same
+    /// transaction or revision boundary used for finalization. A kernel must
+    /// not treat independently read receipts and conflicts as an atomic view.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct EvidenceSnapshot {
+        /// Monotonic implementation-defined evidence revision, if available.
+        pub revision: u64,
+        /// The first immutable terminal receipt, if one was finalized.
+        pub receipt: Option<ReceiptRecord>,
+        /// Every immutable contradiction recorded for this action.
+        pub conflicts: Vec<ReceiptConflict>,
+    }
+
+    /// Result of atomically storing terminal receipt evidence and advancing
+    /// the matching action record.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum EffectFinalizeResult {
+        /// Receipt and action state were finalized together.
+        Finalized(ReceiptRecord),
+        /// The same already-finalized evidence was replayed safely.
+        AlreadyFinalized(ReceiptRecord),
+        /// Contradictory evidence was retained and requires repair.
+        FinalizationConflict(ReceiptConflict),
+        /// The same contradiction was already retained.
+        ConflictAlreadyRecorded(ReceiptConflict),
+    }
+
+    /// Transaction-shaped Effect Fabric boundary.
+    ///
+    /// A production implementation owns one atomic transaction for receipt
+    /// insertion, conflict retention, evidence snapshot reads, and the
+    /// corresponding fenced terminal action transition. `ActionStore` and
+    /// `ReceiptStore` remain useful lower-level contracts for tests and
+    /// adapters, but callers that require durable terminal semantics must use
+    /// this boundary rather than compose two independent writes.
+    pub trait EffectStore {
+        /// Adapter-specific failure type.
+        type Error;
+
+        /// Read the primary receipt and all conflict evidence atomically.
+        fn evidence_snapshot(&self, action_id: &str) -> Result<EvidenceSnapshot, Self::Error>;
+
+        /// Atomically validate, persist, and bind a terminal receipt to the
+        /// fenced action transition. The receipt must be `COMMITTED` or
+        /// `FAILED` and fully bind the action's persisted authorization.
+        fn finalize_terminal_receipt(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error>;
+    }
+
     /// Error emitted by the non-durable reference stores.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ReferenceStoreError {
         /// The requested action does not exist.
         ActionMissing(String),
+        /// A new claim attempted to reuse an existing immutable action ID.
+        ActionIdConflict(String),
+        /// A caller attempted to smuggle authorization evidence into PROPOSED.
+        InvalidActionClaim(ClaimValidationError),
         /// A compare-and-set state did not match.
         UnexpectedState {
             /// Expected state.
@@ -1006,6 +1204,8 @@ pub mod unstable {
         },
         /// A verified non-empty grant digest was required for this operation.
         InvalidGrantDigest,
+        /// A receipt could not become immutable terminal evidence.
+        InvalidReceipt(ReceiptValidationError),
         /// An unfenced update attempted to bypass a live lease.
         LeaseHeld(ActionLease),
         /// The reference store lock was poisoned.
@@ -1016,6 +1216,12 @@ pub mod unstable {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::ActionMissing(action_id) => write!(formatter, "unknown action: {action_id}"),
+                Self::ActionIdConflict(action_id) => {
+                    write!(formatter, "action identifier already exists: {action_id}")
+                }
+                Self::InvalidActionClaim(reason) => {
+                    write!(formatter, "invalid proposed action claim: {reason:?}")
+                }
                 Self::UnexpectedState { expected, actual } => {
                     write!(
                         formatter,
@@ -1048,6 +1254,9 @@ pub mod unstable {
                 }
                 Self::InvalidGrantDigest => {
                     write!(formatter, "a non-empty verified grant digest is required")
+                }
+                Self::InvalidReceipt(reason) => {
+                    write!(formatter, "invalid terminal receipt: {reason:?}")
                 }
                 Self::LeaseHeld(lease) => write!(
                     formatter,
@@ -1113,6 +1322,21 @@ pub mod unstable {
             action: &ActionPreparation,
         ) -> Result<PrepareActionResult, Self::Error> {
             let mut records = self.records()?;
+            if action.grant_digest.is_some() {
+                return Err(ReferenceStoreError::InvalidActionClaim(
+                    ClaimValidationError::PrepopulatedGrantDigest,
+                ));
+            }
+            if action.approval_reference.is_some() {
+                return Err(ReferenceStoreError::InvalidActionClaim(
+                    ClaimValidationError::PrepopulatedApprovalReference,
+                ));
+            }
+            if let Some(existing) = records.get(&action.action_id) {
+                return Ok(PrepareActionResult::ActionIdConflict(Box::new(
+                    existing.clone(),
+                )));
+            }
             if let Some(existing) = records
                 .values()
                 .find(|record| record.preparation.idempotency_key == action.idempotency_key)
@@ -1473,6 +1697,9 @@ pub mod unstable {
         type Error = ReferenceStoreError;
 
         fn finalize(&self, receipt: &ReceiptRecord) -> Result<FinalizeResult, Self::Error> {
+            receipt
+                .validate_terminal()
+                .map_err(ReferenceStoreError::InvalidReceipt)?;
             let mut receipts = self
                 .receipts
                 .lock()
@@ -1525,6 +1752,156 @@ pub mod unstable {
         }
     }
 
+    /// Reference implementation of the transaction-shaped [`EffectStore`]
+    /// contract.
+    ///
+    /// This is deliberately non-durable. Its process-local operation gate
+    /// makes the required ordering executable for conformance tests; a real
+    /// Effect Fabric adapter must provide the same operation in one durable
+    /// database transaction and must not expose this as production storage.
+    #[derive(Clone)]
+    pub struct InMemoryEffectStore<C = SystemStoreClock> {
+        actions: InMemoryActionStore<C>,
+        receipts: InMemoryReceiptStore,
+        operation_gate: Arc<Mutex<()>>,
+        evidence_revisions: Arc<Mutex<HashMap<String, u64>>>,
+    }
+
+    impl InMemoryEffectStore<SystemStoreClock> {
+        /// Create a non-durable reference effect store using the wall clock.
+        pub fn new(lease_configuration: LeaseConfiguration) -> Self {
+            Self::with_clock(SystemStoreClock, lease_configuration)
+        }
+    }
+
+    impl<C> InMemoryEffectStore<C>
+    where
+        C: StoreClock,
+    {
+        /// Create a reference effect store using a store-owned test clock.
+        pub fn with_clock(clock: C, lease_configuration: LeaseConfiguration) -> Self {
+            Self {
+                actions: InMemoryActionStore::with_clock(clock, lease_configuration),
+                receipts: InMemoryReceiptStore::default(),
+                operation_gate: Arc::new(Mutex::new(())),
+                evidence_revisions: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        /// Access the action contract for setup and non-terminal transitions.
+        pub fn actions(&self) -> &InMemoryActionStore<C> {
+            &self.actions
+        }
+
+        /// Access the receipt contract for read-only inspection in tests.
+        pub fn receipts(&self) -> &InMemoryReceiptStore {
+            &self.receipts
+        }
+
+        fn bump_evidence_revision(&self, action_id: &str) -> Result<(), ReferenceStoreError> {
+            let mut revisions = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let revision = revisions.entry(action_id.to_owned()).or_default();
+            *revision = revision.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    impl<C> EffectStore for InMemoryEffectStore<C>
+    where
+        C: StoreClock,
+    {
+        type Error = ReferenceStoreError;
+
+        fn evidence_snapshot(&self, action_id: &str) -> Result<EvidenceSnapshot, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let revision = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                .get(action_id)
+                .copied()
+                .unwrap_or_default();
+            Ok(EvidenceSnapshot {
+                revision,
+                receipt: self.receipts.load(action_id)?,
+                conflicts: self.receipts.load_conflicts(action_id)?,
+            })
+        }
+
+        fn finalize_terminal_receipt(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            receipt
+                .validate_terminal()
+                .map_err(ReferenceStoreError::InvalidReceipt)?;
+            if receipt.action_id != action_id {
+                return Err(ReferenceStoreError::EvidenceBindingMismatch {
+                    action_id: action_id.to_owned(),
+                });
+            }
+            let action = self
+                .actions
+                .load_action(action_id)?
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            let evidence = TerminalEvidence::Receipt(receipt.identity());
+            if action.state != expected {
+                return Err(ReferenceStoreError::UnexpectedState {
+                    expected: Some(expected),
+                    actual: action.state,
+                });
+            }
+            if action.lease.as_ref() != Some(lease)
+                || lease.expires_at_unix_ms <= self.actions.clock.now_unix_ms()
+            {
+                return Err(ReferenceStoreError::LeaseHeld(
+                    action.lease.unwrap_or_else(|| lease.clone()),
+                ));
+            }
+            if !evidence
+                .binds_action(&action.preparation)
+                .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
+                || !is_valid_evidence_transition(expected, receipt.final_state, &evidence)
+            {
+                return Err(ReferenceStoreError::EvidenceBindingMismatch {
+                    action_id: action_id.to_owned(),
+                });
+            }
+            let finalized = match self.receipts.finalize(receipt)? {
+                FinalizeResult::Finalized(receipt) => receipt,
+                FinalizeResult::AlreadyFinalized(receipt) => {
+                    self.actions
+                        .finalize_from_evidence(action_id, expected, lease, &evidence)?;
+                    return Ok(EffectFinalizeResult::AlreadyFinalized(receipt));
+                }
+                FinalizeResult::FinalizationConflict(conflict) => {
+                    self.bump_evidence_revision(action_id)?;
+                    return Ok(EffectFinalizeResult::FinalizationConflict(conflict));
+                }
+                FinalizeResult::ConflictAlreadyRecorded(conflict) => {
+                    return Ok(EffectFinalizeResult::ConflictAlreadyRecorded(conflict));
+                }
+            };
+            self.actions
+                .finalize_from_evidence(action_id, expected, lease, &evidence)?;
+            self.bump_evidence_revision(action_id)?;
+            Ok(EffectFinalizeResult::Finalized(finalized))
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1571,6 +1948,38 @@ pub mod unstable {
         }
 
         #[cfg(feature = "unstable-hardening-testkit")]
+        struct ReferenceEffectHarness {
+            effects: InMemoryEffectStore<ManualStoreClock>,
+        }
+
+        #[cfg(feature = "unstable-hardening-testkit")]
+        impl crate::conformance::EffectStoreConformanceHarness for ReferenceEffectHarness {
+            type Effects = InMemoryEffectStore<ManualStoreClock>;
+            type Actions = InMemoryActionStore<ManualStoreClock>;
+
+            fn new_harness() -> Self {
+                Self {
+                    effects: InMemoryEffectStore::with_clock(
+                        ManualStoreClock::new(1_000),
+                        LeaseConfiguration {
+                            default_duration_ms: 10,
+                            maximum_duration_ms: 100,
+                            renewal_enabled: true,
+                        },
+                    ),
+                }
+            }
+
+            fn effects(&self) -> &Self::Effects {
+                &self.effects
+            }
+
+            fn actions(&self) -> &Self::Actions {
+                self.effects.actions()
+            }
+        }
+
+        #[cfg(feature = "unstable-hardening-testkit")]
         #[test]
         fn reference_action_store_satisfies_reusable_conformance_suite() {
             crate::conformance::run_action_store_conformance::<ReferenceHarness>();
@@ -1580,6 +1989,12 @@ pub mod unstable {
         #[test]
         fn reference_receipt_store_satisfies_reusable_conformance_suite() {
             crate::conformance::run_receipt_store_conformance::<ReferenceHarness>();
+        }
+
+        #[cfg(feature = "unstable-hardening-testkit")]
+        #[test]
+        fn reference_effect_store_satisfies_reusable_conformance_suite() {
+            crate::conformance::run_effect_store_conformance::<ReferenceEffectHarness>();
         }
 
         #[test]
@@ -2004,6 +2419,82 @@ pub mod unstable {
                 )
                 .unwrap();
             (store, clock)
+        }
+
+        #[test]
+        fn effect_store_finalizes_receipt_and_terminal_action_as_one_contract_operation() {
+            let clock = ManualStoreClock::new(1_000);
+            let effect_store = InMemoryEffectStore::with_clock(
+                clock,
+                LeaseConfiguration {
+                    default_duration_ms: 10,
+                    maximum_duration_ms: 100,
+                    renewal_enabled: true,
+                },
+            );
+            let action = reference_action();
+            effect_store.actions().claim_action(&action).unwrap();
+            effect_store
+                .actions()
+                .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+                .unwrap();
+            effect_store
+                .actions()
+                .transition(
+                    &action.action_id,
+                    Some(ExecutionState::Authorized),
+                    ExecutionState::Prepared,
+                )
+                .unwrap();
+            let lease = match effect_store
+                .actions()
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    "effect-worker",
+                    Some(10),
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                outcome => panic!("unexpected lease result: {outcome:?}"),
+            };
+            effect_store
+                .actions()
+                .transition_with_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    &lease,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            let committed = reference_receipt(ExecutionState::Committed, "evidence-a");
+            assert!(matches!(
+                effect_store
+                    .finalize_terminal_receipt(
+                        &action.action_id,
+                        ExecutionState::Dispatching,
+                        &lease,
+                        &committed,
+                    )
+                    .unwrap(),
+                EffectFinalizeResult::Finalized(_)
+            ));
+            assert_eq!(
+                effect_store
+                    .actions()
+                    .load_state(&action.action_id)
+                    .unwrap(),
+                Some(ExecutionState::Committed)
+            );
+            assert_eq!(
+                effect_store.evidence_snapshot(&action.action_id).unwrap(),
+                EvidenceSnapshot {
+                    revision: 1,
+                    receipt: Some(committed),
+                    conflicts: Vec::new(),
+                }
+            );
         }
 
         #[test]

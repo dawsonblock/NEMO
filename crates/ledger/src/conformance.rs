@@ -26,6 +26,26 @@ pub trait StoreConformanceHarness: Sized {
     fn advance_store_clock(&self, duration_ms: u64);
 }
 
+/// Factory for backend-independent transactional EffectStore conformance.
+///
+/// The action store returned here must be the same durable action history that
+/// the effect store finalizes. A production adapter uses this runner to prove
+/// that receipt insertion and terminal action mutation have one observable
+/// contract rather than two independently composed writes.
+pub trait EffectStoreConformanceHarness: Sized {
+    /// Transaction-shaped store under test.
+    type Effects: EffectStore;
+    /// Action store sharing the effect store's durable action history.
+    type Actions: ActionStore;
+
+    /// Construct an isolated transactional store fixture.
+    fn new_harness() -> Self;
+    /// Return the transactional evidence store.
+    fn effects(&self) -> &Self::Effects;
+    /// Return the paired action store for lifecycle setup and inspection.
+    fn actions(&self) -> &Self::Actions;
+}
+
 /// Return a claimed-but-not-authorized action fixture.
 pub fn fixture_action() -> ActionPreparation {
     ActionPreparation {
@@ -168,7 +188,18 @@ where
     H::Actions: ActionStore,
     <H::Actions as ActionStore>::Error: std::fmt::Debug,
 {
-    let harness = H::new_harness();
+    run_claim_input_conformance::<H>();
+    run_authorization_bypass_conformance::<H>();
+    run_leased_evidence_conformance::<H>();
+    run_action_binding_mutation_conformance::<H>();
+}
+
+fn run_claim_input_conformance<H>()
+where
+    H: StoreConformanceHarness,
+    H::Actions: ActionStore,
+    <H::Actions as ActionStore>::Error: std::fmt::Debug,
+{
     let action = fixture_action();
     assert_eq!(
         ActionEvidenceBinding::try_from(&action),
@@ -180,6 +211,71 @@ where
         ActionEvidenceBinding::try_from(&empty_grant),
         Err(EvidenceBindingError::EmptyGrantDigest)
     );
+
+    let invalid_claim = H::new_harness();
+    let mut preauthorized = fixture_action();
+    preauthorized.grant_digest = Some("smuggled-grant".into());
+    assert!(
+        invalid_claim
+            .actions()
+            .claim_action(&preauthorized)
+            .is_err(),
+        "claims must begin without authorization evidence"
+    );
+    preauthorized.grant_digest = None;
+    preauthorized.approval_reference = Some("smuggled-approval".into());
+    assert!(
+        invalid_claim
+            .actions()
+            .claim_action(&preauthorized)
+            .is_err(),
+        "claims must begin without approval evidence"
+    );
+
+    let action_id_conflict = H::new_harness();
+    let action = fixture_action();
+    assert!(matches!(
+        action_id_conflict
+            .actions()
+            .claim_action(&action)
+            .expect("claim original action"),
+        PrepareActionResult::NewAction
+    ));
+    let mut conflicting_action_id = action.clone();
+    conflicting_action_id.idempotency_key = "different-idempotency".into();
+    conflicting_action_id.fingerprint = "different-fingerprint".into();
+    assert!(matches!(
+        action_id_conflict
+            .actions()
+            .claim_action(&conflicting_action_id)
+            .expect("detect action id collision"),
+        PrepareActionResult::ActionIdConflict(existing)
+            if existing.preparation == action
+    ));
+    assert_eq!(
+        action_id_conflict
+            .actions()
+            .load_action(&action.action_id)
+            .expect("load original action"),
+        Some(ActionRecord {
+            preparation: action.clone(),
+            state: ExecutionState::Proposed,
+            lease: None,
+            lease_generation: 0,
+            terminal_evidence: None,
+        }),
+        "an action-id collision must never overwrite durable identity"
+    );
+}
+
+fn run_authorization_bypass_conformance<H>()
+where
+    H: StoreConformanceHarness,
+    H::Actions: ActionStore,
+    <H::Actions as ActionStore>::Error: std::fmt::Debug,
+{
+    let action = fixture_action();
+    let harness = H::new_harness();
     harness
         .actions()
         .claim_action(&action)
@@ -263,7 +359,43 @@ where
         .expect("terminal action exists");
     assert_eq!(terminal.state, ExecutionState::Committed);
     assert_eq!(terminal.terminal_evidence, Some(evidence));
+}
 
+fn run_leased_evidence_conformance<H>()
+where
+    H: StoreConformanceHarness,
+    H::Actions: ActionStore,
+    <H::Actions as ActionStore>::Error: std::fmt::Debug,
+{
+    let harness = H::new_harness();
+    let action = authorize_and_prepare(&harness);
+    let lease = dispatch_lease(&harness, &action);
+    let invalid_failure = TerminalEvidence::PreDispatchFailure(PreDispatchFailureEvidence {
+        action_binding: ActionEvidenceBinding::try_from(&action.preparation)
+            .expect("authorized action has evidence binding"),
+        code: " ".into(),
+        evidence_digest: " ".into(),
+    });
+    assert!(
+        harness
+            .actions()
+            .finalize_from_evidence(
+                &action.preparation.action_id,
+                ExecutionState::Dispatching,
+                &lease,
+                &invalid_failure,
+            )
+            .is_err(),
+        "empty pre-dispatch proof must not terminalize an action"
+    );
+}
+
+fn run_action_binding_mutation_conformance<H>()
+where
+    H: StoreConformanceHarness,
+    H::Actions: ActionStore,
+    <H::Actions as ActionStore>::Error: std::fmt::Debug,
+{
     let harness = H::new_harness();
     let action = authorize_and_prepare(&harness);
     let lease = dispatch_lease(&harness, &action);
@@ -327,6 +459,25 @@ where
     let mut action = fixture_action();
     action.grant_digest = Some("grant".into());
     let committed = fixture_receipt(&action, ExecutionState::Committed, "evidence-a");
+
+    let mut non_terminal = committed.clone();
+    non_terminal.final_state = ExecutionState::Unknown;
+    assert!(
+        harness.receipts().finalize(&non_terminal).is_err(),
+        "non-terminal evidence must not occupy the immutable receipt slot"
+    );
+    let mut empty_evidence = committed.clone();
+    empty_evidence.evidence_digest = " \t".into();
+    assert!(
+        harness.receipts().finalize(&empty_evidence).is_err(),
+        "empty evidence digest must not become immutable proof"
+    );
+    let mut empty_identity = committed.clone();
+    empty_identity.grant_digest = "".into();
+    assert!(
+        harness.receipts().finalize(&empty_identity).is_err(),
+        "structurally incomplete receipt identity must be rejected"
+    );
     assert!(matches!(
         harness
             .receipts()
@@ -371,6 +522,98 @@ where
             .len(),
         ReceiptIdentityMutation::ALL.len()
     );
+}
+
+/// Run transactional receipt/action finalization conformance checks.
+pub fn run_effect_store_conformance<H>()
+where
+    H: EffectStoreConformanceHarness,
+    H::Effects: EffectStore,
+    H::Actions: ActionStore,
+    <H::Effects as EffectStore>::Error: std::fmt::Debug,
+    <H::Actions as ActionStore>::Error: std::fmt::Debug,
+{
+    let harness = H::new_harness();
+    let action = fixture_action();
+    assert!(matches!(
+        harness
+            .actions()
+            .claim_action(&action)
+            .expect("claim effect action"),
+        PrepareActionResult::NewAction
+    ));
+    harness
+        .actions()
+        .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+        .expect("authorize effect action");
+    harness
+        .actions()
+        .transition(
+            &action.action_id,
+            Some(ExecutionState::Authorized),
+            ExecutionState::Prepared,
+        )
+        .expect("prepare effect action");
+    let lease = match harness
+        .actions()
+        .claim_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            "effect-store-conformance",
+            Some(10),
+        )
+        .expect("claim dispatch lease")
+    {
+        LeaseAcquireResult::Acquired(lease) => lease,
+        other => panic!("expected dispatch lease, got {other:?}"),
+    };
+    harness
+        .actions()
+        .transition_with_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            &lease,
+            ExecutionState::Dispatching,
+        )
+        .expect("enter dispatching");
+    let prepared = harness
+        .actions()
+        .load_action(&action.action_id)
+        .expect("load dispatching action")
+        .expect("action exists");
+    let receipt = fixture_receipt(
+        &prepared.preparation,
+        ExecutionState::Committed,
+        "effect-store-evidence",
+    );
+    assert!(matches!(
+        harness
+            .effects()
+            .finalize_terminal_receipt(
+                &action.action_id,
+                ExecutionState::Dispatching,
+                &lease,
+                &receipt,
+            )
+            .expect("atomically finalize terminal receipt"),
+        EffectFinalizeResult::Finalized(_)
+    ));
+    assert_eq!(
+        harness
+            .actions()
+            .load_action(&action.action_id)
+            .expect("load finalized action")
+            .expect("finalized action exists")
+            .state,
+        ExecutionState::Committed
+    );
+    let snapshot = harness
+        .effects()
+        .evidence_snapshot(&action.action_id)
+        .expect("read evidence snapshot");
+    assert_eq!(snapshot.receipt, Some(receipt));
+    assert!(snapshot.conflicts.is_empty());
+    assert!(snapshot.revision > 0);
 }
 
 #[derive(Clone, Copy)]

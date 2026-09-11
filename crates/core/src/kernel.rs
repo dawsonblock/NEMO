@@ -91,6 +91,9 @@ pub enum KernelError {
     /// The idempotency key is bound to a different logical action.
     #[error("idempotency key conflicts with an existing action")]
     IdempotencyConflict,
+    /// A generated action identifier collided with an existing durable action.
+    #[error("action identifier conflicts with an existing action: {0:?}")]
+    ActionIdConflict(Box<ActionStatus>),
     /// An effect backend completed without the authoritative receipt required for an effect.
     #[error("consequential execution completed without an authoritative receipt")]
     ReceiptMissing,
@@ -255,6 +258,8 @@ pub enum RecoveryDecision {
     RecoverCommitted(ActionStatus),
     /// Evidence proves the action failed and the durable state was repaired.
     RecoverFailed(ActionStatus),
+    /// The action was deliberately cancelled before external dispatch.
+    RecoverCancelled(ActionStatus),
     /// A valid owner still holds the action lease.
     HeldByOther(ActionStatus),
     /// Lease expiry left no terminal evidence; external outcome remains unknown.
@@ -836,7 +841,7 @@ where
             ExecutionState::Dispatching | ExecutionState::Reconciling | ExecutionState::Unknown => {
             }
             ExecutionState::Cancelled => {
-                return Ok(RecoveryDecision::RecoverFailed(
+                return Ok(RecoveryDecision::RecoverCancelled(
                     self.action_status(&action, None),
                 ));
             }
@@ -1389,7 +1394,8 @@ where
         ) {
             return match self.recover_terminal_action(&action)? {
                 RecoveryDecision::RecoverCommitted(status)
-                | RecoveryDecision::RecoverFailed(status) => {
+                | RecoveryDecision::RecoverFailed(status)
+                | RecoveryDecision::RecoverCancelled(status) => {
                     Ok(InvocationOutcome::ExistingAction(Box::new(status)))
                 }
                 RecoveryDecision::ContradictoryEvidence {
@@ -1495,6 +1501,9 @@ where
         {
             PrepareActionResult::NewAction => Ok(None),
             PrepareActionResult::ExistingSameAction(action) => Ok(Some(*action)),
+            PrepareActionResult::ActionIdConflict(action) => Err(KernelError::ActionIdConflict(
+                Box::new(self.action_status(&action, None)),
+            )),
             PrepareActionResult::IdempotencyConflict => Err(KernelError::IdempotencyConflict),
         }
     }
