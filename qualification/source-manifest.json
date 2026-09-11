@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "73502e11cb325ffc20d1352d7fef63f7d31c1d7fcac7c8cebca76a418dfc5443",
+  "root_digest": "cb2f1e74e5bed732377c6c2cc296b3870ea5c7e622fcc85a511244fef79ea427",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -403,7 +403,7 @@
     "crates/cli/tests/coverage/commands/model_pricing_tests.rs": "afa4c1078fc5ab37bba47a29f95c7af2f2b78dc464e6e0ddea857978d963351e",
     "crates/cli/tests/coverage/shared/agent_process_tests.rs": "30892806f9a0269b097be250afac1544d6aad763bd79d6cf309d29283921497f",
     "crates/cli/tests/coverage/shared/banner_tests.rs": "b3f55ccf686fa1f17adb602e92aacb001afe1f462a1356d244280febc455e41c",
-    "crates/cli/tests/coverage/shared/bootstrap_state_tests.rs": "023557cee5f6b27398b7afaab8d8ec4b74c4efb356e4ce5ff0b68330e62c4224",
+    "crates/cli/tests/coverage/shared/bootstrap_state_tests.rs": "96406e03e0cb4658634fbe0c469a18b1cfe39f9c0d131484949df50bfed58f7a",
     "crates/cli/tests/coverage/shared/bootstrap_tests.rs": "486ac330835af50f7f3f211fa5add412541cc8ac108cc1c491066bc94b28cb6f",
     "crates/cli/tests/coverage/shared/completions_install_tests.rs": "d63aaccb79a27b9324b1b4621b2671b4147393371afb33c679c7802952e2e194",
     "crates/cli/tests/coverage/shared/config_tests.rs": "e44de1af3b980fd0eb381044b1f15002ce82347cb0a773e13e00e127fc6a778a",
@@ -466,7 +466,7 @@
     "crates/core/src/context/registries.rs": "11a9f411d370cfb8feeaf86e6131a0883fa245c403a6433faf177e29c2332989",
     "crates/core/src/error.rs": "bd6a0370ffc3f73c19d13eead8eed8449f61cc1dbc6d00195af84c3e5a98ff90",
     "crates/core/src/json.rs": "384a15923841c448d8db1a643383a3c1471cebe2bbfb2ed689e5243da84edcef",
-    "crates/core/src/kernel.rs": "219730b56647c244df432a45c9c1ba95dfa98675b454c2ad5e3cf0d732545e00",
+    "crates/core/src/kernel.rs": "eda10e2d3e0257fe72c5c531ecf1607bbcea08486d104b7a74e8cbeb018aff57",
     "crates/core/src/lib.rs": "536660f4b6735c51466002bcfc08ed2571393b5d2f750792d7cc29a4d233eaa1",
     "crates/core/src/logging/config.rs": "f3695584854c360f34e558453d76c7c737854d603cf26c27ed0dfa5eeb933914",
     "crates/core/src/logging/format.rs": "41621187a4ba0cbacac859e214586ec56d409bf96b1d77f597c4b44ab6a5a599",
@@ -623,8 +623,8 @@
     "crates/isolation/Cargo.toml": "72d54e18ad996f4f4db410d0c6e036b6fefd80e52979471d88eb0254a628b1c3",
     "crates/isolation/src/lib.rs": "62d469d8a2a4bdf1dc1ebda5122cd9cdae2ab595c2b7375b20e6048f2af2cda4",
     "crates/ledger/Cargo.toml": "21f7c758a614885c1e419dc5d3421816ce0ae234961c23ae60c5c3ea058fb1bc",
-    "crates/ledger/src/conformance.rs": "0485392189079ad9863d713b4398c04065fb0c7d2801b12514c20d8621f08e85",
-    "crates/ledger/src/lib.rs": "f42e2e9a16620d4c4810987731766ba6d8bd566d347bb4a7704ee7d3a3d79c4c",
+    "crates/ledger/src/conformance.rs": "e7deadd7503a5077db59440395051e11f499bd203a9febd3db41ccffc3e8f83e",
+    "crates/ledger/src/lib.rs": "c986453e00454dd57eac2d9624a2c39d0672d780025369a61e86781c47db677a",
     "crates/node/Cargo.toml": "7fcdb1fa79845584cacc805879f9a208a2844cae3635bd4cd8d67509dc91d341",
     "crates/node/README.md": "d99acaf3bf89aff377415a6e174c701d484fd435bccc1f8a6d46ef0dff08b1a7",
     "crates/node/adaptive.d.ts": "721a53796be6dfddbd9d95d80d7a7fbd066083bed5e7595f6da1bea7a689cb8d",
@@ -852,7 +852,7 @@
     "docs/reference/api/index.mdx": "e8f871cfa073d8cadddb8b24630c45c847222a0a3d0555a91a77d9bec1ae7b58",
     "docs/reference/atof-event-format.mdx": "65c2826a93a8339f4d11d1448bd17bdd89daec73c94bfb93f97a5f5a6b02f9e7",
     "docs/reference/event-sanitizers.mdx": "208dbf06f7001e585fdacabc5b8ec641a3322a0782f73c51b4077b276063f147",
-    "docs/reference/hardening.mdx": "3a14ab0a22c63f7537e1fe39d48527c7b178be758c4849ad5f6987acef20237b",
+    "docs/reference/hardening.mdx": "50058a3742246654f73ee69ea9d87971f233e2656878c30c8c7cfec3d88f6da2",
     "docs/reference/llm-request-intercept-outcomes.mdx": "5eb27460a378b6ed634e8866d1554cbcdd69f7f4facbaccbafd837f2b7ce8eae",
     "docs/reference/migration-guides.mdx": "91460a0d5d84a16d742a102df37d3fb025090c3897424e306c015149bc4f761e",
     "docs/reference/operational-logging.mdx": "5ea9963bf24b24dbac9bdf75b834c3b534e2fd853c50d448cfff4c4347eb1295",
@@ -1215,7 +1215,7 @@
     "scripts/qualification/generate_spdx_sbom.py": "315487d329f7ab35c8a80d3776ea7a087d6001a7e4e98287551d1e10a0f8c7f6",
     "scripts/qualification/package_release.py": "155ee97ca5711253af2fd8765b09f81f2eb65055e230e637cb640b0a8f989e7e",
     "scripts/qualification/provenance_check.py": "4ea7ff9281a82836d2b4e2c452533c5412a53a52a35c00ad68a41d9894ceddce",
-    "scripts/qualification/run.sh": "d4283c0f22b14e0c289d6f992cffd77c721f3fcd972970b31a7e7816393751d4",
+    "scripts/qualification/run.sh": "f5eaadcf59ddb5c36ad4e9e48411a7151e80f2c8bd1316c7a7e1d1898d07cac6",
     "scripts/qualification/test_package_release.py": "1a31384dca1e3073469b72a0f1d41eee92a6774f6000fff661c40a10c1d901ec",
     "scripts/qualification/test_provenance_check.py": "24ad3fe5898c6b678c51249dd559b98b5de272b0371e1ee249702677f7560050",
     "scripts/test-claude-plugin-e2e.sh": "5f1fd3f11c182043d9b56f326ca254f33c871c9da290084b5c5bd374117c61af",
@@ -1322,17 +1322,17 @@
     "build",
     "dist"
   ],
-  "source_archive_sha256": "85502e78649fa2c5e69f88a11cf4a555b6070dd4681b3f1fae03b3e4750f8add",
-  "release_archive_sha256": null,
+  "source_archive_sha256": "50e3af57c35ca9b2bc1871bd324cf2054dbefcc5c1f6e0195b0065414417e716",
+  "release_archive_sha256": "50e3af57c35ca9b2bc1871bd324cf2054dbefcc5c1f6e0195b0065414417e716",
   "lockfiles": {
     "Cargo.lock": "sha256:2be462e17c580021359a2f0032efcea2a487439e594ba9f1f653fd241e76d1a1",
     "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
     "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
   },
   "git": {
-    "commit": "b60db2d74ae978fcc196d93302f4cd0d9c5f0093",
-    "tree": "8f0ab0b0327a062a711290baf7cfbad99b9d8b35",
-    "source_tree_sha256": "73502e11cb325ffc20d1352d7fef63f7d31c1d7fcac7c8cebca76a418dfc5443",
+    "commit": "cb75fe72cadb4f0c82a064c87bbaef78463fb768",
+    "tree": "563654fa4b2b5b9793c4fa579705faa3374d6f16",
+    "source_tree_sha256": "cb2f1e74e5bed732377c6c2cc296b3870ea5c7e622fcc85a511244fef79ea427",
     "status": []
   }
 }

@@ -1,1 +1,89 @@
-qualification checks intentionally skipped in manifest-only mode
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay_authority-9d66c6092f98c35a)
+
+running 4 tests
+test unstable::tests::correct_once_adapter_delegates_without_owning_policy ... ok
+test unstable::tests::grants_bind_tenant_and_admission_as_well_as_capability_claims ... ok
+test unstable::tests::external_authority_implementation_compiles_and_receives_bound_identity ... ok
+test unstable::tests::grant_binding_rejects_every_security_claim_mutation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay_executor-ca441965f270a494)
+
+running 5 tests
+test unstable::tests::confirmed_failure_before_dispatch_is_failed ... ok
+test unstable::tests::success_reported_as_an_error_never_commits_without_a_receipt ... ok
+test unstable::tests::unknown_after_any_dispatch_is_never_downgraded_to_failure ... ok
+test unstable::tests::third_party_backend_can_implement_the_public_contract ... ok
+test unstable::tests::concrete_adapters_reject_wrong_execution_classes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-b98946c64d002ecb)
+
+running 14 tests
+test unstable::tests::lifecycle_and_method_specific_transition_predicates_are_distinct ... ok
+test unstable::tests::prepared_actions_reject_unfenced_cancellation_while_leased ... ok
+test unstable::tests::reference_store_rejects_authorization_and_lease_contract_misuse ... ok
+test unstable::tests::renewal_requires_the_live_exact_lease_and_preserves_fencing ... ok
+test unstable::tests::terminal_states_require_fenced_terminal_evidence ... ok
+test unstable::tests::reference_store_owns_time_and_reclaims_only_after_its_clock_expires ... ok
+test unstable::tests::evidence_finalization_rejects_wrong_source_state_or_action_binding ... ok
+test unstable::tests::effect_store_finalizes_receipt_and_terminal_action_as_one_contract_operation ... ok
+test unstable::tests::reference_effect_store_satisfies_reusable_conformance_suite ... ok
+test unstable::tests::two_executors_cannot_claim_the_same_live_lease ... ok
+test unstable::tests::external_effect_contracts_share_one_state_vocabulary ... ok
+test unstable::tests::reference_action_store_satisfies_reusable_conformance_suite ... ok
+test unstable::tests::receipt_finalization_is_append_only_idempotent_or_conflicting ... ok
+test unstable::tests::reference_receipt_store_satisfies_reusable_conformance_suite ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay-67db47e12f6c2699)
+
+running 38 tests
+test kernel::tests::consequential_actions_require_a_stable_request_id ... ok
+test kernel::tests::fast_paths_bypass_authority_and_effect_stores ... ok
+test kernel::tests::explicit_denial_and_modification_cancel_the_original_action ... ok
+test kernel::tests::mismatched_grants_cancel_the_pre_dispatch_action ... ok
+test kernel::tests::lease_generation_remains_monotonic_after_a_lease_is_released ... ok
+test kernel::tests::persisted_terminal_evidence_repairs_unknown_before_provider_reconciliation ... ok
+test kernel::tests::confirmed_pre_dispatch_failure_returns_the_durable_action_status ... ok
+test kernel::tests::ambiguous_dispatch_is_persisted_as_unknown_then_reconciled ... ok
+test kernel::tests::failed_unknown_persistence_returns_state_recovery_with_real_action_id ... ok
+test kernel::tests::durable_approval_resume_rebinds_the_original_action_after_restart ... ok
+test kernel::tests::post_dispatch_receipt_failure_returns_a_reconciliation_handle ... ok
+test kernel::tests::kernel_runs_against_the_reference_effect_stores_as_one_contract ... ok
+test kernel::tests::persisted_receipt_conflicts_block_provider_reconciliation_before_dispatch ... ok
+test kernel::tests::consequential_actions_prepare_verify_and_persist_bound_receipts ... ok
+test kernel::tests::approval_resume_preserves_the_same_bound_action ... ok
+test kernel::tests::proposed_action_resumes_with_its_original_action_identity ... ok
+test kernel::tests::prepared_retry_waits_for_a_live_owner_before_authority_or_cancellation ... ok
+test kernel::tests::reconciliation_cannot_commit_without_a_bound_receipt ... ok
+test kernel::tests::reconciliation_cannot_fail_without_authoritative_evidence ... ok
+test kernel::tests::authorized_and_prepared_actions_resume_without_a_new_action_identity ... ok
+test kernel::tests::reconciliation_receipts_bind_the_original_principal_and_grant ... ok
+test kernel::tests::schema_failure_happens_before_action_preparation_or_authority ... ok
+test kernel::tests::recovery_and_reconciliation_respect_live_leases_then_recover_stale_owners ... ok
+test kernel::tests::receipt_conflict_stays_structured_and_blocks_evidence_recovery ... ok
+test kernel::tests::recovery_repairs_stale_dispatching_state_from_persisted_receipt ... ok
+test kernel::tests::runtime_environment_and_session_binding_are_grant_bound ... ok
+test kernel::tests::recovery_repairs_unknown_from_late_bound_terminal_evidence_without_reconciliation ... ok
+test kernel::tests::recovery_marks_stale_dispatching_without_a_receipt_unknown ... ok
+test kernel::tests::recovery_repairs_stale_reconciling_from_persisted_failure_evidence ... ok
+test kernel::tests::retry_of_an_unknown_action_returns_its_reconciliation_handle_without_redispatch ... ok
+test kernel::tests::recovery_reports_contradictory_evidence_without_rewriting_unknown_state ... ok
+test kernel::tests::stale_fencing_failure_reloads_the_actual_durable_state ... ok
+test kernel::tests::unknown_actions_reconcile_through_external_effect_fabric ... ok
+test kernel::tests::stable_request_id_rejects_a_different_effect_fingerprint ... ok
+test kernel::tests::stable_request_id_prevents_duplicate_dispatch_after_kernel_restart ... ok
+test kernel::tests::scoped_idempotency_does_not_cross_tenant_boundaries ... ok
+test kernel::tests::unsafe_lease_configuration_blocks_dispatch_before_provider_execution ... ok
+test kernel::tests::late_receipt_after_reconciliation_lease_blocks_provider_reconciliation ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1586 filtered out; finished in 0.04s
+

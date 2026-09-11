@@ -1,1 +1,7 @@
-qualification checks intentionally skipped in manifest-only mode
+   Compiling pyo3-ffi v0.29.0
+    Checking nemo-relay-cli v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/cli)
+   Compiling pyo3 v0.29.0
+    Checking pyo3-async-runtimes v0.29.0
+    Checking pythonize v0.29.0
+    Checking nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.32s

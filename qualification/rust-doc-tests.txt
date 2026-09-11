@@ -1,1 +1,105 @@
-qualification checks intentionally skipped in manifest-only mode
+warning: doc tests are not supported for crate type(s) `cdylib` in package `nemo-relay-node`
+   Compiling pyo3-ffi v0.29.0
+   Compiling nemo-relay-ffi v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ffi)
+   Compiling pyo3 v0.29.0
+   Compiling pyo3-async-runtimes v0.29.0
+   Compiling pythonize v0.29.0
+   Compiling nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.15s
+   Doc-tests nemo_relay
+
+running 1 test
+test crates/core/src/api/runtime/scope_stack.rs - api::runtime::scope_stack::fork_scope_stack (line 614) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.80s; merged doctests compilation took 0.51s
+   Doc-tests nemo_relay_adaptive
+
+running 4 tests
+test crates/adaptive/src/acg/anthropic_plugin.rs - acg::anthropic_plugin::AnthropicCachePlugin (line 43) ... ignored
+test crates/adaptive/src/acg/openai_plugin.rs - acg::openai_plugin::OpenAICachePlugin (line 48) ... ignored
+test crates/adaptive/src/trie/builder.rs - trie::builder::PredictionTrieBuilder (line 69) ... ignored
+test crates/adaptive/src/acg/types.rs - acg::types::AgentIdentity (line 360) ... ok
+
+test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 1.04s; merged doctests compilation took 0.75s
+   Doc-tests nemo_relay_authority
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_dlp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_executor
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_ffi
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_isolation
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_ledger
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_pii_redaction
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_plugin
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests _native
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_types
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_worker
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nemo_relay_worker_proto
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

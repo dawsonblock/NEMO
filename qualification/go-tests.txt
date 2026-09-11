@@ -1,1 +1,725 @@
-qualification checks intentionally skipped in manifest-only mode
+    Finished `release` profile [optimized] target(s) in 0.31s
+=== RUN   TestTopLevelPluginValidationAndLifecycle
+--- PASS: TestTopLevelPluginValidationAndLifecycle (0.02s)
+=== RUN   TestPluginHelperConstructorsAndRegistryListing
+--- PASS: TestPluginHelperConstructorsAndRegistryListing (0.00s)
+=== RUN   TestPluginFuncsAndClosedContextBranches
+--- PASS: TestPluginFuncsAndClosedContextBranches (0.00s)
+=== RUN   TestValidateAdaptiveConfigAndOwnedRuntime
+--- PASS: TestValidateAdaptiveConfigAndOwnedRuntime (0.00s)
+=== RUN   TestBuildCacheTelemetryEvent
+--- PASS: TestBuildCacheTelemetryEvent (0.00s)
+=== RUN   TestAdaptiveRuntimeBuildCacheRequestFacts
+--- PASS: TestAdaptiveRuntimeBuildCacheRequestFacts (0.00s)
+=== RUN   TestAdaptiveRuntimeBindScopeRejectsNilScope
+--- PASS: TestAdaptiveRuntimeBindScopeRejectsNilScope (0.00s)
+=== RUN   TestSetLatencySensitivityRejectsInvalidValue
+--- PASS: TestSetLatencySensitivityRejectsInvalidValue (0.00s)
+=== RUN   TestResponseCacheConfigReachesTypedSurface
+--- PASS: TestResponseCacheConfigReachesTypedSurface (0.00s)
+=== RUN   TestAdaptiveConfigCarriesIndependentProviderAdmission
+--- PASS: TestAdaptiveConfigCarriesIndependentProviderAdmission (0.00s)
+=== RUN   TestResponseCacheToolsConfigReachesTypedSurface
+--- PASS: TestResponseCacheToolsConfigReachesTypedSurface (0.00s)
+=== RUN   TestResponseCacheConfigPreservesOmissionAndExplicitZero
+=== RUN   TestResponseCacheConfigPreservesOmissionAndExplicitZero/partial_config_delegates_to_Rust_defaults
+=== RUN   TestResponseCacheConfigPreservesOmissionAndExplicitZero/missing_namespace_remains_invalid
+=== RUN   TestResponseCacheConfigPreservesOmissionAndExplicitZero/explicit_TTL_zero_remains_invalid
+=== RUN   TestResponseCacheConfigPreservesOmissionAndExplicitZero/explicit_priority_zero_remains_valid
+=== RUN   TestResponseCacheConfigPreservesOmissionAndExplicitZero/explicit_singleflight_zero_remains_invalid
+--- PASS: TestResponseCacheConfigPreservesOmissionAndExplicitZero (0.00s)
+    --- PASS: TestResponseCacheConfigPreservesOmissionAndExplicitZero/partial_config_delegates_to_Rust_defaults (0.00s)
+    --- PASS: TestResponseCacheConfigPreservesOmissionAndExplicitZero/missing_namespace_remains_invalid (0.00s)
+    --- PASS: TestResponseCacheConfigPreservesOmissionAndExplicitZero/explicit_TTL_zero_remains_invalid (0.00s)
+    --- PASS: TestResponseCacheConfigPreservesOmissionAndExplicitZero/explicit_priority_zero_remains_valid (0.00s)
+    --- PASS: TestResponseCacheConfigPreservesOmissionAndExplicitZero/explicit_singleflight_zero_remains_invalid (0.00s)
+=== RUN   TestAdaptiveRuntimeLifecycleRejectsUseAfterShutdown
+--- PASS: TestAdaptiveRuntimeLifecycleRejectsUseAfterShutdown (0.00s)
+=== RUN   TestAdaptiveRuntimePublicHelpersPropagateJSONMarshalFailures
+--- PASS: TestAdaptiveRuntimePublicHelpersPropagateJSONMarshalFailures (0.00s)
+=== RUN   TestNewAdaptiveConfigDefaults
+--- PASS: TestNewAdaptiveConfigDefaults (0.00s)
+=== RUN   TestAdaptiveHelperConstructors
+--- PASS: TestAdaptiveHelperConstructors (0.00s)
+=== RUN   TestMustConfigMapPanicBranches
+--- PASS: TestMustConfigMapPanicBranches (0.00s)
+=== RUN   TestValidatePluginConfigWarnsMissingStateForTelemetry
+--- PASS: TestValidatePluginConfigWarnsMissingStateForTelemetry (0.00s)
+=== RUN   TestConfigureAdaptiveComponentLifecycle
+--- PASS: TestConfigureAdaptiveComponentLifecycle (0.05s)
+=== RUN   TestNewAtofExporterConfigDefaults
+--- PASS: TestNewAtofExporterConfigDefaults (0.00s)
+=== RUN   TestAtofSinkConfigConstructorsSerializeTheirDiscriminators
+--- PASS: TestAtofSinkConfigConstructorsSerializeTheirDiscriminators (0.00s)
+=== RUN   TestAtofExporterLifecycleWritesRawJSONL
+--- PASS: TestAtofExporterLifecycleWritesRawJSONL (0.00s)
+=== RUN   TestAtofExporterAppendAndOverwriteModes
+--- PASS: TestAtofExporterAppendAndOverwriteModes (0.00s)
+=== RUN   TestLLMSanitizeCodecInvocationInvalidationWaitsForInflightCall
+--- PASS: TestLLMSanitizeCodecInvocationInvalidationWaitsForInflightCall (0.02s)
+=== RUN   TestRegisterAndUnregisterClosure
+--- PASS: TestRegisterAndUnregisterClosure (0.00s)
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/none
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/openai_chat
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/openai_responses
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/anthropic_messages
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/gemini_generate_content
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/runtime
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/opaque
+=== RUN   TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/unknown
+--- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/none (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/openai_chat (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/openai_responses (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/anthropic_messages (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/gemini_generate_content (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/runtime (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/opaque (0.00s)
+    --- PASS: TestLlmSanitizeDirectionalContextsPreserveEveryCodecIdentity/unknown (0.00s)
+=== RUN   TestNewScopeStack
+--- PASS: TestNewScopeStack (0.00s)
+=== RUN   TestScopeStackClose
+--- PASS: TestScopeStackClose (0.00s)
+=== RUN   TestScopeStackActiveInsideRun
+--- PASS: TestScopeStackActiveInsideRun (0.00s)
+=== RUN   TestScopeStackRunIsolation
+--- PASS: TestScopeStackRunIsolation (0.00s)
+=== RUN   TestMultipleGoroutinesIndependentScopeStacks
+--- PASS: TestMultipleGoroutinesIndependentScopeStacks (0.00s)
+=== RUN   TestCreateScopeStackCreatesFreshStack
+--- PASS: TestCreateScopeStackCreatesFreshStack (0.00s)
+=== RUN   TestNewScopeStackFromPropagationUsesParentAsCurrentHandle
+--- PASS: TestNewScopeStackFromPropagationUsesParentAsCurrentHandle (0.00s)
+=== RUN   TestPropagationContextCaptureAndValidation
+--- PASS: TestPropagationContextCaptureAndValidation (0.00s)
+=== RUN   TestCaptureTraceparentUsesCurrentScope
+--- PASS: TestCaptureTraceparentUsesCurrentScope (0.00s)
+=== RUN   TestPropagationContextJSONRoundTripAndValidation
+--- PASS: TestPropagationContextJSONRoundTripAndValidation (0.00s)
+=== RUN   TestNewScopeStackFromRootlessAndRootParentPropagation
+--- PASS: TestNewScopeStackFromRootlessAndRootParentPropagation (0.00s)
+=== RUN   TestPropagatedScopeStackRunRestoresOuterBinding
+--- PASS: TestPropagatedScopeStackRunRestoresOuterBinding (0.00s)
+=== RUN   TestPropagatedScopeStacksRemainIsolated
+--- PASS: TestPropagatedScopeStacksRemainIsolated (0.00s)
+=== RUN   TestConcurrentScopeStacksWithToolCalls
+--- PASS: TestConcurrentScopeStacksWithToolCalls (0.00s)
+=== RUN   TestScopeStackRunNestedScopes
+--- PASS: TestScopeStackRunNestedScopes (0.00s)
+=== RUN   TestEventBaseNilPointerFallbacks
+--- PASS: TestEventBaseNilPointerFallbacks (0.00s)
+=== RUN   TestPublicAPIErrorAndDefaultCoverage
+--- PASS: TestPublicAPIErrorAndDefaultCoverage (0.00s)
+=== RUN   TestWrapperAndCodecFinalizersRun
+--- PASS: TestWrapperAndCodecFinalizersRun (0.10s)
+=== RUN   TestGoBindingErrorAndDefaultContracts
+--- PASS: TestGoBindingErrorAndDefaultContracts (0.00s)
+=== RUN   TestRemainingPublicDefaultsAndPropagationCoverage
+--- PASS: TestRemainingPublicDefaultsAndPropagationCoverage (0.00s)
+=== RUN   TestGeminiGenerateContentCodecFunctionCallID
+--- PASS: TestGeminiGenerateContentCodecFunctionCallID (0.00s)
+=== RUN   TestDeregisterNonexistentGuardrails
+--- PASS: TestDeregisterNonexistentGuardrails (0.00s)
+=== RUN   TestDeregisterNonexistentIntercepts
+--- PASS: TestDeregisterNonexistentIntercepts (0.00s)
+=== RUN   TestDeregisterNonexistentGuardrailIsSafe
+--- PASS: TestDeregisterNonexistentGuardrailIsSafe (0.00s)
+=== RUN   TestDeregisterNonexistentSubscriberIsSafe
+--- PASS: TestDeregisterNonexistentSubscriberIsSafe (0.00s)
+=== RUN   TestDeregisterNonexistentInterceptsIsSafe
+--- PASS: TestDeregisterNonexistentInterceptsIsSafe (0.00s)
+=== RUN   TestRegisterDeregisterReregisterToolSanitizeRequestGuardrail
+--- PASS: TestRegisterDeregisterReregisterToolSanitizeRequestGuardrail (0.00s)
+=== RUN   TestRegisterDeregisterReregisterSubscriber
+--- PASS: TestRegisterDeregisterReregisterSubscriber (0.00s)
+=== RUN   TestRegisterDeregisterReregisterToolRequestIntercept
+--- PASS: TestRegisterDeregisterReregisterToolRequestIntercept (0.00s)
+=== RUN   TestRegisterDeregisterReregisterToolExecutionIntercept
+--- PASS: TestRegisterDeregisterReregisterToolExecutionIntercept (0.00s)
+=== RUN   TestRegisterDeregisterReregisterLlmSanitizeRequestGuardrail
+--- PASS: TestRegisterDeregisterReregisterLlmSanitizeRequestGuardrail (0.00s)
+=== RUN   TestRegisterDeregisterReregisterToolConditionalGuardrail
+--- PASS: TestRegisterDeregisterReregisterToolConditionalGuardrail (0.00s)
+=== RUN   TestDeregisterAllToolGuardrailTypes
+--- PASS: TestDeregisterAllToolGuardrailTypes (0.00s)
+=== RUN   TestDeregisterAllInterceptTypes
+--- PASS: TestDeregisterAllInterceptTypes (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateToolSanitizeRequest
+--- PASS: TestAlreadyExistsErrorOnDuplicateToolSanitizeRequest (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateToolSanitizeResponse
+--- PASS: TestAlreadyExistsErrorOnDuplicateToolSanitizeResponse (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateToolConditional
+--- PASS: TestAlreadyExistsErrorOnDuplicateToolConditional (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateToolRequestIntercept
+--- PASS: TestAlreadyExistsErrorOnDuplicateToolRequestIntercept (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateToolExecutionIntercept
+--- PASS: TestAlreadyExistsErrorOnDuplicateToolExecutionIntercept (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateSubscriber
+--- PASS: TestAlreadyExistsErrorOnDuplicateSubscriber (0.00s)
+=== RUN   TestAlreadyExistsErrorOnDuplicateLlmGuardrails
+=== RUN   TestAlreadyExistsErrorOnDuplicateLlmGuardrails/LlmSanitizeRequest
+=== RUN   TestAlreadyExistsErrorOnDuplicateLlmGuardrails/LlmSanitizeResponse
+=== RUN   TestAlreadyExistsErrorOnDuplicateLlmGuardrails/LlmConditional
+--- PASS: TestAlreadyExistsErrorOnDuplicateLlmGuardrails (0.00s)
+    --- PASS: TestAlreadyExistsErrorOnDuplicateLlmGuardrails/LlmSanitizeRequest (0.00s)
+    --- PASS: TestAlreadyExistsErrorOnDuplicateLlmGuardrails/LlmSanitizeResponse (0.00s)
+    --- PASS: TestAlreadyExistsErrorOnDuplicateLlmGuardrails/LlmConditional (0.00s)
+=== RUN   TestGuardrailRejectedErrorMessage
+--- PASS: TestGuardrailRejectedErrorMessage (0.00s)
+=== RUN   TestLlmGuardrailRejectedErrorMessage
+--- PASS: TestLlmGuardrailRejectedErrorMessage (0.00s)
+=== RUN   TestScopeLocalDuplicateRegistrationError
+--- PASS: TestScopeLocalDuplicateRegistrationError (0.00s)
+=== RUN   TestSanitizeGuardrailAffectsEventInput
+--- PASS: TestSanitizeGuardrailAffectsEventInput (0.00s)
+=== RUN   TestEventMetadataInjectorGlobalScopeLocalAndFailureBehavior
+2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-mark injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-mark injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+--- PASS: TestEventMetadataInjectorGlobalScopeLocalAndFailureBehavior (0.00s)
+=== RUN   TestPluginContextEventMetadataInjectorLifecycle
+--- PASS: TestPluginContextEventMetadataInjectorLifecycle (0.00s)
+=== RUN   TestEventMetadataInjectorRegistrationErrorsReleaseCallbacks
+--- PASS: TestEventMetadataInjectorRegistrationErrorsReleaseCallbacks (0.00s)
+=== RUN   TestEventMetadataInjectorNilCallbacksDoNotRegister
+--- PASS: TestEventMetadataInjectorNilCallbacksDoNotRegister (0.00s)
+=== RUN   TestEventSanitizerRegistries
+--- PASS: TestEventSanitizerRegistries (0.00s)
+=== RUN   TestEventSanitizerMarshalFailureClearsObservabilityFields
+2026-09-11T09:16:28.679Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_sanitizer_failed event_name=invalid-sanitizer sanitizer=go-mark-sanitize-invalid Event sanitizer failed; clearing observability fields
+--- PASS: TestEventSanitizerMarshalFailureClearsObservabilityFields (0.00s)
+=== RUN   TestScopeLocalEventSanitizerInheritanceAndCleanup
+--- PASS: TestScopeLocalEventSanitizerInheritanceAndCleanup (0.00s)
+=== RUN   TestScopeLocalEventSanitizersCanBeDeregistered
+--- PASS: TestScopeLocalEventSanitizersCanBeDeregistered (0.00s)
+=== RUN   TestEventSanitizerRegistrationErrorsReleaseCallbacks
+--- PASS: TestEventSanitizerRegistrationErrorsReleaseCallbacks (0.00s)
+=== RUN   TestLlmCallAndEnd
+--- PASS: TestLlmCallAndEnd (0.00s)
+=== RUN   TestLlmCallWithAttributes
+--- PASS: TestLlmCallWithAttributes (0.00s)
+=== RUN   TestLlmCallWithDataMetadata
+--- PASS: TestLlmCallWithDataMetadata (0.00s)
+=== RUN   TestLlmCallWithParent
+--- PASS: TestLlmCallWithParent (0.00s)
+=== RUN   TestLlmEvents
+--- PASS: TestLlmEvents (0.00s)
+=== RUN   TestLlmCallExecuteBasic
+--- PASS: TestLlmCallExecuteBasic (0.00s)
+=== RUN   TestLlmCallExecuteAddsOTELStatusMetadataToEndEvents
+--- PASS: TestLlmCallExecuteAddsOTELStatusMetadataToEndEvents (0.00s)
+=== RUN   TestCodecHandleConstructors
+--- PASS: TestCodecHandleConstructors (0.00s)
+=== RUN   TestLlmCallExecuteWithRequestAndResponseCodecs
+--- PASS: TestLlmCallExecuteWithRequestAndResponseCodecs (0.00s)
+=== RUN   TestLlmSanitizersResolveDirectionalCodecs
+--- PASS: TestLlmSanitizersResolveDirectionalCodecs (0.00s)
+=== RUN   TestLlmSanitizeRequestGuardrail
+--- PASS: TestLlmSanitizeRequestGuardrail (0.00s)
+=== RUN   TestLlmSanitizeResponseGuardrail
+--- PASS: TestLlmSanitizeResponseGuardrail (0.00s)
+=== RUN   TestLlmSanitizeGuardrailsReceiveContext
+--- PASS: TestLlmSanitizeGuardrailsReceiveContext (0.00s)
+=== RUN   TestLlmConditionalExecutionGuardrail
+--- PASS: TestLlmConditionalExecutionGuardrail (0.00s)
+=== RUN   TestLlmDuplicateGuardrailFails
+--- PASS: TestLlmDuplicateGuardrailFails (0.00s)
+=== RUN   TestLlmConditionalBlocksExecution
+--- PASS: TestLlmConditionalBlocksExecution (0.00s)
+=== RUN   TestLlmRequestInterceptRegisterDeregister
+--- PASS: TestLlmRequestInterceptRegisterDeregister (0.00s)
+=== RUN   TestLlmExecutionInterceptRegisterDeregister
+--- PASS: TestLlmExecutionInterceptRegisterDeregister (0.00s)
+=== RUN   TestLlmStreamExecutionInterceptRegisterDeregister
+--- PASS: TestLlmStreamExecutionInterceptRegisterDeregister (0.00s)
+=== RUN   TestLlmStreamExecutionInterceptCanCallNext
+--- PASS: TestLlmStreamExecutionInterceptCanCallNext (0.00s)
+=== RUN   TestLlmRequestInterceptModifies
+--- PASS: TestLlmRequestInterceptModifies (0.00s)
+=== RUN   TestLlmExecutionInterceptReplaces
+--- PASS: TestLlmExecutionInterceptReplaces (0.00s)
+=== RUN   TestLlmCallableErrorPropagation
+--- PASS: TestLlmCallableErrorPropagation (0.00s)
+=== RUN   TestLlmFullPipelineInterceptsAndExecute
+--- PASS: TestLlmFullPipelineInterceptsAndExecute (0.00s)
+=== RUN   TestLlmSanitizeRequestGuardrailModifiesEventInput
+    llm_test.go:974: captured event input: {"content":{"messages":[],"model":"test-model","system_prompt_injected":true},"headers":{}}
+--- PASS: TestLlmSanitizeRequestGuardrailModifiesEventInput (0.00s)
+=== RUN   TestLlmConditionalGuardrailSelectiveReject
+--- PASS: TestLlmConditionalGuardrailSelectiveReject (0.00s)
+=== RUN   TestLlmExecutionInterceptWrapsCallable
+--- PASS: TestLlmExecutionInterceptWrapsCallable (0.00s)
+=== RUN   TestLlmExecutionInterceptSeesNextError
+--- PASS: TestLlmExecutionInterceptSeesNextError (0.00s)
+=== RUN   TestLlmCallWithModelName
+--- PASS: TestLlmCallWithModelName (0.00s)
+=== RUN   TestLlmEventInputOutput
+--- PASS: TestLlmEventInputOutput (0.00s)
+=== RUN   TestLlmStreamCallExecuteBasic
+    llm_test.go:1190: received 1 chunks from stream
+--- PASS: TestLlmStreamCallExecuteBasic (0.00s)
+=== RUN   TestLlmStreamCallExecuteWithCollectorFinalizer
+    llm_test.go:1241: collector received 1 chunks
+    llm_test.go:1243: finalizer was called as expected
+--- PASS: TestLlmStreamCallExecuteWithCollectorFinalizer (0.00s)
+=== RUN   TestLlmStreamCloseIsIdempotent
+--- PASS: TestLlmStreamCloseIsIdempotent (0.00s)
+=== RUN   TestLlmStreamConcurrentCloseIsSafe
+--- PASS: TestLlmStreamConcurrentCloseIsSafe (0.00s)
+=== RUN   TestLlmStreamCollectorCanClose
+--- PASS: TestLlmStreamCollectorCanClose (0.00s)
+=== RUN   TestLlmStreamHelperAndReleaseCoverage
+--- PASS: TestLlmStreamHelperAndReleaseCoverage (0.00s)
+=== RUN   TestLlmStreamFinishCloseWaitsForInFlightWork
+--- PASS: TestLlmStreamFinishCloseWaitsForInFlightWork (0.00s)
+=== RUN   TestLlmStreamCloseWaitsForActiveCollectorBeforeFinalizing
+--- PASS: TestLlmStreamCloseWaitsForActiveCollectorBeforeFinalizing (0.00s)
+=== RUN   TestLlmStreamCloseFinalizesPartialResponse
+--- PASS: TestLlmStreamCloseFinalizesPartialResponse (0.00s)
+=== RUN   TestLlmStreamNilCollectorFinalizer
+--- PASS: TestLlmStreamNilCollectorFinalizer (0.00s)
+=== RUN   TestBindingLoggingEnvironment
+=== RUN   TestBindingLoggingEnvironment/initializes_from_environment
+=== RUN   TestBindingLoggingEnvironment/disables_stderr_from_environment
+=== RUN   TestBindingLoggingEnvironment/rejects_invalid_environment
+=== RUN   TestBindingLoggingEnvironment/flushes_file_sink_during_shutdown
+--- PASS: TestBindingLoggingEnvironment (0.04s)
+    --- PASS: TestBindingLoggingEnvironment/initializes_from_environment (0.01s)
+    --- PASS: TestBindingLoggingEnvironment/disables_stderr_from_environment (0.01s)
+    --- PASS: TestBindingLoggingEnvironment/rejects_invalid_environment (0.01s)
+    --- PASS: TestBindingLoggingEnvironment/flushes_file_sink_during_shutdown (0.01s)
+=== RUN   TestPricingConfigHelpers
+--- PASS: TestPricingConfigHelpers (0.00s)
+=== RUN   TestPricingRateScheduleHelper
+--- PASS: TestPricingRateScheduleHelper (0.00s)
+=== RUN   TestValidatePricingConfig
+--- PASS: TestValidatePricingConfig (0.00s)
+=== RUN   TestListKindsIncludesPricing
+--- PASS: TestListKindsIncludesPricing (0.00s)
+=== RUN   TestObservabilityConfigHelpers
+--- PASS: TestObservabilityConfigHelpers (0.00s)
+=== RUN   TestObservabilityAtofSinkConfigConstructorsSerializeTheirDiscriminators
+--- PASS: TestObservabilityAtofSinkConfigConstructorsSerializeTheirDiscriminators (0.00s)
+=== RUN   TestObservabilitySignalEndpointOmittedVersusExplicitEmpty
+=== RUN   TestObservabilitySignalEndpointOmittedVersusExplicitEmpty/logs
+=== RUN   TestObservabilitySignalEndpointOmittedVersusExplicitEmpty/metrics
+--- PASS: TestObservabilitySignalEndpointOmittedVersusExplicitEmpty (0.00s)
+    --- PASS: TestObservabilitySignalEndpointOmittedVersusExplicitEmpty/logs (0.00s)
+    --- PASS: TestObservabilitySignalEndpointOmittedVersusExplicitEmpty/metrics (0.00s)
+=== RUN   TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings
+--- PASS: TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings (0.00s)
+=== RUN   TestObservabilityPluginAtofAndAtifFiles
+--- PASS: TestObservabilityPluginAtofAndAtifFiles (0.01s)
+=== RUN   TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics
+--- PASS: TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics (0.00s)
+=== RUN   TestObservabilityPluginAtifSplitsMultipleTopLevelAgents
+--- PASS: TestObservabilityPluginAtifSplitsMultipleTopLevelAgents (0.05s)
+=== RUN   TestObservabilityPluginValidationRejectsBadValues
+--- PASS: TestObservabilityPluginValidationRejectsBadValues (0.00s)
+=== RUN   TestObservabilityPluginListKindIsAutomatic
+--- PASS: TestObservabilityPluginListKindIsAutomatic (0.00s)
+=== RUN   TestObservabilityAtifOpenAgentFlushesOnClear
+--- PASS: TestObservabilityAtifOpenAgentFlushesOnClear (0.01s)
+=== RUN   TestOpenInferenceUsesTypedOpenTelemetrySubscriber
+--- PASS: TestOpenInferenceUsesTypedOpenTelemetrySubscriber (0.00s)
+=== RUN   TestLLMOptimizationContributionFixtureRoundTrip
+--- PASS: TestLLMOptimizationContributionFixtureRoundTrip (0.00s)
+=== RUN   TestLLMOptimizationContributionRequiresPayloadSchema
+--- PASS: TestLLMOptimizationContributionRequiresPayloadSchema (0.00s)
+=== RUN   TestLLMOptimizationContributionOmittedAppliedIsNonApplied
+--- PASS: TestLLMOptimizationContributionOmittedAppliedIsNonApplied (0.00s)
+=== RUN   TestLLMRequestInterceptOptimizationContributionsRoundTrip
+--- PASS: TestLLMRequestInterceptOptimizationContributionsRoundTrip (0.00s)
+=== RUN   TestEventSchemaSeverityAndMetricParity
+--- PASS: TestEventSchemaSeverityAndMetricParity (0.00s)
+=== RUN   TestEventAndMetricValidationErrors
+--- PASS: TestEventAndMetricValidationErrors (0.00s)
+=== RUN   TestWithMetricParentRetainsScopeHandle
+--- PASS: TestWithMetricParentRetainsScopeHandle (0.00s)
+=== RUN   TestMetricMeasurementBoundarySerializationPreservesNilAndEmpty
+--- PASS: TestMetricMeasurementBoundarySerializationPreservesNilAndEmpty (0.00s)
+=== RUN   TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations
+=== RUN   TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/log_timeout
+=== RUN   TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/log_scheduled_delay
+=== RUN   TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/metric_timeout
+=== RUN   TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/metric_export_interval
+--- PASS: TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations (0.00s)
+    --- PASS: TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/log_timeout (0.00s)
+    --- PASS: TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/log_scheduled_delay (0.00s)
+    --- PASS: TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/metric_timeout (0.00s)
+    --- PASS: TestOpenTelemetrySignalConfigRejectsFractionalMillisecondDurations/metric_export_interval (0.00s)
+=== RUN   TestOpenTelemetrySubscribersExposeRuntimeDiagnostics
+--- PASS: TestOpenTelemetrySubscribersExposeRuntimeDiagnostics (0.00s)
+=== RUN   TestOpenTelemetryLogSubscriberLifecycleAndDerivation
+--- PASS: TestOpenTelemetryLogSubscriberLifecycleAndDerivation (0.00s)
+=== RUN   TestOpenTelemetryMetricSubscriberLifecycleAndDerivation
+--- PASS: TestOpenTelemetryMetricSubscriberLifecycleAndDerivation (0.00s)
+=== RUN   TestNewOpenTelemetryConfigDefaults
+--- PASS: TestNewOpenTelemetryConfigDefaults (0.00s)
+=== RUN   TestOpenTelemetrySubscriberAcceptsProjectionControls
+--- PASS: TestOpenTelemetrySubscriberAcceptsProjectionControls (0.00s)
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidMetadataPromotionPrefix
+--- PASS: TestOpenTelemetrySubscriberRejectsInvalidMetadataPromotionPrefix (0.00s)
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidAttributeMappings
+--- PASS: TestOpenTelemetrySubscriberRejectsInvalidAttributeMappings (0.00s)
+=== RUN   TestOpenTelemetrySubscriberLifecycle
+--- PASS: TestOpenTelemetrySubscriberLifecycle (0.00s)
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidTransport
+--- PASS: TestOpenTelemetrySubscriberRejectsInvalidTransport (0.00s)
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidRequiredFields
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/missing_type
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/unknown_type
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/missing_endpoint
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/blank_endpoint
+--- PASS: TestOpenTelemetrySubscriberRejectsInvalidRequiredFields (0.00s)
+    --- PASS: TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/missing_type (0.00s)
+    --- PASS: TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/unknown_type (0.00s)
+    --- PASS: TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/missing_endpoint (0.00s)
+    --- PASS: TestOpenTelemetrySubscriberRejectsInvalidRequiredFields/blank_endpoint (0.00s)
+=== RUN   TestOpenTelemetrySubscriberExportsScopeLifecycleAndMarks
+--- PASS: TestOpenTelemetrySubscriberExportsScopeLifecycleAndMarks (0.00s)
+=== RUN   TestOpenTelemetrySubscriberRejectsInvalidHeaderEnvWithoutSecretValues
+--- PASS: TestOpenTelemetrySubscriberRejectsInvalidHeaderEnvWithoutSecretValues (0.00s)
+=== RUN   TestOpenTelemetrySubscriberExportsGenAIAgentProjection
+--- PASS: TestOpenTelemetrySubscriberExportsGenAIAgentProjection (0.00s)
+=== RUN   TestPiiRedactionConfigHelpers
+--- PASS: TestPiiRedactionConfigHelpers (0.00s)
+=== RUN   TestPiiRedactionValidationRejectsBadValues
+--- PASS: TestPiiRedactionValidationRejectsBadValues (0.00s)
+=== RUN   TestPiiRedactionListKindIsAutomatic
+--- PASS: TestPiiRedactionListKindIsAutomatic (0.00s)
+=== RUN   TestInitializeWithDynamicPluginsSerializesSpecsAndOwnsCleanup
+--- PASS: TestInitializeWithDynamicPluginsSerializesSpecsAndOwnsCleanup (0.00s)
+=== RUN   TestPluginConfigPublicJSONShapeRemainsCompatible
+--- PASS: TestPluginConfigPublicJSONShapeRemainsCompatible (0.00s)
+=== RUN   TestInitializeWithDynamicPluginsUsesPrivateConfigWireShape
+--- PASS: TestInitializeWithDynamicPluginsUsesPrivateConfigWireShape (0.00s)
+=== RUN   TestComponentWrappersPreserveDisabledValuesDuringConversion
+--- PASS: TestComponentWrappersPreserveDisabledValuesDuringConversion (0.00s)
+=== RUN   TestInitializeWithDynamicPluginsRejectsEmptySpecsWithoutCallingCgo
+--- PASS: TestInitializeWithDynamicPluginsRejectsEmptySpecsWithoutCallingCgo (0.00s)
+=== RUN   TestInitializeWithDynamicPluginsCleansUpInvalidReport
+--- PASS: TestInitializeWithDynamicPluginsCleansUpInvalidReport (0.00s)
+=== RUN   TestPluginActivationCloseFreesAfterClearFailure
+--- PASS: TestPluginActivationCloseFreesAfterClearFailure (0.00s)
+=== RUN   TestPluginActivationFinalizerReportsClearFailure
+--- PASS: TestPluginActivationFinalizerReportsClearFailure (0.00s)
+=== RUN   TestPluginActivationFinalizerDoesNotBlockOnCleanup
+--- PASS: TestPluginActivationFinalizerDoesNotBlockOnCleanup (0.00s)
+=== RUN   TestPluginActivationCopiesShareCloseStateAndError
+--- PASS: TestPluginActivationCopiesShareCloseStateAndError (0.00s)
+=== RUN   TestPluginActivationCopyPreventsEarlyFinalization
+--- PASS: TestPluginActivationCopyPreventsEarlyFinalization (0.04s)
+=== RUN   TestInitializeWithDynamicPluginsSurfacesSerializationAndActivationErrors
+--- PASS: TestInitializeWithDynamicPluginsSurfacesSerializationAndActivationErrors (0.00s)
+=== RUN   TestNilPluginActivationCloseIsSafe
+--- PASS: TestNilPluginActivationCloseIsSafe (0.00s)
+=== RUN   TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo
+--- PASS: TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo (0.30s)
+=== RUN   TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig
+--- PASS: TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig (0.01s)
+=== RUN   TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo
+--- PASS: TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo (0.54s)
+=== RUN   TestPluginActivationFinalizerReleasesHostOwnership
+--- PASS: TestPluginActivationFinalizerReleasesHostOwnership (0.00s)
+=== RUN   TestWorkspaceVersionFromCargoTOML
+=== RUN   TestWorkspaceVersionFromCargoTOML/standard_workspace_package
+=== RUN   TestWorkspaceVersionFromCargoTOML/whitespace_comments_CRLF_and_literal_string
+=== RUN   TestWorkspaceVersionFromCargoTOML/missing_workspace_package
+=== RUN   TestWorkspaceVersionFromCargoTOML/missing_workspace_version
+--- PASS: TestWorkspaceVersionFromCargoTOML (0.00s)
+    --- PASS: TestWorkspaceVersionFromCargoTOML/standard_workspace_package (0.00s)
+    --- PASS: TestWorkspaceVersionFromCargoTOML/whitespace_comments_CRLF_and_literal_string (0.00s)
+    --- PASS: TestWorkspaceVersionFromCargoTOML/missing_workspace_package (0.00s)
+    --- PASS: TestWorkspaceVersionFromCargoTOML/missing_workspace_version (0.00s)
+=== RUN   TestPluginConfigSerializationErrorsSurfaceBeforeFFI
+--- PASS: TestPluginConfigSerializationErrorsSurfaceBeforeFFI (0.00s)
+=== RUN   TestClosedPluginContextRejectsEveryRegistrationSurface
+--- PASS: TestClosedPluginContextRejectsEveryRegistrationSurface (0.00s)
+=== RUN   TestRegisterConditionalMiddlewareGuardrailRejectsNilCallback
+--- PASS: TestRegisterConditionalMiddlewareGuardrailRejectsNilCallback (0.00s)
+=== RUN   TestConditionalMiddlewareGuardrailTogglesExistingRegistration
+--- PASS: TestConditionalMiddlewareGuardrailTogglesExistingRegistration (0.00s)
+=== RUN   TestScopeLocalToolSanitizeRequestGuardrail
+--- PASS: TestScopeLocalToolSanitizeRequestGuardrail (0.00s)
+=== RUN   TestScopeLocalToolSanitizeResponseGuardrail
+--- PASS: TestScopeLocalToolSanitizeResponseGuardrail (0.00s)
+=== RUN   TestScopeLocalToolConditionalExecutionGuardrail
+--- PASS: TestScopeLocalToolConditionalExecutionGuardrail (0.00s)
+=== RUN   TestScopeLocalGuardrailCleanupOnPop
+--- PASS: TestScopeLocalGuardrailCleanupOnPop (0.00s)
+=== RUN   TestScopeLocalInterceptCleanupOnPop
+--- PASS: TestScopeLocalInterceptCleanupOnPop (0.00s)
+=== RUN   TestScopeLocalSubscriberCleanupOnPop
+--- PASS: TestScopeLocalSubscriberCleanupOnPop (0.00s)
+=== RUN   TestPriorityMergeGlobalAndScopeLocal
+--- PASS: TestPriorityMergeGlobalAndScopeLocal (0.00s)
+=== RUN   TestPriorityMergeGlobalBeforeScopeLocal
+--- PASS: TestPriorityMergeGlobalBeforeScopeLocal (0.00s)
+=== RUN   TestScopeLocalIsolationBetweenGoroutines
+--- PASS: TestScopeLocalIsolationBetweenGoroutines (0.00s)
+=== RUN   TestScopeLocalConditionalGuardrailIsolation
+--- PASS: TestScopeLocalConditionalGuardrailIsolation (0.00s)
+=== RUN   TestScopeLocalToolRequestIntercept
+--- PASS: TestScopeLocalToolRequestIntercept (0.00s)
+=== RUN   TestScopeLocalToolExecutionIntercept
+--- PASS: TestScopeLocalToolExecutionIntercept (0.00s)
+=== RUN   TestScopeLocalSubscriberReceivesEvents
+--- PASS: TestScopeLocalSubscriberReceivesEvents (0.00s)
+=== RUN   TestScopeLocalExplicitDeregistration
+--- PASS: TestScopeLocalExplicitDeregistration (0.00s)
+=== RUN   TestScopeLocalDuplicateRegistrationFails
+--- PASS: TestScopeLocalDuplicateRegistrationFails (0.00s)
+=== RUN   TestScopeLocalInterceptAppliedWithinScope
+--- PASS: TestScopeLocalInterceptAppliedWithinScope (0.00s)
+=== RUN   TestScopeLocalAndGlobalInterceptMerging
+--- PASS: TestScopeLocalAndGlobalInterceptMerging (0.00s)
+=== RUN   TestScopeLocalLlmSanitizeRequestGuardrailAffectsEvent
+    scope_local_test.go:983: scope-local LLM sanitize guardrail affected event input: {"content":{"model":"test","scope_llm_sanitized":true},"headers":{"x-dynamo-session-id":"llm_scope_guard"}}
+--- PASS: TestScopeLocalLlmSanitizeRequestGuardrailAffectsEvent (0.00s)
+=== RUN   TestScopeLocalLlmConditionalGuardrail
+--- PASS: TestScopeLocalLlmConditionalGuardrail (0.00s)
+=== RUN   TestScopeLocalExplicitDeregisterToolWrappers
+--- PASS: TestScopeLocalExplicitDeregisterToolWrappers (0.00s)
+=== RUN   TestScopeLocalExplicitDeregisterLlmWrappers
+--- PASS: TestScopeLocalExplicitDeregisterLlmWrappers (0.00s)
+=== RUN   TestEventJSONHelpers
+--- PASS: TestEventJSONHelpers (0.00s)
+=== RUN   TestEventBaseJSONHandlesNilPointer
+--- PASS: TestEventBaseJSONHandlesNilPointer (0.00s)
+=== RUN   TestPushPopScope
+--- PASS: TestPushPopScope (0.00s)
+=== RUN   TestScopeHandleProperties
+--- PASS: TestScopeHandleProperties (0.00s)
+=== RUN   TestPushScopeWithAttributes
+--- PASS: TestPushScopeWithAttributes (0.00s)
+=== RUN   TestPushScopeWithParent
+--- PASS: TestPushScopeWithParent (0.00s)
+=== RUN   TestNestedScopes
+--- PASS: TestNestedScopes (0.00s)
+=== RUN   TestPopInvalidScopeErrors
+--- PASS: TestPopInvalidScopeErrors (0.00s)
+=== RUN   TestAllScopeTypes
+--- PASS: TestAllScopeTypes (0.00s)
+=== RUN   TestEmitEvent
+--- PASS: TestEmitEvent (0.00s)
+=== RUN   TestEmitEventWithData
+--- PASS: TestEmitEventWithData (0.00s)
+=== RUN   TestEmitEventWithParent
+--- PASS: TestEmitEventWithParent (0.00s)
+=== RUN   TestSubscriberRegistration
+--- PASS: TestSubscriberRegistration (0.00s)
+=== RUN   TestFlushSubscribersWaitsForQueuedDelivery
+--- PASS: TestFlushSubscribersWaitsForQueuedDelivery (0.00s)
+=== RUN   TestDuplicateSubscriberFails
+--- PASS: TestDuplicateSubscriberFails (0.00s)
+=== RUN   TestSubscriberEventProperties
+--- PASS: TestSubscriberEventProperties (0.00s)
+=== RUN   TestMarkEvent
+--- PASS: TestMarkEvent (0.00s)
+=== RUN   TestEventScopeTypeMatchesEventFamily
+--- PASS: TestEventScopeTypeMatchesEventFamily (0.00s)
+=== RUN   TestDeeplyNestedScopes
+--- PASS: TestDeeplyNestedScopes (0.00s)
+=== RUN   TestPushScopeWithCombinedAttributes
+--- PASS: TestPushScopeWithCombinedAttributes (0.00s)
+=== RUN   TestScopeWithDataAndMetadata
+--- PASS: TestScopeWithDataAndMetadata (0.00s)
+=== RUN   TestPopScopeWithEndMetadataMergesWithScopeMetadata
+--- PASS: TestPopScopeWithEndMetadataMergesWithScopeMetadata (0.00s)
+=== RUN   TestScopeEventWithDataAndMetadata
+--- PASS: TestScopeEventWithDataAndMetadata (0.00s)
+=== RUN   TestConcurrentScopePushPop
+--- PASS: TestConcurrentScopePushPop (0.00s)
+=== RUN   TestSubscriberReceivesAllEventFields
+--- PASS: TestSubscriberReceivesAllEventFields (0.00s)
+=== RUN   TestManualLifecycleTimestamps
+--- PASS: TestManualLifecycleTimestamps (0.00s)
+=== RUN   TestManualLifecycleTimestampNormalizesToUnixMicroseconds
+--- PASS: TestManualLifecycleTimestampNormalizesToUnixMicroseconds (0.00s)
+=== RUN   TestToolCallAndEnd
+--- PASS: TestToolCallAndEnd (0.00s)
+=== RUN   TestToolCallWithAttributes
+--- PASS: TestToolCallWithAttributes (0.00s)
+=== RUN   TestToolCallWithDataMetadata
+--- PASS: TestToolCallWithDataMetadata (0.00s)
+=== RUN   TestToolCallWithParent
+--- PASS: TestToolCallWithParent (0.00s)
+=== RUN   TestToolEvents
+--- PASS: TestToolEvents (0.00s)
+=== RUN   TestToolCallExecuteBasic
+--- PASS: TestToolCallExecuteBasic (0.00s)
+=== RUN   TestToolExecutionResultAnnotationRoundTrip
+--- PASS: TestToolExecutionResultAnnotationRoundTrip (0.00s)
+=== RUN   TestDecodeToolExecutionResultCanonicalContract
+=== RUN   TestDecodeToolExecutionResultCanonicalContract/rejects_legacy_raw_result
+=== RUN   TestDecodeToolExecutionResultCanonicalContract/allows_explicit_null_result
+=== RUN   TestDecodeToolExecutionResultCanonicalContract/normalizes_null_annotation
+--- PASS: TestDecodeToolExecutionResultCanonicalContract (0.00s)
+    --- PASS: TestDecodeToolExecutionResultCanonicalContract/rejects_legacy_raw_result (0.00s)
+    --- PASS: TestDecodeToolExecutionResultCanonicalContract/allows_explicit_null_result (0.00s)
+    --- PASS: TestDecodeToolExecutionResultCanonicalContract/normalizes_null_annotation (0.00s)
+=== RUN   TestToolExecutionNullAnnotationsNormalizeToAbsent
+--- PASS: TestToolExecutionNullAnnotationsNormalizeToAbsent (0.00s)
+=== RUN   TestToolCallEndNormalizesNullAnnotationBeforeMarshal
+--- PASS: TestToolCallEndNormalizesNullAnnotationBeforeMarshal (0.00s)
+=== RUN   TestToolCallExecuteWithAttributes
+--- PASS: TestToolCallExecuteWithAttributes (0.00s)
+=== RUN   TestToolCallExecuteAddsOTELStatusMetadataToEndEvents
+--- PASS: TestToolCallExecuteAddsOTELStatusMetadataToEndEvents (0.00s)
+=== RUN   TestToolSanitizeRequestGuardrail
+--- PASS: TestToolSanitizeRequestGuardrail (0.00s)
+=== RUN   TestToolSanitizeResponseGuardrail
+--- PASS: TestToolSanitizeResponseGuardrail (0.00s)
+=== RUN   TestToolConditionalExecutionGuardrail
+--- PASS: TestToolConditionalExecutionGuardrail (0.00s)
+=== RUN   TestDuplicateGuardrailFails
+--- PASS: TestDuplicateGuardrailFails (0.00s)
+=== RUN   TestToolConditionalBlocksExecution
+--- PASS: TestToolConditionalBlocksExecution (0.00s)
+=== RUN   TestToolRequestInterceptRegisterDeregister
+--- PASS: TestToolRequestInterceptRegisterDeregister (0.00s)
+=== RUN   TestToolExecutionInterceptRegisterDeregister
+--- PASS: TestToolExecutionInterceptRegisterDeregister (0.00s)
+=== RUN   TestDuplicateInterceptFails
+--- PASS: TestDuplicateInterceptFails (0.00s)
+=== RUN   TestToolRequestInterceptModifiesArgs
+--- PASS: TestToolRequestInterceptModifiesArgs (0.00s)
+=== RUN   TestToolExecutionInterceptReplacesFunc
+--- PASS: TestToolExecutionInterceptReplacesFunc (0.00s)
+=== RUN   TestToolRequestInterceptBreakChain
+--- PASS: TestToolRequestInterceptBreakChain (0.00s)
+=== RUN   TestToolFullPipelineInterceptsAndExecute
+--- PASS: TestToolFullPipelineInterceptsAndExecute (0.00s)
+=== RUN   TestToolSanitizeRequestGuardrailModifiesEventInput
+--- PASS: TestToolSanitizeRequestGuardrailModifiesEventInput (0.00s)
+=== RUN   TestToolConditionalGuardrailSelectiveReject
+--- PASS: TestToolConditionalGuardrailSelectiveReject (0.00s)
+=== RUN   TestToolMultipleGuardrailsPriorityOrder
+--- PASS: TestToolMultipleGuardrailsPriorityOrder (0.00s)
+=== RUN   TestToolCallableErrorPropagation
+--- PASS: TestToolCallableErrorPropagation (0.00s)
+=== RUN   TestToolExecutionInterceptWrapsCallable
+--- PASS: TestToolExecutionInterceptWrapsCallable (0.00s)
+=== RUN   TestToolExecutionInterceptEmitsPendingMarks
+--- PASS: TestToolExecutionInterceptEmitsPendingMarks (0.00s)
+=== RUN   TestToolExecutionInterceptSeesNextError
+--- PASS: TestToolExecutionInterceptSeesNextError (0.00s)
+=== RUN   TestToolCallWithToolCallID
+--- PASS: TestToolCallWithToolCallID (0.00s)
+=== RUN   TestToolCallExecutePropagatesToolCallIDToLifecycleEvents
+--- PASS: TestToolCallExecutePropagatesToolCallIDToLifecycleEvents (0.00s)
+=== RUN   TestToolEventInputOutput
+--- PASS: TestToolEventInputOutput (0.00s)
+=== RUN   TestTopLevelNemoRelayCoverage
+--- PASS: TestTopLevelNemoRelayCoverage (0.00s)
+=== RUN   TestTopLevelCallbacksCoverage
+--- PASS: TestTopLevelCallbacksCoverage (0.00s)
+=== RUN   TestTopLevelPluginCoverage
+--- PASS: TestTopLevelPluginCoverage (0.00s)
+=== RUN   TestTopLevelStreamCoverage
+--- PASS: TestTopLevelStreamCoverage (0.00s)
+=== RUN   TestScopeTypeConstants
+--- PASS: TestScopeTypeConstants (0.00s)
+=== RUN   TestScopeAttributeConstants
+--- PASS: TestScopeAttributeConstants (0.00s)
+=== RUN   TestToolAttributeConstants
+--- PASS: TestToolAttributeConstants (0.00s)
+=== RUN   TestLLMAttributeConstants
+--- PASS: TestLLMAttributeConstants (0.00s)
+=== RUN   TestNewLLMRequest
+--- PASS: TestNewLLMRequest (0.00s)
+=== RUN   TestNewLLMRequestEmptyHeaders
+--- PASS: TestNewLLMRequestEmptyHeaders (0.00s)
+=== RUN   TestStandaloneMiddlewareHelpers
+--- PASS: TestStandaloneMiddlewareHelpers (0.00s)
+=== RUN   TestNilWrapperConstructors
+--- PASS: TestNilWrapperConstructors (0.00s)
+=== RUN   TestNewLLMRequestRoundTrip
+--- PASS: TestNewLLMRequestRoundTrip (0.00s)
+=== RUN   TestWrapperHelpersCoverNilAndErrorPaths
+--- PASS: TestWrapperHelpersCoverNilAndErrorPaths (0.00s)
+=== RUN   TestAtifExporterLifecycleAndFiltering
+--- PASS: TestAtifExporterLifecycleAndFiltering (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	(cached)
+=== RUN   TestConfigBuilders
+--- PASS: TestConfigBuilders (0.00s)
+=== RUN   TestRedisBackendAndComponentSpecBuilders
+--- PASS: TestRedisBackendAndComponentSpecBuilders (0.00s)
+=== RUN   TestAdaptivePackageTelemetryAndLatencyHelpers
+--- PASS: TestAdaptivePackageTelemetryAndLatencyHelpers (0.00s)
+=== RUN   TestResponseCacheBuilders
+--- PASS: TestResponseCacheBuilders (0.00s)
+=== RUN   TestAdaptivePackageRuntimeHelpers
+--- PASS: TestAdaptivePackageRuntimeHelpers (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/adaptive	(cached)
+=== RUN   TestGuardrailShorthandsGlobal
+--- PASS: TestGuardrailShorthandsGlobal (0.01s)
+=== RUN   TestGuardrailShorthandsScopeLocal
+--- PASS: TestGuardrailShorthandsScopeLocal (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/guardrails	(cached)
+=== RUN   TestInterceptShorthandsGlobal
+--- PASS: TestInterceptShorthandsGlobal (0.01s)
+=== RUN   TestInterceptShorthandsScopeLocal
+--- PASS: TestInterceptShorthandsScopeLocal (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/intercepts	(cached)
+=== RUN   TestLlmShorthands
+--- PASS: TestLlmShorthands (0.01s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/llm	(cached)
+=== RUN   TestPricingPackageHelpers
+--- PASS: TestPricingPackageHelpers (0.01s)
+=== RUN   TestPricingPackageSourceAndRateHelpers
+--- PASS: TestPricingPackageSourceAndRateHelpers (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/model_pricing	(cached)
+=== RUN   TestPiiRedactionShorthandHelpers
+--- PASS: TestPiiRedactionShorthandHelpers (0.01s)
+=== RUN   TestPiiRedactionComponentSpecAndLocalModelHelpers
+--- PASS: TestPiiRedactionComponentSpecAndLocalModelHelpers (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	(cached)
+=== RUN   TestWithScopeCleanupNoopsWhenPushFails
+--- PASS: TestWithScopeCleanupNoopsWhenPushFails (0.00s)
+=== RUN   TestWithScopeNormalReturn
+--- PASS: TestWithScopeNormalReturn (0.00s)
+=== RUN   TestWithScopeDeferCleanup
+--- PASS: TestWithScopeDeferCleanup (0.00s)
+=== RUN   TestWithScopeRecordsOKStatusMetadata
+--- PASS: TestWithScopeRecordsOKStatusMetadata (0.00s)
+=== RUN   TestWithScopeCleanupOnPanic
+--- PASS: TestWithScopeCleanupOnPanic (0.00s)
+=== RUN   TestWithScopeRecordsErrorStatusMetadataOnPanic
+--- PASS: TestWithScopeRecordsErrorStatusMetadataOnPanic (0.00s)
+=== RUN   TestWithScopeHandleNormalReturn
+--- PASS: TestWithScopeHandleNormalReturn (0.00s)
+=== RUN   TestWithScopeHandleCleanupOnPanic
+--- PASS: TestWithScopeHandleCleanupOnPanic (0.00s)
+=== RUN   TestWithScopeWithOptions
+--- PASS: TestWithScopeWithOptions (0.00s)
+=== RUN   TestWithScopeNested
+--- PASS: TestWithScopeNested (0.00s)
+=== RUN   TestScopeShorthands
+--- PASS: TestScopeShorthands (0.00s)
+=== RUN   TestScopeShorthandsForwardTimestamps
+--- PASS: TestScopeShorthandsForwardTimestamps (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/scope	(cached)
+=== RUN   TestSubscriberShorthands
+--- PASS: TestSubscriberShorthands (0.00s)
+=== RUN   TestScopeSubscriberShorthands
+--- PASS: TestScopeSubscriberShorthands (0.00s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/subscribers	(cached)
+=== RUN   TestToolShorthands
+--- PASS: TestToolShorthands (0.01s)
+PASS
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/tools	(cached)
