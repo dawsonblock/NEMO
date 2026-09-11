@@ -1565,10 +1565,16 @@ where
                 )?);
                 self.finalize_from_dispatching(request, lease, &evidence)?;
                 return Err(KernelError::EffectFailed {
-                    action: Box::new(self.action_status_with_state(
+                    // `finalize_from_dispatching` has durably recorded the
+                    // pre-dispatch failure. Preserve that exact evidence on
+                    // the immediate public error just as a later replay does;
+                    // callers must never have to retry merely to learn why a
+                    // terminal failure is authoritative.
+                    action: Box::new(self.action_status_with_terminal_evidence(
                         &request.action_preparation(),
                         ExecutionState::Failed,
                         None,
+                        evidence,
                     )),
                     cause: error.to_string(),
                 });
@@ -2126,6 +2132,23 @@ where
         }
     }
 
+    /// Build a terminal status immediately after a successful evidence-gated
+    /// store finalization. The evidence transition itself confirms persistence,
+    /// so this does not require a second store read before returning the
+    /// consequential error to the harness.
+    fn action_status_with_terminal_evidence(
+        &self,
+        action: &ActionPreparation,
+        state: ExecutionState,
+        receipt: Option<ReceiptRecord>,
+        evidence: TerminalEvidence,
+    ) -> ActionStatus {
+        ActionStatus {
+            terminal_evidence: Some(evidence),
+            ..self.action_status_with_state(action, state, receipt)
+        }
+    }
+
     fn action_status_recovery(
         &self,
         action: &ActionPreparation,
@@ -2671,13 +2694,19 @@ mod tests {
                 LeaseAcquireResult::Acquired(lease)
             };
             drop(records);
-            if owner_id == "reconcile"
+            if owner_id.contains(":reconcile:")
                 && let Some(barrier) = self
                     .reconciliation_claim_barrier
                     .lock()
                     .map_err(|_| "test reconciliation barrier lock poisoned".to_owned())?
                     .clone()
             {
+                // First rendezvous proves the recovery lease has been
+                // acquired. The second keeps reconciliation from re-reading
+                // receipts until the test has persisted the late evidence.
+                // This models the exact race boundary without relying on
+                // scheduler timing.
+                barrier.wait();
                 barrier.wait();
             }
             Ok(result)
