@@ -1797,16 +1797,6 @@ pub mod unstable {
         pub fn receipts(&self) -> &InMemoryReceiptStore {
             &self.receipts
         }
-
-        fn bump_evidence_revision(&self, action_id: &str) -> Result<(), ReferenceStoreError> {
-            let mut revisions = self
-                .evidence_revisions
-                .lock()
-                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
-            let revision = revisions.entry(action_id.to_owned()).or_default();
-            *revision = revision.saturating_add(1);
-            Ok(())
-        }
     }
 
     impl<C> EffectStore for InMemoryEffectStore<C>
@@ -1853,52 +1843,105 @@ pub mod unstable {
                     action_id: action_id.to_owned(),
                 });
             }
-            let action = self
-                .actions
-                .load_action(action_id)?
-                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
             let evidence = TerminalEvidence::Receipt(receipt.identity());
+            // Hold every backing record required for the operation before
+            // inspecting or mutating either side. This is the in-memory
+            // reference equivalent of the single database transaction a
+            // durable Effect Fabric implementation must provide. In
+            // particular, never write a receipt and then discover that the
+            // fenced action transition cannot be committed.
+            let mut records = self.actions.records()?;
+            let mut receipts = self
+                .receipts
+                .receipts
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let mut conflicts = self
+                .receipts
+                .conflicts
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let mut revisions = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let action = records
+                .get_mut(action_id)
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+
+            if !evidence
+                .binds_action(&action.preparation)
+                .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
+            {
+                return Err(ReferenceStoreError::EvidenceBindingMismatch {
+                    action_id: action_id.to_owned(),
+                });
+            }
+
+            // A repeated operation is safe only when both durable records
+            // already prove exactly the same terminal result. It must not
+            // require a still-live lease merely to observe that fact.
+            if action.state == receipt.final_state
+                && action.terminal_evidence.as_ref() == Some(&evidence)
+                && let Some(existing) = receipts.get(action_id)
+                && existing.identity() == receipt.identity()
+            {
+                return Ok(EffectFinalizeResult::AlreadyFinalized(existing.clone()));
+            }
+
+            if !is_leaseable_state(expected) {
+                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            }
             if action.state != expected {
                 return Err(ReferenceStoreError::UnexpectedState {
                     expected: Some(expected),
                     actual: action.state,
                 });
             }
-            if action.lease.as_ref() != Some(lease)
-                || lease.expires_at_unix_ms <= self.actions.clock.now_unix_ms()
-            {
+            let now = self.actions.clock.now_unix_ms();
+            if action.lease.as_ref() != Some(lease) || lease.expires_at_unix_ms <= now {
                 return Err(ReferenceStoreError::LeaseHeld(
-                    action.lease.unwrap_or_else(|| lease.clone()),
+                    action.lease.clone().unwrap_or_else(|| lease.clone()),
                 ));
             }
-            if !evidence
-                .binds_action(&action.preparation)
-                .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
-                || !is_valid_evidence_transition(expected, receipt.final_state, &evidence)
-            {
+            if !is_valid_evidence_transition(expected, receipt.final_state, &evidence) {
                 return Err(ReferenceStoreError::EvidenceBindingMismatch {
                     action_id: action_id.to_owned(),
                 });
             }
-            let finalized = match self.receipts.finalize(receipt)? {
-                FinalizeResult::Finalized(receipt) => receipt,
-                FinalizeResult::AlreadyFinalized(receipt) => {
-                    self.actions
-                        .finalize_from_evidence(action_id, expected, lease, &evidence)?;
-                    return Ok(EffectFinalizeResult::AlreadyFinalized(receipt));
+
+            match receipts.get(action_id) {
+                Some(existing) if existing.identity() == receipt.identity() => {
+                    action.terminal_evidence = Some(evidence);
+                    action.state = receipt.final_state;
+                    action.lease = None;
+                    Ok(EffectFinalizeResult::AlreadyFinalized(existing.clone()))
                 }
-                FinalizeResult::FinalizationConflict(conflict) => {
-                    self.bump_evidence_revision(action_id)?;
-                    return Ok(EffectFinalizeResult::FinalizationConflict(conflict));
+                Some(existing) => {
+                    let conflict = ReceiptConflict::new(existing, receipt);
+                    let action_conflicts = conflicts.entry(action_id.to_owned()).or_default();
+                    let already_recorded = action_conflicts
+                        .iter()
+                        .any(|recorded| recorded.conflict_digest == conflict.conflict_digest);
+                    if already_recorded {
+                        Ok(EffectFinalizeResult::ConflictAlreadyRecorded(conflict))
+                    } else {
+                        action_conflicts.push(conflict.clone());
+                        let revision = revisions.entry(action_id.to_owned()).or_default();
+                        *revision = revision.saturating_add(1);
+                        Ok(EffectFinalizeResult::FinalizationConflict(conflict))
+                    }
                 }
-                FinalizeResult::ConflictAlreadyRecorded(conflict) => {
-                    return Ok(EffectFinalizeResult::ConflictAlreadyRecorded(conflict));
+                None => {
+                    receipts.insert(action_id.to_owned(), receipt.clone());
+                    action.terminal_evidence = Some(evidence);
+                    action.state = receipt.final_state;
+                    action.lease = None;
+                    let revision = revisions.entry(action_id.to_owned()).or_default();
+                    *revision = revision.saturating_add(1);
+                    Ok(EffectFinalizeResult::Finalized(receipt.clone()))
                 }
-            };
-            self.actions
-                .finalize_from_evidence(action_id, expected, lease, &evidence)?;
-            self.bump_evidence_revision(action_id)?;
-            Ok(EffectFinalizeResult::Finalized(finalized))
+            }
         }
     }
 

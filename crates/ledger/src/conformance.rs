@@ -598,6 +598,21 @@ where
             .expect("atomically finalize terminal receipt"),
         EffectFinalizeResult::Finalized(_)
     ));
+    // Replaying the same completed transaction must be observable as an
+    // idempotent result. It must not require the lease that was consumed by
+    // the first terminal transition, nor attempt to overwrite evidence.
+    assert!(matches!(
+        harness
+            .effects()
+            .finalize_terminal_receipt(
+                &action.action_id,
+                ExecutionState::Dispatching,
+                &lease,
+                &receipt,
+            )
+            .expect("replay terminal finalization"),
+        EffectFinalizeResult::AlreadyFinalized(_)
+    ));
     assert_eq!(
         harness
             .actions()
@@ -613,7 +628,7 @@ where
         .expect("read evidence snapshot");
     assert_eq!(snapshot.receipt, Some(receipt));
     assert!(snapshot.conflicts.is_empty());
-    assert!(snapshot.revision > 0);
+    assert_eq!(snapshot.revision, 1);
 }
 
 #[derive(Clone, Copy)]
