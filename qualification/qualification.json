@@ -10,6 +10,7 @@
     "clippy": "NOT_RUN",
     "rust-tests": "NOT_RUN",
     "rust-doc-tests": "NOT_RUN",
+    "effect-contracts": "NOT_RUN",
     "cargo-deny": "NOT_RUN",
     "cargo-audit": "NOT_RUN",
     "python-tests": "NOT_RUN",
@@ -31,6 +32,10 @@
       "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
     "rust-doc-tests": {
+      "status": "NOT_RUN",
+      "reason": "qualification checks intentionally skipped in manifest-only mode"
+    },
+    "effect-contracts": {
       "status": "NOT_RUN",
       "reason": "qualification checks intentionally skipped in manifest-only mode"
     },
@@ -60,19 +65,19 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "c597316f63d2e9e912b31d4e1c3d49745b49ed33a1df95b556fb8a2ccf8143a7",
-    "source_archive_sha256": "aa8f5824ac0c9d5fd7f394c91f965f6ac6bc42edf0879a072da910ee5200b436",
-    "release_archive_sha256": "aa8f5824ac0c9d5fd7f394c91f965f6ac6bc42edf0879a072da910ee5200b436",
+    "source_tree_sha256": "90900b7b3e81ae234c9db4c37454d50c08eaaf445130ba7bce7a170ab5d56b51",
+    "source_archive_sha256": "42629f783b3d180953144bb948fb3f8e14133d48786de28b2773930e16483856",
+    "release_archive_sha256": null,
     "environment_sha256": "3df3c8bc5dac9ad45562ccecbe4b4d0890a491112251fa84fec0cf84b0ef58d5",
     "lockfiles": {
-      "Cargo.lock": "sha256:5cc45155ec25aee61f24414593c16f05900828d8d2a674a15dcaaaaf1b320b89",
+      "Cargo.lock": "sha256:2be462e17c580021359a2f0032efcea2a487439e594ba9f1f653fd241e76d1a1",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
       "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "5ca099e6c4eaae276c127d192edb5240a1fcf539",
-      "tree": "a381ff49be019a2cb7d7c70739217d61bd6f9c63",
-      "source_tree_sha256": "c597316f63d2e9e912b31d4e1c3d49745b49ed33a1df95b556fb8a2ccf8143a7",
+      "commit": "75833822a741b6a5f4b1e51c816c102a1d577202",
+      "tree": "19305db48bca1f6c3e1d67359ea44da1784de591",
+      "source_tree_sha256": "90900b7b3e81ae234c9db4c37454d50c08eaaf445130ba7bce7a170ab5d56b51",
       "status": []
     }
   },
