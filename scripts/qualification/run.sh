@@ -305,11 +305,11 @@ else
     else
         run_if_available rust-format cargo cargo fmt --all -- --check
         run_if_available clippy cargo cargo clippy --workspace --all-targets --all-features -- -D warnings
-        if has_cargo_subcommand nextest || command -v cargo-nextest >/dev/null 2>&1; then
-            run_check rust-tests cargo nextest run --workspace --all-features --no-fail-fast
-        else
-            not_run rust-tests "missing prerequisite: cargo-nextest"
-        fi
+        # The canonical Rust recipe builds the native and worker plugin
+        # fixtures before invoking nextest. Calling nextest directly leaves
+        # the workspace integration suite with missing fixture binaries and
+        # produces a false source failure on an otherwise valid checkout.
+        run_if_available rust-tests just just test-rust
         run_if_available rust-doc-tests cargo cargo test --doc --workspace
         run_if_available effect-contracts just just test-effect-contracts
     fi

@@ -303,9 +303,15 @@ fn unhealthy_owned_gateway_is_force_killed_after_the_grace_period() {
         });
     }
     let mut child = command.spawn().unwrap();
+    let pid_deadline = Instant::now() + Duration::from_secs(1);
     let child_pid = loop {
         if let Ok(value) = std::fs::read_to_string(&child_pid_path) {
-            break value.trim().parse::<i32>().unwrap();
+            if let Ok(pid) = value.trim().parse::<i32>() {
+                break pid;
+            }
+        }
+        if Instant::now() >= pid_deadline {
+            panic!("child process did not publish a valid pid before timeout");
         }
         std::thread::sleep(Duration::from_millis(10));
     };
