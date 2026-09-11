@@ -138,7 +138,13 @@ visible to the caller instead of silently rewriting action history. The
 generic state-transition API cannot write `COMMITTED` or externally meaningful
 `FAILED`; `ActionStore::finalize_from_evidence` must verify the current state,
 fenced lease, immutable action binding, and evidence-authorized terminal
-transition in one operation.
+transition in one operation. Lifecycle legality and method legality are
+separate contracts: `authorize_action` alone may write
+`PROPOSED → AUTHORIZED`; generic transition alone may write
+`AUTHORIZED → PREPARED` or pre-dispatch cancellation; and only a live fenced
+lease may write dispatch, reconciliation, or uncertainty transitions. A
+missing, empty, or whitespace-only grant digest blocks authorization,
+preparation, and terminal-evidence construction.
 
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live
@@ -150,6 +156,19 @@ Missing evidence remains
 never translated into `FAILED` merely because a worker disappeared. The
 in-memory stores and deterministic clocks are reference implementations for
 these contract tests only. They do not enable production durability.
+
+### Contract conformance testkit
+
+The `unstable-hardening-testkit` feature exposes backend-independent store
+conformance runners. An adapter supplies fresh action and receipt stores plus
+a controller for its store-owned test clock, then runs the same lifecycle,
+lease, idempotency, immutable-receipt, conflict-history, and security-binding
+mutation cases as the in-memory reference stores. The mutation matrix changes
+each bound action/evidence field independently and asserts that rejected input
+cannot alter durable state or evidence history. Receipt replay and conflict
+tests independently mutate provider request identity, terminal state, and
+evidence digest. This suite is a contract gate; it is not a durable-store
+implementation.
 
 An action's runtime binding digest canonically covers its stable runtime or
 deployment identity, environment, and session provenance. Deployments using

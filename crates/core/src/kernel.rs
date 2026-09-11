@@ -18,10 +18,11 @@ use nemo_relay_executor::unstable::{
     RuntimeIdentity,
 };
 use nemo_relay_ledger::unstable::{
-    ActionLease, ActionPreparation, ActionRecord, ActionStore, ExecutionState, FinalizeResult,
-    LeaseAcquireResult, LeaseConfiguration, LeaseReleaseResult, LeaseRenewResult, LeaseStatus,
-    PreDispatchFailureEvidence, PrepareActionResult, ReceiptConflict, ReceiptRecord, ReceiptStore,
-    TerminalEvidence, is_valid_evidence_transition, is_valid_transition,
+    ActionEvidenceBinding, ActionLease, ActionPreparation, ActionRecord, ActionStore,
+    ExecutionState, FinalizeResult, LeaseAcquireResult, LeaseConfiguration, LeaseReleaseResult,
+    LeaseRenewResult, LeaseStatus, PreDispatchFailureEvidence, PrepareActionResult,
+    ReceiptConflict, ReceiptRecord, ReceiptStore, TerminalEvidence, is_valid_evidence_transition,
+    is_valid_generic_transition, is_valid_leased_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -237,6 +238,8 @@ pub struct ActionStatus {
     pub reconciliation_required: bool,
     /// Persisted receipt when the action is already committed.
     pub receipt: Option<ReceiptRecord>,
+    /// Durable terminal evidence for committed or failed actions.
+    pub terminal_evidence: Option<TerminalEvidence>,
     /// Whether `state` was freshly loaded from durable action storage.
     pub durable_state_confirmed: bool,
 }
@@ -516,6 +519,7 @@ impl PendingAction {
             safe_to_retry: false,
             reconciliation_required: false,
             receipt: None,
+            terminal_evidence: None,
             durable_state_confirmed: true,
         }
     }
@@ -1007,64 +1011,6 @@ where
         if action.state != ExecutionState::Unknown {
             return Err(KernelError::ActionNotUnknown(action_id.to_owned()));
         }
-        match self.recover(action_id)? {
-            RecoveryDecision::RecoverCommitted(status) => {
-                return Ok(ReconciliationResult {
-                    state: ExecutionState::Committed,
-                    receipt: status.receipt,
-                });
-            }
-            RecoveryDecision::RecoverFailed(status) => {
-                return Ok(ReconciliationResult {
-                    state: ExecutionState::Failed,
-                    receipt: status.receipt,
-                });
-            }
-            RecoveryDecision::HeldByOther(status) => {
-                return Err(KernelError::ActionPending {
-                    action: Box::new(status),
-                    cause: ActionPendingCause::LeaseHeld,
-                });
-            }
-            RecoveryDecision::ContradictoryEvidence {
-                action,
-                conflicts,
-                cause: _,
-            } if !conflicts.is_empty() => {
-                return Err(KernelError::EvidenceIntegrityConflict {
-                    action: Box::new(action),
-                    conflicts,
-                });
-            }
-            RecoveryDecision::ContradictoryEvidence { action, cause, .. } => {
-                return Err(KernelError::EvidenceIntegrityFailure {
-                    action: Box::new(action),
-                    cause,
-                });
-            }
-            RecoveryDecision::RecoverUnknown(_) => {}
-            RecoveryDecision::RecoverRetry(status) => {
-                return Err(KernelError::ActionPending {
-                    action: Box::new(status),
-                    cause: ActionPendingCause::StatePersistenceFailure(
-                        "unknown action unexpectedly became pre-dispatch work during recovery"
-                            .into(),
-                    ),
-                });
-            }
-        }
-        let conflicts = self.load_receipt_conflicts(&action)?;
-        if !conflicts.is_empty() {
-            return Err(KernelError::EvidenceIntegrityConflict {
-                action: Box::new(self.action_status_with_next_action(
-                    &action.preparation,
-                    action.state,
-                    ActionNextStep::RepairEvidence,
-                    None,
-                )),
-                conflicts,
-            });
-        }
         let deadline_unix_ms = kernel_deadline_unix_ms();
         let (configuration, requested_duration_ms) =
             self.lease_request_for_deadline(deadline_unix_ms)?;
@@ -1082,8 +1028,73 @@ where
                 });
             }
         };
+
+        // Receipt and conflict stores are separate adapter boundaries. Re-read
+        // both only after fenced ownership is acquired so late evidence cannot
+        // be ignored immediately before provider reconciliation.
+        let leased_action = self
+            .action_store
+            .load_action(action_id)
+            .map_err(|error| KernelError::ActionStore(error.to_string()))?
+            .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
+        if leased_action.state != ExecutionState::Unknown
+            || leased_action.lease.as_ref() != Some(&lease)
+        {
+            return Err(self.state_recovery_required(
+                &action.preparation,
+                ExecutionState::Unknown,
+                ExecutionState::Unknown,
+                "reconciliation lease was not durably observed".into(),
+            ));
+        }
+        let conflicts = self.load_receipt_conflicts(&leased_action)?;
+        if !conflicts.is_empty() {
+            self.release_lease(&leased_action, ExecutionState::Unknown, &lease)?;
+            return Err(KernelError::EvidenceIntegrityConflict {
+                action: Box::new(self.action_status_with_next_action(
+                    &leased_action.preparation,
+                    ExecutionState::Unknown,
+                    ActionNextStep::RepairEvidence,
+                    None,
+                )),
+                conflicts,
+            });
+        }
+        if let Some(receipt) = self
+            .receipt_store
+            .load(action_id)
+            .map_err(|error| KernelError::ReceiptStore(error.to_string()))?
+        {
+            if !matches!(
+                receipt.final_state,
+                ExecutionState::Committed | ExecutionState::Failed
+            ) || !self.receipt_matches_action(&receipt, &leased_action.preparation)
+            {
+                self.release_lease(&leased_action, ExecutionState::Unknown, &lease)?;
+                return Err(KernelError::EvidenceIntegrityFailure {
+                    action: Box::new(self.action_status_with_next_action(
+                        &leased_action.preparation,
+                        ExecutionState::Unknown,
+                        ActionNextStep::RepairEvidence,
+                        None,
+                    )),
+                    cause: "persisted terminal receipt does not bind to the action".into(),
+                });
+            }
+            self.finalize_action_from_evidence(
+                &leased_action.preparation,
+                ExecutionState::Unknown,
+                &lease,
+                &TerminalEvidence::Receipt(receipt.identity()),
+            )?;
+            return Ok(ReconciliationResult {
+                state: receipt.final_state,
+                receipt: Some(receipt),
+            });
+        }
+
         self.transition_action_with_lease(
-            &action,
+            &leased_action,
             ExecutionState::Unknown,
             &lease,
             ExecutionState::Reconciling,
@@ -1096,15 +1107,19 @@ where
                 error.to_string(),
             )
         })?;
-        let lease =
-            self.renew_reconciliation_lease(&action, &lease, configuration, requested_duration_ms)?;
+        let lease = self.renew_reconciliation_lease(
+            &leased_action,
+            &lease,
+            configuration,
+            requested_duration_ms,
+        )?;
         let result = match self.router.reconcile(&ReconciliationRequest {
             action_id: action_id.to_owned(),
             deadline_unix_ms,
         }) {
             Ok(result) => result,
             Err(error) => {
-                return Err(self.reconciliation_unknown(&action, &lease, error.to_string()));
+                return Err(self.reconciliation_unknown(&leased_action, &lease, error.to_string()));
             }
         };
         if !matches!(
@@ -1112,7 +1127,7 @@ where
             ExecutionState::Committed | ExecutionState::Failed | ExecutionState::Unknown
         ) {
             return Err(self.reconciliation_unknown(
-                &action,
+                &leased_action,
                 &lease,
                 format!("reconciliation returned invalid state: {:?}", result.state),
             ));
@@ -1123,7 +1138,7 @@ where
         ) && result.receipt.is_none()
         {
             return Err(self.reconciliation_unknown(
-                &action,
+                &leased_action,
                 &lease,
                 "reconciliation terminal result requires authoritative evidence".into(),
             ));
@@ -1131,10 +1146,10 @@ where
         if let Some(receipt) = result.receipt.as_ref() {
             if receipt.action_id != action_id
                 || receipt.final_state != result.state
-                || !self.receipt_matches_action(receipt, &action.preparation)
+                || !self.receipt_matches_action(receipt, &leased_action.preparation)
             {
                 return Err(self.reconciliation_unknown(
-                    &action,
+                    &leased_action,
                     &lease,
                     "reconciled receipt does not bind to the original action".into(),
                 ));
@@ -1142,13 +1157,13 @@ where
             if let Err(error) = self.finalize_receipt(receipt) {
                 return Err(match error {
                     KernelError::ReceiptFinalizationConflict(conflict) => {
-                        self.evidence_conflict_after_reconciling(&action, &lease, conflict)
+                        self.evidence_conflict_after_reconciling(&leased_action, &lease, conflict)
                     }
-                    other => self.reconciliation_unknown(&action, &lease, other.to_string()),
+                    other => self.reconciliation_unknown(&leased_action, &lease, other.to_string()),
                 });
             }
             self.finalize_action_from_evidence(
-                &action.preparation,
+                &leased_action.preparation,
                 ExecutionState::Reconciling,
                 &lease,
                 &TerminalEvidence::Receipt(receipt.identity()),
@@ -1157,7 +1172,7 @@ where
         }
         debug_assert_eq!(result.state, ExecutionState::Unknown);
         self.transition_action_with_lease(
-            &action,
+            &leased_action,
             ExecutionState::Reconciling,
             &lease,
             ExecutionState::Unknown,
@@ -1213,13 +1228,27 @@ where
             AuthorizationOutcome::Granted(grant) => {
                 request.attach_grant(*grant);
                 let identity = &request.backend_request().identity;
+                let grant_digest = match identity
+                    .grant_digest
+                    .as_deref()
+                    .filter(|digest| !digest.trim().is_empty())
+                {
+                    Some(digest) => digest,
+                    None => {
+                        return Err(self.cancel_after_authority_error(
+                            request,
+                            current_state,
+                            ActionRejectionCause::GrantBindingFailure,
+                        ));
+                    }
+                };
                 let mut state = current_state;
                 if state == ExecutionState::Proposed {
                     self.action_store
                         .authorize_action(
                             &identity.action_id,
                             ExecutionState::Proposed,
-                            identity.grant_digest.as_deref().unwrap_or_default(),
+                            grant_digest,
                             identity.approval_reference.as_deref(),
                         )
                         .map_err(|error| {
@@ -1235,7 +1264,7 @@ where
                         .refresh_authorization(
                             &identity.action_id,
                             state,
-                            identity.grant_digest.as_deref().unwrap_or_default(),
+                            grant_digest,
                             identity.approval_reference.as_deref(),
                         )
                         .map_err(|error| {
@@ -1354,37 +1383,34 @@ where
                 conflicts,
             });
         }
-        let receipt = if action.state == ExecutionState::Committed {
-            let receipt = self
-                .receipt_store
-                .load(&action.preparation.action_id)
-                .map_err(|error| {
-                    self.state_recovery_required(
-                        &action.preparation,
-                        ExecutionState::Committed,
-                        ExecutionState::Committed,
-                        error.to_string(),
-                    )
-                })?;
-            match receipt {
-                Some(receipt)
-                    if receipt.final_state == ExecutionState::Committed
-                        && self.receipt_matches_action(&receipt, &action.preparation) =>
-                {
-                    Some(receipt)
+        if matches!(
+            action.state,
+            ExecutionState::Committed | ExecutionState::Failed
+        ) {
+            return match self.recover_terminal_action(&action)? {
+                RecoveryDecision::RecoverCommitted(status)
+                | RecoveryDecision::RecoverFailed(status) => {
+                    Ok(InvocationOutcome::ExistingAction(status))
                 }
-                _ => {
-                    return Err(KernelError::EvidenceIntegrityFailure {
-                        action: Box::new(self.action_status(&action, None)),
-                        cause: "committed action has no valid persisted receipt".into(),
-                    });
-                }
-            }
-        } else {
-            None
-        };
+                RecoveryDecision::ContradictoryEvidence {
+                    action,
+                    conflicts,
+                    cause,
+                } if conflicts.is_empty() => Err(KernelError::EvidenceIntegrityFailure {
+                    action: Box::new(action),
+                    cause,
+                }),
+                RecoveryDecision::ContradictoryEvidence {
+                    action, conflicts, ..
+                } => Err(KernelError::EvidenceIntegrityConflict {
+                    action: Box::new(action),
+                    conflicts,
+                }),
+                _ => unreachable!("terminal recovery only returns terminal or integrity states"),
+            };
+        }
         Ok(InvocationOutcome::ExistingAction(
-            self.action_status(&action, receipt),
+            self.action_status(&action, None),
         ))
     }
 
@@ -1536,7 +1562,7 @@ where
                 let evidence = TerminalEvidence::PreDispatchFailure(pre_dispatch_failure_evidence(
                     &request.action_preparation(),
                     &error,
-                ));
+                )?);
                 self.finalize_from_dispatching(request, lease, &evidence)?;
                 return Err(KernelError::EffectFailed {
                     action: Box::new(self.action_status_with_state(
@@ -1590,7 +1616,7 @@ where
         expected: ExecutionState,
         next: ExecutionState,
     ) -> Result<(), KernelError> {
-        if !is_valid_transition(Some(expected), next) {
+        if !is_valid_generic_transition(expected, next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
         self.action_store
@@ -1658,8 +1684,10 @@ where
         evidence: &TerminalEvidence,
     ) -> Result<(), KernelError> {
         let next = evidence.terminal_state();
-        if !evidence.binds_action(action) || !is_valid_evidence_transition(expected, next, evidence)
-        {
+        let binds_action = evidence
+            .binds_action(action)
+            .map_err(|_| KernelError::GrantBindingFailure)?;
+        if !binds_action || !is_valid_evidence_transition(expected, next, evidence) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
         self.action_store
@@ -1681,7 +1709,7 @@ where
         lease: &ActionLease,
         next: ExecutionState,
     ) -> Result<(), KernelError> {
-        if !is_valid_transition(Some(expected), next) {
+        if !is_valid_leased_transition(expected, next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
         self.action_store
@@ -1701,7 +1729,7 @@ where
         lease: &ActionLease,
         next: ExecutionState,
     ) -> Result<(), KernelError> {
-        if !is_valid_transition(Some(expected), next) {
+        if !is_valid_leased_transition(expected, next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
         self.action_store
@@ -2069,7 +2097,10 @@ where
     }
 
     fn action_status(&self, action: &ActionRecord, receipt: Option<ReceiptRecord>) -> ActionStatus {
-        self.action_status_with_state(&action.preparation, action.state, receipt)
+        ActionStatus {
+            terminal_evidence: action.terminal_evidence.clone(),
+            ..self.action_status_with_state(&action.preparation, action.state, receipt)
+        }
     }
 
     fn action_status_with_state(
@@ -2090,6 +2121,7 @@ where
             ),
             reconciliation_required: state == ExecutionState::Unknown,
             receipt,
+            terminal_evidence: None,
             durable_state_confirmed: true,
         }
     }
@@ -2134,9 +2166,12 @@ where
     }
 
     fn receipt_matches_action(&self, receipt: &ReceiptRecord, action: &ActionPreparation) -> bool {
+        let Ok(binding) = ActionEvidenceBinding::try_from(action) else {
+            return false;
+        };
         receipt.action_id == action.action_id
             && receipt.idempotency_key == action.idempotency_key
-            && receipt.grant_digest == action.grant_digest.as_deref().unwrap_or_default()
+            && receipt.identity().action_binding() == binding
             && receipt.principal_id == action.principal_id
             && receipt.capability_id == action.capability_id
             && receipt.capability_generation == action.capability_generation
@@ -2222,7 +2257,7 @@ fn runtime_binding_digest(runtime: &RuntimeIdentity) -> String {
 fn pre_dispatch_failure_evidence(
     action: &ActionPreparation,
     error: &nemo_relay_executor::unstable::EffectExecutionError,
-) -> PreDispatchFailureEvidence {
+) -> Result<PreDispatchFailureEvidence, KernelError> {
     let evidence = serde_json::json!({
         "code": error.code,
         "dispatch_state": error.dispatch_state,
@@ -2231,11 +2266,12 @@ fn pre_dispatch_failure_evidence(
     });
     let bytes = serde_json_canonicalizer::to_vec(&evidence)
         .expect("kernel-owned failure evidence must canonicalize");
-    PreDispatchFailureEvidence {
-        action_binding: nemo_relay_ledger::unstable::ActionEvidenceBinding::from_action(action),
+    Ok(PreDispatchFailureEvidence {
+        action_binding: ActionEvidenceBinding::try_from(action)
+            .map_err(|_| KernelError::GrantBindingFailure)?,
         code: error.code.clone(),
         evidence_digest: sha256_hex(&bytes),
-    }
+    })
 }
 
 fn scoped_idempotency_key(runtime: &RuntimeIdentity, request_id: &str) -> String {
@@ -2281,7 +2317,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -2388,6 +2424,9 @@ mod tests {
         /// Simulates a competing writer that persisted `UNKNOWN` before this
         /// worker learned its stale compare-and-set failed.
         persist_unknown_then_fail: Arc<Mutex<Option<String>>>,
+        /// Pauses reconciliation immediately after its fenced lease is
+        /// persisted so race tests can inject late immutable evidence.
+        reconciliation_claim_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
     }
 
     impl ActionStore for TestActionStore {
@@ -2626,11 +2665,22 @@ mod tests {
             };
             record.lease = Some(lease.clone());
             record.lease_generation = generation;
-            Ok(if reclaimed {
+            let result = if reclaimed {
                 LeaseAcquireResult::ExpiredReclaimed(lease)
             } else {
                 LeaseAcquireResult::Acquired(lease)
-            })
+            };
+            drop(records);
+            if owner_id == "reconcile"
+                && let Some(barrier) = self
+                    .reconciliation_claim_barrier
+                    .lock()
+                    .map_err(|_| "test reconciliation barrier lock poisoned".to_owned())?
+                    .clone()
+            {
+                barrier.wait();
+            }
+            Ok(result)
         }
 
         fn renew_lease(
@@ -2760,9 +2810,10 @@ mod tests {
                 return Err("stale or unexpected terminal evidence lease".into());
             }
             let terminal_state = evidence.terminal_state();
-            if !evidence.binds_action(&record.preparation)
-                || !is_valid_evidence_transition(expected, terminal_state, evidence)
-            {
+            let binds_action = evidence
+                .binds_action(&record.preparation)
+                .map_err(|_| "invalid grant digest in terminal evidence".to_owned())?;
+            if !binds_action || !is_valid_evidence_transition(expected, terminal_state, evidence) {
                 return Err("invalid terminal evidence transition".into());
             }
             record.terminal_evidence = Some(evidence.clone());
@@ -2987,7 +3038,10 @@ mod tests {
             receipt_id: "receipt-1".into(),
             action_id: identity.action_id.clone(),
             idempotency_key: identity.idempotency_key.clone(),
-            grant_digest: identity.grant_digest.clone().unwrap_or_default(),
+            grant_digest: identity
+                .grant_digest
+                .clone()
+                .expect("consequential test receipt requires a verified grant digest"),
             principal_id: identity.runtime.principal_id.clone(),
             tenant_id: identity.runtime.tenant_id.clone(),
             runtime_id: identity.runtime.runtime_id.clone(),
@@ -3629,6 +3683,26 @@ mod tests {
             actions.load_state(&action.action_id).unwrap(),
             Some(ExecutionState::Failed)
         );
+        assert!(matches!(
+            action.terminal_evidence.as_ref(),
+            Some(TerminalEvidence::PreDispatchFailure(_))
+        ));
+
+        let replay = kernel
+            .begin(&invocation())
+            .expect("a failed retry should replay the durable action evidence");
+        match replay {
+            InvocationOutcome::ExistingAction(status) => {
+                assert_eq!(status.action_id, action.action_id);
+                assert_eq!(status.state, ExecutionState::Failed);
+                assert!(matches!(
+                    status.terminal_evidence.as_ref(),
+                    Some(TerminalEvidence::PreDispatchFailure(_))
+                ));
+            }
+            _ => panic!("failed retry must replay durable terminal evidence"),
+        }
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3802,6 +3876,61 @@ mod tests {
             effect.reconciliation_calls.load(Ordering::SeqCst),
             0,
             "provider reconciliation must not run after valid terminal evidence exists"
+        );
+    }
+
+    #[test]
+    fn late_receipt_after_reconciliation_lease_blocks_provider_reconciliation() {
+        let (kernel, _authority, _function, effect, actions, receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
+            code: "TRANSPORT_LOST_AFTER_DISPATCH".into(),
+            dispatch_state: nemo_relay_executor::unstable::DispatchState::DispatchConfirmed,
+            outcome_certainty: OutcomeCertainty::Unknown,
+            provider_request_id: None,
+            retryable: false,
+            reconciliation_required: true,
+            message: "provider response was lost".into(),
+        });
+        let action_id = match kernel.begin(&invocation_with_request_id("receipt-race")) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("expected unknown effect"),
+        };
+        let request = effect
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.identity.action_id == action_id)
+            .cloned()
+            .expect("effect request should be retained for late evidence");
+        let barrier = Arc::new(Barrier::new(2));
+        *actions.reconciliation_claim_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+        let kernel = Arc::new(kernel);
+        let worker = Arc::clone(&kernel);
+        let worker_action_id = action_id.clone();
+        let reconciliation = std::thread::spawn(move || worker.reconcile(&worker_action_id));
+
+        barrier.wait();
+        receipts
+            .finalize(&receipt(&request))
+            .expect("late evidence should persist while the reconciliation lease is held");
+        barrier.wait();
+
+        let result = reconciliation
+            .join()
+            .expect("reconciliation worker should not panic")
+            .expect("late evidence should repair the action");
+        assert_eq!(result.state, ExecutionState::Committed);
+        assert_eq!(
+            effect.reconciliation_calls.load(Ordering::SeqCst),
+            0,
+            "provider reconciliation must not run when evidence appears after lease acquisition"
+        );
+        assert_eq!(
+            actions.renew_calls.load(Ordering::SeqCst),
+            1,
+            "late evidence avoids a provider reconciliation renewal and never invokes recover"
         );
     }
 
@@ -4354,5 +4483,10 @@ mod tests {
             Some(ExecutionState::Committed)
         );
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
+        assert_eq!(
+            actions.renew_calls.load(Ordering::SeqCst),
+            2,
+            "one dispatch renewal plus one reconciliation renewal proves reconciliation does not call recover first"
+        );
     }
 }

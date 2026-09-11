@@ -291,7 +291,7 @@ if [[ "${mode}" == "provenance" ]]; then
     :
 elif [[ "${mode}" == "manifest" ]]; then
     # Manifest-only mode is useful when the host cannot run the full matrix.
-    for check in rust-format clippy rust-tests rust-doc-tests cargo-deny cargo-audit \
+    for check in rust-format clippy rust-tests rust-doc-tests effect-contracts cargo-deny cargo-audit \
         python-tests node-tests go-tests sbom; do
         not_run "${check}" "qualification checks intentionally skipped in manifest-only mode"
     done
@@ -301,6 +301,7 @@ else
         run_if_available clippy cargo cargo clippy -p nemo-relay -p nemo-relay-adaptive -p nemo-relay-cli --lib --all-features -- -D warnings
         run_if_available rust-tests cargo cargo test -p nemo-relay -p nemo-relay-adaptive -p nemo-relay-cli --lib --all-features --no-fail-fast --jobs 1 -- --test-threads=1
         run_if_available rust-doc-tests cargo cargo test -p nemo-relay -p nemo-relay-adaptive -p nemo-relay-cli --doc --jobs 1
+        run_if_available effect-contracts just just test-effect-contracts
     else
         run_if_available rust-format cargo cargo fmt --all -- --check
         run_if_available clippy cargo cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -310,6 +311,7 @@ else
             not_run rust-tests "missing prerequisite: cargo-nextest"
         fi
         run_if_available rust-doc-tests cargo cargo test --doc --workspace
+        run_if_available effect-contracts just just test-effect-contracts
     fi
 
     run_cargo_subcommand cargo-deny deny check
@@ -398,7 +400,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     details[name] = {"status": status, "reason": reason}
 
 required = [
-    "rust-format", "clippy", "rust-tests", "rust-doc-tests", "cargo-deny",
+    "rust-format", "clippy", "rust-tests", "rust-doc-tests", "effect-contracts", "cargo-deny",
     "cargo-audit", "python-tests", "node-tests", "go-tests", "sbom",
 ]
 for name in required:

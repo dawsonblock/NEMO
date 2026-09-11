@@ -1226,7 +1226,9 @@ test-latency-benchmark:
 test-effect-contracts:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo test --locked -p nemo-relay-ledger --features unstable-hardening --lib
+    cargo test --locked -p nemo-relay-authority --features unstable-hardening --lib
+    cargo test --locked -p nemo-relay-executor --features unstable-hardening --lib
+    cargo test --locked -p nemo-relay-ledger --features unstable-hardening-testkit --lib
     cargo test --locked -p nemo-relay --features unstable-hardening --lib kernel::tests
 
 # --set [output_dir=<path>] [ci=true|false]

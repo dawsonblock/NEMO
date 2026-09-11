@@ -15,6 +15,8 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
+      - 'scripts/qualification/run.sh'
+      - 'docs/reference/hardening.mdx'
       - '.github/actions/load-ci-tool-versions/**'
       - '.github/workflows/effect-contract-conformance.yml'
   push:
@@ -29,12 +31,11 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
+      - 'scripts/qualification/run.sh'
+      - 'docs/reference/hardening.mdx'
       - '.github/actions/load-ci-tool-versions/**'
       - '.github/workflows/effect-contract-conformance.yml'
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 concurrency:
   group: effect-contract-conformance-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -45,6 +46,8 @@ jobs:
     name: unstable-hardening contracts
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,6 +77,16 @@ jobs:
         uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
         with:
           tool: just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint contract crates
+        run: |
+          cargo clippy --locked -p nemo-relay-authority --all-targets --features unstable-hardening -- -D warnings
+          cargo clippy --locked -p nemo-relay-executor --all-targets --features unstable-hardening -- -D warnings
+          cargo clippy --locked -p nemo-relay-ledger --all-targets --features unstable-hardening-testkit -- -D warnings
+          cargo clippy --locked -p nemo-relay --all-targets --features unstable-hardening -- -D warnings
 
       - name: Run hardening contract conformance
         run: just test-effect-contracts

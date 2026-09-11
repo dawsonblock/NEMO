@@ -9,6 +9,11 @@
 /// Whether durable ledger persistence is active.
 pub const DURABILITY_ENABLED: bool = false;
 
+/// Backend-independent conformance runners for experimental Effect Fabric
+/// stores. This surface is intentionally test-only until the contract freezes.
+#[cfg(feature = "unstable-hardening-testkit")]
+pub mod conformance;
+
 /// Opt-in experimental contracts.
 #[cfg(feature = "unstable-hardening")]
 pub mod unstable {
@@ -42,12 +47,11 @@ pub mod unstable {
         Cancelled,
     }
 
-    /// Return whether a consequential-effect state transition is legal.
+    /// Return whether a transition exists in the abstract effect lifecycle.
     ///
-    /// This table is shared by in-memory test adapters and durable Effect
-    /// Fabric implementations so an adapter cannot accidentally skip the
-    /// authorization or preparation boundary.
-    pub const fn is_valid_transition(
+    /// This describes the state graph only. Store methods must additionally
+    /// enforce the narrower predicate for the operation they implement.
+    pub const fn is_valid_lifecycle_transition(
         current: Option<ExecutionState>,
         next: ExecutionState,
     ) -> bool {
@@ -60,9 +64,54 @@ pub mod unstable {
                 | (Some(ExecutionState::Authorized), ExecutionState::Cancelled)
                 | (Some(ExecutionState::Prepared), ExecutionState::Dispatching)
                 | (Some(ExecutionState::Prepared), ExecutionState::Cancelled)
+                | (Some(ExecutionState::Dispatching), ExecutionState::Committed)
+                | (Some(ExecutionState::Dispatching), ExecutionState::Failed)
                 | (Some(ExecutionState::Dispatching), ExecutionState::Unknown)
                 | (Some(ExecutionState::Unknown), ExecutionState::Reconciling)
+                | (Some(ExecutionState::Unknown), ExecutionState::Committed)
+                | (Some(ExecutionState::Unknown), ExecutionState::Failed)
                 | (Some(ExecutionState::Reconciling), ExecutionState::Unknown)
+                | (Some(ExecutionState::Reconciling), ExecutionState::Committed)
+                | (Some(ExecutionState::Reconciling), ExecutionState::Failed)
+        )
+    }
+
+    /// Return whether the dedicated authorization method may advance state.
+    pub const fn is_valid_authorization_transition(
+        current: ExecutionState,
+        next: ExecutionState,
+    ) -> bool {
+        matches!(
+            (current, next),
+            (ExecutionState::Proposed, ExecutionState::Authorized)
+        )
+    }
+
+    /// Return whether the generic unfenced transition method may advance state.
+    ///
+    /// Privileged authorization, dispatch, reconciliation, and terminal
+    /// transitions are deliberately absent.
+    pub const fn is_valid_generic_transition(
+        current: ExecutionState,
+        next: ExecutionState,
+    ) -> bool {
+        matches!(
+            (current, next),
+            (ExecutionState::Authorized, ExecutionState::Prepared)
+                | (ExecutionState::Proposed, ExecutionState::Cancelled)
+                | (ExecutionState::Authorized, ExecutionState::Cancelled)
+                | (ExecutionState::Prepared, ExecutionState::Cancelled)
+        )
+    }
+
+    /// Return whether a live fenced lease may advance non-terminal state.
+    pub const fn is_valid_leased_transition(current: ExecutionState, next: ExecutionState) -> bool {
+        matches!(
+            (current, next),
+            (ExecutionState::Prepared, ExecutionState::Dispatching)
+                | (ExecutionState::Dispatching, ExecutionState::Unknown)
+                | (ExecutionState::Unknown, ExecutionState::Reconciling)
+                | (ExecutionState::Reconciling, ExecutionState::Unknown)
         )
     }
 
@@ -436,13 +485,42 @@ pub mod unstable {
         pub policy_epoch: String,
     }
 
-    impl ActionEvidenceBinding {
-        /// Derive the immutable evidence binding from a durable action record.
-        pub fn from_action(action: &ActionPreparation) -> Self {
-            Self {
+    /// Failure to construct evidence identity from an authorized action.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EvidenceBindingError {
+        /// Authorization has not persisted a grant digest.
+        MissingGrantDigest,
+        /// Authorization persisted an empty or whitespace-only grant digest.
+        EmptyGrantDigest,
+    }
+
+    impl std::fmt::Display for EvidenceBindingError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::MissingGrantDigest => write!(formatter, "action has no grant digest"),
+                Self::EmptyGrantDigest => write!(formatter, "action grant digest is empty"),
+            }
+        }
+    }
+
+    impl std::error::Error for EvidenceBindingError {}
+
+    impl TryFrom<&ActionPreparation> for ActionEvidenceBinding {
+        type Error = EvidenceBindingError;
+
+        /// Derive immutable evidence identity from an authorized action.
+        fn try_from(action: &ActionPreparation) -> Result<Self, Self::Error> {
+            let grant_digest = action
+                .grant_digest
+                .as_deref()
+                .ok_or(EvidenceBindingError::MissingGrantDigest)?;
+            if grant_digest.trim().is_empty() {
+                return Err(EvidenceBindingError::EmptyGrantDigest);
+            }
+            Ok(Self {
                 action_id: action.action_id.clone(),
                 idempotency_key: action.idempotency_key.clone(),
-                grant_digest: action.grant_digest.clone().unwrap_or_default(),
+                grant_digest: grant_digest.to_owned(),
                 principal_id: action.principal_id.clone(),
                 tenant_id: action.tenant_id.clone(),
                 runtime_id: action.runtime_id.clone(),
@@ -457,7 +535,7 @@ pub mod unstable {
                 admission_id: action.admission_id.clone(),
                 policy_version: action.policy_version.clone(),
                 policy_epoch: action.policy_epoch.clone(),
-            }
+            })
         }
     }
 
@@ -583,12 +661,15 @@ pub mod unstable {
         }
 
         /// Return whether this evidence binds the exact durable action identity.
-        pub fn binds_action(&self, action: &ActionPreparation) -> bool {
-            let binding = ActionEvidenceBinding::from_action(action);
-            match self {
+        pub fn binds_action(
+            &self,
+            action: &ActionPreparation,
+        ) -> Result<bool, EvidenceBindingError> {
+            let binding = ActionEvidenceBinding::try_from(action)?;
+            Ok(match self {
                 Self::Receipt(receipt) => receipt.action_binding() == binding,
                 Self::PreDispatchFailure(failure) => failure.action_binding == binding,
-            }
+            })
         }
     }
 
@@ -761,7 +842,7 @@ pub mod unstable {
         /// Implementations must persist both the evidence binding and state in
         /// one durable operation. A default no-op would permit an executor to
         /// claim authorization without retaining the evidence that justified
-        /// it.
+        /// it. `grant_digest` must be non-empty.
         fn authorize_action(
             &self,
             action_id: &str,
@@ -854,7 +935,12 @@ pub mod unstable {
             evidence: &TerminalEvidence,
         ) -> Result<(), Self::Error>;
 
-        /// Apply one state transition under the backend's concurrency policy.
+        /// Apply one non-privileged, unfenced state transition.
+        ///
+        /// This method may prepare an already-authorized action or cancel work
+        /// before dispatch. It must reject authorization, dispatch,
+        /// reconciliation, and terminal transitions; callers must use the
+        /// dedicated method for each of those operations.
         fn transition(
             &self,
             action_id: &str,
@@ -918,6 +1004,8 @@ pub mod unstable {
             /// Durable action identity.
             action_id: String,
         },
+        /// A verified non-empty grant digest was required for this operation.
+        InvalidGrantDigest,
         /// An unfenced update attempted to bypass a live lease.
         LeaseHeld(ActionLease),
         /// The reference store lock was poisoned.
@@ -957,6 +1045,9 @@ pub mod unstable {
                         formatter,
                         "terminal evidence does not bind action: {action_id}"
                     )
+                }
+                Self::InvalidGrantDigest => {
+                    write!(formatter, "a non-empty verified grant digest is required")
                 }
                 Self::LeaseHeld(lease) => write!(
                     formatter,
@@ -1056,11 +1147,14 @@ pub mod unstable {
             grant_digest: &str,
             approval_reference: Option<&str>,
         ) -> Result<(), Self::Error> {
+            if grant_digest.trim().is_empty() {
+                return Err(ReferenceStoreError::InvalidGrantDigest);
+            }
             let mut records = self.records()?;
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
-            if expected != ExecutionState::Proposed {
+            if !is_valid_authorization_transition(expected, ExecutionState::Authorized) {
                 return Err(ReferenceStoreError::InvalidAuthorizationState(expected));
             }
             if record.state != ExecutionState::Proposed {
@@ -1079,6 +1173,9 @@ pub mod unstable {
             grant_digest: &str,
             approval_reference: Option<&str>,
         ) -> Result<(), Self::Error> {
+            if grant_digest.trim().is_empty() {
+                return Err(ReferenceStoreError::InvalidGrantDigest);
+            }
             let mut records = self.records()?;
             let record = records
                 .get_mut(action_id)
@@ -1261,7 +1358,7 @@ pub mod unstable {
                     record.lease.clone().unwrap_or_else(|| lease.clone()),
                 ));
             }
-            if !is_valid_transition(Some(expected), next) {
+            if !is_valid_leased_transition(expected, next) {
                 return Err(ReferenceStoreError::InvalidTransition {
                     current: expected,
                     next,
@@ -1301,7 +1398,10 @@ pub mod unstable {
                 ));
             }
             let next = evidence.terminal_state();
-            if !evidence.binds_action(&record.preparation) {
+            if !evidence
+                .binds_action(&record.preparation)
+                .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
+            {
                 return Err(ReferenceStoreError::EvidenceBindingMismatch {
                     action_id: action_id.to_owned(),
                 });
@@ -1340,11 +1440,16 @@ pub mod unstable {
             {
                 return Err(ReferenceStoreError::LeaseHeld(lease.clone()));
             }
-            if !is_valid_transition(Some(record.state), next) {
+            if !is_valid_generic_transition(record.state, next) {
                 return Err(ReferenceStoreError::InvalidTransition {
                     current: record.state,
                     next,
                 });
+            }
+            if next == ExecutionState::Prepared
+                && ActionEvidenceBinding::try_from(&record.preparation).is_err()
+            {
+                return Err(ReferenceStoreError::InvalidGrantDigest);
             }
             record.state = next;
             if next != ExecutionState::Dispatching && next != ExecutionState::Reconciling {
@@ -1424,40 +1529,120 @@ pub mod unstable {
     mod tests {
         use super::*;
 
+        #[cfg(feature = "unstable-hardening-testkit")]
+        struct ReferenceHarness {
+            actions: InMemoryActionStore<ManualStoreClock>,
+            receipts: InMemoryReceiptStore,
+            clock: ManualStoreClock,
+        }
+
+        #[cfg(feature = "unstable-hardening-testkit")]
+        impl crate::conformance::StoreConformanceHarness for ReferenceHarness {
+            type Actions = InMemoryActionStore<ManualStoreClock>;
+            type Receipts = InMemoryReceiptStore;
+
+            fn new_harness() -> Self {
+                let clock = ManualStoreClock::new(1_000);
+                Self {
+                    actions: InMemoryActionStore::with_clock(
+                        clock.clone(),
+                        LeaseConfiguration {
+                            default_duration_ms: 10,
+                            maximum_duration_ms: 100,
+                            renewal_enabled: true,
+                        },
+                    ),
+                    receipts: InMemoryReceiptStore::default(),
+                    clock,
+                }
+            }
+
+            fn actions(&self) -> &Self::Actions {
+                &self.actions
+            }
+
+            fn receipts(&self) -> &Self::Receipts {
+                &self.receipts
+            }
+
+            fn advance_store_clock(&self, duration_ms: u64) {
+                self.clock.advance(duration_ms);
+            }
+        }
+
+        #[cfg(feature = "unstable-hardening-testkit")]
         #[test]
-        fn consequential_state_machine_rejects_skipped_boundaries() {
-            assert!(is_valid_transition(None, ExecutionState::Proposed));
-            assert!(is_valid_transition(
+        fn reference_action_store_satisfies_reusable_conformance_suite() {
+            crate::conformance::run_action_store_conformance::<ReferenceHarness>();
+        }
+
+        #[cfg(feature = "unstable-hardening-testkit")]
+        #[test]
+        fn reference_receipt_store_satisfies_reusable_conformance_suite() {
+            crate::conformance::run_receipt_store_conformance::<ReferenceHarness>();
+        }
+
+        #[test]
+        fn lifecycle_and_method_specific_transition_predicates_are_distinct() {
+            assert!(is_valid_lifecycle_transition(
+                None,
+                ExecutionState::Proposed
+            ));
+            assert!(is_valid_lifecycle_transition(
                 Some(ExecutionState::Proposed),
                 ExecutionState::Authorized
             ));
-            assert!(is_valid_transition(
+            assert!(is_valid_lifecycle_transition(
                 Some(ExecutionState::Authorized),
                 ExecutionState::Prepared
             ));
-            assert!(is_valid_transition(
+            assert!(is_valid_lifecycle_transition(
                 Some(ExecutionState::Prepared),
                 ExecutionState::Dispatching
             ));
-            assert!(is_valid_transition(
+            assert!(is_valid_lifecycle_transition(
                 Some(ExecutionState::Dispatching),
                 ExecutionState::Unknown
             ));
-            assert!(!is_valid_transition(
+            assert!(!is_valid_lifecycle_transition(
                 Some(ExecutionState::Proposed),
                 ExecutionState::Committed
             ));
-            assert!(!is_valid_transition(
+            assert!(!is_valid_lifecycle_transition(
                 Some(ExecutionState::Prepared),
                 ExecutionState::Committed
             ));
-            assert!(!is_valid_transition(
+            assert!(is_valid_lifecycle_transition(
                 Some(ExecutionState::Dispatching),
                 ExecutionState::Committed
             ));
-            assert!(!is_valid_transition(
+            assert!(is_valid_lifecycle_transition(
                 Some(ExecutionState::Unknown),
                 ExecutionState::Failed
+            ));
+            assert!(is_valid_authorization_transition(
+                ExecutionState::Proposed,
+                ExecutionState::Authorized
+            ));
+            assert!(!is_valid_generic_transition(
+                ExecutionState::Proposed,
+                ExecutionState::Authorized
+            ));
+            assert!(is_valid_generic_transition(
+                ExecutionState::Authorized,
+                ExecutionState::Prepared
+            ));
+            assert!(!is_valid_generic_transition(
+                ExecutionState::Prepared,
+                ExecutionState::Dispatching
+            ));
+            assert!(is_valid_leased_transition(
+                ExecutionState::Prepared,
+                ExecutionState::Dispatching
+            ));
+            assert!(!is_valid_generic_transition(
+                ExecutionState::Unknown,
+                ExecutionState::Reconciling
             ));
         }
 
@@ -1769,7 +1954,7 @@ pub mod unstable {
                 admission_id: "admission".into(),
                 policy_version: "policy".into(),
                 policy_epoch: "epoch".into(),
-                grant_digest: Some("grant".into()),
+                grant_digest: None,
                 approval_reference: None,
             }
         }

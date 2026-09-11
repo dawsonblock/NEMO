@@ -111,7 +111,8 @@ pub mod unstable {
     impl VerifiedGrant {
         /// Return whether every security-sensitive claim matches the request.
         pub fn binds(&self, request: &AuthorityRequest) -> bool {
-            self.action_id == request.action_id
+            !self.digest.trim().is_empty()
+                && self.action_id == request.action_id
                 && self.idempotency_key == request.idempotency_key
                 && self.tenant_id == request.tenant_id
                 && self.principal_id == request.principal_id
@@ -381,6 +382,51 @@ pub mod unstable {
             let mut wrong_admission = valid;
             wrong_admission.admission_id = "other-admission".into();
             assert!(!wrong_admission.binds(&request));
+        }
+
+        #[test]
+        fn grant_binding_rejects_every_security_claim_mutation() {
+            let mut identity = identity();
+            identity.approval_reference = Some("approval-1".into());
+            let request = request_from_identity(&identity);
+            let valid = grant(&request);
+            assert!(valid.binds(&request));
+
+            let mut mutations = Vec::new();
+            macro_rules! mutated_grant {
+                ($field:ident, $value:expr) => {{
+                    let mut candidate = valid.clone();
+                    candidate.$field = $value;
+                    mutations.push(candidate);
+                }};
+            }
+            mutated_grant!(action_id, "other-action".into());
+            mutated_grant!(idempotency_key, "other-idempotency".into());
+            mutated_grant!(tenant_id, "other-tenant".into());
+            mutated_grant!(principal_id, "other-principal".into());
+            mutated_grant!(runtime_binding_digest, "other-runtime-binding".into());
+            mutated_grant!(admission_id, "other-admission".into());
+            mutated_grant!(capability_id, "other-capability".into());
+            mutated_grant!(capability_generation, 2);
+            mutated_grant!(registration_digest, "other-registration".into());
+            mutated_grant!(execution_class, ExecutionClass::Critical);
+            mutated_grant!(operation, "other-operation".into());
+            mutated_grant!(route_digest, "other-route".into());
+            mutated_grant!(args_digest, "other-args".into());
+            mutated_grant!(policy_version, "other-policy".into());
+            mutated_grant!(policy_epoch, "other-epoch".into());
+            mutated_grant!(approval_reference, Some("other-approval".into()));
+
+            for candidate in mutations {
+                assert!(
+                    !candidate.binds(&request),
+                    "mutated grant unexpectedly bound: {candidate:?}"
+                );
+            }
+
+            let mut empty_digest = valid;
+            empty_digest.digest = " \t".into();
+            assert!(!empty_digest.binds(&request));
         }
     }
 }

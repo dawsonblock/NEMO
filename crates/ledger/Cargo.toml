@@ -21,6 +21,7 @@ unstable-hardening = [
     "dep:serde_json_canonicalizer",
     "dep:sha2",
 ]
+unstable-hardening-testkit = ["unstable-hardening"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
