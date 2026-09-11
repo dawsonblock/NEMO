@@ -102,7 +102,7 @@ pub enum KernelError {
     ReceiptStore(String),
     /// Immutable receipt finalization found contradictory terminal evidence.
     #[error("receipt finalization conflicts with existing evidence: {0:?}")]
-    ReceiptFinalizationConflict(ReceiptConflict),
+    ReceiptFinalizationConflict(Box<ReceiptConflict>),
     /// Contradictory terminal evidence requires operator evidence repair.
     #[error("terminal evidence is contradictory: {action:?}: {conflicts:?}")]
     EvidenceIntegrityConflict {
@@ -539,7 +539,7 @@ pub enum InvocationOutcome {
     /// The exact bound action awaits external approval before it can execute.
     PendingApproval(PendingAction),
     /// An existing logical action was returned without redispatching it.
-    ExistingAction(ActionStatus),
+    ExistingAction(Box<ActionStatus>),
 }
 
 enum AuthorizationOutcome {
@@ -985,9 +985,9 @@ where
             action.state,
             ExecutionState::Proposed | ExecutionState::Authorized | ExecutionState::Prepared
         ) {
-            return Ok(InvocationOutcome::ExistingAction(
+            return Ok(InvocationOutcome::ExistingAction(Box::new(
                 self.action_status(&action, None),
-            ));
+            )));
         }
         let mut request = self.bind(invocation)?;
         let candidate = request.action_preparation();
@@ -1157,7 +1157,7 @@ where
             if let Err(error) = self.finalize_receipt(receipt) {
                 return Err(match error {
                     KernelError::ReceiptFinalizationConflict(conflict) => {
-                        self.evidence_conflict_after_reconciling(&leased_action, &lease, conflict)
+                        self.evidence_conflict_after_reconciling(&leased_action, &lease, *conflict)
                     }
                     other => self.reconciliation_unknown(&leased_action, &lease, other.to_string()),
                 });
@@ -1390,7 +1390,7 @@ where
             return match self.recover_terminal_action(&action)? {
                 RecoveryDecision::RecoverCommitted(status)
                 | RecoveryDecision::RecoverFailed(status) => {
-                    Ok(InvocationOutcome::ExistingAction(status))
+                    Ok(InvocationOutcome::ExistingAction(Box::new(status)))
                 }
                 RecoveryDecision::ContradictoryEvidence {
                     action,
@@ -1409,9 +1409,9 @@ where
                 _ => unreachable!("terminal recovery only returns terminal or integrity states"),
             };
         }
-        Ok(InvocationOutcome::ExistingAction(
+        Ok(InvocationOutcome::ExistingAction(Box::new(
             self.action_status(&action, None),
-        ))
+        )))
     }
 
     fn handle_authority_error(
@@ -1603,7 +1603,7 @@ where
         if let Err(error) = self.finalize_receipt(receipt) {
             return Err(match error {
                 KernelError::ReceiptFinalizationConflict(conflict) => {
-                    self.evidence_conflict_after_dispatching(request, lease, conflict)
+                    self.evidence_conflict_after_dispatching(request, lease, *conflict)
                 }
                 other => self.unknown_after_dispatching(request, lease, other.to_string()),
             });
@@ -1645,7 +1645,7 @@ where
             }
             FinalizeResult::FinalizationConflict(conflict)
             | FinalizeResult::ConflictAlreadyRecorded(conflict) => {
-                Err(KernelError::ReceiptFinalizationConflict(conflict))
+                Err(KernelError::ReceiptFinalizationConflict(Box::new(conflict)))
             }
         }
     }
