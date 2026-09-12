@@ -1,6 +1,284 @@
-    Finished `release` profile [optimized] target(s) in 0.31s
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling pin-project-lite v0.2.17
+   Compiling memchr v2.8.2
+   Compiling cfg-if v1.0.4
+   Compiling serde_core v1.0.228
+   Compiling bytes v1.12.0
+   Compiling futures-core v0.3.32
+   Compiling futures-sink v0.3.32
+   Compiling itoa v1.0.18
+   Compiling log v0.4.33
+   Compiling slab v0.4.12
+   Compiling futures-channel v0.3.32
+   Compiling find-msvc-tools v0.1.9
+   Compiling futures-task v0.3.32
+   Compiling shlex v2.0.1
+   Compiling once_cell v1.21.4
+   Compiling futures-io v0.3.32
+   Compiling dunce v1.0.5
+   Compiling pkg-config v0.3.33
+   Compiling fs_extra v1.3.0
+   Compiling smallvec v1.15.2
+   Compiling core-foundation-sys v0.8.7
+   Compiling tracing-core v0.1.36
+   Compiling http v1.4.2
+   Compiling aws-lc-rs v1.17.3
+   Compiling percent-encoding v2.3.2
+   Compiling stable_deref_trait v1.2.1
+   Compiling zeroize v1.9.0
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling httparse v1.10.1
+   Compiling untrusted v0.9.0
+   Compiling tower-service v0.3.3
+   Compiling anyhow v1.0.104
+   Compiling rustls-pki-types v1.14.1
+   Compiling rustls v0.23.41
+   Compiling subtle v2.6.1
+   Compiling http-body v1.0.1
+   Compiling indexmap v2.14.0
+   Compiling either v1.16.0
+   Compiling fnv v1.0.7
+   Compiling atomic-waker v1.1.2
+   Compiling try-lock v0.2.5
+   Compiling sync_wrapper v1.0.2
+   Compiling want v0.3.1
+   Compiling itertools v0.14.0
+   Compiling writeable v0.6.3
+   Compiling zmij v1.0.21
+   Compiling litemap v0.8.2
+   Compiling getrandom v0.3.4
+   Compiling tower-layer v0.3.3
+   Compiling httpdate v1.0.3
+   Compiling serde v1.0.228
+   Compiling rustix v1.1.4
+   Compiling utf8_iter v1.0.4
+   Compiling autocfg v1.5.1
+   Compiling syn v2.0.118
+   Compiling typenum v1.20.1
+   Compiling icu_normalizer_data v2.2.0
+   Compiling jobserver v0.1.35
+   Compiling errno v0.3.14
+   Compiling socket2 v0.6.4
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.1
+   Compiling getrandom v0.2.17
+   Compiling cc v1.2.65
+   Compiling security-framework-sys v2.17.0
+   Compiling core-foundation v0.10.1
+   Compiling icu_properties_data v2.2.0
+   Compiling base64 v0.22.1
+   Compiling ipnet v2.12.0
+   Compiling bitflags v2.13.0
+   Compiling num-traits v0.2.19
+   Compiling http-body-util v0.1.3
+   Compiling getrandom v0.4.3
+   Compiling security-framework v3.7.0
+   Compiling cmake v0.1.58
+   Compiling heck v0.5.0
+   Compiling zerocopy v0.8.52
+   Compiling fastrand v2.4.1
+   Compiling thiserror v2.0.18
+   Compiling version_check v0.9.5
+   Compiling mime v0.3.17
+   Compiling aws-lc-sys v0.43.0
+   Compiling ring v0.17.14
+   Compiling generic-array v0.14.7
+   Compiling rustls-native-certs v0.8.3
+   Compiling form_urlencoded v1.2.2
+   Compiling prettyplease v0.2.37
+   Compiling pulldown-cmark v0.13.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling synstructure v0.13.2
+   Compiling tempfile v3.27.0
+   Compiling axum-core v0.5.6
+   Compiling rand_core v0.9.5
+   Compiling matchit v0.8.4
+   Compiling regex-syntax v0.8.11
+   Compiling foldhash v0.1.5
+   Compiling unicase v2.9.0
+   Compiling futures-macro v0.3.32
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+   Compiling zerofrom-derive v0.1.7
+   Compiling futures-util v0.3.32
+   Compiling tokio v1.52.3
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling tracing v0.1.44
+   Compiling serde_derive v1.0.228
+   Compiling displaydoc v0.2.6
+   Compiling zerofrom v0.1.8
+   Compiling prost-derive v0.14.3
+   Compiling thiserror-impl v2.0.18
+   Compiling pin-project-internal v1.1.11
+   Compiling ppv-lite86 v0.2.21
+   Compiling async-trait v0.1.89
+   Compiling rand_chacha v0.9.0
+   Compiling pin-project v1.1.11
+   Compiling prost v0.14.3
+   Compiling yoke v0.8.3
+   Compiling regex-automata v0.4.14
+   Compiling hashbrown v0.15.5
+   Compiling serde_json v1.0.150
+   Compiling fixedbitset v0.5.7
+   Compiling prost-types v0.14.3
+   Compiling petgraph v0.8.3
+   Compiling regex v1.12.4
+   Compiling pulldown-cmark-to-cmark v22.0.0
+   Compiling futures-executor v0.3.32
+   Compiling tokio-util v0.7.18
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling rand v0.9.4
+   Compiling rustversion v1.0.22
+   Compiling crossbeam-epoch v0.9.20
+   Compiling h2 v0.4.16
+   Compiling tower v0.5.3
+   Compiling tokio-stream v0.1.18
+   Compiling multimap v0.10.1
+   Compiling prost-build v0.14.3
+   Compiling axum v0.8.9
+   Compiling opentelemetry v0.32.0
+   Compiling tonic-build v0.14.6
+   Compiling block-buffer v0.10.4
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling crypto-common v0.1.7
+   Compiling hybrid-array v0.4.10
+   Compiling iana-time-zone v0.1.65
+   Compiling aho-corasick v1.1.4
+   Compiling semver v1.0.28
+   Compiling protoc-bin-vendored-linux-s390_64 v3.2.0
+   Compiling protoc-bin-vendored-macos-x86_64 v3.2.0
+   Compiling utf8parse v0.2.2
+   Compiling protoc-bin-vendored-linux-ppcle_64 v3.2.0
+   Compiling crossbeam-deque v0.8.7
+   Compiling protoc-bin-vendored-linux-x86_32 v3.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling icu_provider v2.2.0
+   Compiling protoc-bin-vendored-linux-aarch_64 v3.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling protoc-bin-vendored-win32 v3.2.0
+   Compiling protoc-bin-vendored-macos-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-linux-x86_64 v3.2.0
+   Compiling hyper v1.10.1
+   Compiling protoc-bin-vendored v3.2.0
+   Compiling anstyle-parse v1.0.0
+   Compiling rustc_version v0.4.1
+   Compiling chrono v0.4.45
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling hyper-util v0.1.20
+   Compiling url v2.5.8
+   Compiling digest v0.10.7
+   Compiling tonic-prost-build v0.14.6
+   Compiling tower-http v0.6.11
+   Compiling typed-builder-macro v0.23.2
+   Compiling bytemuck_derive v1.11.0
+   Compiling cpufeatures v0.2.17
+   Compiling nom v8.0.0
+   Compiling scopeguard v1.2.0
+   Compiling anstyle v1.0.14
+   Compiling hyper-timeout v0.5.2
+   Compiling colorchoice v1.0.5
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling ryu v1.0.23
+   Compiling anstream v1.0.0
+   Compiling lock_api v0.4.14
+   Compiling sha1 v0.10.6
+   Compiling bytemuck v1.25.1
+   Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
+   Compiling arc-swap v1.9.1
+   Compiling spdlog-rs v0.5.3
+   Compiling typed-builder v0.23.2
+   Compiling crypto-common v0.2.1
+   Compiling block-buffer v0.12.0
+   Compiling opentelemetry_sdk v0.32.1
+   Compiling uuid v1.18.1
+   Compiling crossbeam-queue v0.3.13
+   Compiling crossbeam-channel v0.5.16
+   Compiling winnow v1.0.3
+   Compiling data-encoding v2.11.0
+   Compiling unicode-general-category v1.1.0
+   Compiling strsim v0.11.1
+   Compiling spdlog-internal v0.2.1
+   Compiling clap_lex v1.1.0
+   Compiling const-oid v0.10.2
+   Compiling parking v2.2.1
+   Compiling utf-8 v0.7.6
+   Compiling digest v0.11.2
+   Compiling clap_builder v4.6.0
+   Compiling event-listener v5.4.2
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling crossbeam v0.8.4
+   Compiling spdlog-macros v0.3.1
+   Compiling nemo-relay-types v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/types)
+   Compiling atomic v0.6.1
+   Compiling parking_lot v0.12.5
+   Compiling env_filter v0.1.4
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling futures v0.3.32
+   Compiling strum_macros v0.27.2
+   Compiling cpufeatures v0.3.0
+   Compiling encoding_rs v0.8.35
+   Compiling winnow v0.7.15
+   Compiling ryu-js v1.0.2
+   Compiling dyn-clone v1.0.20
+   Compiling toml_writer v1.1.1+spec-1.1.0
+   Compiling cbindgen v0.29.2
+   Compiling value-bag v1.13.0
+   Compiling serde_json_canonicalizer v0.3.2
+   Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling strum v0.27.2
+   Compiling sha2 v0.11.0
+   Compiling clap v4.6.1
+   Compiling event-listener-strategy v0.5.4
+   Compiling num-integer v0.1.46
+   Compiling libloading v0.8.9
+   Compiling opentelemetry-semantic-conventions v0.32.1
+   Compiling shell-words v1.1.1
+   Compiling num-bigint v0.4.6
+   Compiling backon v1.6.0
+   Compiling async-lock v3.4.2
+   Compiling combine v4.6.7
+   Compiling ordered-float v2.10.1
+   Compiling sha1_smol v1.0.1
+   Compiling xxhash-rust v0.8.15
+   Compiling arcstr v1.2.0
+   Compiling tdigest v0.2.3
+   Compiling nemo-relay-ffi v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ffi)
+   Compiling redis v1.2.0
+   Compiling rustls-webpki v0.103.13
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling tungstenite v0.27.0
+   Compiling tonic v0.14.5
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling reqwest v0.12.28
+   Compiling tokio-tungstenite v0.27.0
+   Compiling opentelemetry-http v0.32.0
+   Compiling tonic-prost v0.14.5
+   Compiling tonic-types v0.14.5
+   Compiling opentelemetry-proto v0.32.0
+   Compiling opentelemetry-otlp v0.32.0
+   Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
+   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
+   Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
+    Finished `release` profile [optimized] target(s) in 1m 38s
 === RUN   TestTopLevelPluginValidationAndLifecycle
---- PASS: TestTopLevelPluginValidationAndLifecycle (0.02s)
+--- PASS: TestTopLevelPluginValidationAndLifecycle (0.01s)
 === RUN   TestPluginHelperConstructorsAndRegistryListing
 --- PASS: TestPluginHelperConstructorsAndRegistryListing (0.00s)
 === RUN   TestPluginFuncsAndClosedContextBranches
@@ -46,7 +324,7 @@
 === RUN   TestValidatePluginConfigWarnsMissingStateForTelemetry
 --- PASS: TestValidatePluginConfigWarnsMissingStateForTelemetry (0.00s)
 === RUN   TestConfigureAdaptiveComponentLifecycle
---- PASS: TestConfigureAdaptiveComponentLifecycle (0.05s)
+--- PASS: TestConfigureAdaptiveComponentLifecycle (0.00s)
 === RUN   TestNewAtofExporterConfigDefaults
 --- PASS: TestNewAtofExporterConfigDefaults (0.00s)
 === RUN   TestAtofSinkConfigConstructorsSerializeTheirDiscriminators
@@ -114,7 +392,7 @@
 === RUN   TestWrapperAndCodecFinalizersRun
 --- PASS: TestWrapperAndCodecFinalizersRun (0.10s)
 === RUN   TestGoBindingErrorAndDefaultContracts
---- PASS: TestGoBindingErrorAndDefaultContracts (0.00s)
+--- PASS: TestGoBindingErrorAndDefaultContracts (0.01s)
 === RUN   TestRemainingPublicDefaultsAndPropagationCoverage
 --- PASS: TestRemainingPublicDefaultsAndPropagationCoverage (0.00s)
 === RUN   TestGeminiGenerateContentCodecFunctionCallID
@@ -174,12 +452,12 @@
 === RUN   TestSanitizeGuardrailAffectsEventInput
 --- PASS: TestSanitizeGuardrailAffectsEventInput (0.00s)
 === RUN   TestEventMetadataInjectorGlobalScopeLocalAndFailureBehavior
-2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
-2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
-2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-mark injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
-2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-mark injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
-2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
-2026-09-11T09:16:28.676Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-12T02:54:30.554Z ERROR root=01a09389 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-12T02:54:30.554Z ERROR root=01a09389 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-12T02:54:30.554Z ERROR root=01a09389 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-mark injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-12T02:54:30.554Z ERROR root=01a09389 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-mark injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-12T02:54:30.554Z ERROR root=01a09389 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-12T02:54:30.554Z ERROR root=01a09389 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
 --- PASS: TestEventMetadataInjectorGlobalScopeLocalAndFailureBehavior (0.00s)
 === RUN   TestPluginContextEventMetadataInjectorLifecycle
 --- PASS: TestPluginContextEventMetadataInjectorLifecycle (0.00s)
@@ -190,7 +468,7 @@
 === RUN   TestEventSanitizerRegistries
 --- PASS: TestEventSanitizerRegistries (0.00s)
 === RUN   TestEventSanitizerMarshalFailureClearsObservabilityFields
-2026-09-11T09:16:28.679Z ERROR root=01a08fc1 target=nemo_relay.runtime event=event_sanitizer_failed event_name=invalid-sanitizer sanitizer=go-mark-sanitize-invalid Event sanitizer failed; clearing observability fields
+2026-09-12T02:54:30.558Z ERROR root=01a09389 target=nemo_relay.runtime event=event_sanitizer_failed event_name=invalid-sanitizer sanitizer=go-mark-sanitize-invalid Event sanitizer failed; clearing observability fields
 --- PASS: TestEventSanitizerMarshalFailureClearsObservabilityFields (0.00s)
 === RUN   TestScopeLocalEventSanitizerInheritanceAndCleanup
 --- PASS: TestScopeLocalEventSanitizerInheritanceAndCleanup (0.00s)
@@ -313,11 +591,11 @@
 === RUN   TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings
 --- PASS: TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings (0.00s)
 === RUN   TestObservabilityPluginAtofAndAtifFiles
---- PASS: TestObservabilityPluginAtofAndAtifFiles (0.01s)
+--- PASS: TestObservabilityPluginAtofAndAtifFiles (0.02s)
 === RUN   TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics
 --- PASS: TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics (0.00s)
 === RUN   TestObservabilityPluginAtifSplitsMultipleTopLevelAgents
---- PASS: TestObservabilityPluginAtifSplitsMultipleTopLevelAgents (0.05s)
+--- PASS: TestObservabilityPluginAtifSplitsMultipleTopLevelAgents (0.02s)
 === RUN   TestObservabilityPluginValidationRejectsBadValues
 --- PASS: TestObservabilityPluginValidationRejectsBadValues (0.00s)
 === RUN   TestObservabilityPluginListKindIsAutomatic
@@ -419,11 +697,11 @@
 === RUN   TestNilPluginActivationCloseIsSafe
 --- PASS: TestNilPluginActivationCloseIsSafe (0.00s)
 === RUN   TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo
---- PASS: TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo (0.30s)
+--- PASS: TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo (0.36s)
 === RUN   TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig
 --- PASS: TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig (0.01s)
 === RUN   TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo
---- PASS: TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo (0.54s)
+--- PASS: TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo (0.49s)
 === RUN   TestPluginActivationFinalizerReleasesHostOwnership
 --- PASS: TestPluginActivationFinalizerReleasesHostOwnership (0.00s)
 === RUN   TestWorkspaceVersionFromCargoTOML
@@ -646,7 +924,7 @@
 === RUN   TestAtifExporterLifecycleAndFiltering
 --- PASS: TestAtifExporterLifecycleAndFiltering (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	4.434s
 === RUN   TestConfigBuilders
 --- PASS: TestConfigBuilders (0.00s)
 === RUN   TestRedisBackendAndComponentSpecBuilders
@@ -658,35 +936,35 @@ ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	(cached)
 === RUN   TestAdaptivePackageRuntimeHelpers
 --- PASS: TestAdaptivePackageRuntimeHelpers (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/adaptive	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/adaptive	3.282s
 === RUN   TestGuardrailShorthandsGlobal
 --- PASS: TestGuardrailShorthandsGlobal (0.01s)
 === RUN   TestGuardrailShorthandsScopeLocal
 --- PASS: TestGuardrailShorthandsScopeLocal (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/guardrails	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/guardrails	3.283s
 === RUN   TestInterceptShorthandsGlobal
 --- PASS: TestInterceptShorthandsGlobal (0.01s)
 === RUN   TestInterceptShorthandsScopeLocal
 --- PASS: TestInterceptShorthandsScopeLocal (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/intercepts	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/intercepts	3.282s
 === RUN   TestLlmShorthands
 --- PASS: TestLlmShorthands (0.01s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/llm	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/llm	3.282s
 === RUN   TestPricingPackageHelpers
 --- PASS: TestPricingPackageHelpers (0.01s)
 === RUN   TestPricingPackageSourceAndRateHelpers
 --- PASS: TestPricingPackageSourceAndRateHelpers (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/model_pricing	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/model_pricing	3.280s
 === RUN   TestPiiRedactionShorthandHelpers
 --- PASS: TestPiiRedactionShorthandHelpers (0.01s)
 === RUN   TestPiiRedactionComponentSpecAndLocalModelHelpers
 --- PASS: TestPiiRedactionComponentSpecAndLocalModelHelpers (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	3.279s
 === RUN   TestWithScopeCleanupNoopsWhenPushFails
 --- PASS: TestWithScopeCleanupNoopsWhenPushFails (0.00s)
 === RUN   TestWithScopeNormalReturn
@@ -712,14 +990,14 @@ ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	(cached)
 === RUN   TestScopeShorthandsForwardTimestamps
 --- PASS: TestScopeShorthandsForwardTimestamps (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/scope	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/scope	3.281s
 === RUN   TestSubscriberShorthands
---- PASS: TestSubscriberShorthands (0.00s)
+--- PASS: TestSubscriberShorthands (0.01s)
 === RUN   TestScopeSubscriberShorthands
 --- PASS: TestScopeSubscriberShorthands (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/subscribers	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/subscribers	3.280s
 === RUN   TestToolShorthands
---- PASS: TestToolShorthands (0.01s)
+--- PASS: TestToolShorthands (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/tools	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/tools	3.281s

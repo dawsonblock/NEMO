@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "cb2f1e74e5bed732377c6c2cc296b3870ea5c7e622fcc85a511244fef79ea427",
+  "root_digest": "2f152ff6f82c7e3789cbcd071b3e608478ce2bdbde86742870aead377e25da3e",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -623,8 +623,8 @@
     "crates/isolation/Cargo.toml": "72d54e18ad996f4f4db410d0c6e036b6fefd80e52979471d88eb0254a628b1c3",
     "crates/isolation/src/lib.rs": "62d469d8a2a4bdf1dc1ebda5122cd9cdae2ab595c2b7375b20e6048f2af2cda4",
     "crates/ledger/Cargo.toml": "21f7c758a614885c1e419dc5d3421816ce0ae234961c23ae60c5c3ea058fb1bc",
-    "crates/ledger/src/conformance.rs": "e7deadd7503a5077db59440395051e11f499bd203a9febd3db41ccffc3e8f83e",
-    "crates/ledger/src/lib.rs": "c986453e00454dd57eac2d9624a2c39d0672d780025369a61e86781c47db677a",
+    "crates/ledger/src/conformance.rs": "40eea9dcf0fc018fc3dbd17b2f2cc6029b1b313c445ac85a4857e4381c787b39",
+    "crates/ledger/src/lib.rs": "58bbfe4fa42fdcffe7d6308521e7bf39d2af7472cfb545868d01120fd4192c65",
     "crates/node/Cargo.toml": "7fcdb1fa79845584cacc805879f9a208a2844cae3635bd4cd8d67509dc91d341",
     "crates/node/README.md": "d99acaf3bf89aff377415a6e174c701d484fd435bccc1f8a6d46ef0dff08b1a7",
     "crates/node/adaptive.d.ts": "721a53796be6dfddbd9d95d80d7a7fbd066083bed5e7595f6da1bea7a689cb8d",
@@ -1322,17 +1322,17 @@
     "build",
     "dist"
   ],
-  "source_archive_sha256": "50e3af57c35ca9b2bc1871bd324cf2054dbefcc5c1f6e0195b0065414417e716",
-  "release_archive_sha256": "50e3af57c35ca9b2bc1871bd324cf2054dbefcc5c1f6e0195b0065414417e716",
+  "source_archive_sha256": "92e66c4b32557ad90841e53720543ff5a7955bc09dc8b935f12e5d48dcc5376d",
+  "release_archive_sha256": "92e66c4b32557ad90841e53720543ff5a7955bc09dc8b935f12e5d48dcc5376d",
   "lockfiles": {
     "Cargo.lock": "sha256:2be462e17c580021359a2f0032efcea2a487439e594ba9f1f653fd241e76d1a1",
     "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
     "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
   },
   "git": {
-    "commit": "cb75fe72cadb4f0c82a064c87bbaef78463fb768",
-    "tree": "563654fa4b2b5b9793c4fa579705faa3374d6f16",
-    "source_tree_sha256": "cb2f1e74e5bed732377c6c2cc296b3870ea5c7e622fcc85a511244fef79ea427",
+    "commit": "09cd1d1ee26a2f8cbc592b222f70d7332338ca62",
+    "tree": "628b3c8217f7999da9ca6bc002aff2582358512b",
+    "source_tree_sha256": "2f152ff6f82c7e3789cbcd071b3e608478ce2bdbde86742870aead377e25da3e",
     "status": []
   }
 }
