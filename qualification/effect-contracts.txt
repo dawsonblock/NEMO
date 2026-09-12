@@ -1,163 +1,169 @@
    Compiling serde_core v1.0.228
    Compiling libc v0.2.186
+   Compiling syn v2.0.118
    Compiling serde v1.0.228
    Compiling serde_json v1.0.150
    Compiling memchr v2.8.2
-   Compiling syn v2.0.118
-   Compiling serde_derive v1.0.228
    Compiling cpufeatures v0.3.0
+   Compiling serde_derive v1.0.228
    Compiling sha2 v0.11.0
    Compiling serde_json_canonicalizer v0.3.2
    Compiling nemo-relay-ledger v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ledger)
    Compiling nemo-relay-executor v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/executor)
    Compiling nemo-relay-authority v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/authority)
-    Finished `test` profile [unoptimized] target(s) in 3.34s
+    Finished `test` profile [unoptimized] target(s) in 3.72s
      Running unittests src/lib.rs (target/debug/deps/nemo_relay_authority-6c91de24bf48370d)
 
 running 4 tests
 test unstable::tests::correct_once_adapter_delegates_without_owning_policy ... ok
-test unstable::tests::external_authority_implementation_compiles_and_receives_bound_identity ... ok
 test unstable::tests::grants_bind_tenant_and_admission_as_well_as_capability_claims ... ok
 test unstable::tests::grant_binding_rejects_every_security_claim_mutation ... ok
+test unstable::tests::external_authority_implementation_compiles_and_receives_bound_identity ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
    Compiling nemo-relay-executor v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/executor)
-    Finished `test` profile [unoptimized] target(s) in 0.31s
+    Finished `test` profile [unoptimized] target(s) in 0.33s
      Running unittests src/lib.rs (target/debug/deps/nemo_relay_executor-df019c388155cef6)
 
 running 5 tests
 test unstable::tests::success_reported_as_an_error_never_commits_without_a_receipt ... ok
 test unstable::tests::confirmed_failure_before_dispatch_is_failed ... ok
-test unstable::tests::unknown_after_any_dispatch_is_never_downgraded_to_failure ... ok
 test unstable::tests::concrete_adapters_reject_wrong_execution_classes ... ok
 test unstable::tests::third_party_backend_can_implement_the_public_contract ... ok
+test unstable::tests::unknown_after_any_dispatch_is_never_downgraded_to_failure ... ok
 
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
    Compiling nemo-relay-ledger v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ledger)
-    Finished `test` profile [unoptimized] target(s) in 0.65s
+    Finished `test` profile [unoptimized] target(s) in 0.75s
      Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-8e9454aa42f4ab57)
 
-running 14 tests
-test unstable::tests::lifecycle_and_method_specific_transition_predicates_are_distinct ... ok
-test unstable::tests::prepared_actions_reject_unfenced_cancellation_while_leased ... ok
+running 21 tests
 test unstable::tests::external_effect_contracts_share_one_state_vocabulary ... ok
+test unstable::tests::lifecycle_and_method_specific_transition_predicates_are_distinct ... ok
+test unstable::tests::fencing_generation_overflow_fails_closed ... ok
+test unstable::tests::prepared_actions_reject_unfenced_cancellation_while_leased ... ok
 test unstable::tests::evidence_finalization_rejects_wrong_source_state_or_action_binding ... ok
 test unstable::tests::effect_store_finalizes_receipt_and_terminal_action_as_one_contract_operation ... ok
+test unstable::tests::reconciliation_completion_is_fenced_by_evidence_revision ... ok
 test unstable::tests::reference_store_owns_time_and_reclaims_only_after_its_clock_expires ... ok
 test unstable::tests::reference_store_rejects_authorization_and_lease_contract_misuse ... ok
-test unstable::tests::reference_effect_store_satisfies_reusable_conformance_suite ... ok
-test unstable::tests::reference_action_store_satisfies_reusable_conformance_suite ... ok
 test unstable::tests::renewal_requires_the_live_exact_lease_and_preserves_fencing ... ok
+test unstable::tests::terminal_observation_cannot_create_primary_evidence ... ok
 test unstable::tests::terminal_states_require_fenced_terminal_evidence ... ok
+test unstable::tests::stale_dispatcher_cannot_insert_receipt_after_lease_reclamation ... ok
+test unstable::tests::reference_action_store_satisfies_reusable_conformance_suite ... ok
 test unstable::tests::two_executors_cannot_claim_the_same_live_lease ... ok
+test unstable::tests::evidence_revision_overflow_leaves_receipts_actions_and_conflicts_unchanged ... ok
+test unstable::tests::terminal_fault_boundaries_leave_the_complete_old_state ... ok
 test unstable::tests::receipt_finalization_is_append_only_idempotent_or_conflicting ... ok
+test unstable::tests::terminal_evidence_observation_preserves_primary_state_and_deduplicates_conflicts ... ok
+test unstable::tests::reference_effect_store_satisfies_reusable_conformance_suite ... ok
 test unstable::tests::reference_receipt_store_satisfies_reusable_conformance_suite ... ok
 
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-   Compiling serde v1.0.228
    Compiling tokio v1.52.3
+   Compiling serde v1.0.228
    Compiling subtle v2.6.1
    Compiling num-traits v0.2.19
+   Compiling rustls v0.23.41
    Compiling serde_json v1.0.150
    Compiling idna v1.1.0
-   Compiling axum-core v0.5.6
-   Compiling regex-syntax v0.8.11
-   Compiling nom v8.0.0
-   Compiling crypto-common v0.1.7
-   Compiling rand v0.9.4
-   Compiling rustix v1.1.4
-   Compiling rustls v0.23.41
-   Compiling digest v0.10.7
-   Compiling crc-fast v1.10.0
    Compiling url v2.5.8
-   Compiling toml_datetime v0.7.5+spec-1.1.0
-   Compiling regex-automata v0.4.14
-   Compiling toml_writer v1.1.1+spec-1.1.0
+   Compiling axum-core v0.5.6
    Compiling chrono v0.4.45
-   Compiling serde_json_canonicalizer v0.3.2
-   Compiling uuid v1.18.1
-   Compiling serde_urlencoded v0.7.1
-   Compiling quick-xml v0.41.0
-   Compiling tempfile v3.27.0
-   Compiling nemo-relay-ledger v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ledger)
-   Compiling toml v0.9.12+spec-1.1.0
-   Compiling nemo-relay-types v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/types)
-   Compiling spdlog-internal v0.2.1
-   Compiling nemo-relay-executor v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/executor)
-   Compiling nemo-relay-authority v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/authority)
-   Compiling regex v1.12.4
-   Compiling spdlog-macros v0.3.1
-   Compiling env_filter v0.1.4
-   Compiling rustls-platform-verifier v0.7.0
-   Compiling spdlog-rs v0.5.3
+   Compiling regex-syntax v0.8.11
    Compiling tokio-util v0.7.18
    Compiling tokio-rustls v0.26.4
-   Compiling opentelemetry_sdk v0.32.1
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling serde_json_canonicalizer v0.3.2
    Compiling h2 v0.4.16
    Compiling tower v0.5.3
    Compiling tokio-stream v0.1.18
-   Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
-   Compiling axum v0.8.9
+   Compiling regex-automata v0.4.14
+   Compiling nom v8.0.0
    Compiling tower-http v0.6.11
+   Compiling axum v0.8.9
    Compiling hyper v1.10.1
+   Compiling crypto-common v0.1.7
+   Compiling rand v0.9.4
+   Compiling serde_urlencoded v0.7.1
+   Compiling opentelemetry_sdk v0.32.1
+   Compiling digest v0.10.7
+   Compiling nemo-relay-ledger v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ledger)
    Compiling hyper-util v0.1.20
+   Compiling spdlog-internal v0.2.1
+   Compiling regex v1.12.4
+   Compiling uuid v1.18.1
+   Compiling crc-fast v1.10.0
+   Compiling rustix v1.1.4
    Compiling hyper-rustls v0.27.9
    Compiling hyper-timeout v0.5.2
    Compiling tonic v0.14.5
    Compiling reqwest v0.13.4
-   Compiling reqwest v0.12.28
-   Compiling opentelemetry-http v0.32.0
-   Compiling object_store v0.14.1
+   Compiling nemo-relay-types v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/types)
    Compiling tonic-prost v0.14.5
-   Compiling tonic-types v0.14.5
    Compiling opentelemetry-proto v0.32.0
+   Compiling opentelemetry-http v0.32.0
+   Compiling tonic-types v0.14.5
+   Compiling env_filter v0.1.4
+   Compiling spdlog-macros v0.3.1
+   Compiling nemo-relay-executor v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/executor)
+   Compiling quick-xml v0.41.0
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling toml_writer v1.1.1+spec-1.1.0
+   Compiling tempfile v3.27.0
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling spdlog-rs v0.5.3
+   Compiling nemo-relay-authority v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/authority)
+   Compiling reqwest v0.12.28
+   Compiling object_store v0.14.1
+   Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
    Compiling opentelemetry-otlp v0.32.0
    Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
-    Finished `test` profile [unoptimized] target(s) in 27.55s
+    Finished `test` profile [unoptimized] target(s) in 31.89s
      Running unittests src/lib.rs (target/debug/deps/nemo_relay-f40fbb5b0bd0916c)
 
 running 38 tests
 test kernel::tests::consequential_actions_require_a_stable_request_id ... ok
 test kernel::tests::fast_paths_bypass_authority_and_effect_stores ... ok
-test kernel::tests::explicit_denial_and_modification_cancel_the_original_action ... ok
-test kernel::tests::kernel_runs_against_the_reference_effect_stores_as_one_contract ... ok
-test kernel::tests::ambiguous_dispatch_is_persisted_as_unknown_then_reconciled ... ok
-test kernel::tests::approval_resume_preserves_the_same_bound_action ... ok
 test kernel::tests::lease_generation_remains_monotonic_after_a_lease_is_released ... ok
-test kernel::tests::consequential_actions_prepare_verify_and_persist_bound_receipts ... ok
+test kernel::tests::kernel_runs_against_the_reference_effect_store_as_one_contract ... ok
 test kernel::tests::durable_approval_resume_rebinds_the_original_action_after_restart ... ok
-test kernel::tests::confirmed_pre_dispatch_failure_returns_the_durable_action_status ... ok
-test kernel::tests::failed_unknown_persistence_returns_state_recovery_with_real_action_id ... ok
 test kernel::tests::mismatched_grants_cancel_the_pre_dispatch_action ... ok
-test kernel::tests::late_receipt_after_reconciliation_lease_blocks_provider_reconciliation ... ok
+test kernel::tests::approval_resume_preserves_the_same_bound_action ... ok
+test kernel::tests::failed_unknown_persistence_returns_state_recovery_with_real_action_id ... ok
+test kernel::tests::consequential_actions_prepare_verify_and_persist_bound_receipts ... ok
+test kernel::tests::explicit_denial_and_modification_cancel_the_original_action ... ok
+test kernel::tests::ambiguous_dispatch_is_persisted_as_unknown_then_reconciled ... ok
+test kernel::tests::confirmed_pre_dispatch_failure_returns_the_durable_action_status ... ok
 test kernel::tests::authorized_and_prepared_actions_resume_without_a_new_action_identity ... ok
+test kernel::tests::late_unfenced_receipt_after_reconciliation_lease_fails_closed ... ok
 test kernel::tests::post_dispatch_receipt_failure_returns_a_reconciliation_handle ... ok
-test kernel::tests::persisted_terminal_evidence_repairs_unknown_before_provider_reconciliation ... ok
-test kernel::tests::prepared_retry_waits_for_a_live_owner_before_authority_or_cancellation ... ok
 test kernel::tests::persisted_receipt_conflicts_block_provider_reconciliation_before_dispatch ... ok
-test kernel::tests::reconciliation_cannot_commit_without_a_bound_receipt ... ok
-test kernel::tests::receipt_conflict_stays_structured_and_blocks_evidence_recovery ... ok
 test kernel::tests::proposed_action_resumes_with_its_original_action_identity ... ok
-test kernel::tests::recovery_and_reconciliation_respect_live_leases_then_recover_stale_owners ... ok
+test kernel::tests::prepared_retry_waits_for_a_live_owner_before_authority_or_cancellation ... ok
 test kernel::tests::reconciliation_cannot_fail_without_authoritative_evidence ... ok
-test kernel::tests::schema_failure_happens_before_action_preparation_or_authority ... ok
-test kernel::tests::recovery_repairs_stale_dispatching_state_from_persisted_receipt ... ok
-test kernel::tests::recovery_repairs_unknown_from_late_bound_terminal_evidence_without_reconciliation ... ok
 test kernel::tests::recovery_marks_stale_dispatching_without_a_receipt_unknown ... ok
-test kernel::tests::runtime_environment_and_session_binding_are_grant_bound ... ok
-test kernel::tests::recovery_repairs_stale_reconciling_from_persisted_failure_evidence ... ok
-test kernel::tests::recovery_reports_contradictory_evidence_without_rewriting_unknown_state ... ok
+test kernel::tests::recovery_and_reconciliation_respect_live_leases_then_recover_stale_owners ... ok
+test kernel::tests::schema_failure_happens_before_action_preparation_or_authority ... ok
 test kernel::tests::reconciliation_receipts_bind_the_original_principal_and_grant ... ok
-test kernel::tests::unsafe_lease_configuration_blocks_dispatch_before_provider_execution ... ok
+test kernel::tests::receipt_conflict_stays_structured_and_blocks_evidence_recovery ... ok
+test kernel::tests::runtime_environment_and_session_binding_are_grant_bound ... ok
+test kernel::tests::recovery_rejects_unknown_with_unfenced_primary_evidence ... ok
+test kernel::tests::reconciliation_cannot_commit_without_a_bound_receipt ... ok
+test kernel::tests::recovery_reports_contradictory_evidence_without_rewriting_unknown_state ... ok
+test kernel::tests::recovery_rejects_split_receipt_and_dispatching_state ... ok
 test kernel::tests::retry_of_an_unknown_action_returns_its_reconciliation_handle_without_redispatch ... ok
+test kernel::tests::recovery_rejects_reconciling_with_unfenced_primary_evidence ... ok
+test kernel::tests::unsafe_lease_configuration_blocks_dispatch_before_provider_execution ... ok
 test kernel::tests::stale_fencing_failure_reloads_the_actual_durable_state ... ok
 test kernel::tests::stable_request_id_prevents_duplicate_dispatch_after_kernel_restart ... ok
+test kernel::tests::unfenced_primary_evidence_is_rejected_before_provider_reconciliation ... ok
 test kernel::tests::unknown_actions_reconcile_through_external_effect_fabric ... ok
-test kernel::tests::stable_request_id_rejects_a_different_effect_fingerprint ... ok
 test kernel::tests::scoped_idempotency_does_not_cross_tenant_boundaries ... ok
+test kernel::tests::stable_request_id_rejects_a_different_effect_fingerprint ... ok
 
-test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1586 filtered out; finished in 0.02s
-
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1586 filtered out; finished in 0.01s

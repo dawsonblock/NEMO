@@ -436,3 +436,20 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(report, indent=2) + "\n")
 PY
 
 cat "${output_dir}/qualification.json"
+
+# The report is the contract for callers: an incomplete or failed gate must
+# fail the recipe as well as remain visible in the JSON evidence.  Without
+# this check a shell redirection or unavailable prerequisite could produce a
+# DEV/FAIL report while CI still observed exit status zero.
+overall="$(python3 - "${output_dir}/qualification.json" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print(report.get("overall", "INCONCLUSIVE"))
+PY
+)"
+if [[ "${overall}" != "PASS" ]]; then
+    exit 1
+fi

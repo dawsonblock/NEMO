@@ -22,9 +22,18 @@ unstable-hardening = [
     "dep:sha2",
 ]
 unstable-hardening-testkit = ["unstable-hardening"]
+unstable-postgres = [
+    "unstable-hardening",
+    "dep:postgres",
+    "dep:r2d2",
+    "dep:r2d2_postgres",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 serde_json_canonicalizer = { version = "0.3", optional = true }
 sha2 = { version = "0.11", optional = true }
+postgres = { version = "0.19.14", features = ["with-serde_json-1"], optional = true }
+r2d2 = { version = "0.8.10", optional = true }
+r2d2_postgres = { version = "0.18.2", optional = true }

@@ -1231,6 +1231,16 @@ test-effect-contracts:
     cargo test --locked -p nemo-relay-ledger --features unstable-hardening-testkit --lib
     cargo test --locked -p nemo-relay --features unstable-hardening --lib kernel::tests
 
+# Run the durable EffectStore conformance suite against a live PostgreSQL database.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
+test-postgres-effect-store:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests -- --include-ignored --test-threads=1
+
 # --set [output_dir=<path>] [ci=true|false]
 test-rust:
     #!/usr/bin/env bash

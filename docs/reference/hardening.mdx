@@ -151,21 +151,58 @@ New `PROPOSED` claims must not carry a grant digest or approval reference;
 only `authorize_action` may attach them. An action-ID collision is a typed
 conflict and must never overwrite an existing durable action.
 
-For a real durable adapter, terminal receipt persistence and the fenced action
-transition are one `EffectStore::finalize_terminal_receipt` operation. The
-same contract provides an `EvidenceSnapshot` containing the primary receipt,
-all retained conflicts, and an implementation revision. This prevents callers
-from treating independent action and receipt writes or reads as a transaction.
-`InMemoryEffectStore` makes that ordering executable for tests only; PostgreSQL
-or another Effect Fabric backend must provide the atomic transaction before any
-production durability claim is made.
+For a real durable adapter, the kernel consumes one `DurableEffectStore` for
+the entire consequential lifecycle. Terminal receipt persistence and the
+fenced action transition are one `EffectStore::finalize_terminal_receipt`
+operation. The same contract provides an `EvidenceSnapshot` containing the
+action, primary receipt, retained conflicts, and a monotonic evidence revision.
+Writable action or receipt sub-stores are not exposed by the aggregate reference
+implementation, so terminal writes cannot bypass the transactional boundary.
+
+Post-terminal evidence uses `observe_terminal_evidence`, not terminal
+finalization. Exact evidence is idempotent. Contradictory evidence appends one
+deduplicated conflict and advances the evidence revision without replacing the
+primary receipt or rewriting the terminal action state. Observation cannot
+establish a missing primary receipt; that remains exclusive to fenced
+finalization.
+
+Reconciliation uses `begin_reconciliation` to validate its lease, inspect one
+consistent evidence view, and transition `UNKNOWN → RECONCILING` atomically.
+Terminal or inconclusive completion must present the revision returned by that
+operation. If evidence changed while the provider was queried, completion fails
+closed and the worker reloads evidence before deciding again. Provider calls
+occur between store transactions; implementations must not hold a database
+transaction open across an external request.
+
+`InMemoryEffectStore` makes these ordering rules executable for tests only;
+its deterministic fault injector covers validation, staged receipt insertion,
+action terminalization, revision increment, and commit boundaries. Every
+injected failure must leave the complete pre-transaction snapshot, and the
+one-shot retry must be able to commit the complete terminal snapshot.
+
+The opt-in `unstable-postgres` feature provides `PostgresEffectStore` with a
+bounded connection pool and an idempotent migration for actions, primary
+receipts, and deduplicated conflicts. It locks the action row before lifecycle
+writes, uses `clock_timestamp()` for lease decisions, reads evidence under one
+repeatable-read snapshot, and commits terminal receipt, action state, lease
+release, and evidence revision in one transaction. Run the same generic suite
+against an isolated disposable schema with:
+
+```bash
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-effect-store
+```
+
+The adapter remains experimental and disabled by default. Passing this suite
+alone does not establish restart, crash-matrix, load, real-provider, or release
+qualification.
 
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live
-owner, fully bound success evidence, fully bound failure evidence, missing
-terminal evidence after lease expiry, and contradictory evidence. It may
-repair an action to `COMMITTED` or `FAILED` only from valid persisted evidence.
-Missing evidence remains
+owner, fully bound terminal state, missing terminal evidence after lease
+expiry, and contradictory evidence. A primary receipt paired with a
+non-terminal action is an integrity violation rather than a state-repair path,
+because conforming stores make those writes atomic. Missing evidence remains
 `UNKNOWN` (or becomes recoverable under the external effect policy); it is
 never translated into `FAILED` merely because a worker disappeared. The
 in-memory stores and deterministic clocks are reference implementations for
@@ -174,15 +211,15 @@ these contract tests only. They do not enable production durability.
 ### Contract conformance testkit
 
 The `unstable-hardening-testkit` feature exposes backend-independent store
-conformance runners. An adapter supplies fresh action and receipt stores plus
-a controller for its store-owned test clock, then runs the same lifecycle,
-lease, idempotency, immutable-receipt, conflict-history, and security-binding
-mutation cases as the in-memory reference stores. The mutation matrix changes
-each bound action/evidence field independently and asserts that rejected input
-cannot alter durable state or evidence history. Receipt replay and conflict
-tests independently mutate provider request identity, terminal state, and
-evidence digest. This suite is a contract gate; it is not a durable-store
-implementation.
+conformance runners. An adapter supplies a fresh aggregate effect store plus a
+controller for its store-owned test clock, then runs the same lifecycle, lease,
+idempotency, immutable-receipt, conflict-history, stale-worker, and
+reconciliation-revision cases as the in-memory reference store. The mutation
+matrix changes each bound action/evidence field independently and asserts that
+rejected input cannot alter durable state or evidence history. Receipt replay
+and conflict tests independently mutate provider request identity, terminal
+state, and evidence digest. This suite is a contract gate; it does not by itself
+qualify production durability.
 
 An action's runtime binding digest canonically covers its stable runtime or
 deployment identity, environment, and session provenance. Deployments using
@@ -197,9 +234,9 @@ system; `UNKNOWN` must never be automatically re-dispatched. An external
 reconciliation provider must resolve it with evidence to `COMMITTED`,
 `FAILED`, or remain `UNKNOWN`. Explicit authority denial cancels the claimed
 action; authority modification cancels it and returns structured constraints
-for a new invocation with a new identity. NeMo Relay defines these contracts
-only; Effect Fabric or another external implementation owns durable storage,
-dispatch, leases, and reconciliation.
+for a new invocation with a new identity. Effect Fabric owns dispatch and
+provider reconciliation; deployments may supply the opt-in PostgreSQL adapter
+or another conforming durable store for actions, leases, and evidence.
 
 The built-in `nemo_guardrails` component remains available for compatibility and
 is formally deprecated. New deployments should use current guardrail and

@@ -14,12 +14,16 @@ pub const DURABILITY_ENABLED: bool = false;
 #[cfg(feature = "unstable-hardening-testkit")]
 pub mod conformance;
 
+/// Opt-in PostgreSQL implementation of the experimental durable-effect store.
+#[cfg(feature = "unstable-postgres")]
+pub mod postgres;
+
 /// Opt-in experimental contracts.
 #[cfg(feature = "unstable-hardening")]
 pub mod unstable {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1116,12 +1120,23 @@ pub mod unstable {
     /// not treat independently read receipts and conflicts as an atomic view.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct EvidenceSnapshot {
+        /// Durable action state observed in the same consistency boundary.
+        pub action: ActionRecord,
         /// Monotonic implementation-defined evidence revision, if available.
         pub revision: u64,
         /// The first immutable terminal receipt, if one was finalized.
         pub receipt: Option<ReceiptRecord>,
         /// Every immutable contradiction recorded for this action.
         pub conflicts: Vec<ReceiptConflict>,
+    }
+
+    /// State and evidence captured by an atomic reconciliation start.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReconciliationStart {
+        /// Action after the fenced `UNKNOWN -> RECONCILING` transition.
+        pub action: ActionRecord,
+        /// Evidence observed in the same transaction as that transition.
+        pub evidence: EvidenceSnapshot,
     }
 
     /// Result of atomically storing terminal receipt evidence and advancing
@@ -1139,6 +1154,38 @@ pub mod unstable {
         ConflictAlreadyRecorded(ReceiptConflict),
     }
 
+    /// Result of observing terminal evidence after a primary receipt exists.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum EvidenceObservationResult {
+        /// The exact primary receipt was observed again.
+        AlreadyObserved,
+        /// New contradictory evidence was retained without changing action state.
+        ConflictRecorded(ReceiptConflict),
+        /// The same contradiction was already retained.
+        ConflictAlreadyRecorded(ReceiptConflict),
+    }
+
+    /// Deterministic failure boundary for the in-memory transaction oracle.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum EffectStoreFaultPoint {
+        /// Fail before validating the receipt and action binding.
+        BeforeValidation,
+        /// Fail after validation but before staging any writes.
+        AfterValidation,
+        /// Fail before staging primary receipt insertion.
+        BeforeReceiptInsertion,
+        /// Fail after staging receipt insertion but before staging action state.
+        AfterLogicalReceiptInsertion,
+        /// Fail before staging terminal action state and lease release.
+        BeforeActionTerminalization,
+        /// Fail before staging the evidence revision increment.
+        BeforeRevisionIncrement,
+        /// Fail immediately before publishing the complete staged transaction.
+        Commit,
+    }
+
     /// Transaction-shaped Effect Fabric boundary.
     ///
     /// A production implementation owns one atomic transaction for receipt
@@ -1154,6 +1201,43 @@ pub mod unstable {
         /// Read the primary receipt and all conflict evidence atomically.
         fn evidence_snapshot(&self, action_id: &str) -> Result<EvidenceSnapshot, Self::Error>;
 
+        /// Observe terminal evidence without granting it authority to establish
+        /// or replace the primary result. Only fenced finalization may create
+        /// the primary receipt and terminalize the action.
+        fn observe_terminal_evidence(
+            &self,
+            action_id: &str,
+            receipt: &ReceiptRecord,
+        ) -> Result<EvidenceObservationResult, Self::Error>;
+
+        /// Atomically validate the reconciliation lease, reject inconsistent
+        /// terminal evidence, transition `UNKNOWN -> RECONCILING`, and return
+        /// the evidence revision on which provider reconciliation may rely.
+        fn begin_reconciliation(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+        ) -> Result<ReconciliationStart, Self::Error>;
+
+        /// Atomically finalize reconciliation only if evidence has not changed
+        /// since [`EffectStore::begin_reconciliation`].
+        fn finalize_reconciliation_receipt(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+            expected_evidence_revision: u64,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error>;
+
+        /// Return an inconclusive reconciliation to `UNKNOWN` only if the
+        /// evidence revision used by the reconciler is still current.
+        fn complete_reconciliation_unknown(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+            expected_evidence_revision: u64,
+        ) -> Result<(), Self::Error>;
+
         /// Atomically validate, persist, and bind a terminal receipt to the
         /// fenced action transition. The receipt must be `COMMITTED` or
         /// `FAILED` and fully bind the action's persisted authorization.
@@ -1165,6 +1249,14 @@ pub mod unstable {
             receipt: &ReceiptRecord,
         ) -> Result<EffectFinalizeResult, Self::Error>;
     }
+
+    /// Aggregate durable-effect authority consumed by the kernel.
+    ///
+    /// Implementations own both lifecycle and evidence writes so callers
+    /// cannot compose terminal receipt and action transitions independently.
+    pub trait DurableEffectStore: ActionStore + EffectStore {}
+
+    impl<T> DurableEffectStore for T where T: ActionStore + EffectStore {}
 
     /// Error emitted by the non-durable reference stores.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1204,6 +1296,23 @@ pub mod unstable {
         },
         /// A verified non-empty grant digest was required for this operation.
         InvalidGrantDigest,
+        /// A fencing generation cannot advance without wrapping.
+        FencingGenerationExhausted,
+        /// An evidence revision cannot advance without wrapping.
+        EvidenceRevisionExhausted,
+        /// Unfenced observation cannot establish a primary terminal receipt.
+        PrimaryEvidenceRequiresFencedFinalization,
+        /// Reconciliation attempted to start from an inconsistent evidence set.
+        ReconciliationEvidencePresent,
+        /// Evidence changed while a provider reconciliation was in flight.
+        EvidenceRevisionChanged {
+            /// Revision captured at reconciliation start.
+            expected: u64,
+            /// Current durable revision.
+            actual: u64,
+        },
+        /// A deterministic reference-store transaction fault was triggered.
+        InjectedFault(EffectStoreFaultPoint),
         /// A receipt could not become immutable terminal evidence.
         InvalidReceipt(ReceiptValidationError),
         /// An unfenced update attempted to bypass a live lease.
@@ -1254,6 +1363,29 @@ pub mod unstable {
                 }
                 Self::InvalidGrantDigest => {
                     write!(formatter, "a non-empty verified grant digest is required")
+                }
+                Self::FencingGenerationExhausted => {
+                    write!(formatter, "fencing generation exhausted")
+                }
+                Self::EvidenceRevisionExhausted => {
+                    write!(formatter, "evidence revision exhausted")
+                }
+                Self::PrimaryEvidenceRequiresFencedFinalization => write!(
+                    formatter,
+                    "primary terminal evidence requires fenced finalization"
+                ),
+                Self::ReconciliationEvidencePresent => {
+                    write!(
+                        formatter,
+                        "reconciliation cannot start with terminal evidence"
+                    )
+                }
+                Self::EvidenceRevisionChanged { expected, actual } => write!(
+                    formatter,
+                    "reconciliation evidence changed: expected revision {expected}, got {actual}"
+                ),
+                Self::InjectedFault(point) => {
+                    write!(formatter, "injected effect-store fault at {point:?}")
                 }
                 Self::InvalidReceipt(reason) => {
                     write!(formatter, "invalid terminal receipt: {reason:?}")
@@ -1333,9 +1465,11 @@ pub mod unstable {
                 ));
             }
             if let Some(existing) = records.get(&action.action_id) {
-                return Ok(PrepareActionResult::ActionIdConflict(Box::new(
-                    existing.clone(),
-                )));
+                return Ok(if existing.preparation == *action {
+                    PrepareActionResult::ExistingSameAction(Box::new(existing.clone()))
+                } else {
+                    PrepareActionResult::ActionIdConflict(Box::new(existing.clone()))
+                });
             }
             if let Some(existing) = records
                 .values()
@@ -1482,7 +1616,10 @@ pub mod unstable {
                 return Ok(LeaseAcquireResult::HeldByOther(lease.clone()));
             }
             let reclaimed = record.lease.is_some();
-            let generation = record.lease_generation.saturating_add(1);
+            let generation = record
+                .lease_generation
+                .checked_add(1)
+                .ok_or(ReferenceStoreError::FencingGenerationExhausted)?;
             let lease = ActionLease {
                 owner_id: owner_id.to_owned(),
                 generation,
@@ -1765,6 +1902,7 @@ pub mod unstable {
         receipts: InMemoryReceiptStore,
         operation_gate: Arc<Mutex<()>>,
         evidence_revisions: Arc<Mutex<HashMap<String, u64>>>,
+        fault_points: Arc<Mutex<VecDeque<EffectStoreFaultPoint>>>,
     }
 
     impl InMemoryEffectStore<SystemStoreClock> {
@@ -1785,56 +1923,61 @@ pub mod unstable {
                 receipts: InMemoryReceiptStore::default(),
                 operation_gate: Arc::new(Mutex::new(())),
                 evidence_revisions: Arc::new(Mutex::new(HashMap::new())),
+                fault_points: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
 
-        /// Access the action contract for setup and non-terminal transitions.
-        pub fn actions(&self) -> &InMemoryActionStore<C> {
-            &self.actions
+        /// Queue a one-shot deterministic fault for terminal finalization.
+        ///
+        /// Faults are consumed in FIFO order when their named boundary is
+        /// reached. This keeps crash-boundary tests repeatable without
+        /// exposing writable action or receipt sub-stores.
+        pub fn inject_fault_once(
+            &self,
+            point: EffectStoreFaultPoint,
+        ) -> Result<(), ReferenceStoreError> {
+            self.fault_points
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                .push_back(point);
+            Ok(())
         }
 
-        /// Access the receipt contract for read-only inspection in tests.
-        pub fn receipts(&self) -> &InMemoryReceiptStore {
-            &self.receipts
+        fn fail_if_injected(
+            &self,
+            point: EffectStoreFaultPoint,
+        ) -> Result<(), ReferenceStoreError> {
+            let mut faults = self
+                .fault_points
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            if faults.front() == Some(&point) {
+                faults.pop_front();
+                return Err(ReferenceStoreError::InjectedFault(point));
+            }
+            Ok(())
         }
-    }
 
-    impl<C> EffectStore for InMemoryEffectStore<C>
-    where
-        C: StoreClock,
-    {
-        type Error = ReferenceStoreError;
-
-        fn evidence_snapshot(&self, action_id: &str) -> Result<EvidenceSnapshot, Self::Error> {
+        fn with_actions<T>(
+            &self,
+            operation: impl FnOnce(&InMemoryActionStore<C>) -> Result<T, ReferenceStoreError>,
+        ) -> Result<T, ReferenceStoreError> {
             let _gate = self
                 .operation_gate
                 .lock()
                 .map_err(|_| ReferenceStoreError::LockPoisoned)?;
-            let revision = self
-                .evidence_revisions
-                .lock()
-                .map_err(|_| ReferenceStoreError::LockPoisoned)?
-                .get(action_id)
-                .copied()
-                .unwrap_or_default();
-            Ok(EvidenceSnapshot {
-                revision,
-                receipt: self.receipts.load(action_id)?,
-                conflicts: self.receipts.load_conflicts(action_id)?,
-            })
+            operation(&self.actions)
         }
 
-        fn finalize_terminal_receipt(
+        fn finalize_terminal_receipt_while_gated(
             &self,
             action_id: &str,
             expected: ExecutionState,
             lease: &ActionLease,
+            expected_evidence_revision: Option<u64>,
             receipt: &ReceiptRecord,
-        ) -> Result<EffectFinalizeResult, Self::Error> {
-            let _gate = self
-                .operation_gate
-                .lock()
-                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+        ) -> Result<EffectFinalizeResult, ReferenceStoreError> {
+            self.fail_if_injected(EffectStoreFaultPoint::BeforeValidation)?;
             receipt
                 .validate_terminal()
                 .map_err(ReferenceStoreError::InvalidReceipt)?;
@@ -1844,12 +1987,6 @@ pub mod unstable {
                 });
             }
             let evidence = TerminalEvidence::Receipt(receipt.identity());
-            // Hold every backing record required for the operation before
-            // inspecting or mutating either side. This is the in-memory
-            // reference equivalent of the single database transaction a
-            // durable Effect Fabric implementation must provide. In
-            // particular, never write a receipt and then discover that the
-            // fenced action transition cannot be committed.
             let mut records = self.actions.records()?;
             let mut receipts = self
                 .receipts
@@ -1877,10 +2014,6 @@ pub mod unstable {
                     action_id: action_id.to_owned(),
                 });
             }
-
-            // A repeated operation is safe only when both durable records
-            // already prove exactly the same terminal result. It must not
-            // require a still-live lease merely to observe that fact.
             if action.state == receipt.final_state
                 && action.terminal_evidence.as_ref() == Some(&evidence)
                 && let Some(existing) = receipts.get(action_id)
@@ -1888,7 +2021,15 @@ pub mod unstable {
             {
                 return Ok(EffectFinalizeResult::AlreadyFinalized(existing.clone()));
             }
-
+            let actual_revision = revisions.get(action_id).copied().unwrap_or_default();
+            if let Some(expected_revision) = expected_evidence_revision
+                && actual_revision != expected_revision
+            {
+                return Err(ReferenceStoreError::EvidenceRevisionChanged {
+                    expected: expected_revision,
+                    actual: actual_revision,
+                });
+            }
             if !is_leaseable_state(expected) {
                 return Err(ReferenceStoreError::InvalidLeaseState(expected));
             }
@@ -1909,6 +2050,7 @@ pub mod unstable {
                     action_id: action_id.to_owned(),
                 });
             }
+            self.fail_if_injected(EffectStoreFaultPoint::AfterValidation)?;
 
             match receipts.get(action_id) {
                 Some(existing) if existing.identity() == receipt.identity() => {
@@ -1920,28 +2062,422 @@ pub mod unstable {
                 Some(existing) => {
                     let conflict = ReceiptConflict::new(existing, receipt);
                     let action_conflicts = conflicts.entry(action_id.to_owned()).or_default();
-                    let already_recorded = action_conflicts
+                    if action_conflicts
                         .iter()
-                        .any(|recorded| recorded.conflict_digest == conflict.conflict_digest);
-                    if already_recorded {
+                        .any(|recorded| recorded.conflict_digest == conflict.conflict_digest)
+                    {
                         Ok(EffectFinalizeResult::ConflictAlreadyRecorded(conflict))
                     } else {
+                        let next_revision = revisions
+                            .get(action_id)
+                            .copied()
+                            .unwrap_or_default()
+                            .checked_add(1)
+                            .ok_or(ReferenceStoreError::EvidenceRevisionExhausted)?;
                         action_conflicts.push(conflict.clone());
-                        let revision = revisions.entry(action_id.to_owned()).or_default();
-                        *revision = revision.saturating_add(1);
+                        revisions.insert(action_id.to_owned(), next_revision);
                         Ok(EffectFinalizeResult::FinalizationConflict(conflict))
                     }
                 }
                 None => {
-                    receipts.insert(action_id.to_owned(), receipt.clone());
-                    action.terminal_evidence = Some(evidence);
-                    action.state = receipt.final_state;
-                    action.lease = None;
-                    let revision = revisions.entry(action_id.to_owned()).or_default();
-                    *revision = revision.saturating_add(1);
-                    Ok(EffectFinalizeResult::Finalized(receipt.clone()))
+                    self.fail_if_injected(EffectStoreFaultPoint::BeforeReceiptInsertion)?;
+                    let staged_receipt = receipt.clone();
+                    self.fail_if_injected(EffectStoreFaultPoint::AfterLogicalReceiptInsertion)?;
+                    self.fail_if_injected(EffectStoreFaultPoint::BeforeActionTerminalization)?;
+                    let mut staged_action = action.clone();
+                    staged_action.terminal_evidence = Some(evidence);
+                    staged_action.state = receipt.final_state;
+                    staged_action.lease = None;
+                    self.fail_if_injected(EffectStoreFaultPoint::BeforeRevisionIncrement)?;
+                    let next_revision = actual_revision
+                        .checked_add(1)
+                        .ok_or(ReferenceStoreError::EvidenceRevisionExhausted)?;
+                    self.fail_if_injected(EffectStoreFaultPoint::Commit)?;
+
+                    // Nothing fallible occurs after this point. The operation
+                    // gate prevents readers from observing these assignments
+                    // separately, making this the reference-store commit.
+                    receipts.insert(action_id.to_owned(), staged_receipt.clone());
+                    *action = staged_action;
+                    revisions.insert(action_id.to_owned(), next_revision);
+                    Ok(EffectFinalizeResult::Finalized(staged_receipt))
                 }
             }
+        }
+
+        /// Inspect one action without exposing a writable backing store.
+        pub fn action(&self, action_id: &str) -> Result<Option<ActionRecord>, ReferenceStoreError> {
+            self.with_actions(|actions| actions.load_action(action_id))
+        }
+
+        /// Inspect the primary receipt without exposing a writable backing store.
+        pub fn receipt(
+            &self,
+            action_id: &str,
+        ) -> Result<Option<ReceiptRecord>, ReferenceStoreError> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            self.receipts.load(action_id)
+        }
+
+        /// Inspect contradictory evidence without exposing a writable backing store.
+        pub fn conflicts(
+            &self,
+            action_id: &str,
+        ) -> Result<Vec<ReceiptConflict>, ReferenceStoreError> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            self.receipts.load_conflicts(action_id)
+        }
+    }
+
+    impl<C> ActionStore for InMemoryEffectStore<C>
+    where
+        C: StoreClock,
+    {
+        type Error = ReferenceStoreError;
+
+        fn claim_action(
+            &self,
+            action: &ActionPreparation,
+        ) -> Result<PrepareActionResult, Self::Error> {
+            self.with_actions(|actions| actions.claim_action(action))
+        }
+
+        fn load_action(&self, action_id: &str) -> Result<Option<ActionRecord>, Self::Error> {
+            self.with_actions(|actions| actions.load_action(action_id))
+        }
+
+        fn authorize_action(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            self.with_actions(|actions| {
+                actions.authorize_action(action_id, expected, grant_digest, approval_reference)
+            })
+        }
+
+        fn refresh_authorization(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            self.with_actions(|actions| {
+                actions.refresh_authorization(action_id, expected, grant_digest, approval_reference)
+            })
+        }
+
+        fn lease_configuration(&self) -> Result<LeaseConfiguration, Self::Error> {
+            self.with_actions(ActionStore::lease_configuration)
+        }
+
+        fn lease_status(&self, action_id: &str) -> Result<LeaseStatus, Self::Error> {
+            self.with_actions(|actions| actions.lease_status(action_id))
+        }
+
+        fn claim_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            owner_id: &str,
+            requested_duration_ms: Option<u64>,
+        ) -> Result<LeaseAcquireResult, Self::Error> {
+            self.with_actions(|actions| {
+                actions.claim_lease(action_id, expected, owner_id, requested_duration_ms)
+            })
+        }
+
+        fn renew_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            requested_duration_ms: Option<u64>,
+        ) -> Result<LeaseRenewResult, Self::Error> {
+            self.with_actions(|actions| {
+                actions.renew_lease(action_id, expected, lease, requested_duration_ms)
+            })
+        }
+
+        fn release_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+        ) -> Result<LeaseReleaseResult, Self::Error> {
+            self.with_actions(|actions| actions.release_lease(action_id, expected, lease))
+        }
+
+        fn transition_with_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error> {
+            self.with_actions(|actions| {
+                actions.transition_with_lease(action_id, expected, lease, next)
+            })
+        }
+
+        fn finalize_from_evidence(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            evidence: &TerminalEvidence,
+        ) -> Result<(), Self::Error> {
+            self.with_actions(|actions| {
+                actions.finalize_from_evidence(action_id, expected, lease, evidence)
+            })
+        }
+
+        fn transition(
+            &self,
+            action_id: &str,
+            expected: Option<ExecutionState>,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error> {
+            self.with_actions(|actions| actions.transition(action_id, expected, next))
+        }
+    }
+
+    impl<C> EffectStore for InMemoryEffectStore<C>
+    where
+        C: StoreClock,
+    {
+        type Error = ReferenceStoreError;
+
+        fn evidence_snapshot(&self, action_id: &str) -> Result<EvidenceSnapshot, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let action = self
+                .actions
+                .records()?
+                .get(action_id)
+                .cloned()
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            let revision = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                .get(action_id)
+                .copied()
+                .unwrap_or_default();
+            Ok(EvidenceSnapshot {
+                action,
+                revision,
+                receipt: self.receipts.load(action_id)?,
+                conflicts: self.receipts.load_conflicts(action_id)?,
+            })
+        }
+
+        fn observe_terminal_evidence(
+            &self,
+            action_id: &str,
+            receipt: &ReceiptRecord,
+        ) -> Result<EvidenceObservationResult, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            receipt
+                .validate_terminal()
+                .map_err(ReferenceStoreError::InvalidReceipt)?;
+            if receipt.action_id != action_id {
+                return Err(ReferenceStoreError::EvidenceBindingMismatch {
+                    action_id: action_id.to_owned(),
+                });
+            }
+            let records = self.actions.records()?;
+            let action = records
+                .get(action_id)
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            let evidence = TerminalEvidence::Receipt(receipt.identity());
+            if !evidence
+                .binds_action(&action.preparation)
+                .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
+            {
+                return Err(ReferenceStoreError::EvidenceBindingMismatch {
+                    action_id: action_id.to_owned(),
+                });
+            }
+            let receipts = self
+                .receipts
+                .receipts
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let primary = receipts
+                .get(action_id)
+                .ok_or(ReferenceStoreError::PrimaryEvidenceRequiresFencedFinalization)?;
+            if primary.identity() == receipt.identity() {
+                return Ok(EvidenceObservationResult::AlreadyObserved);
+            }
+            let conflict = ReceiptConflict::new(primary, receipt);
+            let mut conflicts = self
+                .receipts
+                .conflicts
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let action_conflicts = conflicts.entry(action_id.to_owned()).or_default();
+            if action_conflicts
+                .iter()
+                .any(|existing| existing.conflict_digest == conflict.conflict_digest)
+            {
+                return Ok(EvidenceObservationResult::ConflictAlreadyRecorded(conflict));
+            }
+            let mut revisions = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let next_revision = revisions
+                .get(action_id)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(1)
+                .ok_or(ReferenceStoreError::EvidenceRevisionExhausted)?;
+            action_conflicts.push(conflict.clone());
+            revisions.insert(action_id.to_owned(), next_revision);
+            Ok(EvidenceObservationResult::ConflictRecorded(conflict))
+        }
+
+        fn begin_reconciliation(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+        ) -> Result<ReconciliationStart, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let mut records = self.actions.records()?;
+            let action = records
+                .get_mut(action_id)
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if action.state != ExecutionState::Unknown {
+                return Err(ReferenceStoreError::UnexpectedState {
+                    expected: Some(ExecutionState::Unknown),
+                    actual: action.state,
+                });
+            }
+            let now = self.actions.clock.now_unix_ms();
+            if action.lease.as_ref() != Some(lease) || lease.expires_at_unix_ms <= now {
+                return Err(ReferenceStoreError::LeaseHeld(
+                    action.lease.clone().unwrap_or_else(|| lease.clone()),
+                ));
+            }
+            let receipt = self.receipts.load(action_id)?;
+            let conflicts = self.receipts.load_conflicts(action_id)?;
+            if receipt.is_some() || !conflicts.is_empty() {
+                return Err(ReferenceStoreError::ReconciliationEvidencePresent);
+            }
+            let revision = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                .get(action_id)
+                .copied()
+                .unwrap_or_default();
+            action.state = ExecutionState::Reconciling;
+            let action = action.clone();
+            Ok(ReconciliationStart {
+                action: action.clone(),
+                evidence: EvidenceSnapshot {
+                    action,
+                    revision,
+                    receipt,
+                    conflicts,
+                },
+            })
+        }
+
+        fn finalize_reconciliation_receipt(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+            expected_evidence_revision: u64,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            self.finalize_terminal_receipt_while_gated(
+                action_id,
+                ExecutionState::Reconciling,
+                lease,
+                Some(expected_evidence_revision),
+                receipt,
+            )
+        }
+
+        fn complete_reconciliation_unknown(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+            expected_evidence_revision: u64,
+        ) -> Result<(), Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            let actual_revision = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?
+                .get(action_id)
+                .copied()
+                .unwrap_or_default();
+            if actual_revision != expected_evidence_revision {
+                return Err(ReferenceStoreError::EvidenceRevisionChanged {
+                    expected: expected_evidence_revision,
+                    actual: actual_revision,
+                });
+            }
+            let now = self.actions.clock.now_unix_ms();
+            let mut records = self.actions.records()?;
+            let action = records
+                .get_mut(action_id)
+                .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+            if action.state != ExecutionState::Reconciling {
+                return Err(ReferenceStoreError::UnexpectedState {
+                    expected: Some(ExecutionState::Reconciling),
+                    actual: action.state,
+                });
+            }
+            if action.lease.as_ref() != Some(lease) || lease.expires_at_unix_ms <= now {
+                return Err(ReferenceStoreError::LeaseHeld(
+                    action.lease.clone().unwrap_or_else(|| lease.clone()),
+                ));
+            }
+            action.state = ExecutionState::Unknown;
+            action.lease = None;
+            Ok(())
+        }
+
+        fn finalize_terminal_receipt(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error> {
+            let _gate = self
+                .operation_gate
+                .lock()
+                .map_err(|_| ReferenceStoreError::LockPoisoned)?;
+            self.finalize_terminal_receipt_while_gated(action_id, expected, lease, None, receipt)
         }
     }
 
@@ -1993,23 +2529,25 @@ pub mod unstable {
         #[cfg(feature = "unstable-hardening-testkit")]
         struct ReferenceEffectHarness {
             effects: InMemoryEffectStore<ManualStoreClock>,
+            clock: ManualStoreClock,
         }
 
         #[cfg(feature = "unstable-hardening-testkit")]
         impl crate::conformance::EffectStoreConformanceHarness for ReferenceEffectHarness {
             type Effects = InMemoryEffectStore<ManualStoreClock>;
-            type Actions = InMemoryActionStore<ManualStoreClock>;
 
             fn new_harness() -> Self {
+                let clock = ManualStoreClock::new(1_000);
                 Self {
                     effects: InMemoryEffectStore::with_clock(
-                        ManualStoreClock::new(1_000),
+                        clock.clone(),
                         LeaseConfiguration {
                             default_duration_ms: 10,
                             maximum_duration_ms: 100,
                             renewal_enabled: true,
                         },
                     ),
+                    clock,
                 }
             }
 
@@ -2017,8 +2555,13 @@ pub mod unstable {
                 &self.effects
             }
 
-            fn actions(&self) -> &Self::Actions {
-                self.effects.actions()
+            fn advance_store_clock(&self, duration_ms: u64) {
+                self.clock.advance(duration_ms);
+            }
+
+            fn advance_evidence_revision(&self, action_id: &str) {
+                let mut revisions = self.effects.evidence_revisions.lock().unwrap();
+                *revisions.entry(action_id.to_owned()).or_default() += 1;
             }
         }
 
@@ -2464,6 +3007,51 @@ pub mod unstable {
             (store, clock)
         }
 
+        fn dispatching_reference_effect_store() -> (
+            InMemoryEffectStore<ManualStoreClock>,
+            ActionLease,
+            ReceiptRecord,
+        ) {
+            let effect_store = InMemoryEffectStore::with_clock(
+                ManualStoreClock::new(1_000),
+                LeaseConfiguration::default(),
+            );
+            let action = reference_action();
+            effect_store.claim_action(&action).unwrap();
+            effect_store
+                .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+                .unwrap();
+            effect_store
+                .transition(
+                    &action.action_id,
+                    Some(ExecutionState::Authorized),
+                    ExecutionState::Prepared,
+                )
+                .unwrap();
+            let lease = match effect_store
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    "effect-worker",
+                    None,
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                outcome => panic!("unexpected lease result: {outcome:?}"),
+            };
+            effect_store
+                .transition_with_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    &lease,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            let receipt = reference_receipt(ExecutionState::Committed, "fault-boundary");
+            (effect_store, lease, receipt)
+        }
+
         #[test]
         fn effect_store_finalizes_receipt_and_terminal_action_as_one_contract_operation() {
             let clock = ManualStoreClock::new(1_000);
@@ -2476,13 +3064,11 @@ pub mod unstable {
                 },
             );
             let action = reference_action();
-            effect_store.actions().claim_action(&action).unwrap();
+            effect_store.claim_action(&action).unwrap();
             effect_store
-                .actions()
                 .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
                 .unwrap();
             effect_store
-                .actions()
                 .transition(
                     &action.action_id,
                     Some(ExecutionState::Authorized),
@@ -2490,7 +3076,6 @@ pub mod unstable {
                 )
                 .unwrap();
             let lease = match effect_store
-                .actions()
                 .claim_lease(
                     &action.action_id,
                     ExecutionState::Prepared,
@@ -2503,7 +3088,6 @@ pub mod unstable {
                 outcome => panic!("unexpected lease result: {outcome:?}"),
             };
             effect_store
-                .actions()
                 .transition_with_lease(
                     &action.action_id,
                     ExecutionState::Prepared,
@@ -2524,19 +3108,412 @@ pub mod unstable {
                 EffectFinalizeResult::Finalized(_)
             ));
             assert_eq!(
-                effect_store
-                    .actions()
-                    .load_state(&action.action_id)
-                    .unwrap(),
+                effect_store.load_state(&action.action_id).unwrap(),
                 Some(ExecutionState::Committed)
             );
+            let snapshot = effect_store.evidence_snapshot(&action.action_id).unwrap();
+            assert_eq!(snapshot.action.state, ExecutionState::Committed);
+            assert_eq!(snapshot.revision, 1);
+            assert_eq!(snapshot.receipt, Some(committed));
+            assert!(snapshot.conflicts.is_empty());
+        }
+
+        #[test]
+        fn terminal_fault_boundaries_leave_the_complete_old_state() {
+            for point in [
+                EffectStoreFaultPoint::BeforeValidation,
+                EffectStoreFaultPoint::AfterValidation,
+                EffectStoreFaultPoint::BeforeReceiptInsertion,
+                EffectStoreFaultPoint::AfterLogicalReceiptInsertion,
+                EffectStoreFaultPoint::BeforeActionTerminalization,
+                EffectStoreFaultPoint::BeforeRevisionIncrement,
+                EffectStoreFaultPoint::Commit,
+            ] {
+                let (effect_store, lease, receipt) = dispatching_reference_effect_store();
+                let before = effect_store
+                    .evidence_snapshot(&receipt.action_id)
+                    .expect("snapshot before injected fault");
+                effect_store.inject_fault_once(point).unwrap();
+
+                assert_eq!(
+                    effect_store.finalize_terminal_receipt(
+                        &receipt.action_id,
+                        ExecutionState::Dispatching,
+                        &lease,
+                        &receipt,
+                    ),
+                    Err(ReferenceStoreError::InjectedFault(point)),
+                    "fault boundary {point:?} must fail deterministically"
+                );
+                assert_eq!(
+                    effect_store
+                        .evidence_snapshot(&receipt.action_id)
+                        .expect("snapshot after injected fault"),
+                    before,
+                    "fault boundary {point:?} must publish no partial state"
+                );
+                assert!(matches!(
+                    effect_store
+                        .finalize_terminal_receipt(
+                            &receipt.action_id,
+                            ExecutionState::Dispatching,
+                            &lease,
+                            &receipt,
+                        )
+                        .expect("retry after one-shot fault"),
+                    EffectFinalizeResult::Finalized(_)
+                ));
+            }
+        }
+
+        #[test]
+        fn evidence_revision_overflow_leaves_receipts_actions_and_conflicts_unchanged() {
+            let (effect_store, lease, receipt) = dispatching_reference_effect_store();
+            effect_store
+                .evidence_revisions
+                .lock()
+                .unwrap()
+                .insert(receipt.action_id.clone(), u64::MAX);
+            let before = effect_store.evidence_snapshot(&receipt.action_id).unwrap();
             assert_eq!(
-                effect_store.evidence_snapshot(&action.action_id).unwrap(),
-                EvidenceSnapshot {
-                    revision: 1,
-                    receipt: Some(committed),
-                    conflicts: Vec::new(),
-                }
+                effect_store.finalize_terminal_receipt(
+                    &receipt.action_id,
+                    ExecutionState::Dispatching,
+                    &lease,
+                    &receipt,
+                ),
+                Err(ReferenceStoreError::EvidenceRevisionExhausted)
+            );
+            assert_eq!(
+                effect_store.evidence_snapshot(&receipt.action_id).unwrap(),
+                before
+            );
+
+            effect_store
+                .evidence_revisions
+                .lock()
+                .unwrap()
+                .insert(receipt.action_id.clone(), 0);
+            effect_store
+                .finalize_terminal_receipt(
+                    &receipt.action_id,
+                    ExecutionState::Dispatching,
+                    &lease,
+                    &receipt,
+                )
+                .unwrap();
+            effect_store
+                .evidence_revisions
+                .lock()
+                .unwrap()
+                .insert(receipt.action_id.clone(), u64::MAX);
+            let before = effect_store.evidence_snapshot(&receipt.action_id).unwrap();
+            let conflicting = reference_receipt(ExecutionState::Failed, "conflict-overflow");
+            assert_eq!(
+                effect_store.observe_terminal_evidence(&receipt.action_id, &conflicting),
+                Err(ReferenceStoreError::EvidenceRevisionExhausted)
+            );
+            assert_eq!(
+                effect_store.evidence_snapshot(&receipt.action_id).unwrap(),
+                before
+            );
+        }
+
+        #[test]
+        fn terminal_evidence_observation_preserves_primary_state_and_deduplicates_conflicts() {
+            let effect_store = InMemoryEffectStore::with_clock(
+                ManualStoreClock::new(1_000),
+                LeaseConfiguration::default(),
+            );
+            let action = reference_action();
+            effect_store.claim_action(&action).unwrap();
+            effect_store
+                .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+                .unwrap();
+            effect_store
+                .transition(
+                    &action.action_id,
+                    Some(ExecutionState::Authorized),
+                    ExecutionState::Prepared,
+                )
+                .unwrap();
+            let lease = match effect_store
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    "effect-worker",
+                    None,
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                outcome => panic!("unexpected lease result: {outcome:?}"),
+            };
+            effect_store
+                .transition_with_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    &lease,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            let committed = reference_receipt(ExecutionState::Committed, "committed");
+            effect_store
+                .finalize_terminal_receipt(
+                    &action.action_id,
+                    ExecutionState::Dispatching,
+                    &lease,
+                    &committed,
+                )
+                .unwrap();
+
+            assert_eq!(
+                effect_store
+                    .observe_terminal_evidence(&action.action_id, &committed)
+                    .unwrap(),
+                EvidenceObservationResult::AlreadyObserved
+            );
+            let failed = reference_receipt(ExecutionState::Failed, "failed");
+            assert!(matches!(
+                effect_store
+                    .observe_terminal_evidence(&action.action_id, &failed)
+                    .unwrap(),
+                EvidenceObservationResult::ConflictRecorded(_)
+            ));
+            assert!(matches!(
+                effect_store
+                    .observe_terminal_evidence(&action.action_id, &failed)
+                    .unwrap(),
+                EvidenceObservationResult::ConflictAlreadyRecorded(_)
+            ));
+            let terminal = effect_store.action(&action.action_id).unwrap().unwrap();
+            assert_eq!(terminal.state, ExecutionState::Committed);
+            assert_eq!(
+                effect_store.receipt(&action.action_id).unwrap(),
+                Some(committed)
+            );
+            assert_eq!(effect_store.conflicts(&action.action_id).unwrap().len(), 1);
+            assert_eq!(
+                effect_store
+                    .evidence_snapshot(&action.action_id)
+                    .unwrap()
+                    .revision,
+                2
+            );
+        }
+
+        #[test]
+        fn terminal_observation_cannot_create_primary_evidence() {
+            let effect_store = InMemoryEffectStore::with_clock(
+                ManualStoreClock::new(1_000),
+                LeaseConfiguration::default(),
+            );
+            let action = reference_action();
+            effect_store.claim_action(&action).unwrap();
+            effect_store
+                .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+                .unwrap();
+            assert_eq!(
+                effect_store.observe_terminal_evidence(
+                    &action.action_id,
+                    &reference_receipt(ExecutionState::Committed, "unfenced"),
+                ),
+                Err(ReferenceStoreError::PrimaryEvidenceRequiresFencedFinalization)
+            );
+        }
+
+        #[test]
+        fn stale_dispatcher_cannot_insert_receipt_after_lease_reclamation() {
+            let clock = ManualStoreClock::new(1_000);
+            let effect_store = InMemoryEffectStore::with_clock(
+                clock.clone(),
+                LeaseConfiguration {
+                    default_duration_ms: 10,
+                    maximum_duration_ms: 100,
+                    renewal_enabled: true,
+                },
+            );
+            let action = reference_action();
+            effect_store.claim_action(&action).unwrap();
+            effect_store
+                .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+                .unwrap();
+            effect_store
+                .transition(
+                    &action.action_id,
+                    Some(ExecutionState::Authorized),
+                    ExecutionState::Prepared,
+                )
+                .unwrap();
+            let lease_a = match effect_store
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    "worker-a",
+                    Some(10),
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                outcome => panic!("unexpected lease result: {outcome:?}"),
+            };
+            effect_store
+                .transition_with_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    &lease_a,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            clock.advance(11);
+            let lease_b = match effect_store
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Dispatching,
+                    "worker-b",
+                    Some(10),
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::ExpiredReclaimed(lease) => lease,
+                outcome => panic!("recovery worker should reclaim the lease: {outcome:?}"),
+            };
+
+            assert!(
+                effect_store
+                    .finalize_terminal_receipt(
+                        &action.action_id,
+                        ExecutionState::Dispatching,
+                        &lease_a,
+                        &reference_receipt(ExecutionState::Committed, "worker-a-success"),
+                    )
+                    .is_err()
+            );
+            assert_eq!(effect_store.receipt(&action.action_id).unwrap(), None);
+            let current = effect_store.action(&action.action_id).unwrap().unwrap();
+            assert_eq!(current.state, ExecutionState::Dispatching);
+            assert_eq!(current.lease, Some(lease_b));
+            assert!(current.lease_generation > lease_a.generation);
+        }
+
+        #[test]
+        fn reconciliation_completion_is_fenced_by_evidence_revision() {
+            let effect_store = InMemoryEffectStore::with_clock(
+                ManualStoreClock::new(1_000),
+                LeaseConfiguration::default(),
+            );
+            let action = reference_action();
+            effect_store.claim_action(&action).unwrap();
+            effect_store
+                .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+                .unwrap();
+            effect_store
+                .transition(
+                    &action.action_id,
+                    Some(ExecutionState::Authorized),
+                    ExecutionState::Prepared,
+                )
+                .unwrap();
+            let dispatch = match effect_store
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    "dispatcher",
+                    None,
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                outcome => panic!("unexpected dispatch lease: {outcome:?}"),
+            };
+            effect_store
+                .transition_with_lease(
+                    &action.action_id,
+                    ExecutionState::Prepared,
+                    &dispatch,
+                    ExecutionState::Dispatching,
+                )
+                .unwrap();
+            effect_store
+                .transition_with_lease(
+                    &action.action_id,
+                    ExecutionState::Dispatching,
+                    &dispatch,
+                    ExecutionState::Unknown,
+                )
+                .unwrap();
+            let reconciliation = match effect_store
+                .claim_lease(
+                    &action.action_id,
+                    ExecutionState::Unknown,
+                    "reconciler",
+                    None,
+                )
+                .unwrap()
+            {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                outcome => panic!("unexpected reconciliation lease: {outcome:?}"),
+            };
+            let start = effect_store
+                .begin_reconciliation(&action.action_id, &reconciliation)
+                .unwrap();
+            assert_eq!(start.action.state, ExecutionState::Reconciling);
+            assert_eq!(start.evidence.action, start.action);
+            assert_eq!(start.evidence.revision, 0);
+            effect_store
+                .evidence_revisions
+                .lock()
+                .unwrap()
+                .insert(action.action_id.clone(), 1);
+
+            assert_eq!(
+                effect_store.finalize_reconciliation_receipt(
+                    &action.action_id,
+                    &reconciliation,
+                    start.evidence.revision,
+                    &reference_receipt(ExecutionState::Committed, "stale-reconciliation"),
+                ),
+                Err(ReferenceStoreError::EvidenceRevisionChanged {
+                    expected: 0,
+                    actual: 1,
+                })
+            );
+            assert_eq!(effect_store.receipt(&action.action_id).unwrap(), None);
+            assert_eq!(
+                effect_store
+                    .action(&action.action_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ExecutionState::Reconciling
+            );
+        }
+
+        #[test]
+        fn fencing_generation_overflow_fails_closed() {
+            let (store, _) = prepared_reference_store();
+            store
+                .records()
+                .unwrap()
+                .get_mut("reference-action")
+                .unwrap()
+                .lease_generation = u64::MAX;
+            assert_eq!(
+                store.claim_lease(
+                    "reference-action",
+                    ExecutionState::Prepared,
+                    "overflow",
+                    None,
+                ),
+                Err(ReferenceStoreError::FencingGenerationExhausted)
+            );
+            assert_eq!(
+                store
+                    .load_action("reference-action")
+                    .unwrap()
+                    .unwrap()
+                    .lease,
+                None
             );
         }
 

@@ -34,16 +34,20 @@ pub trait StoreConformanceHarness: Sized {
 /// contract rather than two independently composed writes.
 pub trait EffectStoreConformanceHarness: Sized {
     /// Transaction-shaped store under test.
-    type Effects: EffectStore;
-    /// Action store sharing the effect store's durable action history.
-    type Actions: ActionStore;
+    type Effects: DurableEffectStore;
 
     /// Construct an isolated transactional store fixture.
     fn new_harness() -> Self;
     /// Return the transactional evidence store.
     fn effects(&self) -> &Self::Effects;
-    /// Return the paired action store for lifecycle setup and inspection.
-    fn actions(&self) -> &Self::Actions;
+    /// Return the same aggregate store for lifecycle setup and inspection.
+    fn actions(&self) -> &Self::Effects {
+        self.effects()
+    }
+    /// Advance the store-owned test clock.
+    fn advance_store_clock(&self, duration_ms: u64);
+    /// Simulate evidence arriving while reconciliation is outside the store.
+    fn advance_evidence_revision(&self, action_id: &str);
 }
 
 /// Return a claimed-but-not-authorized action fixture.
@@ -240,6 +244,14 @@ where
             .claim_action(&action)
             .expect("claim original action"),
         PrepareActionResult::NewAction
+    ));
+    assert!(matches!(
+        action_id_conflict
+            .actions()
+            .claim_action(&action)
+            .expect("replay exact action"),
+        PrepareActionResult::ExistingSameAction(existing)
+            if existing.preparation == action
     ));
     let mut conflicting_action_id = action.clone();
     conflicting_action_id.idempotency_key = "different-idempotency".into();
@@ -524,14 +536,11 @@ where
     );
 }
 
-/// Run transactional receipt/action finalization conformance checks.
-pub fn run_effect_store_conformance<H>()
+fn dispatching_effect_harness<H>(owner: &str) -> (H, ActionPreparation, ActionLease, ActionRecord)
 where
     H: EffectStoreConformanceHarness,
-    H::Effects: EffectStore,
-    H::Actions: ActionStore,
-    <H::Effects as EffectStore>::Error: std::fmt::Debug,
-    <H::Actions as ActionStore>::Error: std::fmt::Debug,
+    H::Effects: DurableEffectStore,
+    <H::Effects as ActionStore>::Error: std::fmt::Debug,
 {
     let harness = H::new_harness();
     let action = fixture_action();
@@ -556,12 +565,7 @@ where
         .expect("prepare effect action");
     let lease = match harness
         .actions()
-        .claim_lease(
-            &action.action_id,
-            ExecutionState::Prepared,
-            "effect-store-conformance",
-            Some(10),
-        )
+        .claim_lease(&action.action_id, ExecutionState::Prepared, owner, Some(10))
         .expect("claim dispatch lease")
     {
         LeaseAcquireResult::Acquired(lease) => lease,
@@ -581,6 +585,18 @@ where
         .load_action(&action.action_id)
         .expect("load dispatching action")
         .expect("action exists");
+    (harness, action, lease, prepared)
+}
+
+fn run_effect_store_terminal_conformance<H>()
+where
+    H: EffectStoreConformanceHarness,
+    H::Effects: DurableEffectStore,
+    <H::Effects as EffectStore>::Error: std::fmt::Debug,
+    <H::Effects as ActionStore>::Error: std::fmt::Debug,
+{
+    let (harness, action, lease, prepared) =
+        dispatching_effect_harness::<H>("effect-store-conformance");
     let receipt = fixture_receipt(
         &prepared.preparation,
         ExecutionState::Committed,
@@ -629,6 +645,273 @@ where
     assert_eq!(snapshot.receipt, Some(receipt));
     assert!(snapshot.conflicts.is_empty());
     assert_eq!(snapshot.revision, 1);
+}
+
+fn run_effect_store_observation_conformance<H>()
+where
+    H: EffectStoreConformanceHarness,
+    H::Effects: DurableEffectStore,
+    <H::Effects as EffectStore>::Error: std::fmt::Debug,
+    <H::Effects as ActionStore>::Error: std::fmt::Debug,
+{
+    let (harness, action, lease, prepared) =
+        dispatching_effect_harness::<H>("effect-observation-conformance");
+    let receipt = fixture_receipt(
+        &prepared.preparation,
+        ExecutionState::Committed,
+        "effect-store-evidence",
+    );
+    harness
+        .effects()
+        .finalize_terminal_receipt(
+            &action.action_id,
+            ExecutionState::Dispatching,
+            &lease,
+            &receipt,
+        )
+        .expect("finalize primary terminal receipt");
+    let snapshot = harness
+        .effects()
+        .evidence_snapshot(&action.action_id)
+        .expect("read primary evidence snapshot");
+    let terminal = snapshot.action.clone();
+    let conflicting = fixture_receipt(
+        &terminal.preparation,
+        ExecutionState::Failed,
+        "contradictory-effect-store-evidence",
+    );
+    assert!(matches!(
+        harness
+            .effects()
+            .observe_terminal_evidence(&action.action_id, &conflicting)
+            .expect("record post-terminal contradiction"),
+        EvidenceObservationResult::ConflictRecorded(_)
+    ));
+    assert!(matches!(
+        harness
+            .effects()
+            .observe_terminal_evidence(&action.action_id, &conflicting)
+            .expect("deduplicate post-terminal contradiction"),
+        EvidenceObservationResult::ConflictAlreadyRecorded(_)
+    ));
+    let observed = harness
+        .effects()
+        .evidence_snapshot(&action.action_id)
+        .expect("read evidence after contradiction");
+    assert_eq!(observed.action.state, ExecutionState::Committed);
+    assert_eq!(observed.receipt, snapshot.receipt);
+    assert_eq!(observed.conflicts.len(), 1);
+    assert_eq!(observed.revision, 2);
+}
+
+fn run_effect_store_stale_worker_conformance<H>()
+where
+    H: EffectStoreConformanceHarness,
+    H::Effects: DurableEffectStore,
+    <H::Effects as EffectStore>::Error: std::fmt::Debug,
+    <H::Effects as ActionStore>::Error: std::fmt::Debug,
+{
+    let stale = H::new_harness();
+    let action = fixture_action();
+    stale
+        .actions()
+        .claim_action(&action)
+        .expect("claim stale-worker action");
+    stale
+        .actions()
+        .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+        .expect("authorize stale-worker action");
+    stale
+        .actions()
+        .transition(
+            &action.action_id,
+            Some(ExecutionState::Authorized),
+            ExecutionState::Prepared,
+        )
+        .expect("prepare stale-worker action");
+    let lease_a = match stale
+        .actions()
+        .claim_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            "stale-worker-a",
+            Some(10),
+        )
+        .expect("claim worker A lease")
+    {
+        LeaseAcquireResult::Acquired(lease) => lease,
+        other => panic!("expected worker A lease, got {other:?}"),
+    };
+    stale
+        .actions()
+        .transition_with_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            &lease_a,
+            ExecutionState::Dispatching,
+        )
+        .expect("worker A enters dispatching");
+    stale.advance_store_clock(11);
+    let lease_b = match stale
+        .actions()
+        .claim_lease(
+            &action.action_id,
+            ExecutionState::Dispatching,
+            "recovery-worker-b",
+            Some(10),
+        )
+        .expect("reclaim expired lease")
+    {
+        LeaseAcquireResult::ExpiredReclaimed(lease) => lease,
+        other => panic!("expected reclaimed lease, got {other:?}"),
+    };
+    let reclaimed = stale
+        .actions()
+        .load_action(&action.action_id)
+        .expect("load reclaimed action")
+        .expect("reclaimed action exists");
+    let stale_receipt = fixture_receipt(
+        &reclaimed.preparation,
+        ExecutionState::Committed,
+        "stale-worker-provider-success",
+    );
+    assert!(
+        stale
+            .effects()
+            .finalize_terminal_receipt(
+                &action.action_id,
+                ExecutionState::Dispatching,
+                &lease_a,
+                &stale_receipt,
+            )
+            .is_err(),
+        "a stale dispatcher must not finalize after reclamation"
+    );
+    let after_stale = stale
+        .effects()
+        .evidence_snapshot(&action.action_id)
+        .expect("inspect stale-worker rejection");
+    assert_eq!(after_stale.receipt, None);
+    assert_eq!(after_stale.action.state, ExecutionState::Dispatching);
+    assert_eq!(after_stale.action.lease, Some(lease_b));
+}
+
+fn run_effect_store_reconciliation_conformance<H>()
+where
+    H: EffectStoreConformanceHarness,
+    H::Effects: DurableEffectStore,
+    <H::Effects as EffectStore>::Error: std::fmt::Debug,
+    <H::Effects as ActionStore>::Error: std::fmt::Debug,
+{
+    let reconciliation = H::new_harness();
+    let action = fixture_action();
+    reconciliation
+        .actions()
+        .claim_action(&action)
+        .expect("claim reconciliation action");
+    reconciliation
+        .actions()
+        .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+        .expect("authorize reconciliation action");
+    reconciliation
+        .actions()
+        .transition(
+            &action.action_id,
+            Some(ExecutionState::Authorized),
+            ExecutionState::Prepared,
+        )
+        .expect("prepare reconciliation action");
+    let dispatch = match reconciliation
+        .actions()
+        .claim_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            "reconciliation-dispatcher",
+            Some(10),
+        )
+        .expect("claim reconciliation dispatch lease")
+    {
+        LeaseAcquireResult::Acquired(lease) => lease,
+        other => panic!("expected reconciliation dispatch lease, got {other:?}"),
+    };
+    reconciliation
+        .actions()
+        .transition_with_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            &dispatch,
+            ExecutionState::Dispatching,
+        )
+        .expect("enter dispatching before uncertainty");
+    reconciliation
+        .actions()
+        .transition_with_lease(
+            &action.action_id,
+            ExecutionState::Dispatching,
+            &dispatch,
+            ExecutionState::Unknown,
+        )
+        .expect("preserve ambiguous outcome as unknown");
+    let lease = match reconciliation
+        .actions()
+        .claim_lease(
+            &action.action_id,
+            ExecutionState::Unknown,
+            "reconciliation-worker",
+            Some(10),
+        )
+        .expect("claim reconciliation lease")
+    {
+        LeaseAcquireResult::Acquired(lease) => lease,
+        other => panic!("expected reconciliation lease, got {other:?}"),
+    };
+    let start = reconciliation
+        .effects()
+        .begin_reconciliation(&action.action_id, &lease)
+        .expect("begin reconciliation atomically");
+    assert_eq!(start.action.state, ExecutionState::Reconciling);
+    assert_eq!(start.evidence.action, start.action);
+    reconciliation.advance_evidence_revision(&action.action_id);
+    let reconciled_receipt = fixture_receipt(
+        &start.action.preparation,
+        ExecutionState::Committed,
+        "revision-fenced-reconciliation",
+    );
+    assert!(
+        reconciliation
+            .effects()
+            .finalize_reconciliation_receipt(
+                &action.action_id,
+                &lease,
+                start.evidence.revision,
+                &reconciled_receipt,
+            )
+            .is_err(),
+        "reconciliation must not commit against a stale evidence revision"
+    );
+    let after_revision_change = reconciliation
+        .effects()
+        .evidence_snapshot(&action.action_id)
+        .expect("inspect revision-fenced reconciliation");
+    assert_eq!(
+        after_revision_change.action.state,
+        ExecutionState::Reconciling
+    );
+    assert_eq!(after_revision_change.receipt, None);
+}
+
+/// Run transactional receipt/action finalization conformance checks.
+pub fn run_effect_store_conformance<H>()
+where
+    H: EffectStoreConformanceHarness,
+    H::Effects: DurableEffectStore,
+    <H::Effects as EffectStore>::Error: std::fmt::Debug,
+    <H::Effects as ActionStore>::Error: std::fmt::Debug,
+{
+    run_effect_store_terminal_conformance::<H>();
+    run_effect_store_observation_conformance::<H>();
+    run_effect_store_stale_worker_conformance::<H>();
+    run_effect_store_reconciliation_conformance::<H>();
 }
 
 #[derive(Clone, Copy)]

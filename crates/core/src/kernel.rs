@@ -19,10 +19,11 @@ use nemo_relay_executor::unstable::{
 };
 use nemo_relay_ledger::unstable::{
     ActionEvidenceBinding, ActionLease, ActionPreparation, ActionRecord, ActionStore,
-    ExecutionState, FinalizeResult, LeaseAcquireResult, LeaseConfiguration, LeaseReleaseResult,
-    LeaseRenewResult, LeaseStatus, PreDispatchFailureEvidence, PrepareActionResult,
-    ReceiptConflict, ReceiptRecord, ReceiptStore, TerminalEvidence, is_valid_evidence_transition,
-    is_valid_generic_transition, is_valid_leased_transition,
+    DurableEffectStore, EffectFinalizeResult, EffectStore, ExecutionState, LeaseAcquireResult,
+    LeaseConfiguration, LeaseReleaseResult, LeaseRenewResult, LeaseStatus,
+    PreDispatchFailureEvidence, PrepareActionResult, ReceiptConflict, ReceiptRecord,
+    TerminalEvidence, is_valid_evidence_transition, is_valid_generic_transition,
+    is_valid_leased_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -100,12 +101,9 @@ pub enum KernelError {
     /// An effect receipt did not bind to the exact action executed by the kernel.
     #[error("effect receipt does not bind to the exact execution request")]
     ReceiptBindingFailure,
-    /// The external receipt store rejected a receipt.
-    #[error("receipt store failed: {0}")]
-    ReceiptStore(String),
-    /// Immutable receipt finalization found contradictory terminal evidence.
-    #[error("receipt finalization conflicts with existing evidence: {0:?}")]
-    ReceiptFinalizationConflict(Box<ReceiptConflict>),
+    /// The aggregate effect store rejected an evidence operation.
+    #[error("effect store failed: {0}")]
+    EffectStore(String),
     /// Contradictory terminal evidence requires operator evidence repair.
     #[error("terminal evidence is contradictory: {action:?}: {conflicts:?}")]
     EvidenceIntegrityConflict {
@@ -680,30 +678,27 @@ where
 /// immutable descriptor, validates its arguments, and constructs the opaque
 /// request consumed by [`BackendRouter`]. Authority and execution mechanisms
 /// remain external adapters.
-pub struct Kernel<A, F, E, S, R> {
+pub struct Kernel<A, F, E, ES> {
     runtime: RuntimeIdentity,
     registry: CapabilityRegistry,
     router: BackendRouter<A, F, E>,
-    action_store: S,
-    receipt_store: R,
+    effect_store: ES,
 }
 
-impl<A, F, E, S, R> Kernel<A, F, E, S, R> {
+impl<A, F, E, ES> Kernel<A, F, E, ES> {
     /// Construct a kernel from a trusted runtime identity, immutable registry,
     /// and external adapter router.
     pub fn new(
         runtime: RuntimeIdentity,
         registry: CapabilityRegistry,
         router: BackendRouter<A, F, E>,
-        action_store: S,
-        receipt_store: R,
+        effect_store: ES,
     ) -> Self {
         Self {
             runtime,
             registry,
             router,
-            action_store,
-            receipt_store,
+            effect_store,
         }
     }
 
@@ -763,16 +758,15 @@ impl<A, F, E, S, R> Kernel<A, F, E, S, R> {
     }
 }
 
-impl<A, F, E, S, R> Kernel<A, F, E, S, R>
+impl<A, F, E, ES> Kernel<A, F, E, ES>
 where
     A: AuthorityProvider,
     <A as GrantVerifier>::Error: std::fmt::Display,
     F: ExecutionBackend,
     E: ExecutionBackend + ReconciliationProvider,
-    S: ActionStore,
-    S::Error: std::fmt::Display,
-    R: ReceiptStore,
-    R::Error: std::fmt::Display,
+    ES: DurableEffectStore,
+    <ES as ActionStore>::Error: std::fmt::Display,
+    <ES as EffectStore>::Error: std::fmt::Display,
 {
     /// Begin an admitted capability invocation through the secure kernel.
     ///
@@ -800,7 +794,7 @@ where
     /// worker did not cross the provider boundary.
     pub fn recover(&self, action_id: &str) -> Result<RecoveryDecision, KernelError> {
         let action = self
-            .action_store
+            .effect_store
             .load_action(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
             .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
@@ -862,9 +856,9 @@ where
                 ));
             }
         };
-        let conflicts = self
-            .receipt_store
-            .load_conflicts(action_id)
+        let snapshot = self
+            .effect_store
+            .evidence_snapshot(action_id)
             .map_err(|error| {
                 self.state_recovery_required(
                     &action.preparation,
@@ -873,6 +867,7 @@ where
                     error.to_string(),
                 )
             })?;
+        let conflicts = snapshot.conflicts;
         if !conflicts.is_empty() {
             self.release_lease(&action, action.state, &lease)?;
             return Ok(RecoveryDecision::ContradictoryEvidence {
@@ -886,14 +881,7 @@ where
                 cause: "immutable receipt conflict requires evidence repair".into(),
             });
         }
-        let receipt = self.receipt_store.load(action_id).map_err(|error| {
-            self.state_recovery_required(
-                &action.preparation,
-                action.state,
-                ExecutionState::Unknown,
-                error.to_string(),
-            )
-        })?;
+        let receipt = snapshot.receipt;
         if let Some(receipt) = receipt {
             if !matches!(
                 receipt.final_state,
@@ -912,21 +900,16 @@ where
                     cause: "persisted terminal receipt does not bind to the action".into(),
                 });
             }
-            self.finalize_action_from_evidence(
-                &action.preparation,
-                action.state,
-                &lease,
-                &TerminalEvidence::Receipt(receipt.identity()),
-            )?;
-            let status = self.action_status_with_state(
-                &action.preparation,
-                receipt.final_state,
-                Some(receipt.clone()),
-            );
-            return Ok(match receipt.final_state {
-                ExecutionState::Committed => RecoveryDecision::RecoverCommitted(status),
-                ExecutionState::Failed => RecoveryDecision::RecoverFailed(status),
-                _ => unreachable!("terminal receipt states are checked above"),
+            self.release_lease(&action, action.state, &lease)?;
+            return Ok(RecoveryDecision::ContradictoryEvidence {
+                action: self.action_status_with_next_action(
+                    &action.preparation,
+                    action.state,
+                    ActionNextStep::RepairEvidence,
+                    Some(receipt),
+                ),
+                conflicts: Vec::new(),
+                cause: "non-terminal action has primary terminal evidence".into(),
             });
         }
 
@@ -982,7 +965,7 @@ where
         continuation: ApprovalContinuation,
     ) -> Result<InvocationOutcome, KernelError> {
         let action = self
-            .action_store
+            .effect_store
             .load_action(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
             .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
@@ -1009,7 +992,7 @@ where
     /// Reconcile one external action already recorded as `UNKNOWN`.
     pub fn reconcile(&self, action_id: &str) -> Result<ReconciliationResult, KernelError> {
         let action = self
-            .action_store
+            .effect_store
             .load_action(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?;
         let action = action.ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
@@ -1034,84 +1017,50 @@ where
             }
         };
 
-        // Receipt and conflict stores are separate adapter boundaries. Re-read
-        // both only after fenced ownership is acquired so late evidence cannot
-        // be ignored immediately before provider reconciliation.
-        let leased_action = self
-            .action_store
-            .load_action(action_id)
-            .map_err(|error| KernelError::ActionStore(error.to_string()))?
-            .ok_or_else(|| KernelError::ActionNotUnknown(action_id.to_owned()))?;
-        if leased_action.state != ExecutionState::Unknown
-            || leased_action.lease.as_ref() != Some(&lease)
-        {
-            return Err(self.state_recovery_required(
-                &action.preparation,
-                ExecutionState::Unknown,
-                ExecutionState::Unknown,
-                "reconciliation lease was not durably observed".into(),
-            ));
-        }
-        let conflicts = self.load_receipt_conflicts(&leased_action)?;
-        if !conflicts.is_empty() {
-            self.release_lease(&leased_action, ExecutionState::Unknown, &lease)?;
-            return Err(KernelError::EvidenceIntegrityConflict {
-                action: Box::new(self.action_status_with_next_action(
-                    &leased_action.preparation,
-                    ExecutionState::Unknown,
-                    ActionNextStep::RepairEvidence,
-                    None,
-                )),
-                conflicts,
-            });
-        }
-        if let Some(receipt) = self
-            .receipt_store
-            .load(action_id)
-            .map_err(|error| KernelError::ReceiptStore(error.to_string()))?
-        {
-            if !matches!(
-                receipt.final_state,
-                ExecutionState::Committed | ExecutionState::Failed
-            ) || !self.receipt_matches_action(&receipt, &leased_action.preparation)
-            {
-                self.release_lease(&leased_action, ExecutionState::Unknown, &lease)?;
-                return Err(KernelError::EvidenceIntegrityFailure {
-                    action: Box::new(self.action_status_with_next_action(
-                        &leased_action.preparation,
+        let start =
+            match self.effect_store.begin_reconciliation(action_id, &lease) {
+                Ok(start) => start,
+                Err(error) => {
+                    let snapshot = self.effect_store.evidence_snapshot(action_id).map_err(
+                        |snapshot_error| KernelError::EffectStore(snapshot_error.to_string()),
+                    )?;
+                    if snapshot.action.state == ExecutionState::Unknown
+                        && snapshot.action.lease.as_ref() == Some(&lease)
+                    {
+                        self.release_lease(&snapshot.action, ExecutionState::Unknown, &lease)?;
+                    }
+                    if !snapshot.conflicts.is_empty() {
+                        return Err(KernelError::EvidenceIntegrityConflict {
+                            action: Box::new(self.action_status_with_next_action(
+                                &snapshot.action.preparation,
+                                snapshot.action.state,
+                                ActionNextStep::RepairEvidence,
+                                snapshot.receipt,
+                            )),
+                            conflicts: snapshot.conflicts,
+                        });
+                    }
+                    if let Some(receipt) = snapshot.receipt {
+                        return Err(KernelError::EvidenceIntegrityFailure {
+                            action: Box::new(self.action_status_with_next_action(
+                                &snapshot.action.preparation,
+                                snapshot.action.state,
+                                ActionNextStep::RepairEvidence,
+                                Some(receipt),
+                            )),
+                            cause: "non-terminal action has primary terminal evidence".into(),
+                        });
+                    }
+                    return Err(self.state_recovery_required(
+                        &action.preparation,
                         ExecutionState::Unknown,
-                        ActionNextStep::RepairEvidence,
-                        None,
-                    )),
-                    cause: "persisted terminal receipt does not bind to the action".into(),
-                });
-            }
-            self.finalize_action_from_evidence(
-                &leased_action.preparation,
-                ExecutionState::Unknown,
-                &lease,
-                &TerminalEvidence::Receipt(receipt.identity()),
-            )?;
-            return Ok(ReconciliationResult {
-                state: receipt.final_state,
-                receipt: Some(receipt),
-            });
-        }
-
-        self.transition_action_with_lease(
-            &leased_action,
-            ExecutionState::Unknown,
-            &lease,
-            ExecutionState::Reconciling,
-        )
-        .map_err(|error| {
-            self.state_recovery_required(
-                &action.preparation,
-                ExecutionState::Unknown,
-                ExecutionState::Unknown,
-                error.to_string(),
-            )
-        })?;
+                        ExecutionState::Reconciling,
+                        error.to_string(),
+                    ));
+                }
+            };
+        let leased_action = start.action;
+        let evidence_revision = start.evidence.revision;
         let lease = self.renew_reconciliation_lease(
             &leased_action,
             &lease,
@@ -1124,7 +1073,12 @@ where
         }) {
             Ok(result) => result,
             Err(error) => {
-                return Err(self.reconciliation_unknown(&leased_action, &lease, error.to_string()));
+                return Err(self.reconciliation_unknown(
+                    &leased_action,
+                    &lease,
+                    evidence_revision,
+                    error.to_string(),
+                ));
             }
         };
         if !matches!(
@@ -1134,6 +1088,7 @@ where
             return Err(self.reconciliation_unknown(
                 &leased_action,
                 &lease,
+                evidence_revision,
                 format!("reconciliation returned invalid state: {:?}", result.state),
             ));
         }
@@ -1145,6 +1100,7 @@ where
             return Err(self.reconciliation_unknown(
                 &leased_action,
                 &lease,
+                evidence_revision,
                 "reconciliation terminal result requires authoritative evidence".into(),
             ));
         }
@@ -1156,40 +1112,45 @@ where
                 return Err(self.reconciliation_unknown(
                     &leased_action,
                     &lease,
+                    evidence_revision,
                     "reconciled receipt does not bind to the original action".into(),
                 ));
             }
-            if let Err(error) = self.finalize_receipt(receipt) {
-                return Err(match error {
-                    KernelError::ReceiptFinalizationConflict(conflict) => {
-                        self.evidence_conflict_after_reconciling(&leased_action, &lease, *conflict)
-                    }
-                    other => self.reconciliation_unknown(&leased_action, &lease, other.to_string()),
-                });
+            match self
+                .effect_store
+                .finalize_reconciliation_receipt(action_id, &lease, evidence_revision, receipt)
+                .map_err(|error| {
+                    self.state_recovery_required(
+                        &leased_action.preparation,
+                        ExecutionState::Reconciling,
+                        receipt.final_state,
+                        error.to_string(),
+                    )
+                })? {
+                EffectFinalizeResult::Finalized(_) | EffectFinalizeResult::AlreadyFinalized(_) => {}
+                EffectFinalizeResult::FinalizationConflict(conflict)
+                | EffectFinalizeResult::ConflictAlreadyRecorded(conflict) => {
+                    return Err(self.evidence_conflict_after_reconciling(
+                        &leased_action,
+                        &lease,
+                        evidence_revision,
+                        conflict,
+                    ));
+                }
             }
-            self.finalize_action_from_evidence(
-                &leased_action.preparation,
-                ExecutionState::Reconciling,
-                &lease,
-                &TerminalEvidence::Receipt(receipt.identity()),
-            )?;
             return Ok(result);
         }
         debug_assert_eq!(result.state, ExecutionState::Unknown);
-        self.transition_action_with_lease(
-            &leased_action,
-            ExecutionState::Reconciling,
-            &lease,
-            ExecutionState::Unknown,
-        )
-        .map_err(|error| {
-            self.state_recovery_required(
-                &action.preparation,
-                ExecutionState::Reconciling,
-                ExecutionState::Unknown,
-                error.to_string(),
-            )
-        })?;
+        self.effect_store
+            .complete_reconciliation_unknown(action_id, &lease, evidence_revision)
+            .map_err(|error| {
+                self.state_recovery_required(
+                    &action.preparation,
+                    ExecutionState::Reconciling,
+                    ExecutionState::Unknown,
+                    error.to_string(),
+                )
+            })?;
         Ok(result)
     }
 
@@ -1249,7 +1210,7 @@ where
                 };
                 let mut state = current_state;
                 if state == ExecutionState::Proposed {
-                    self.action_store
+                    self.effect_store
                         .authorize_action(
                             &identity.action_id,
                             ExecutionState::Proposed,
@@ -1265,7 +1226,7 @@ where
                         })?;
                     state = ExecutionState::Authorized;
                 } else if matches!(state, ExecutionState::Authorized | ExecutionState::Prepared) {
-                    self.action_store
+                    self.effect_store
                         .refresh_authorization(
                             &identity.action_id,
                             state,
@@ -1495,7 +1456,7 @@ where
         request: &BoundExecutionRequest,
     ) -> Result<Option<ActionRecord>, KernelError> {
         match self
-            .action_store
+            .effect_store
             .claim_action(&request.action_preparation())
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
         {
@@ -1609,19 +1570,24 @@ where
                 "effect receipt does not bind to the execution identity".into(),
             ));
         }
-        if let Err(error) = self.finalize_receipt(receipt) {
-            return Err(match error {
-                KernelError::ReceiptFinalizationConflict(conflict) => {
-                    self.evidence_conflict_after_dispatching(request, lease, *conflict)
-                }
-                other => self.unknown_after_dispatching(request, lease, other.to_string()),
-            });
-        }
-        self.finalize_from_dispatching(
-            request,
+        let finalization = self.effect_store.finalize_terminal_receipt(
+            &request.backend_request().identity.action_id,
+            ExecutionState::Dispatching,
             lease,
-            &TerminalEvidence::Receipt(receipt.identity()),
-        )?;
+            receipt,
+        );
+        match finalization {
+            Err(error) => {
+                return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
+            }
+            Ok(result) => match result {
+                EffectFinalizeResult::Finalized(_) | EffectFinalizeResult::AlreadyFinalized(_) => {}
+                EffectFinalizeResult::FinalizationConflict(conflict)
+                | EffectFinalizeResult::ConflictAlreadyRecorded(conflict) => {
+                    return Err(self.evidence_conflict_after_dispatching(request, lease, conflict));
+                }
+            },
+        }
         Ok(result)
     }
 
@@ -1634,29 +1600,13 @@ where
         if !is_valid_generic_transition(expected, next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
-        self.action_store
+        self.effect_store
             .transition(
                 &request.backend_request().identity.action_id,
                 Some(expected),
                 next,
             )
             .map_err(|error| KernelError::ActionStore(error.to_string()))
-    }
-
-    fn finalize_receipt(&self, receipt: &ReceiptRecord) -> Result<ReceiptRecord, KernelError> {
-        match self
-            .receipt_store
-            .finalize(receipt)
-            .map_err(|error| KernelError::ReceiptStore(error.to_string()))?
-        {
-            FinalizeResult::Finalized(receipt) | FinalizeResult::AlreadyFinalized(receipt) => {
-                Ok(receipt)
-            }
-            FinalizeResult::FinalizationConflict(conflict)
-            | FinalizeResult::ConflictAlreadyRecorded(conflict) => {
-                Err(KernelError::ReceiptFinalizationConflict(Box::new(conflict)))
-            }
-        }
     }
 
     fn transition_from_dispatching(
@@ -1705,7 +1655,7 @@ where
         if !binds_action || !is_valid_evidence_transition(expected, next, evidence) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
-        self.action_store
+        self.effect_store
             .finalize_from_evidence(&action.action_id, expected, lease, evidence)
             .map_err(|error| {
                 self.state_recovery_required(
@@ -1727,7 +1677,7 @@ where
         if !is_valid_leased_transition(expected, next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
-        self.action_store
+        self.effect_store
             .transition_with_lease(
                 &request.backend_request().identity.action_id,
                 expected,
@@ -1747,7 +1697,7 @@ where
         if !is_valid_leased_transition(expected, next) {
             return Err(KernelError::InvalidStateTransition { expected, next });
         }
-        self.action_store
+        self.effect_store
             .transition_with_lease(&action.preparation.action_id, expected, lease, next)
             .map_err(|error| KernelError::ActionStore(error.to_string()))
     }
@@ -1775,13 +1725,13 @@ where
         &self,
         action: &ActionRecord,
         lease: &ActionLease,
+        expected_evidence_revision: u64,
         cause: String,
     ) -> KernelError {
-        match self.transition_action_with_lease(
-            action,
-            ExecutionState::Reconciling,
+        match self.effect_store.complete_reconciliation_unknown(
+            &action.preparation.action_id,
             lease,
-            ExecutionState::Unknown,
+            expected_evidence_revision,
         ) {
             Ok(()) => KernelError::EffectUnknown {
                 action: Box::new(self.action_status_with_state(
@@ -1824,13 +1774,13 @@ where
         &self,
         action: &ActionRecord,
         lease: &ActionLease,
+        expected_evidence_revision: u64,
         conflict: ReceiptConflict,
     ) -> KernelError {
-        match self.transition_action_with_lease(
-            action,
-            ExecutionState::Reconciling,
+        match self.effect_store.complete_reconciliation_unknown(
+            &action.preparation.action_id,
             lease,
-            ExecutionState::Unknown,
+            expected_evidence_revision,
         ) {
             Ok(()) => KernelError::EvidenceIntegrityConflict {
                 action: Box::new(self.action_status_with_next_action(
@@ -1857,7 +1807,7 @@ where
         intended_state: ExecutionState,
         cause: String,
     ) -> KernelError {
-        let status = match self.action_store.load_action(&action.action_id) {
+        let status = match self.effect_store.load_action(&action.action_id) {
             Ok(Some(current)) => {
                 self.action_status_recovery(&current.preparation, current.state, intended_state)
             }
@@ -1897,7 +1847,7 @@ where
     ) -> Result<(LeaseConfiguration, u64), KernelError> {
         const LEASE_MARGIN_MS: u64 = 1_000;
         let configuration = self
-            .action_store
+            .effect_store
             .lease_configuration()
             .map_err(|error| KernelError::ActionStore(error.to_string()))?;
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1926,7 +1876,7 @@ where
             return Ok(lease.clone());
         }
         match self
-            .action_store
+            .effect_store
             .renew_lease(
                 &request.backend_request().identity.action_id,
                 ExecutionState::Dispatching,
@@ -1960,7 +1910,7 @@ where
             return Ok(lease.clone());
         }
         match self
-            .action_store
+            .effect_store
             .renew_lease(
                 &action.preparation.action_id,
                 ExecutionState::Reconciling,
@@ -1993,7 +1943,7 @@ where
     ) -> Result<Option<ActionLease>, KernelError> {
         let owner = format!("{}:{purpose}:{}", self.runtime.runtime_id, Uuid::now_v7());
         match self
-            .action_store
+            .effect_store
             .claim_lease(
                 &action.preparation.action_id,
                 expected,
@@ -2013,7 +1963,7 @@ where
     }
 
     fn lease_status(&self, action_id: &str) -> Result<LeaseStatus, KernelError> {
-        self.action_store
+        self.effect_store
             .lease_status(action_id)
             .map_err(|error| KernelError::ActionStore(error.to_string()))
     }
@@ -2025,7 +1975,7 @@ where
         lease: &ActionLease,
     ) -> Result<(), KernelError> {
         match self
-            .action_store
+            .effect_store
             .release_lease(&action.preparation.action_id, expected, lease)
             .map_err(|error| KernelError::ActionStore(error.to_string()))?
         {
@@ -2044,8 +1994,8 @@ where
         action: &ActionRecord,
     ) -> Result<RecoveryDecision, KernelError> {
         let receipt = self
-            .receipt_store
-            .load(&action.preparation.action_id)
+            .effect_store
+            .evidence_snapshot(&action.preparation.action_id)
             .map_err(|error| {
                 self.state_recovery_required(
                     &action.preparation,
@@ -2053,7 +2003,8 @@ where
                     action.state,
                     error.to_string(),
                 )
-            })?;
+            })?
+            .receipt;
         match (action.state, &action.terminal_evidence, receipt) {
             (
                 ExecutionState::Committed,
@@ -2099,8 +2050,8 @@ where
         &self,
         action: &ActionRecord,
     ) -> Result<Vec<ReceiptConflict>, KernelError> {
-        self.receipt_store
-            .load_conflicts(&action.preparation.action_id)
+        self.effect_store
+            .evidence_snapshot(&action.preparation.action_id)
             .map_err(|error| {
                 self.state_recovery_required(
                     &action.preparation,
@@ -2109,6 +2060,7 @@ where
                     error.to_string(),
                 )
             })
+            .map(|snapshot| snapshot.conflicts)
     }
 
     fn action_status(&self, action: &ActionRecord, receipt: Option<ReceiptRecord>) -> ActionStatus {
@@ -2344,7 +2296,7 @@ mod tests {
     use nemo_relay_authority::unstable::AuthorityRequest;
     use nemo_relay_executor::unstable::{EffectExecutionError, OutcomeCertainty};
     use nemo_relay_ledger::unstable::{
-        ActionRecord, InMemoryActionStore, InMemoryReceiptStore, ManualStoreClock,
+        ActionRecord, FinalizeResult, ManualStoreClock, ReceiptStore,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -2473,6 +2425,13 @@ mod tests {
                 .records
                 .lock()
                 .map_err(|_| "test action record lock poisoned".to_owned())?;
+            if let Some(existing) = records.get(&action.action_id).cloned() {
+                return Ok(if existing.preparation == *action {
+                    PrepareActionResult::ExistingSameAction(Box::new(existing))
+                } else {
+                    PrepareActionResult::ActionIdConflict(Box::new(existing))
+                });
+            }
             if let Some(existing) = records
                 .values()
                 .find(|record| record.preparation.idempotency_key == action.idempotency_key)
@@ -2689,7 +2648,10 @@ mod tests {
                 return Ok(LeaseAcquireResult::HeldByOther(lease.clone()));
             }
             let reclaimed = record.lease.is_some();
-            let generation = record.lease_generation.saturating_add(1);
+            let generation = record
+                .lease_generation
+                .checked_add(1)
+                .ok_or_else(|| "fencing generation exhausted".to_owned())?;
             let lease = ActionLease {
                 owner_id: owner_id.to_owned(),
                 generation,
@@ -2953,6 +2915,297 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    struct TestEffectStore {
+        actions: TestActionStore,
+        receipts: TestReceiptStore,
+        evidence_revisions: Arc<Mutex<HashMap<String, u64>>>,
+    }
+
+    impl ActionStore for TestEffectStore {
+        type Error = String;
+
+        fn claim_action(
+            &self,
+            action: &ActionPreparation,
+        ) -> Result<PrepareActionResult, Self::Error> {
+            self.actions.claim_action(action)
+        }
+
+        fn load_action(&self, action_id: &str) -> Result<Option<ActionRecord>, Self::Error> {
+            self.actions.load_action(action_id)
+        }
+
+        fn authorize_action(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            self.actions
+                .authorize_action(action_id, expected, grant_digest, approval_reference)
+        }
+
+        fn refresh_authorization(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            grant_digest: &str,
+            approval_reference: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            self.actions.refresh_authorization(
+                action_id,
+                expected,
+                grant_digest,
+                approval_reference,
+            )
+        }
+
+        fn lease_configuration(&self) -> Result<LeaseConfiguration, Self::Error> {
+            self.actions.lease_configuration()
+        }
+
+        fn lease_status(&self, action_id: &str) -> Result<LeaseStatus, Self::Error> {
+            self.actions.lease_status(action_id)
+        }
+
+        fn claim_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            owner_id: &str,
+            requested_duration_ms: Option<u64>,
+        ) -> Result<LeaseAcquireResult, Self::Error> {
+            self.actions
+                .claim_lease(action_id, expected, owner_id, requested_duration_ms)
+        }
+
+        fn renew_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            requested_duration_ms: Option<u64>,
+        ) -> Result<LeaseRenewResult, Self::Error> {
+            self.actions
+                .renew_lease(action_id, expected, lease, requested_duration_ms)
+        }
+
+        fn release_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+        ) -> Result<LeaseReleaseResult, Self::Error> {
+            self.actions.release_lease(action_id, expected, lease)
+        }
+
+        fn transition_with_lease(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error> {
+            self.actions
+                .transition_with_lease(action_id, expected, lease, next)
+        }
+
+        fn finalize_from_evidence(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            evidence: &TerminalEvidence,
+        ) -> Result<(), Self::Error> {
+            self.actions
+                .finalize_from_evidence(action_id, expected, lease, evidence)
+        }
+
+        fn transition(
+            &self,
+            action_id: &str,
+            expected: Option<ExecutionState>,
+            next: ExecutionState,
+        ) -> Result<(), Self::Error> {
+            self.actions.transition(action_id, expected, next)
+        }
+    }
+
+    impl EffectStore for TestEffectStore {
+        type Error = String;
+
+        fn evidence_snapshot(
+            &self,
+            action_id: &str,
+        ) -> Result<nemo_relay_ledger::unstable::EvidenceSnapshot, Self::Error> {
+            Ok(nemo_relay_ledger::unstable::EvidenceSnapshot {
+                action: self
+                    .actions
+                    .load_action(action_id)?
+                    .ok_or_else(|| "unknown action evidence snapshot".to_owned())?,
+                revision: self
+                    .evidence_revisions
+                    .lock()
+                    .map_err(|_| "test evidence revision lock poisoned".to_owned())?
+                    .get(action_id)
+                    .copied()
+                    .unwrap_or_default(),
+                receipt: self.receipts.load(action_id)?,
+                conflicts: self.receipts.load_conflicts(action_id)?,
+            })
+        }
+
+        fn observe_terminal_evidence(
+            &self,
+            action_id: &str,
+            receipt: &ReceiptRecord,
+        ) -> Result<nemo_relay_ledger::unstable::EvidenceObservationResult, Self::Error> {
+            if self.receipts.load(action_id)?.is_none() {
+                return Err("primary terminal evidence requires fenced finalization".into());
+            }
+            match self.receipts.finalize(receipt)? {
+                FinalizeResult::Finalized(_) => {
+                    Err("observation unexpectedly established primary evidence".into())
+                }
+                FinalizeResult::AlreadyFinalized(_) => {
+                    Ok(nemo_relay_ledger::unstable::EvidenceObservationResult::AlreadyObserved)
+                }
+                FinalizeResult::FinalizationConflict(conflict) => {
+                    *self
+                        .evidence_revisions
+                        .lock()
+                        .map_err(|_| "test evidence revision lock poisoned".to_owned())?
+                        .entry(action_id.to_owned())
+                        .or_default() += 1;
+                    Ok(
+                        nemo_relay_ledger::unstable::EvidenceObservationResult::ConflictRecorded(
+                            conflict,
+                        ),
+                    )
+                }
+                FinalizeResult::ConflictAlreadyRecorded(conflict) => Ok(
+                    nemo_relay_ledger::unstable::EvidenceObservationResult::ConflictAlreadyRecorded(
+                        conflict,
+                    ),
+                ),
+            }
+        }
+
+        fn begin_reconciliation(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+        ) -> Result<nemo_relay_ledger::unstable::ReconciliationStart, Self::Error> {
+            let snapshot = self.evidence_snapshot(action_id)?;
+            if snapshot.receipt.is_some() || !snapshot.conflicts.is_empty() {
+                return Err("reconciliation cannot start with terminal evidence".into());
+            }
+            self.actions.transition_with_lease(
+                action_id,
+                ExecutionState::Unknown,
+                lease,
+                ExecutionState::Reconciling,
+            )?;
+            let action = self
+                .actions
+                .load_action(action_id)?
+                .ok_or_else(|| "unknown reconciliation action".to_owned())?;
+            Ok(nemo_relay_ledger::unstable::ReconciliationStart {
+                action: action.clone(),
+                evidence: nemo_relay_ledger::unstable::EvidenceSnapshot { action, ..snapshot },
+            })
+        }
+
+        fn finalize_reconciliation_receipt(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+            expected_evidence_revision: u64,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error> {
+            let actual = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| "test evidence revision lock poisoned".to_owned())?
+                .get(action_id)
+                .copied()
+                .unwrap_or_default();
+            if actual != expected_evidence_revision {
+                return Err("reconciliation evidence changed".into());
+            }
+            self.finalize_terminal_receipt(action_id, ExecutionState::Reconciling, lease, receipt)
+        }
+
+        fn complete_reconciliation_unknown(
+            &self,
+            action_id: &str,
+            lease: &ActionLease,
+            expected_evidence_revision: u64,
+        ) -> Result<(), Self::Error> {
+            let actual = self
+                .evidence_revisions
+                .lock()
+                .map_err(|_| "test evidence revision lock poisoned".to_owned())?
+                .get(action_id)
+                .copied()
+                .unwrap_or_default();
+            if actual != expected_evidence_revision {
+                return Err("reconciliation evidence changed".into());
+            }
+            self.actions.transition_with_lease(
+                action_id,
+                ExecutionState::Reconciling,
+                lease,
+                ExecutionState::Unknown,
+            )
+        }
+
+        fn finalize_terminal_receipt(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+        ) -> Result<EffectFinalizeResult, Self::Error> {
+            if let Some(action) = self.actions.load_action(action_id)?
+                && action.state == receipt.final_state
+                && action.terminal_evidence == Some(TerminalEvidence::Receipt(receipt.identity()))
+                && self
+                    .receipts
+                    .load(action_id)?
+                    .is_some_and(|existing| existing.identity() == receipt.identity())
+            {
+                return Ok(EffectFinalizeResult::AlreadyFinalized(receipt.clone()));
+            }
+            let finalized = self.receipts.finalize(receipt)?;
+            match finalized {
+                FinalizeResult::Finalized(stored) | FinalizeResult::AlreadyFinalized(stored) => {
+                    self.actions.finalize_from_evidence(
+                        action_id,
+                        expected,
+                        lease,
+                        &TerminalEvidence::Receipt(stored.identity()),
+                    )?;
+                    *self
+                        .evidence_revisions
+                        .lock()
+                        .map_err(|_| "test evidence revision lock poisoned".to_owned())?
+                        .entry(action_id.to_owned())
+                        .or_default() += 1;
+                    Ok(EffectFinalizeResult::Finalized(stored))
+                }
+                FinalizeResult::FinalizationConflict(conflict) => {
+                    Ok(EffectFinalizeResult::FinalizationConflict(conflict))
+                }
+                FinalizeResult::ConflictAlreadyRecorded(conflict) => {
+                    Ok(EffectFinalizeResult::ConflictAlreadyRecorded(conflict))
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
     struct TestBackend {
         calls: Arc<AtomicUsize>,
         reconciliation_calls: Arc<AtomicUsize>,
@@ -3161,8 +3414,7 @@ mod tests {
         }
     }
 
-    type TestKernel =
-        Kernel<TestAuthority, TestBackend, TestBackend, TestActionStore, TestReceiptStore>;
+    type TestKernel = Kernel<TestAuthority, TestBackend, TestBackend, TestEffectStore>;
     type TestKernelParts = (
         TestKernel,
         TestAuthority,
@@ -3181,12 +3433,16 @@ mod tests {
         let effect = TestBackend::default();
         let actions = TestActionStore::default();
         let receipts = TestReceiptStore::default();
+        let effects = TestEffectStore {
+            actions: actions.clone(),
+            receipts: receipts.clone(),
+            ..TestEffectStore::default()
+        };
         let kernel = Kernel::new(
             runtime(),
             registry(class),
             BackendRouter::new(authority.clone(), function.clone(), effect.clone()),
-            actions.clone(),
-            receipts.clone(),
+            effects,
         );
         (kernel, authority, function, effect, actions, receipts)
     }
@@ -3228,30 +3484,28 @@ mod tests {
     }
 
     #[test]
-    fn kernel_runs_against_the_reference_effect_stores_as_one_contract() {
+    fn kernel_runs_against_the_reference_effect_store_as_one_contract() {
         let authority = TestAuthority {
             decision: Decision::Allow,
             calls: Arc::new(AtomicUsize::new(0)),
         };
         let effect = TestBackend::default();
-        let actions = InMemoryActionStore::with_clock(
+        let effects = nemo_relay_ledger::unstable::InMemoryEffectStore::with_clock(
             ManualStoreClock::new(1_000),
             LeaseConfiguration::default(),
         );
-        let receipts = InMemoryReceiptStore::default();
         let kernel = Kernel::new(
             runtime(),
             registry(ExecutionClass::Mutation),
             BackendRouter::new(authority, TestBackend::default(), effect.clone()),
-            actions.clone(),
-            receipts.clone(),
+            effects.clone(),
         );
         assert!(matches!(
             kernel.begin(&invocation_with_request_id("reference-store-kernel")),
             Ok(InvocationOutcome::Completed(_))
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
-        let action = actions
+        let action = effects
             .load_action(&effect.requests.lock().unwrap()[0].identity.action_id)
             .unwrap()
             .expect("reference action store retains the claimed action");
@@ -3261,14 +3515,14 @@ mod tests {
             Some(TerminalEvidence::Receipt(_))
         ));
         assert!(
-            receipts
-                .load(&action.preparation.action_id)
+            effects
+                .receipt(&action.preparation.action_id)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            receipts
-                .load_conflicts(&action.preparation.action_id)
+            effects
+                .conflicts(&action.preparation.action_id)
                 .unwrap()
                 .is_empty()
         );
@@ -3294,8 +3548,11 @@ mod tests {
             runtime(),
             registry(ExecutionClass::Mutation),
             BackendRouter::new(authority, TestBackend::default(), second_effect.clone()),
-            actions.clone(),
-            receipts,
+            TestEffectStore {
+                actions: actions.clone(),
+                receipts,
+                ..TestEffectStore::default()
+            },
         );
         let existing = match restarted.begin(&request) {
             Ok(InvocationOutcome::ExistingAction(existing)) => existing,
@@ -3487,8 +3744,11 @@ mod tests {
                 TestBackend::default(),
                 resumed_effect.clone(),
             ),
-            actions,
-            receipts,
+            TestEffectStore {
+                actions,
+                receipts,
+                ..TestEffectStore::default()
+            },
         );
         assert!(matches!(
             resumed.resume_approval(
@@ -3665,8 +3925,11 @@ mod tests {
                 TestBackend::default(),
                 resumed_effect.clone(),
             ),
-            actions,
-            receipts,
+            TestEffectStore {
+                actions,
+                receipts,
+                ..TestEffectStore::default()
+            },
         );
         let existing = match resumed.begin(&request) {
             Ok(InvocationOutcome::ExistingAction(existing)) => existing,
@@ -3879,7 +4142,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_terminal_evidence_repairs_unknown_before_provider_reconciliation() {
+    fn unfenced_primary_evidence_is_rejected_before_provider_reconciliation() {
         let (kernel, _authority, _function, effect, _actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
         *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
@@ -3906,10 +4169,10 @@ mod tests {
         receipts
             .finalize(&receipt(&request))
             .expect("late evidence should persist");
-        let result = kernel
-            .reconcile(&action_id)
-            .expect("local evidence should repair the action");
-        assert_eq!(result.state, ExecutionState::Committed);
+        assert!(matches!(
+            kernel.reconcile(&action_id),
+            Err(KernelError::EvidenceIntegrityFailure { .. })
+        ));
         assert_eq!(
             effect.reconciliation_calls.load(Ordering::SeqCst),
             0,
@@ -3918,7 +4181,7 @@ mod tests {
     }
 
     #[test]
-    fn late_receipt_after_reconciliation_lease_blocks_provider_reconciliation() {
+    fn late_unfenced_receipt_after_reconciliation_lease_fails_closed() {
         let (kernel, _authority, _function, effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
         *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
@@ -3955,11 +4218,12 @@ mod tests {
             .expect("late evidence should persist while the reconciliation lease is held");
         barrier.wait();
 
-        let result = reconciliation
-            .join()
-            .expect("reconciliation worker should not panic")
-            .expect("late evidence should repair the action");
-        assert_eq!(result.state, ExecutionState::Committed);
+        assert!(matches!(
+            reconciliation
+                .join()
+                .expect("reconciliation worker should not panic"),
+            Err(KernelError::EvidenceIntegrityFailure { .. })
+        ));
         assert_eq!(
             effect.reconciliation_calls.load(Ordering::SeqCst),
             0,
@@ -4095,7 +4359,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_repairs_stale_dispatching_state_from_persisted_receipt() {
+    fn recovery_rejects_split_receipt_and_dispatching_state() {
         let (kernel, _authority, _function, _effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
         assert!(matches!(
@@ -4124,13 +4388,11 @@ mod tests {
             .state = ExecutionState::Dispatching;
         let decision = kernel
             .recover(&action_id)
-            .expect("receipt should repair state");
-        let status = match decision {
-            RecoveryDecision::RecoverCommitted(status) => status,
-            other => panic!("expected committed recovery, got {other:?}"),
-        };
-        assert_eq!(status.state, ExecutionState::Committed);
-        assert!(status.receipt.is_some());
+            .expect("recovery should fail closed");
+        assert!(matches!(
+            decision,
+            RecoveryDecision::ContradictoryEvidence { .. }
+        ));
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
     }
 
@@ -4181,7 +4443,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_repairs_unknown_from_late_bound_terminal_evidence_without_reconciliation() {
+    fn recovery_rejects_unknown_with_unfenced_primary_evidence() {
         let (kernel, _authority, _function, effect, _actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
         *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
@@ -4200,18 +4462,14 @@ mod tests {
         let request = effect.requests.lock().unwrap().last().cloned().unwrap();
         receipts.finalize(&receipt(&request)).unwrap();
 
-        let recovered = kernel.recover(&action_id).unwrap();
-        match recovered {
-            RecoveryDecision::RecoverCommitted(status) => {
-                assert_eq!(status.state, ExecutionState::Committed);
-                assert!(status.receipt.is_some());
-            }
-            other => panic!("late committed evidence must repair locally: {other:?}"),
-        }
+        assert!(matches!(
+            kernel.recover(&action_id).unwrap(),
+            RecoveryDecision::ContradictoryEvidence { .. }
+        ));
     }
 
     #[test]
-    fn recovery_repairs_stale_reconciling_from_persisted_failure_evidence() {
+    fn recovery_rejects_reconciling_with_unfenced_primary_evidence() {
         let (kernel, _authority, _function, effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::Allow);
         *effect.effect_error.lock().unwrap() = Some(EffectExecutionError {
@@ -4245,14 +4503,10 @@ mod tests {
             .unwrap()
             .insert(action_id.clone(), ExecutionState::Reconciling);
 
-        let recovered = kernel.recover(&action_id).unwrap();
-        match recovered {
-            RecoveryDecision::RecoverFailed(status) => {
-                assert_eq!(status.state, ExecutionState::Failed);
-                assert_eq!(status.receipt, Some(failed));
-            }
-            other => panic!("late failed evidence must repair locally: {other:?}"),
-        }
+        assert!(matches!(
+            kernel.recover(&action_id).unwrap(),
+            RecoveryDecision::ContradictoryEvidence { .. }
+        ));
     }
 
     #[test]
@@ -4484,8 +4738,11 @@ mod tests {
                 TestBackend::default(),
                 second_effect.clone(),
             ),
-            actions,
-            receipts,
+            TestEffectStore {
+                actions,
+                receipts,
+                ..TestEffectStore::default()
+            },
         );
         assert!(matches!(
             second.begin(&request),

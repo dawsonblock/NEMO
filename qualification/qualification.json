@@ -65,20 +65,34 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "2f152ff6f82c7e3789cbcd071b3e608478ce2bdbde86742870aead377e25da3e",
-    "source_archive_sha256": "92e66c4b32557ad90841e53720543ff5a7955bc09dc8b935f12e5d48dcc5376d",
-    "release_archive_sha256": "92e66c4b32557ad90841e53720543ff5a7955bc09dc8b935f12e5d48dcc5376d",
+    "source_tree_sha256": "017a2fbd1e2234572dcc97a846389844eb94bd83a809c3e9a1962aa74acf6d96",
+    "source_archive_sha256": null,
+    "release_archive_sha256": null,
     "environment_sha256": "3df3c8bc5dac9ad45562ccecbe4b4d0890a491112251fa84fec0cf84b0ef58d5",
     "lockfiles": {
-      "Cargo.lock": "sha256:2be462e17c580021359a2f0032efcea2a487439e594ba9f1f653fd241e76d1a1",
+      "Cargo.lock": "sha256:df7d61c497e91eb2be39b2480e4a93fe1f07da437d0092be02b9a5c6a10e17d0",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
       "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "09cd1d1ee26a2f8cbc592b222f70d7332338ca62",
-      "tree": "628b3c8217f7999da9ca6bc002aff2582358512b",
-      "source_tree_sha256": "2f152ff6f82c7e3789cbcd071b3e608478ce2bdbde86742870aead377e25da3e",
-      "status": []
+      "commit": "0c9cfab81a452872a35ef07b3d67bfddbe41653d",
+      "tree": "42fa3c7bcc18327afcd67c346b995351fd2b05ff",
+      "source_tree_sha256": "017a2fbd1e2234572dcc97a846389844eb94bd83a809c3e9a1962aa74acf6d96",
+      "status": [
+        " M ATTRIBUTIONS-Rust.md",
+        " M Cargo.lock",
+        " M FORK_PROVENANCE.md",
+        " M README.md",
+        " M crates/core/src/kernel.rs",
+        " M crates/executor/src/lib.rs",
+        " M crates/ledger/Cargo.toml",
+        " M crates/ledger/src/conformance.rs",
+        " M crates/ledger/src/lib.rs",
+        " M docs/reference/hardening.mdx",
+        " M justfile",
+        "?? crates/ledger/migrations/",
+        "?? crates/ledger/src/postgres.rs"
+      ]
     }
   },
   "notes": [

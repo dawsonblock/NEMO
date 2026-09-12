@@ -78,7 +78,7 @@ downgrade the class, replace the identity, or redirect the route.
 | Class      | Runtime path                          | Typical examples                                      |
 | ---------- | ------------------------------------- | ----------------------------------------------------- |
 | `PURE`     | Function Hooks                        | deterministic transforms, hashing, local calculations |
-| `READ`     | Function Hooks or a safe read adapter | search, lookup, snapshot, provider reads              |
+| `READ`     | Function Hooks                        | search, lookup, snapshot, provider reads              |
 | `MUTATION` | Correct-Once → Effect Fabric          | file writes, issue creation, state changes            |
 | `CRITICAL` | Correct-Once approval → Effect Fabric | send, delete, publish, security-sensitive actions     |
 
@@ -102,17 +102,35 @@ capability entry point. A harness submits only a capability ID, arguments, and
 optional trace context. The kernel resolves the immutable registration,
 validates the schema, binds runtime identity and canonical argument digest, and
 creates an opaque request for its internal `BackendRouter`. Consequential
-actions are atomically prepared through the supplied `ActionStore` before
+actions are atomically claimed through the supplied `DurableEffectStore` before
 authority evaluation. The router selects Function Hooks for `PURE`/`READ` and
 requires a verified authority grant before dispatching `MUTATION`/`CRITICAL`
 work to an `ExecutionBackend`.
 
 When authority requires approval, `Kernel::begin` returns an opaque
 `PendingAction`; `Kernel::resume` accepts only an approval reference and keeps
-the original action and idempotency identities. Effect Fabric supplies any
-durable `ActionStore`, `ReceiptStore`, and reconciliation implementation. Relay
-binds and persists returned receipts through those contracts, but does not
-claim durable storage, retries, or provider reconciliation of its own.
+the original action and idempotency identities. Effect Fabric supplies one
+`DurableEffectStore` that owns action lifecycle and evidence state. Terminal
+receipt insertion and action terminalization are one fenced operation;
+reconciliation starts atomically from one evidence snapshot and completion is
+conditioned on its evidence revision. Relay does not claim durable storage,
+retries, or provider reconciliation of its own.
+
+The execution lane is descriptor-owned. A harness cannot supply an execution
+class or route: `PURE` and `READ` always use Function Hooks, while `MUTATION`
+and `CRITICAL` always use Effect Fabric. Both concrete backend adapters reject
+a request from the wrong class as a defense-in-depth check. Provider calls occur
+after a dispatch lease is committed and before the terminal store transaction;
+an Effect Fabric implementation must not hold a database transaction open while
+calling an external provider.
+
+The optional `unstable-postgres` ledger feature supplies a pooled
+`PostgresEffectStore`. Its migration creates action, primary-receipt, and
+deduplicated conflict tables; all lease decisions use `clock_timestamp()` and
+terminalization locks the action row and commits receipt, terminal state, lease
+release, and evidence revision together. Run its isolated-schema certification
+against a disposable database with
+`NEMO_RELAY_TEST_POSTGRES_URL=... just test-postgres-effect-store`.
 
 `BackendRouter` is deliberately a post-binding component, not a public
 harness entry point. Correct-Once and Effect Fabric implementations plug into

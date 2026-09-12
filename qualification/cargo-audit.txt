@@ -1,4 +1,4 @@
     Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
       Loaded 1243 security advisories (from /Users/dawsonblock/.cargo/advisory-db)
     Updating crates.io index
-    Scanning Cargo.lock for vulnerabilities (470 crate dependencies)
+    Scanning Cargo.lock for vulnerabilities (492 crate dependencies)

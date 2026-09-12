@@ -454,11 +454,24 @@ pub mod unstable {
                     })
                 },
             );
-            assert!(function.execute(&request()).is_ok());
-            assert_eq!(
-                effect.execute(&request()).unwrap_err().code,
-                "BACKEND_CLASS_MISMATCH"
-            );
+            for class in [ExecutionClass::Pure, ExecutionClass::Read] {
+                let mut request = request();
+                request.identity.capability.execution_class = class;
+                assert!(function.execute(&request).is_ok());
+                assert_eq!(
+                    effect.execute(&request).unwrap_err().code,
+                    "BACKEND_CLASS_MISMATCH"
+                );
+            }
+            for class in [ExecutionClass::Mutation, ExecutionClass::Critical] {
+                let mut request = request();
+                request.identity.capability.execution_class = class;
+                assert_eq!(
+                    function.execute(&request).unwrap_err().code,
+                    "BACKEND_CLASS_MISMATCH"
+                );
+                assert!(effect.execute(&request).is_ok());
+            }
         }
     }
 }

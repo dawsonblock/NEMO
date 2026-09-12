@@ -2,147 +2,147 @@
    Compiling num-traits v0.2.19
    Compiling indexmap v2.14.0
    Compiling opentelemetry v0.32.0
-   Compiling pyo3-ffi v0.29.0
-   Compiling uuid v1.18.1
-   Compiling tungstenite v0.27.0
-   Compiling env_filter v0.1.4
-   Compiling fastrand v2.4.1
-   Compiling backon v1.6.0
    Compiling petgraph v0.8.3
-   Compiling opentelemetry_sdk v0.32.1
-   Compiling pyo3 v0.29.0
+   Compiling pyo3-ffi v0.29.0
    Compiling chrono v0.4.45
-   Compiling num-integer v0.1.46
-   Compiling ordered-float v2.10.1
+   Compiling opentelemetry_sdk v0.32.1
    Compiling prost-build v0.14.3
-   Compiling num-bigint v0.4.6
-   Compiling tdigest v0.2.3
    Compiling tonic-prost-build v0.14.6
-   Compiling nemo-relay-types v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/types)
-   Compiling spdlog-rs v0.5.3
+   Compiling uuid v1.18.1
    Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
+   Compiling tungstenite v0.27.0
    Compiling tokio-util v0.7.18
-   Compiling tokio-rustls v0.26.4
-   Compiling pythonize v0.29.0
-   Compiling pyo3-async-runtimes v0.29.0
-   Compiling tokio-tungstenite v0.27.0
    Compiling h2 v0.4.16
    Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
    Compiling tokio-stream v0.1.18
-   Compiling combine v4.6.7
-   Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
    Compiling axum v0.8.9
    Compiling tower-http v0.6.11
+   Compiling nemo-relay-types v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/types)
+   Compiling env_filter v0.1.4
+   Compiling spdlog-rs v0.5.3
    Compiling hyper v1.10.1
-   Compiling redis v1.2.0
+   Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
+   Compiling pyo3 v0.29.0
+   Compiling tokio-tungstenite v0.27.0
+   Compiling num-integer v0.1.46
+   Compiling fastrand v2.4.1
+   Compiling backon v1.6.0
    Compiling hyper-util v0.1.20
+   Compiling num-bigint v0.4.6
+   Compiling combine v4.6.7
    Compiling hyper-timeout v0.5.2
-   Compiling hyper-rustls v0.27.9
    Compiling tonic v0.14.5
+   Compiling hyper-rustls v0.27.9
    Compiling reqwest v0.13.4
-   Compiling reqwest v0.12.28
-   Compiling opentelemetry-http v0.32.0
-   Compiling object_store v0.14.1
    Compiling tonic-prost v0.14.5
-   Compiling tonic-types v0.14.5
    Compiling opentelemetry-proto v0.32.0
+   Compiling tonic-types v0.14.5
+   Compiling opentelemetry-http v0.32.0
    Compiling opentelemetry-otlp v0.32.0
+   Compiling object_store v0.14.1
+   Compiling reqwest v0.12.28
+   Compiling ordered-float v2.10.1
+   Compiling redis v1.2.0
+   Compiling tdigest v0.2.3
+   Compiling pythonize v0.29.0
+   Compiling pyo3-async-runtimes v0.29.0
    Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
-   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
    Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
+   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
    Compiling nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Finished `test` profile [unoptimized] target(s) in 28.74s
+    Finished `test` profile [unoptimized] target(s) in 30.78s
 ────────────
- Nextest run ID 8e78f12b-c964-4633-8b08-2c9bda97c79e with nextest profile: ci
+ Nextest run ID e75ce994-90f9-4ccc-a874-dcca60deea82 with nextest profile: ci
     Starting 80 tests across 1 binary
-        PASS [   0.049s] ( 1/80) nemo-relay-python coverage_tests::test_py_api_forward_stream_to_channel_exits_when_receiver_is_dropped
-        PASS [   0.094s] ( 2/80) nemo-relay-python convert::tests::json_helpers_report_invalid_python_objects
-        PASS [   0.094s] ( 3/80) nemo-relay-python convert::tests::optional_python_json_helpers_round_trip_values
-        PASS [   0.110s] ( 4/80) nemo-relay-python coverage_tests::test_convert_helpers_error_on_non_json_python_objects
-        PASS [   0.113s] ( 5/80) nemo-relay-python coverage_tests::test_convert_helpers_roundtrip_optional_and_none_paths
-        PASS [   0.113s] ( 6/80) nemo-relay-python coverage_tests::test_native_module_registers_types_and_api_functions
-        PASS [   0.114s] ( 7/80) nemo-relay-python coverage_tests::test_py_adaptive_binding_rejects_zero_sensitivity
-        PASS [   0.065s] ( 8/80) nemo-relay-python coverage_tests::test_python_test_guard_restores_existing_runtime_env
-        PASS [   0.117s] ( 9/80) nemo-relay-python coverage_tests::test_native_pymodule_entrypoint_registers_bindings
-        PASS [   0.054s] (10/80) nemo-relay-python coverage_tests::test_register_exposes_all_native_api_functions
-        PASS [   0.160s] (11/80) nemo-relay-python coverage_tests::test_plugin_bindings_validate_configure_and_clear
-        PASS [   0.163s] (12/80) nemo-relay-python coverage_tests::test_async_exec_and_intercept_wrappers
-        PASS [   0.163s] (13/80) nemo-relay-python coverage_tests::test_python_test_guard_keeps_absent_runtime_env_absent
-        PASS [   0.166s] (14/80) nemo-relay-python coverage_tests::test_async_wrapper_error_paths_and_sync_stream_intercept
-        PASS [   0.090s] (15/80) nemo-relay-python coverage_tests::test_stream_wrappers_cover_async_iterator_paths
-        PASS [   0.079s] (16/80) nemo-relay-python coverage_tests::test_sync_wrapper_fallbacks_and_helpers
-        PASS [   0.032s] (17/80) nemo-relay-python py_adaptive::coverage_tests::py_adaptive_uses_canonical_adaptive_acg_imports
-        PASS [   0.032s] (18/80) nemo-relay-python py_adaptive::coverage_tests::python_crate_manifest_drops_direct_acg_dependency
-        PASS [   0.059s] (19/80) nemo-relay-python py_adaptive::coverage_tests::adaptive_runtime_locking_and_helper_errors_are_covered
-        PASS [   0.115s] (20/80) nemo-relay-python nemo_guardrails_coverage_tests::test_native_pymodule_entrypoint_registers_bindings_without_local_provider_install
-        PASS [   0.043s] (21/80) nemo-relay-python py_adaptive::coverage_tests::validate_adaptive_config_accepts_openai_provider_without_transport_fields
-        PASS [   0.077s] (22/80) nemo-relay-python py_adaptive::coverage_tests::adaptive_runtime_methods_cover_pending_ready_and_shutdown_paths
-        PASS [   0.060s] (23/80) nemo-relay-python py_adaptive::coverage_tests::set_latency_sensitivity_rejects_zero_and_registers_binding
-        PASS [   0.100s] (24/80) nemo-relay-python py_adaptive::coverage_tests::adaptive_runtime_shutdown_and_register_error_paths_are_covered
-        PASS [   0.063s] (25/80) nemo-relay-python py_api::coverage_tests::py_api_helpers_and_scope_lifecycle_round_trip
-        PASS [   0.026s] (26/80) nemo-relay-python py_api::coverage_tests::synchronous_middleware_bridge_avoids_tokio_runtime_reentry
-        PASS [   0.053s] (27/80) nemo-relay-python py_api::coverage_tests::safe_future_into_py_skips_completion_on_closed_loop
-        PASS [   0.061s] (28/80) nemo-relay-python py_api::coverage_tests::safe_future_into_py_cancels_rust_work
-        PASS [   0.070s] (29/80) nemo-relay-python py_api::coverage_tests::safe_future_into_py_settles_rust_panics
-        PASS [   0.113s] (30/80) nemo-relay-python py_api::coverage_tests::llm_execution_uses_all_response_codec_selection_paths
-        PASS [   0.205s] (31/80) nemo-relay-python nemo_guardrails_coverage_tests::test_guardrails_local_runtime_rejects_unsupported_nemoguardrails_version
-        PASS [   0.061s] (32/80) nemo-relay-python py_api::coverage_tests::to_py_err_and_forward_stream_to_channel_cover_private_helpers
-        PASS [   0.070s] (33/80) nemo-relay-python py_callable::coverage_tests::awaitable_middleware_wrappers_cover_success_and_failure
-        PASS [   0.048s] (34/80) nemo-relay-python py_callable::coverage_tests::continuation_scope_lookup_supports_native_only_embeddings
-        PASS [   0.146s] (35/80) nemo-relay-python py_api::coverage_tests::py_api_execute_and_registry_paths_cover_global_and_scope_local_features
-        PASS [   0.236s] (36/80) nemo-relay-python nemo_guardrails_coverage_tests::test_guardrails_local_runtime_enforces_llm_input_and_output_checks
-        PASS [   0.233s] (37/80) nemo-relay-python nemo_guardrails_coverage_tests::test_local_guardrails_provider_initializes_and_enforces_managed_core_calls
-        PASS [   0.030s] (38/80) nemo-relay-python py_callable::coverage_tests::execution_next_context_restores_scope
-        PASS [   0.086s] (39/80) nemo-relay-python py_callable::coverage_tests::async_iter_helpers_cover_stop_error_and_dropped_receiver_paths
-        PASS [   0.060s] (40/80) nemo-relay-python py_callable::coverage_tests::event_sanitize_wrapper_covers_conversion_success_and_error_propagation
-        PASS [   0.067s] (41/80) nemo-relay-python py_callable::coverage_tests::event_metadata_injector_wrapper_covers_sync_async_and_invalid_results
-        PASS [   0.099s] (42/80) nemo-relay-python py_callable::coverage_tests::background_middleware_accepts_custom_awaitables
-        PASS [   0.049s] (43/80) nemo-relay-python py_plugin::coverage_tests::invoke_python_plugin_register_rolls_back_partial_registrations_on_error
-        PASS [   0.052s] (44/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_helpers_and_error_conversion_work
-        PASS [   0.063s] (45/80) nemo-relay-python py_callable::coverage_tests::sync_wrappers_and_codec_errors_cover_remaining_branches
-        PASS [   0.080s] (46/80) nemo-relay-python py_callable::coverage_tests::next_wrappers_cover_success_and_error_paths
-        PASS [   0.072s] (47/80) nemo-relay-python py_plugin::coverage_tests::async_clear_binding_completes_on_python_event_loop
-        PASS [   0.054s] (48/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_rejects_legacy_and_uninspectable_llm_sanitizers
-        PASS [   0.079s] (49/80) nemo-relay-python py_plugin::coverage_tests::forced_plugin_conversion_and_context_allocation_failures_are_covered
-        PASS [   0.025s] (50/80) nemo-relay-python py_plugin::coverage_tests::stale_async_clear_completion_keeps_the_newer_state
-        PASS [   0.069s] (51/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_registers_all_runtime_hooks_and_drains_registrations
-        PASS [   0.085s] (52/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_lock_poisoning_covers_error_paths
-        PASS [   0.031s] (53/80) nemo-relay-python py_storage::coverage_tests::py_storage_uses_canonical_adaptive_acg_imports
-        PASS [   0.074s] (54/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_rollback_from_non_runtime_owner_covers_deregistration_error_mappers
-        PASS [   0.047s] (55/80) nemo-relay-python py_plugin::coverage_tests::register_adds_plugin_management_bindings
-        PASS [   0.344s] (56/80) nemo-relay-python nemo_guardrails_coverage_tests::test_guardrails_local_runtime_enforces_streamed_output_rails
-        PASS [   0.084s] (57/80) nemo-relay-python py_plugin::coverage_tests::python_plugin_validation_and_initialization_cover_error_paths
-        PASS [   0.049s] (58/80) nemo-relay-python py_types::coverage_tests::test_attribute_wrappers_cover_remaining_bitwise_methods
-        PASS [   0.079s] (59/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_covers_missing_method_and_optional_observation_paths
-        PASS [   0.063s] (60/80) nemo-relay-python py_types::coverage_tests::test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs
-        PASS [   0.051s] (61/80) nemo-relay-python py_types::coverage_tests::test_event_wrappers_cover_remaining_methods
-        PASS [   0.070s] (62/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_roundtrips_observations_and_stability
-        PASS [   0.082s] (63/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_covers_none_and_error_paths
-        PASS [   0.063s] (64/80) nemo-relay-python py_types::coverage_tests::test_atif_exporter_methods_cover_register_export_and_clear
-        PASS [   0.074s] (65/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_roundtrips_all_supported_methods
-        PASS [   0.056s] (66/80) nemo-relay-python py_types::coverage_tests::test_bitflags_handles_and_event_wrappers_expose_expected_fields
-        PASS [   0.078s] (67/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_reuses_cached_task_locals_in_background_tasks
-        PASS [   0.052s] (68/80) nemo-relay-python py_types::coverage_tests::test_forced_serialization_error_hooks_cover_unreachable_wrappers
-        PASS [   0.053s] (69/80) nemo-relay-python py_types::coverage_tests::test_metric_enum_conversions_and_tool_execution_outcome_getters
-        PASS [   0.057s] (70/80) nemo-relay-python py_types::coverage_tests::test_metric_measurement_and_pending_mark_getters_cover_python_surface
-        PASS [   0.053s] (71/80) nemo-relay-python py_types::coverage_tests::test_openinference_typed_otel_config_rejects_invalid_inputs
-        PASS [   0.076s] (72/80) nemo-relay-python py_types::coverage_tests::test_llm_stream_wrapper_covers_remaining_methods
-        PASS [   0.062s] (73/80) nemo-relay-python py_types::coverage_tests::test_open_telemetry_config_and_subscriber_cover_lifecycle
-        PASS [   0.056s] (74/80) nemo-relay-python py_types::coverage_tests::test_open_telemetry_config_rejects_invalid_inputs
-        PASS [   0.057s] (75/80) nemo-relay-python py_types::coverage_tests::test_python_side_core_type_constructors_cover_exposed_entrypoints
-        PASS [   0.046s] (76/80) nemo-relay-python py_types::coverage_tests::test_request_and_handle_wrappers_cover_remaining_methods
-        PASS [   0.054s] (77/80) nemo-relay-python py_types::coverage_tests::test_register_exposes_all_type_bindings
-        PASS [   0.058s] (78/80) nemo-relay-python py_types::coverage_tests::test_python_visible_type_none_and_error_paths_cover_remaining_branches
-        PASS [   0.062s] (79/80) nemo-relay-python py_types::coverage_tests::test_openinference_typed_otel_config_and_subscriber_cover_lifecycle
-        PASS [   0.074s] (80/80) nemo-relay-python py_types::coverage_tests::test_python_visible_wrappers_cover_pyclass_trampolines
+        PASS [   0.064s] ( 1/80) nemo-relay-python coverage_tests::test_py_api_forward_stream_to_channel_exits_when_receiver_is_dropped
+        PASS [   0.096s] ( 2/80) nemo-relay-python convert::tests::json_helpers_report_invalid_python_objects
+        PASS [   0.096s] ( 3/80) nemo-relay-python convert::tests::optional_python_json_helpers_round_trip_values
+        PASS [   0.113s] ( 4/80) nemo-relay-python coverage_tests::test_convert_helpers_error_on_non_json_python_objects
+        PASS [   0.113s] ( 5/80) nemo-relay-python coverage_tests::test_python_test_guard_keeps_absent_runtime_env_absent
+        PASS [   0.115s] ( 6/80) nemo-relay-python coverage_tests::test_convert_helpers_roundtrip_optional_and_none_paths
+        PASS [   0.115s] ( 7/80) nemo-relay-python coverage_tests::test_native_module_registers_types_and_api_functions
+        PASS [   0.116s] ( 8/80) nemo-relay-python coverage_tests::test_py_adaptive_binding_rejects_zero_sensitivity
+        PASS [   0.052s] ( 9/80) nemo-relay-python coverage_tests::test_python_test_guard_restores_existing_runtime_env
+        PASS [   0.119s] (10/80) nemo-relay-python coverage_tests::test_native_pymodule_entrypoint_registers_bindings
+        PASS [   0.054s] (11/80) nemo-relay-python coverage_tests::test_register_exposes_all_native_api_functions
+        PASS [   0.153s] (12/80) nemo-relay-python coverage_tests::test_async_exec_and_intercept_wrappers
+        PASS [   0.153s] (13/80) nemo-relay-python coverage_tests::test_plugin_bindings_validate_configure_and_clear
+        PASS [   0.156s] (14/80) nemo-relay-python coverage_tests::test_async_wrapper_error_paths_and_sync_stream_intercept
+        PASS [   0.045s] (15/80) nemo-relay-python py_adaptive::coverage_tests::adaptive_runtime_locking_and_helper_errors_are_covered
+        PASS [   0.058s] (16/80) nemo-relay-python coverage_tests::test_sync_wrapper_fallbacks_and_helpers
+        PASS [   0.077s] (17/80) nemo-relay-python coverage_tests::test_stream_wrappers_cover_async_iterator_paths
+        PASS [   0.025s] (18/80) nemo-relay-python py_adaptive::coverage_tests::py_adaptive_uses_canonical_adaptive_acg_imports
+        PASS [   0.025s] (19/80) nemo-relay-python py_adaptive::coverage_tests::python_crate_manifest_drops_direct_acg_dependency
+        PASS [   0.040s] (20/80) nemo-relay-python py_adaptive::coverage_tests::validate_adaptive_config_accepts_openai_provider_without_transport_fields
+        PASS [   0.048s] (21/80) nemo-relay-python py_adaptive::coverage_tests::set_latency_sensitivity_rejects_zero_and_registers_binding
+        PASS [   0.072s] (22/80) nemo-relay-python py_adaptive::coverage_tests::adaptive_runtime_shutdown_and_register_error_paths_are_covered
+        PASS [   0.083s] (23/80) nemo-relay-python py_adaptive::coverage_tests::adaptive_runtime_methods_cover_pending_ready_and_shutdown_paths
+        PASS [   0.116s] (24/80) nemo-relay-python nemo_guardrails_coverage_tests::test_native_pymodule_entrypoint_registers_bindings_without_local_provider_install
+        PASS [   0.077s] (25/80) nemo-relay-python py_api::coverage_tests::py_api_helpers_and_scope_lifecycle_round_trip
+        PASS [   0.024s] (26/80) nemo-relay-python py_api::coverage_tests::synchronous_middleware_bridge_avoids_tokio_runtime_reentry
+        PASS [   0.087s] (27/80) nemo-relay-python py_api::coverage_tests::llm_execution_uses_all_response_codec_selection_paths
+        PASS [   0.050s] (28/80) nemo-relay-python py_api::coverage_tests::safe_future_into_py_cancels_rust_work
+        PASS [   0.049s] (29/80) nemo-relay-python py_api::coverage_tests::safe_future_into_py_skips_completion_on_closed_loop
+        PASS [   0.044s] (30/80) nemo-relay-python py_api::coverage_tests::to_py_err_and_forward_stream_to_channel_cover_private_helpers
+        PASS [   0.069s] (31/80) nemo-relay-python py_api::coverage_tests::safe_future_into_py_settles_rust_panics
+        PASS [   0.110s] (32/80) nemo-relay-python py_api::coverage_tests::py_api_execute_and_registry_paths_cover_global_and_scope_local_features
+        PASS [   0.024s] (33/80) nemo-relay-python py_callable::coverage_tests::execution_next_context_restores_scope
+        PASS [   0.197s] (34/80) nemo-relay-python nemo_guardrails_coverage_tests::test_guardrails_local_runtime_enforces_llm_input_and_output_checks
+        PASS [   0.197s] (35/80) nemo-relay-python nemo_guardrails_coverage_tests::test_guardrails_local_runtime_rejects_unsupported_nemoguardrails_version
+        PASS [   0.052s] (36/80) nemo-relay-python py_callable::coverage_tests::continuation_scope_lookup_supports_native_only_embeddings
+        PASS [   0.204s] (37/80) nemo-relay-python nemo_guardrails_coverage_tests::test_local_guardrails_provider_initializes_and_enforces_managed_core_calls
+        PASS [   0.067s] (38/80) nemo-relay-python py_callable::coverage_tests::background_middleware_accepts_custom_awaitables
+        PASS [   0.070s] (39/80) nemo-relay-python py_callable::coverage_tests::async_iter_helpers_cover_stop_error_and_dropped_receiver_paths
+        PASS [   0.072s] (40/80) nemo-relay-python py_callable::coverage_tests::awaitable_middleware_wrappers_cover_success_and_failure
+        PASS [   0.064s] (41/80) nemo-relay-python py_callable::coverage_tests::event_metadata_injector_wrapper_covers_sync_async_and_invalid_results
+        PASS [   0.071s] (42/80) nemo-relay-python py_callable::coverage_tests::event_sanitize_wrapper_covers_conversion_success_and_error_propagation
+        PASS [   0.073s] (43/80) nemo-relay-python py_callable::coverage_tests::next_wrappers_cover_success_and_error_paths
+        PASS [   0.047s] (44/80) nemo-relay-python py_plugin::coverage_tests::invoke_python_plugin_register_rolls_back_partial_registrations_on_error
+        PASS [   0.041s] (45/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_helpers_and_error_conversion_work
+        PASS [   0.068s] (46/80) nemo-relay-python py_callable::coverage_tests::sync_wrappers_and_codec_errors_cover_remaining_branches
+        PASS [   0.070s] (47/80) nemo-relay-python py_plugin::coverage_tests::async_clear_binding_completes_on_python_event_loop
+        PASS [   0.070s] (48/80) nemo-relay-python py_plugin::coverage_tests::forced_plugin_conversion_and_context_allocation_failures_are_covered
+        PASS [   0.053s] (49/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_rejects_legacy_and_uninspectable_llm_sanitizers
+        PASS [   0.023s] (50/80) nemo-relay-python py_storage::coverage_tests::py_storage_uses_canonical_adaptive_acg_imports
+        PASS [   0.029s] (51/80) nemo-relay-python py_plugin::coverage_tests::stale_async_clear_completion_keeps_the_newer_state
+        PASS [   0.070s] (52/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_lock_poisoning_covers_error_paths
+        PASS [   0.065s] (53/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_rollback_from_non_runtime_owner_covers_deregistration_error_mappers
+        PASS [   0.076s] (54/80) nemo-relay-python py_plugin::coverage_tests::plugin_context_registers_all_runtime_hooks_and_drains_registrations
+        PASS [   0.046s] (55/80) nemo-relay-python py_plugin::coverage_tests::register_adds_plugin_management_bindings
+        PASS [   0.294s] (56/80) nemo-relay-python nemo_guardrails_coverage_tests::test_guardrails_local_runtime_enforces_streamed_output_rails
+        PASS [   0.072s] (57/80) nemo-relay-python py_plugin::coverage_tests::python_plugin_validation_and_initialization_cover_error_paths
+        PASS [   0.048s] (58/80) nemo-relay-python py_types::coverage_tests::test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs
+        PASS [   0.066s] (59/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_covers_missing_method_and_optional_observation_paths
+        PASS [   0.062s] (60/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_roundtrips_all_supported_methods
+        PASS [   0.070s] (61/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_covers_none_and_error_paths
+        PASS [   0.045s] (62/80) nemo-relay-python py_types::coverage_tests::test_bitflags_handles_and_event_wrappers_expose_expected_fields
+        PASS [   0.052s] (63/80) nemo-relay-python py_types::coverage_tests::test_atif_exporter_methods_cover_register_export_and_clear
+        PASS [   0.070s] (64/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_reuses_cached_task_locals_in_background_tasks
+        PASS [   0.068s] (65/80) nemo-relay-python py_storage::coverage_tests::test_py_storage_backend_roundtrips_observations_and_stability
+        PASS [   0.047s] (66/80) nemo-relay-python py_types::coverage_tests::test_event_wrappers_cover_remaining_methods
+        PASS [   0.052s] (67/80) nemo-relay-python py_types::coverage_tests::test_attribute_wrappers_cover_remaining_bitwise_methods
+        PASS [   0.050s] (68/80) nemo-relay-python py_types::coverage_tests::test_forced_serialization_error_hooks_cover_unreachable_wrappers
+        PASS [   0.044s] (69/80) nemo-relay-python py_types::coverage_tests::test_metric_enum_conversions_and_tool_execution_outcome_getters
+        PASS [   0.043s] (70/80) nemo-relay-python py_types::coverage_tests::test_openinference_typed_otel_config_rejects_invalid_inputs
+        PASS [   0.045s] (71/80) nemo-relay-python py_types::coverage_tests::test_open_telemetry_config_rejects_invalid_inputs
+        PASS [   0.056s] (72/80) nemo-relay-python py_types::coverage_tests::test_metric_measurement_and_pending_mark_getters_cover_python_surface
+        PASS [   0.076s] (73/80) nemo-relay-python py_types::coverage_tests::test_llm_stream_wrapper_covers_remaining_methods
+        PASS [   0.053s] (74/80) nemo-relay-python py_types::coverage_tests::test_open_telemetry_config_and_subscriber_cover_lifecycle
+        PASS [   0.049s] (75/80) nemo-relay-python py_types::coverage_tests::test_openinference_typed_otel_config_and_subscriber_cover_lifecycle
+        PASS [   0.047s] (76/80) nemo-relay-python py_types::coverage_tests::test_python_side_core_type_constructors_cover_exposed_entrypoints
+        PASS [   0.053s] (77/80) nemo-relay-python py_types::coverage_tests::test_python_visible_type_none_and_error_paths_cover_remaining_branches
+        PASS [   0.046s] (78/80) nemo-relay-python py_types::coverage_tests::test_request_and_handle_wrappers_cover_remaining_methods
+        PASS [   0.051s] (79/80) nemo-relay-python py_types::coverage_tests::test_register_exposes_all_type_bindings
+        PASS [   0.063s] (80/80) nemo-relay-python py_types::coverage_tests::test_python_visible_wrappers_cover_pyclass_trampolines
 ────────────
-     Summary [   0.575s] 80 tests run: 80 passed, 0 skipped
+     Summary [   0.518s] 80 tests run: 80 passed, 0 skipped
 WARN Broken interpreter cache entry at /Users/dawsonblock/.cache/uv/interpreter-v4/690e8bc5fc3a5e7e/c2df1ab4532dd354.msgpack, removing: invalid type: boolean `true`, expected a sequence
-Resolved 108 packages in 23ms
+Resolved 108 packages in 24ms
    Building nemo-relay-plugin @ file:///Users/dawsonblock/Downloads/NeMo-Relay-main/python/plugin
       Built nemo-relay-plugin @ file:///Users/dawsonblock/Downloads/NeMo-Relay-main/python/plugin
-Prepared 1 package in 1.38s
-Uninstalled 1 package in 0.94ms
+Prepared 1 package in 1.42s
+Uninstalled 1 package in 1ms
 Installed 1 package in 1ms
  ~ nemo-relay-plugin==0.9.1rc4 (from file:///Users/dawsonblock/Downloads/NeMo-Relay-main/python/plugin)
 📦 Including license file `LICENSE`
@@ -150,8 +150,8 @@ Installed 1 package in 1ms
 🔗 Found pyo3 bindings with abi3 support
 🐍 Found CPython 3.13 at /Users/dawsonblock/Downloads/NeMo-Relay-main/.venv/bin/python
    Compiling proc-macro2 v1.0.106
-   Compiling quote v1.0.46
    Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
    Compiling libc v0.2.186
    Compiling cfg-if v1.0.4
    Compiling memchr v2.8.2
@@ -161,268 +161,268 @@ Installed 1 package in 1ms
    Compiling bytes v1.12.0
    Compiling futures-core v0.3.32
    Compiling once_cell v1.21.4
-   Compiling parking_lot_core v0.9.12
+   Compiling syn v2.0.118
    Compiling futures-sink v0.3.32
+   Compiling parking_lot_core v0.9.12
    Compiling scopeguard v1.2.0
-   Compiling slab v0.4.12
+   Compiling lock_api v0.4.14
+   Compiling errno v0.3.14
    Compiling futures-channel v0.3.32
    Compiling itoa v1.0.18
-   Compiling lock_api v0.4.14
-   Compiling futures-io v0.3.32
    Compiling futures-task v0.3.32
-   Compiling log v0.4.33
+   Compiling futures-io v0.3.32
+   Compiling slab v0.4.12
+   Compiling parking_lot v0.12.5
+   Compiling jobserver v0.1.35
    Compiling find-msvc-tools v0.1.9
+   Compiling log v0.4.33
    Compiling shlex v2.0.1
-   Compiling equivalent v1.0.2
+   Compiling cc v1.2.65
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
    Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling synstructure v0.13.2
+   Compiling cmake v0.1.58
+   Compiling fs_extra v1.3.0
    Compiling dunce v1.0.5
    Compiling pkg-config v0.3.33
-   Compiling fs_extra v1.3.0
    Compiling http v1.4.2
    Compiling core-foundation-sys v0.8.7
    Compiling tracing-core v0.1.36
-   Compiling percent-encoding v2.3.2
+   Compiling aws-lc-sys v0.43.0
+   Compiling ring v0.17.14
    Compiling aws-lc-rs v1.17.3
+   Compiling futures-macro v0.3.32
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+   Compiling futures-util v0.3.32
+   Compiling tokio v1.52.3
+   Compiling zerofrom-derive v0.1.7
+   Compiling zerofrom v0.1.8
+   Compiling tracing v0.1.44
+   Compiling yoke-derive v0.8.2
    Compiling zeroize v1.9.0
+   Compiling percent-encoding v2.3.2
    Compiling stable_deref_trait v1.2.1
-   Compiling untrusted v0.9.0
-   Compiling httparse v1.10.1
-   Compiling indexmap v2.14.0
+   Compiling yoke v0.8.3
+   Compiling tokio-util v0.7.18
+   Compiling bitflags v2.13.0
    Compiling rustls-pki-types v1.14.1
+   Compiling zerovec-derive v0.11.3
+   Compiling http-body v1.0.1
+   Compiling indexmap v2.14.0
+   Compiling getrandom v0.2.17
+   Compiling httparse v1.10.1
+   Compiling untrusted v0.9.0
+   Compiling zerovec v0.11.6
+   Compiling displaydoc v0.2.6
+   Compiling either v1.16.0
    Compiling tower-service v0.3.3
    Compiling rustls v0.23.41
-   Compiling either v1.16.0
+   Compiling subtle v2.6.1
    Compiling serde v1.0.228
    Compiling anyhow v1.0.104
-   Compiling http-body v1.0.1
-   Compiling subtle v2.6.1
-   Compiling typenum v1.20.1
-   Compiling atomic-waker v1.1.2
+   Compiling serde_derive v1.0.228
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
    Compiling try-lock v0.2.5
    Compiling fnv v1.0.7
+   Compiling typenum v1.20.1
+   Compiling atomic-waker v1.1.2
+   Compiling h2 v0.4.16
    Compiling want v0.3.1
+   Compiling security-framework v3.7.0
+   Compiling tinystr v0.8.3
    Compiling itertools v0.14.0
    Compiling sync_wrapper v1.0.2
-   Compiling writeable v0.6.3
    Compiling tower-layer v0.3.3
+   Compiling writeable v0.6.3
    Compiling httpdate v1.0.3
    Compiling litemap v0.8.2
-   Compiling icu_normalizer_data v2.2.0
-   Compiling autocfg v1.5.1
-   Compiling getrandom v0.3.4
+   Compiling icu_locale_core v2.2.0
+   Compiling prost-derive v0.14.3
+   Compiling hyper v1.10.1
+   Compiling potential_utf v0.1.5
+   Compiling zerotrie v0.2.4
    Compiling utf8_iter v1.0.4
-   Compiling icu_properties_data v2.2.0
-   Compiling base64 v0.22.1
    Compiling ipnet v2.12.0
+   Compiling getrandom v0.3.4
+   Compiling icu_properties_data v2.2.0
+   Compiling autocfg v1.5.1
+   Compiling base64 v0.22.1
+   Compiling icu_normalizer_data v2.2.0
    Compiling num-traits v0.2.19
+   Compiling hyper-util v0.1.20
+   Compiling icu_collections v2.2.0
+   Compiling icu_provider v2.2.0
+   Compiling tower v0.5.3
+   Compiling rustls-native-certs v0.8.3
    Compiling http-body-util v0.1.3
    Compiling heck v0.5.0
    Compiling version_check v0.9.5
-   Compiling syn v2.0.118
+   Compiling icu_properties v2.2.0
    Compiling generic-array v0.14.7
-   Compiling zerocopy v0.8.52
-   Compiling errno v0.3.14
-   Compiling jobserver v0.1.35
-   Compiling signal-hook-registry v1.4.8
-   Compiling parking_lot v0.12.5
-   Compiling cc v1.2.65
-   Compiling mio v1.2.1
-   Compiling socket2 v0.6.4
-   Compiling getrandom v0.2.17
-   Compiling bitflags v2.13.0
-   Compiling core-foundation v0.10.1
-   Compiling security-framework-sys v2.17.0
+   Compiling icu_normalizer v2.2.0
    Compiling thiserror v2.0.18
-   Compiling security-framework v3.7.0
+   Compiling zerocopy v0.8.52
+   Compiling idna_adapter v1.2.2
    Compiling form_urlencoded v1.2.2
-   Compiling cmake v0.1.58
-   Compiling mime v0.3.17
-   Compiling rustix v1.1.4
-   Compiling prettyplease v0.2.37
-   Compiling pulldown-cmark v0.13.4
-   Compiling target-lexicon v0.13.5
-   Compiling aws-lc-sys v0.43.0
-   Compiling ring v0.17.14
-   Compiling rustls-native-certs v0.8.3
-   Compiling zmij v1.0.21
-   Compiling getrandom v0.4.3
-   Compiling crossbeam-utils v0.8.21
-   Compiling synstructure v0.13.2
-   Compiling rand_core v0.9.5
-   Compiling axum-core v0.5.6
-   Compiling futures-macro v0.3.32
-   Compiling tokio-macros v2.7.0
-   Compiling futures-util v0.3.32
-   Compiling tokio v1.52.3
-   Compiling tracing-attributes v0.1.31
-   Compiling zerofrom-derive v0.1.7
-   Compiling yoke-derive v0.8.2
-   Compiling zerovec-derive v0.11.3
-   Compiling displaydoc v0.2.6
-   Compiling serde_derive v1.0.228
-   Compiling zerofrom v0.1.8
-   Compiling tracing v0.1.44
-   Compiling prost-derive v0.14.3
    Compiling thiserror-impl v2.0.18
+   Compiling rustix v1.1.4
+   Compiling mime v0.3.17
+   Compiling idna v1.1.0
    Compiling async-trait v0.1.89
+   Compiling zmij v1.0.21
+   Compiling target-lexicon v0.13.5
+   Compiling getrandom v0.4.3
+   Compiling prettyplease v0.2.37
+   Compiling crossbeam-utils v0.8.21
+   Compiling pulldown-cmark v0.13.4
    Compiling ppv-lite86 v0.2.21
+   Compiling url v2.5.8
+   Compiling axum-core v0.5.6
+   Compiling rand_core v0.9.5
    Compiling pin-project-internal v1.1.11
-   Compiling serde_json v1.0.150
-   Compiling foldhash v0.1.5
-   Compiling unicase v2.9.0
    Compiling regex-syntax v0.8.11
    Compiling matchit v0.8.4
+   Compiling unicase v2.9.0
+   Compiling serde_json v1.0.150
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling regex-automata v0.4.14
+   Compiling axum v0.8.9
    Compiling pin-project v1.1.11
    Compiling prost v0.14.3
-   Compiling yoke v0.8.3
-   Compiling regex-automata v0.4.14
-   Compiling hashbrown v0.15.5
    Compiling rand_chacha v0.9.0
-   Compiling block-buffer v0.10.4
    Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling hyper-timeout v0.5.2
    Compiling hybrid-array v0.4.10
-   Compiling fixedbitset v0.5.7
+   Compiling tokio-stream v0.1.18
    Compiling fastrand v2.4.1
-   Compiling pyo3-build-config v0.29.0
+   Compiling fixedbitset v0.5.7
    Compiling tempfile v3.27.0
-   Compiling digest v0.10.7
-   Compiling prost-types v0.14.3
-   Compiling regex v1.12.4
-   Compiling rand v0.9.4
-   Compiling tokio-util v0.7.18
-   Compiling futures-executor v0.3.32
-   Compiling zerovec v0.11.6
-   Compiling zerotrie v0.2.4
    Compiling petgraph v0.8.3
+   Compiling digest v0.10.7
+   Compiling pyo3-build-config v0.29.0
+   Compiling rand v0.9.4
+   Compiling prost-types v0.14.3
    Compiling pulldown-cmark-to-cmark v22.0.0
+   Compiling regex v1.12.4
+   Compiling tower-http v0.6.11
+   Compiling futures-executor v0.3.32
    Compiling iana-time-zone v0.1.65
    Compiling multimap v0.10.1
-   Compiling crossbeam-epoch v0.9.20
    Compiling rustversion v1.0.22
-   Compiling chrono v0.4.45
-   Compiling h2 v0.4.16
-   Compiling tower v0.5.3
-   Compiling tokio-stream v0.1.18
-   Compiling crypto-common v0.2.1
-   Compiling block-buffer v0.12.0
+   Compiling crossbeam-epoch v0.9.20
    Compiling prost-build v0.14.3
-   Compiling tinystr v0.8.3
-   Compiling potential_utf v0.1.5
+   Compiling chrono v0.4.45
+   Compiling block-buffer v0.12.0
+   Compiling crypto-common v0.2.1
    Compiling tonic-build v0.14.6
-   Compiling icu_locale_core v2.2.0
-   Compiling icu_collections v2.2.0
-   Compiling axum v0.8.9
    Compiling opentelemetry v0.32.0
    Compiling aho-corasick v1.1.4
-   Compiling rand_core v0.10.1
-   Compiling ryu v1.0.23
-   Compiling protoc-bin-vendored-macos-aarch_64 v3.2.0
-   Compiling protoc-bin-vendored-linux-aarch_64 v3.2.0
-   Compiling protoc-bin-vendored-macos-x86_64 v3.2.0
+   Compiling semver v1.0.28
    Compiling protoc-bin-vendored-linux-ppcle_64 v3.2.0
-   Compiling crossbeam-deque v0.8.7
-   Compiling const-oid v0.10.2
-   Compiling protoc-bin-vendored-linux-x86_32 v3.2.0
+   Compiling protoc-bin-vendored-macos-aarch_64 v3.2.0
+   Compiling ryu v1.0.23
    Compiling protoc-bin-vendored-linux-s390_64 v3.2.0
    Compiling protoc-bin-vendored-win32 v3.2.0
+   Compiling rand_core v0.10.1
+   Compiling protoc-bin-vendored-macos-x86_64 v3.2.0
    Compiling protoc-bin-vendored-linux-x86_64 v3.2.0
-   Compiling semver v1.0.28
-   Compiling icu_provider v2.2.0
-   Compiling icu_normalizer v2.2.0
-   Compiling icu_properties v2.2.0
-   Compiling rustc_version v0.4.1
+   Compiling const-oid v0.10.2
+   Compiling crossbeam-deque v0.8.7
+   Compiling protoc-bin-vendored-linux-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-linux-x86_32 v3.2.0
    Compiling protoc-bin-vendored v3.2.0
    Compiling digest v0.11.2
+   Compiling rustc_version v0.4.1
    Compiling tonic-prost-build v0.14.6
    Compiling pyo3-ffi v0.29.0
    Compiling bytemuck_derive v1.11.0
    Compiling typed-builder-macro v0.23.2
    Compiling cpufeatures v0.2.17
    Compiling nom v8.0.0
-   Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
-   Compiling sha1 v0.10.6
-   Compiling arc-swap v1.9.1
-   Compiling hyper v1.10.1
-   Compiling idna_adapter v1.2.2
-   Compiling idna v1.1.0
-   Compiling spdlog-rs v0.5.3
-   Compiling opentelemetry_sdk v0.32.1
-   Compiling url v2.5.8
-   Compiling bytemuck v1.25.1
-   Compiling serde_urlencoded v0.7.1
-   Compiling chacha20 v0.10.2
-   Compiling uuid v1.18.1
    Compiling typed-builder v0.23.2
-   Compiling tower-http v0.6.11
+   Compiling sha1 v0.10.6
+   Compiling bytemuck v1.25.1
+   Compiling arc-swap v1.9.1
+   Compiling spdlog-internal v0.2.1
+   Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
+   Compiling spdlog-rs v0.5.3
+   Compiling chacha20 v0.10.2
+   Compiling serde_urlencoded v0.7.1
+   Compiling opentelemetry_sdk v0.32.1
    Compiling crossbeam-channel v0.5.16
    Compiling crossbeam-queue v0.3.13
-   Compiling hyper-util v0.1.20
-   Compiling winnow v1.0.3
-   Compiling data-encoding v2.11.0
-   Compiling utf-8 v0.7.6
+   Compiling uuid v1.18.1
    Compiling unicode-general-category v1.1.0
-   Compiling spin v0.10.1
+   Compiling winnow v1.0.3
    Compiling parking v2.2.1
-   Compiling event-listener v5.4.2
+   Compiling spin v0.10.1
+   Compiling utf-8 v0.7.6
+   Compiling data-encoding v2.11.0
    Compiling crc-fast v1.10.0
-   Compiling env_filter v0.1.4
+   Compiling event-listener v5.4.2
    Compiling toml_parser v1.1.2+spec-1.1.0
    Compiling nemo-relay-types v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/types)
-   Compiling spdlog-internal v0.2.1
    Compiling crossbeam v0.8.4
-   Compiling atomic v0.6.1
    Compiling rand v0.10.1
-   Compiling md-5 v0.11.0
-   Compiling hyper-timeout v0.5.2
    Compiling spdlog-macros v0.3.1
-   Compiling pyo3 v0.29.0
+   Compiling atomic v0.6.1
+   Compiling env_filter v0.1.4
+   Compiling md-5 v0.11.0
    Compiling futures v0.3.32
-   Compiling quick-xml v0.41.0
+   Compiling pyo3 v0.29.0
    Compiling strum_macros v0.27.2
    Compiling pyo3-macros-backend v0.29.0
+   Compiling quick-xml v0.41.0
+   Compiling itertools v0.15.0
    Compiling toml_datetime v0.7.5+spec-1.1.0
    Compiling serde_spanned v1.1.1
    Compiling cpufeatures v0.3.0
-   Compiling itertools v0.15.0
    Compiling encoding_rs v0.8.35
+   Compiling toml_writer v1.1.1+spec-1.1.0
+   Compiling winnow v0.7.15
    Compiling humantime v2.3.0
    Compiling value-bag v1.13.0
-   Compiling toml_writer v1.1.1+spec-1.1.0
    Compiling ryu-js v1.0.2
    Compiling dyn-clone v1.0.20
-   Compiling winnow v0.7.15
    Compiling serde_json_canonicalizer v0.3.2
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling pyo3-macros v0.29.0
    Compiling sha2 v0.11.0
-   Compiling event-listener-strategy v0.5.4
+   Compiling strum v0.27.2
    Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
+   Compiling event-listener-strategy v0.5.4
    Compiling num-integer v0.1.46
    Compiling libloading v0.8.9
-   Compiling opentelemetry-semantic-conventions v0.32.1
    Compiling shell-words v1.1.1
-   Compiling strum v0.27.2
+   Compiling opentelemetry-semantic-conventions v0.32.1
    Compiling backon v1.6.0
    Compiling num-bigint v0.4.6
-   Compiling toml v0.9.12+spec-1.1.0
    Compiling async-lock v3.4.2
-   Compiling combine v4.6.7
    Compiling ordered-float v2.10.1
-   Compiling xxhash-rust v0.8.15
-   Compiling arcstr v1.2.0
+   Compiling combine v4.6.7
    Compiling sha1_smol v1.0.1
+   Compiling arcstr v1.2.0
+   Compiling xxhash-rust v0.8.15
    Compiling tdigest v0.2.3
-   Compiling pyo3-macros v0.29.0
-   Compiling redis v1.2.0
-   Compiling pythonize v0.29.0
    Compiling pyo3-async-runtimes v0.29.0
+   Compiling pythonize v0.29.0
+   Compiling redis v1.2.0
    Compiling rustls-webpki v0.103.13
    Compiling tokio-rustls v0.26.4
    Compiling rustls-platform-verifier v0.7.0
    Compiling tungstenite v0.27.0
-   Compiling tonic v0.14.5
    Compiling hyper-rustls v0.27.9
+   Compiling tonic v0.14.5
    Compiling reqwest v0.13.4
-   Compiling reqwest v0.12.28
    Compiling tokio-tungstenite v0.27.0
+   Compiling reqwest v0.12.28
    Compiling opentelemetry-http v0.32.0
    Compiling object_store v0.14.1
    Compiling tonic-prost v0.14.5
@@ -430,11 +430,11 @@ Installed 1 package in 1ms
    Compiling opentelemetry-proto v0.32.0
    Compiling opentelemetry-otlp v0.32.0
    Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
-   Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
    Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
+   Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
    Compiling nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Finished `dev` profile [unoptimized] target(s) in 44.88s
-📦 Built wheel for abi3 Python ≥ 3.11 to /var/folders/xt/jh84t2kj6hl26tk5qx3m_28h0000gn/T/.tmpZPSAV7/nemo_relay-0.9.1rc4-cp311-abi3-macosx_11_0_arm64.whl
+    Finished `dev` profile [unoptimized] target(s) in 1m 05s
+📦 Built wheel for abi3 Python ≥ 3.11 to /var/folders/xt/jh84t2kj6hl26tk5qx3m_28h0000gn/T/.tmpEcTK0U/nemo_relay-0.9.1rc4-cp311-abi3-macosx_11_0_arm64.whl
 ============================= test session starts ==============================
 platform darwin -- Python 3.13.13, pytest-9.0.3, pluggy-1.6.0
 rootdir: /Users/dawsonblock/Downloads/NeMo-Relay-main
@@ -484,34 +484,34 @@ python/tests/test_utils.py ..                                            [100%]
 2.01s call     python/tests/test_llm.py::TestLLMAsync::test_event_and_response_sanitizers_use_independent_context_snapshots
 1.56s call     python/tests/test_dynamic_plugin_host.py::test_worker_activation_finalizer_never_waits_on_python_thread
 1.02s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_signal_subscribers_export_to_signal_relative_paths
-0.66s call     python/tests/test_observability_plugin.py::TestObservabilityConfigHelpers::test_atof_stream_sink_dotted_fields_deliver_during_plugin_clear[replace_dots-expected_data1]
-0.64s call     python/tests/test_observability_plugin.py::TestObservabilityConfigHelpers::test_atof_stream_sink_snapshots_header_env
-0.63s call     python/tests/test_observability_plugin.py::TestObservabilityConfigHelpers::test_atof_stream_sink_dotted_fields_deliver_during_plugin_clear[preserve-expected_data0]
-0.51s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_direct_log_subscriber_reports_queue_drops_after_force_flush
+0.65s call     python/tests/test_observability_plugin.py::TestObservabilityConfigHelpers::test_atof_stream_sink_dotted_fields_deliver_during_plugin_clear[replace_dots-expected_data1]
+0.65s call     python/tests/test_observability_plugin.py::TestObservabilityConfigHelpers::test_atof_stream_sink_snapshots_header_env
+0.65s call     python/tests/test_observability_plugin.py::TestObservabilityConfigHelpers::test_atof_stream_sink_dotted_fields_deliver_during_plugin_clear[preserve-expected_data0]
+0.52s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_direct_log_subscriber_reports_queue_drops_after_force_flush
 0.51s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_trace_export_failure_stays_unhealthy_until_a_later_export_succeeds
 0.51s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_gen_ai_subscriber_exports_standardized_agent_span
-0.51s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_subscriber_exports_scope_and_mark_events_end_to_end
 0.51s call     python/tests/test_types.py::TestOpenInferenceTypes::test_subscriber_exports_scope_and_mark_events_end_to_end
-0.37s call     python/tests/test_dynamic_plugin_host.py::test_native_activation_context_owns_callbacks_and_close_is_idempotent
+0.51s call     python/tests/test_types.py::TestOpenTelemetryTypes::test_subscriber_exports_scope_and_mark_events_end_to_end
+0.31s call     python/tests/test_dynamic_plugin_host.py::test_native_activation_context_owns_callbacks_and_close_is_idempotent
 0.15s call     python/tests/test_dynamic_plugin_host.py::test_activation_reports_conflicts_and_rolls_back_partial_loads
 0.13s call     python/tests/test_event_sanitizers.py::test_plugin_clear_is_asyncio_safe_with_pending_sanitizer
-0.12s call     python/tests/test_subscribers.py::TestSubscribers::test_concurrent_cancelled_async_flushes_share_one_bridge_thread
-0.11s call     python/tests/test_dynamic_plugin_host.py::test_concurrent_close_waiters_share_cancellation_resistant_teardown
-0.08s call     python/tests/test_subscribers.py::TestSubscribers::test_cancelled_async_flush_does_not_block_process_exit
-0.07s call     python/tests/test_logging.py::test_binding_initializes_logging_from_environment
-0.07s call     python/tests/test_logging.py::test_binding_flushes_file_sink_during_shutdown
-0.07s call     python/tests/test_dynamic_plugin_host.py::test_worker_activation_executes_and_releases_callbacks
+0.11s call     python/tests/test_subscribers.py::TestSubscribers::test_concurrent_cancelled_async_flushes_share_one_bridge_thread
+0.10s call     python/tests/test_dynamic_plugin_host.py::test_concurrent_close_waiters_share_cancellation_resistant_teardown
+0.08s call     python/tests/test_dynamic_plugin_host.py::test_worker_activation_executes_and_releases_callbacks
+0.07s call     python/tests/test_dynamic_plugin_host.py::test_dynamic_activation_layers_plugins_toml_static_components
 0.07s call     python/tests/test_logging.py::test_binding_disables_stderr_logging_from_environment
-0.06s call     python/tests/test_dynamic_plugin_host.py::test_dynamic_activation_layers_plugins_toml_static_components
+0.07s call     python/tests/test_subscribers.py::TestSubscribers::test_cancelled_async_flush_does_not_block_process_exit
+0.06s call     python/tests/test_logging.py::test_binding_initializes_logging_from_environment
+0.06s call     python/tests/test_logging.py::test_binding_flushes_file_sink_during_shutdown
+0.06s call     python/tests/test_typed.py::TestPydanticCodec::test_direct_roundtrip
 0.06s call     python/tests/test_subscribers.py::TestSubscribers::test_fork_does_not_wait_for_pending_async_sanitizer
-0.06s call     python/tests/plugin/test_worker_sdk.py::test_serve_plugin_announces_tcp_endpoint_and_accepts_health_shutdown
 0.06s call     python/tests/test_dynamic_plugin_host.py::test_native_activation_finalizer_releases_callbacks
-============================= 711 passed in 13.64s =============================
+============================= 711 passed in 13.97s =============================
 warning: `VIRTUAL_ENV=/Users/dawsonblock/Downloads/NeMo-Relay-main/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
    Building nemo-relay @ file:///Users/dawsonblock/Downloads/NeMo-Relay-main
       Built nemo-relay @ file:///Users/dawsonblock/Downloads/NeMo-Relay-main
 Uninstalled 1 package in 5ms
-Installed 1 package in 3ms
+Installed 1 package in 2ms
 ============================= test session starts ==============================
 platform darwin -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
 rootdir: /Users/dawsonblock/Downloads/NeMo-Relay-main/examples/language-binding-plugin/python
@@ -523,4 +523,4 @@ collected 24 items
 
 test_plugin.py ........................                                  [100%]
 
-============================== 24 passed in 0.24s ==============================
+============================== 24 passed in 0.16s ==============================

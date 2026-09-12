@@ -8,36 +8,36 @@ warning: doc tests are not supported for crate type(s) `cdylib` in package `nemo
    Compiling tokio-util v0.7.18
    Compiling tokio-rustls v0.26.4
    Compiling opentelemetry_sdk v0.32.1
-   Compiling pyo3-async-runtimes v0.29.0
    Compiling tokio-tungstenite v0.27.0
+   Compiling pyo3-async-runtimes v0.29.0
    Compiling h2 v0.4.16
    Compiling tower v0.5.3
    Compiling tokio-stream v0.1.18
    Compiling nemo-relay-plugin v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin)
-   Compiling combine v4.6.7
    Compiling tower-http v0.6.11
+   Compiling combine v4.6.7
    Compiling hyper v1.10.1
-   Compiling redis v1.2.0
    Compiling hyper-util v0.1.20
-   Compiling hyper-timeout v0.5.2
+   Compiling redis v1.2.0
    Compiling axum v0.8.9
+   Compiling hyper-timeout v0.5.2
    Compiling hyper-rustls v0.27.9
    Compiling reqwest v0.13.4
    Compiling reqwest v0.12.28
+   Compiling tonic v0.14.5
    Compiling opentelemetry-http v0.32.0
    Compiling object_store v0.14.1
-   Compiling tonic v0.14.5
    Compiling tonic-prost v0.14.5
-   Compiling tonic-types v0.14.5
    Compiling opentelemetry-proto v0.32.0
+   Compiling tonic-types v0.14.5
    Compiling opentelemetry-otlp v0.32.0
    Compiling nemo-relay-worker v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker)
    Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
-   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
    Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
+   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
    Compiling nemo-relay-cli v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/cli)
    Compiling nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Finished `test` profile [unoptimized] target(s) in 28.85s
+    Finished `test` profile [unoptimized] target(s) in 31.01s
    Doc-tests nemo_relay
 
 running 1 test
@@ -45,7 +45,7 @@ test crates/core/src/api/runtime/scope_stack.rs - api::runtime::scope_stack::for
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.68s; merged doctests compilation took 0.40s
+all doctests ran in 0.76s; merged doctests compilation took 0.38s
    Doc-tests nemo_relay_adaptive
 
 running 4 tests
@@ -54,9 +54,9 @@ test crates/adaptive/src/acg/openai_plugin.rs - acg::openai_plugin::OpenAICacheP
 test crates/adaptive/src/trie/builder.rs - trie::builder::PredictionTrieBuilder (line 69) ... ignored
 test crates/adaptive/src/acg/types.rs - acg::types::AgentIdentity (line 360) ... ok
 
-test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.79s; merged doctests compilation took 0.49s
+all doctests ran in 0.74s; merged doctests compilation took 0.46s
    Doc-tests nemo_relay_authority
 
 running 0 tests
@@ -134,4 +134,3 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-
