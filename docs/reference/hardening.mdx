@@ -137,10 +137,13 @@ Repeating that exact contradiction returns `CONFLICT_ALREADY_RECORDED` rather
 than multiplying forensic records. This makes contradictory terminal evidence
 visible to the caller instead of silently rewriting action history. The
 generic state-transition API cannot write `COMMITTED` or externally meaningful
-`FAILED`; `ActionStore::finalize_from_evidence` must verify the current state,
-fenced lease, immutable action binding, and evidence-authorized terminal
-transition in one operation. Lifecycle legality and method legality are
-separate contracts: `authorize_action` alone may write
+`FAILED`. `ActionStore::finalize_pre_dispatch_failure` may write only
+`DISPATCHING → FAILED` from a bound proof that dispatch never crossed the
+external effect boundary. It accepts no receipt type. Every receipt-derived
+terminal state, including `COMMITTED`, must use
+`EffectStore::finalize_terminal_receipt` or reconciliation finalization, which
+persists the primary receipt and fenced action transition atomically. Lifecycle
+legality and method legality are separate contracts: `authorize_action` alone may write
 `PROPOSED → AUTHORIZED`; generic transition alone may write
 `AUTHORIZED → PREPARED` or pre-dispatch cancellation; and only a live fenced
 lease may write dispatch, reconciliation, or uncertainty transitions. A
@@ -157,7 +160,8 @@ fenced action transition are one `EffectStore::finalize_terminal_receipt`
 operation. The same contract provides an `EvidenceSnapshot` containing the
 action, primary receipt, retained conflicts, and a monotonic evidence revision.
 Writable action or receipt sub-stores are not exposed by the aggregate reference
-implementation, so terminal writes cannot bypass the transactional boundary.
+implementation, and the lifecycle API has no receipt-finalization operation, so
+receipt-derived terminal writes cannot bypass the transactional boundary.
 
 Post-terminal evidence uses `observe_terminal_evidence`, not terminal
 finalization. Exact evidence is idempotent. Contradictory evidence appends one

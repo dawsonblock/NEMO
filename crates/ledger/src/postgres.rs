@@ -334,7 +334,7 @@ impl PostgresEffectStore {
             lease,
             Self::database_now_ms(&mut transaction)?,
         )?;
-        if !is_valid_evidence_transition(expected, receipt.final_state, &evidence) {
+        if !is_valid_receipt_finalization(expected, receipt.final_state, &receipt.identity()) {
             return Err(ReferenceStoreError::EvidenceBindingMismatch {
                 action_id: action_id.to_owned(),
             }
@@ -749,16 +749,13 @@ impl ActionStore for PostgresEffectStore {
         Ok(())
     }
 
-    fn finalize_from_evidence(
+    fn finalize_pre_dispatch_failure(
         &self,
         action_id: &str,
-        expected: ExecutionState,
         lease: &ActionLease,
-        evidence: &TerminalEvidence,
+        evidence: &PreDispatchFailureEvidence,
     ) -> Result<(), Self::Error> {
-        if !is_leaseable_state(expected) {
-            return Err(ReferenceStoreError::InvalidLeaseState(expected).into());
-        }
+        let expected = ExecutionState::Dispatching;
         let mut connection = self.connection()?;
         let mut transaction = connection.transaction()?;
         let (mut action, revision) = self
@@ -770,7 +767,6 @@ impl ActionStore for PostgresEffectStore {
             lease,
             Self::database_now_ms(&mut transaction)?,
         )?;
-        let next = evidence.terminal_state();
         if !evidence
             .binds_action(&action.preparation)
             .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
@@ -780,15 +776,15 @@ impl ActionStore for PostgresEffectStore {
             }
             .into());
         }
-        if !is_valid_evidence_transition(expected, next, evidence) {
+        if !is_valid_pre_dispatch_failure_finalization(expected) {
             return Err(ReferenceStoreError::InvalidTransition {
                 current: expected,
-                next,
+                next: ExecutionState::Failed,
             }
             .into());
         }
-        action.terminal_evidence = Some(evidence.clone());
-        action.state = next;
+        action.terminal_evidence = Some(TerminalEvidence::PreDispatchFailure(evidence.clone()));
+        action.state = ExecutionState::Failed;
         action.lease = None;
         self.update_action(&mut transaction, &action, revision)?;
         transaction.commit()?;
@@ -1335,6 +1331,40 @@ mod tests {
     #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
     fn postgres_action_store_passes_generic_conformance() {
         run_action_store_conformance::<PostgresHarness>();
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn lifecycle_only_failure_never_creates_a_receipt_backed_terminal_state() {
+        let harness = PostgresHarness::create();
+        let (action, lease, _receipt) = dispatching_action(&harness.effects);
+        let prepared = harness
+            .effects
+            .load_action(&action.action_id)
+            .unwrap()
+            .unwrap();
+        let failure = PreDispatchFailureEvidence {
+            action_binding: ActionEvidenceBinding::try_from(&prepared.preparation)
+                .expect("prepared action has a complete evidence binding"),
+            code: "provider-not-contacted".into(),
+            evidence_digest: "postgres-pre-dispatch-failure".into(),
+        };
+
+        harness
+            .effects
+            .finalize_pre_dispatch_failure(&action.action_id, &lease, &failure)
+            .unwrap();
+
+        let snapshot = harness
+            .effects
+            .evidence_snapshot(&action.action_id)
+            .unwrap();
+        assert_eq!(snapshot.action.state, ExecutionState::Failed);
+        assert_eq!(
+            snapshot.action.terminal_evidence,
+            Some(TerminalEvidence::PreDispatchFailure(failure))
+        );
+        assert_eq!(snapshot.receipt, None);
     }
 
     #[test]

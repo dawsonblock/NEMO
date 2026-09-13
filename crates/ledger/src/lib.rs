@@ -119,59 +119,67 @@ pub mod unstable {
         )
     }
 
-    /// Return whether immutable terminal evidence may complete an action.
+    /// Return whether an immutable receipt may complete an action through the
+    /// aggregate effect store.
     ///
-    /// Terminal state writes intentionally have a smaller domain than ordinary
-    /// lifecycle transitions. Stores must enforce this table themselves rather
-    /// than relying on a well-behaved kernel caller.
-    pub const fn is_valid_evidence_transition(
+    /// This deliberately accepts a receipt identity rather than
+    /// [`TerminalEvidence`]: receipt-derived terminalization is owned by
+    /// [`EffectStore`], which persists the primary receipt and action state in
+    /// the same operation. Lifecycle-only stores cannot use this transition.
+    pub const fn is_valid_receipt_finalization(
         current: ExecutionState,
         next: ExecutionState,
-        evidence: &TerminalEvidence,
+        receipt: &ReceiptIdentity,
     ) -> bool {
         matches!(
-            (current, next, evidence),
+            (current, next, receipt),
             (
                 ExecutionState::Dispatching,
                 ExecutionState::Committed,
-                TerminalEvidence::Receipt(ReceiptIdentity {
+                ReceiptIdentity {
                     final_state: ExecutionState::Committed,
                     ..
-                })
-            ) | (
-                ExecutionState::Dispatching,
-                ExecutionState::Failed,
-                TerminalEvidence::PreDispatchFailure(_)
+                }
             ) | (
                 ExecutionState::Unknown,
                 ExecutionState::Committed,
-                TerminalEvidence::Receipt(ReceiptIdentity {
+                ReceiptIdentity {
                     final_state: ExecutionState::Committed,
                     ..
-                })
+                }
             ) | (
                 ExecutionState::Unknown,
                 ExecutionState::Failed,
-                TerminalEvidence::Receipt(ReceiptIdentity {
+                ReceiptIdentity {
                     final_state: ExecutionState::Failed,
                     ..
-                })
+                }
             ) | (
                 ExecutionState::Reconciling,
                 ExecutionState::Committed,
-                TerminalEvidence::Receipt(ReceiptIdentity {
+                ReceiptIdentity {
                     final_state: ExecutionState::Committed,
                     ..
-                })
+                }
             ) | (
                 ExecutionState::Reconciling,
                 ExecutionState::Failed,
-                TerminalEvidence::Receipt(ReceiptIdentity {
+                ReceiptIdentity {
                     final_state: ExecutionState::Failed,
                     ..
-                })
+                }
             )
         )
+    }
+
+    /// Return whether a proven pre-dispatch failure may terminalize an action.
+    ///
+    /// A provider receipt is never accepted here. That makes it impossible for
+    /// an [`ActionStore`] caller to create a receipt-backed terminal state
+    /// without also atomically persisting the primary receipt through
+    /// [`EffectStore::finalize_terminal_receipt`].
+    pub const fn is_valid_pre_dispatch_failure_finalization(current: ExecutionState) -> bool {
+        matches!(current, ExecutionState::Dispatching)
     }
 
     /// Return whether a lifecycle state may be protected by a fenced lease.
@@ -823,6 +831,15 @@ pub mod unstable {
             }
             Ok(())
         }
+
+        /// Return whether this proof binds the exact durable action identity.
+        pub fn binds_action(
+            &self,
+            action: &ActionPreparation,
+        ) -> Result<bool, EvidenceBindingError> {
+            self.validate()?;
+            Ok(self.action_binding == ActionEvidenceBinding::try_from(action)?)
+        }
     }
 
     /// Immutable receipt conflict reported by an append-only receipt store.
@@ -1063,17 +1080,18 @@ pub mod unstable {
             next: ExecutionState,
         ) -> Result<(), Self::Error>;
 
-        /// Finalize a consequential action from explicit terminal evidence.
+        /// Finalize an action that is proven not to have crossed the external
+        /// effect boundary.
         ///
-        /// Generic transitions must not manufacture `COMMITTED` or
-        /// externally meaningful `FAILED` states. Implementations persist the
-        /// evidence identity and fenced terminal transition together.
-        fn finalize_from_evidence(
+        /// This lifecycle-only operation can only produce `FAILED` from a
+        /// bound [`PreDispatchFailureEvidence`]. Receipt-backed terminal
+        /// states must use [`EffectStore::finalize_terminal_receipt`] so the
+        /// primary receipt and action state are one atomic write.
+        fn finalize_pre_dispatch_failure(
             &self,
             action_id: &str,
-            expected: ExecutionState,
             lease: &ActionLease,
-            evidence: &TerminalEvidence,
+            evidence: &PreDispatchFailureEvidence,
         ) -> Result<(), Self::Error>;
 
         /// Apply one non-privileged, unfenced state transition.
@@ -1732,20 +1750,23 @@ pub mod unstable {
             Ok(())
         }
 
-        fn finalize_from_evidence(
+        fn finalize_pre_dispatch_failure(
             &self,
             action_id: &str,
-            expected: ExecutionState,
             lease: &ActionLease,
-            evidence: &TerminalEvidence,
+            evidence: &PreDispatchFailureEvidence,
         ) -> Result<(), Self::Error> {
             let now = self.clock.now_unix_ms();
             let mut records = self.records()?;
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
-            if !is_leaseable_state(expected) {
-                return Err(ReferenceStoreError::InvalidLeaseState(expected));
+            let expected = ExecutionState::Dispatching;
+            if !is_valid_pre_dispatch_failure_finalization(record.state) {
+                return Err(ReferenceStoreError::InvalidTransition {
+                    current: record.state,
+                    next: ExecutionState::Failed,
+                });
             }
             if record.state != expected {
                 return Err(ReferenceStoreError::UnexpectedState {
@@ -1758,7 +1779,6 @@ pub mod unstable {
                     record.lease.clone().unwrap_or_else(|| lease.clone()),
                 ));
             }
-            let next = evidence.terminal_state();
             if !evidence
                 .binds_action(&record.preparation)
                 .map_err(|_| ReferenceStoreError::InvalidGrantDigest)?
@@ -1767,14 +1787,8 @@ pub mod unstable {
                     action_id: action_id.to_owned(),
                 });
             }
-            if !is_valid_evidence_transition(expected, next, evidence) {
-                return Err(ReferenceStoreError::InvalidTransition {
-                    current: expected,
-                    next,
-                });
-            }
-            record.terminal_evidence = Some(evidence.clone());
-            record.state = next;
+            record.terminal_evidence = Some(TerminalEvidence::PreDispatchFailure(evidence.clone()));
+            record.state = ExecutionState::Failed;
             record.lease = None;
             Ok(())
         }
@@ -2045,7 +2059,7 @@ pub mod unstable {
                     action.lease.clone().unwrap_or_else(|| lease.clone()),
                 ));
             }
-            if !is_valid_evidence_transition(expected, receipt.final_state, &evidence) {
+            if !is_valid_receipt_finalization(expected, receipt.final_state, &receipt.identity()) {
                 return Err(ReferenceStoreError::EvidenceBindingMismatch {
                     action_id: action_id.to_owned(),
                 });
@@ -2229,15 +2243,14 @@ pub mod unstable {
             })
         }
 
-        fn finalize_from_evidence(
+        fn finalize_pre_dispatch_failure(
             &self,
             action_id: &str,
-            expected: ExecutionState,
             lease: &ActionLease,
-            evidence: &TerminalEvidence,
+            evidence: &PreDispatchFailureEvidence,
         ) -> Result<(), Self::Error> {
             self.with_actions(|actions| {
-                actions.finalize_from_evidence(action_id, expected, lease, evidence)
+                actions.finalize_pre_dispatch_failure(action_id, lease, evidence)
             })
         }
 
@@ -2773,17 +2786,13 @@ pub mod unstable {
                 Ok(())
             }
 
-            fn finalize_from_evidence(
+            fn finalize_pre_dispatch_failure(
                 &self,
                 _action_id: &str,
-                _expected: ExecutionState,
                 _lease: &ActionLease,
-                evidence: &TerminalEvidence,
+                evidence: &PreDispatchFailureEvidence,
             ) -> Result<(), Self::Error> {
-                assert!(matches!(
-                    evidence.terminal_state(),
-                    ExecutionState::Committed | ExecutionState::Failed
-                ));
+                assert!(!evidence.code.is_empty());
                 Ok(())
             }
 
@@ -3666,23 +3675,8 @@ pub mod unstable {
         }
 
         #[test]
-        fn terminal_states_require_fenced_terminal_evidence() {
-            let (store, _clock) = prepared_reference_store();
-            let lease = match store
-                .claim_lease("reference-action", ExecutionState::Prepared, "owner", None)
-                .unwrap()
-            {
-                LeaseAcquireResult::Acquired(lease) => lease,
-                result => panic!("unexpected lease result: {result:?}"),
-            };
-            store
-                .transition_with_lease(
-                    "reference-action",
-                    ExecutionState::Prepared,
-                    &lease,
-                    ExecutionState::Dispatching,
-                )
-                .unwrap();
+        fn terminal_receipts_are_effect_store_only_and_atomic() {
+            let (store, lease, receipt) = dispatching_reference_effect_store();
             assert!(matches!(
                 store.transition_with_lease(
                     "reference-action",
@@ -3692,24 +3686,25 @@ pub mod unstable {
                 ),
                 Err(ReferenceStoreError::InvalidTransition { .. })
             ));
-            let evidence = TerminalEvidence::Receipt(
-                reference_receipt(ExecutionState::Committed, "provider-evidence").identity(),
-            );
             store
-                .finalize_from_evidence(
+                .finalize_terminal_receipt(
                     "reference-action",
                     ExecutionState::Dispatching,
                     &lease,
-                    &evidence,
+                    &receipt,
                 )
                 .unwrap();
             let action = store.load_action("reference-action").unwrap().unwrap();
             assert_eq!(action.state, ExecutionState::Committed);
-            assert_eq!(action.terminal_evidence, Some(evidence));
+            assert_eq!(
+                action.terminal_evidence,
+                Some(TerminalEvidence::Receipt(receipt.identity()))
+            );
+            assert_eq!(store.receipt("reference-action").unwrap(), Some(receipt));
         }
 
         #[test]
-        fn evidence_finalization_rejects_wrong_source_state_or_action_binding() {
+        fn lifecycle_only_finalization_rejects_wrong_failure_binding() {
             let (store, _clock) = prepared_reference_store();
             let lease = match store
                 .claim_lease("reference-action", ExecutionState::Prepared, "owner", None)
@@ -3718,16 +3713,6 @@ pub mod unstable {
                 LeaseAcquireResult::Acquired(lease) => lease,
                 result => panic!("unexpected lease result: {result:?}"),
             };
-            let receipt = reference_receipt(ExecutionState::Committed, "provider-evidence");
-            assert!(matches!(
-                store.finalize_from_evidence(
-                    "reference-action",
-                    ExecutionState::Prepared,
-                    &lease,
-                    &TerminalEvidence::Receipt(receipt.identity()),
-                ),
-                Err(ReferenceStoreError::InvalidTransition { .. })
-            ));
             store
                 .transition_with_lease(
                     "reference-action",
@@ -3736,15 +3721,22 @@ pub mod unstable {
                     ExecutionState::Dispatching,
                 )
                 .unwrap();
-            let mut mismatched = receipt.identity();
-            mismatched.principal_id = "mallory".into();
+            let mut binding = ActionEvidenceBinding::try_from(
+                &store
+                    .load_action("reference-action")
+                    .unwrap()
+                    .unwrap()
+                    .preparation,
+            )
+            .unwrap();
+            binding.principal_id = "mallory".into();
+            let mismatched = PreDispatchFailureEvidence {
+                action_binding: binding,
+                code: "provider-not-contacted".into(),
+                evidence_digest: "failure-evidence".into(),
+            };
             assert!(matches!(
-                store.finalize_from_evidence(
-                    "reference-action",
-                    ExecutionState::Dispatching,
-                    &lease,
-                    &TerminalEvidence::Receipt(mismatched),
-                ),
+                store.finalize_pre_dispatch_failure("reference-action", &lease, &mismatched,),
                 Err(ReferenceStoreError::EvidenceBindingMismatch { .. })
             ));
         }

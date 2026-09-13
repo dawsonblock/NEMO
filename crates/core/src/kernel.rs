@@ -22,8 +22,7 @@ use nemo_relay_ledger::unstable::{
     DurableEffectStore, EffectFinalizeResult, EffectStore, ExecutionState, LeaseAcquireResult,
     LeaseConfiguration, LeaseReleaseResult, LeaseRenewResult, LeaseStatus,
     PreDispatchFailureEvidence, PrepareActionResult, ReceiptConflict, ReceiptRecord,
-    TerminalEvidence, is_valid_evidence_transition, is_valid_generic_transition,
-    is_valid_leased_transition,
+    TerminalEvidence, is_valid_generic_transition, is_valid_leased_transition,
 };
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -1529,10 +1528,8 @@ where
                 if state == ExecutionState::Unknown {
                     return Err(self.unknown_after_dispatching(request, lease, error.to_string()));
                 }
-                let evidence = TerminalEvidence::PreDispatchFailure(pre_dispatch_failure_evidence(
-                    &request.action_preparation(),
-                    &error,
-                )?);
+                let evidence =
+                    pre_dispatch_failure_evidence(&request.action_preparation(), &error)?;
                 self.finalize_from_dispatching(request, lease, &evidence)?;
                 return Err(KernelError::EffectFailed {
                     // `finalize_from_dispatching` has durably recorded the
@@ -1544,7 +1541,7 @@ where
                         &request.action_preparation(),
                         ExecutionState::Failed,
                         None,
-                        evidence,
+                        TerminalEvidence::PreDispatchFailure(evidence),
                     )),
                     cause: error.to_string(),
                 });
@@ -1631,37 +1628,33 @@ where
         &self,
         request: &BoundExecutionRequest,
         lease: &ActionLease,
-        evidence: &TerminalEvidence,
+        evidence: &PreDispatchFailureEvidence,
     ) -> Result<(), KernelError> {
-        self.finalize_action_from_evidence(
-            &request.action_preparation(),
-            ExecutionState::Dispatching,
-            lease,
-            evidence,
-        )
+        self.finalize_pre_dispatch_failure(&request.action_preparation(), lease, evidence)
     }
 
-    fn finalize_action_from_evidence(
+    fn finalize_pre_dispatch_failure(
         &self,
         action: &ActionPreparation,
-        expected: ExecutionState,
         lease: &ActionLease,
-        evidence: &TerminalEvidence,
+        evidence: &PreDispatchFailureEvidence,
     ) -> Result<(), KernelError> {
-        let next = evidence.terminal_state();
         let binds_action = evidence
             .binds_action(action)
             .map_err(|_| KernelError::GrantBindingFailure)?;
-        if !binds_action || !is_valid_evidence_transition(expected, next, evidence) {
-            return Err(KernelError::InvalidStateTransition { expected, next });
+        if !binds_action {
+            return Err(KernelError::InvalidStateTransition {
+                expected: ExecutionState::Dispatching,
+                next: ExecutionState::Failed,
+            });
         }
         self.effect_store
-            .finalize_from_evidence(&action.action_id, expected, lease, evidence)
+            .finalize_pre_dispatch_failure(&action.action_id, lease, evidence)
             .map_err(|error| {
                 self.state_recovery_required(
                     action,
-                    expected,
-                    evidence.terminal_state(),
+                    ExecutionState::Dispatching,
+                    ExecutionState::Failed,
                     error.to_string(),
                 )
             })
@@ -2792,12 +2785,11 @@ mod tests {
             Ok(())
         }
 
-        fn finalize_from_evidence(
+        fn finalize_pre_dispatch_failure(
             &self,
             action_id: &str,
-            expected: ExecutionState,
             lease: &ActionLease,
-            evidence: &TerminalEvidence,
+            evidence: &PreDispatchFailureEvidence,
         ) -> Result<(), Self::Error> {
             let mut records = self
                 .records
@@ -2806,24 +2798,23 @@ mod tests {
             let record = records
                 .get_mut(action_id)
                 .ok_or_else(|| "unknown action terminal evidence".to_owned())?;
-            if record.state != expected || record.lease.as_ref() != Some(lease) {
+            if record.state != ExecutionState::Dispatching || record.lease.as_ref() != Some(lease) {
                 return Err("stale or unexpected terminal evidence lease".into());
             }
-            let terminal_state = evidence.terminal_state();
             let binds_action = evidence
                 .binds_action(&record.preparation)
                 .map_err(|_| "invalid grant digest in terminal evidence".to_owned())?;
-            if !binds_action || !is_valid_evidence_transition(expected, terminal_state, evidence) {
+            if !binds_action {
                 return Err("invalid terminal evidence transition".into());
             }
-            record.terminal_evidence = Some(evidence.clone());
-            record.state = terminal_state;
+            record.terminal_evidence = Some(TerminalEvidence::PreDispatchFailure(evidence.clone()));
+            record.state = ExecutionState::Failed;
             record.lease = None;
             drop(records);
             self.states
                 .lock()
                 .map_err(|_| "test action state lock poisoned".to_owned())?
-                .insert(action_id.to_owned(), terminal_state);
+                .insert(action_id.to_owned(), ExecutionState::Failed);
             Ok(())
         }
     }
@@ -3011,15 +3002,14 @@ mod tests {
                 .transition_with_lease(action_id, expected, lease, next)
         }
 
-        fn finalize_from_evidence(
+        fn finalize_pre_dispatch_failure(
             &self,
             action_id: &str,
-            expected: ExecutionState,
             lease: &ActionLease,
-            evidence: &TerminalEvidence,
+            evidence: &PreDispatchFailureEvidence,
         ) -> Result<(), Self::Error> {
             self.actions
-                .finalize_from_evidence(action_id, expected, lease, evidence)
+                .finalize_pre_dispatch_failure(action_id, lease, evidence)
         }
 
         fn transition(
@@ -3181,12 +3171,34 @@ mod tests {
             let finalized = self.receipts.finalize(receipt)?;
             match finalized {
                 FinalizeResult::Finalized(stored) | FinalizeResult::AlreadyFinalized(stored) => {
-                    self.actions.finalize_from_evidence(
-                        action_id,
-                        expected,
-                        lease,
-                        &TerminalEvidence::Receipt(stored.identity()),
-                    )?;
+                    let mut records = self
+                        .actions
+                        .records
+                        .lock()
+                        .map_err(|_| "test action record lock poisoned".to_owned())?;
+                    let action = records
+                        .get_mut(action_id)
+                        .ok_or_else(|| "unknown action terminal receipt".to_owned())?;
+                    if action.state != expected || action.lease.as_ref() != Some(lease) {
+                        return Err("stale or unexpected terminal receipt lease".into());
+                    }
+                    if !stored
+                        .identity()
+                        .action_binding()
+                        .eq(&ActionEvidenceBinding::try_from(&action.preparation)
+                            .map_err(|_| "invalid grant digest in terminal receipt".to_owned())?)
+                    {
+                        return Err("terminal receipt does not bind action".into());
+                    }
+                    action.terminal_evidence = Some(TerminalEvidence::Receipt(stored.identity()));
+                    action.state = stored.final_state;
+                    action.lease = None;
+                    drop(records);
+                    self.actions
+                        .states
+                        .lock()
+                        .map_err(|_| "test action state lock poisoned".to_owned())?
+                        .insert(action_id.to_owned(), stored.final_state);
                     *self
                         .evidence_revisions
                         .lock()

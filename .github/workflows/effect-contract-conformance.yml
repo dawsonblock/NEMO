@@ -48,6 +48,20 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    services:
+      postgres:
+        image: postgres:17.6-alpine@sha256:747d5ed1fdeeb124b880fbe3d7c6557d2c4064ae41d6b6297d417882effce4be
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,3 +104,8 @@ jobs:
 
       - name: Run hardening contract conformance
         run: just test-effect-contracts
+
+      - name: Run PostgreSQL EffectStore conformance
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-effect-store

@@ -344,33 +344,26 @@ where
         LeaseAcquireResult::HeldByOther(_)
     ));
 
-    let receipt = fixture_receipt(
-        &harness
-            .actions()
-            .load_action(&action.preparation.action_id)
-            .expect("load dispatching action")
-            .expect("dispatching action exists")
-            .preparation,
-        ExecutionState::Committed,
-        "evidence",
-    );
-    let evidence = TerminalEvidence::Receipt(receipt.identity());
+    let evidence = PreDispatchFailureEvidence {
+        action_binding: ActionEvidenceBinding::try_from(&action.preparation)
+            .expect("authorized action has evidence binding"),
+        code: "provider-not-contacted".into(),
+        evidence_digest: "pre-dispatch-evidence".into(),
+    };
     harness
         .actions()
-        .finalize_from_evidence(
-            &action.preparation.action_id,
-            ExecutionState::Dispatching,
-            &lease,
-            &evidence,
-        )
-        .expect("finalize bound receipt evidence");
+        .finalize_pre_dispatch_failure(&action.preparation.action_id, &lease, &evidence)
+        .expect("finalize bound pre-dispatch failure");
     let terminal = harness
         .actions()
         .load_action(&action.preparation.action_id)
         .expect("load terminal action")
         .expect("terminal action exists");
-    assert_eq!(terminal.state, ExecutionState::Committed);
-    assert_eq!(terminal.terminal_evidence, Some(evidence));
+    assert_eq!(terminal.state, ExecutionState::Failed);
+    assert_eq!(
+        terminal.terminal_evidence,
+        Some(TerminalEvidence::PreDispatchFailure(evidence))
+    );
 }
 
 fn run_leased_evidence_conformance<H>()
@@ -382,21 +375,16 @@ where
     let harness = H::new_harness();
     let action = authorize_and_prepare(&harness);
     let lease = dispatch_lease(&harness, &action);
-    let invalid_failure = TerminalEvidence::PreDispatchFailure(PreDispatchFailureEvidence {
+    let invalid_failure = PreDispatchFailureEvidence {
         action_binding: ActionEvidenceBinding::try_from(&action.preparation)
             .expect("authorized action has evidence binding"),
         code: " ".into(),
         evidence_digest: " ".into(),
-    });
+    };
     assert!(
         harness
             .actions()
-            .finalize_from_evidence(
-                &action.preparation.action_id,
-                ExecutionState::Dispatching,
-                &lease,
-                &invalid_failure,
-            )
+            .finalize_pre_dispatch_failure(&action.preparation.action_id, &lease, &invalid_failure,)
             .is_err(),
         "empty pre-dispatch proof must not terminalize an action"
     );
@@ -416,34 +404,28 @@ where
         .load_action(&action.preparation.action_id)
         .expect("load dispatching action")
         .expect("dispatching action exists");
-    for field in ActionBindingField::ALL {
-        let mut receipt = fixture_receipt(
-            &prepared.preparation,
-            ExecutionState::Committed,
-            "mutation-matrix",
-        );
-        field.mutate(&mut receipt);
-        assert!(
-            harness
-                .actions()
-                .finalize_from_evidence(
-                    &prepared.preparation.action_id,
-                    ExecutionState::Dispatching,
-                    &lease,
-                    &TerminalEvidence::Receipt(receipt.identity()),
-                )
-                .is_err(),
-            "mutating {} must reject terminal evidence",
-            field.name()
-        );
-        let current = harness
+    let mut binding = ActionEvidenceBinding::try_from(&prepared.preparation)
+        .expect("authorized action has evidence binding");
+    binding.principal_id = "mallory".into();
+    let failure = PreDispatchFailureEvidence {
+        action_binding: binding,
+        code: "provider-not-contacted".into(),
+        evidence_digest: "binding-mutation".into(),
+    };
+    assert!(
+        harness
             .actions()
-            .load_action(&prepared.preparation.action_id)
-            .expect("load unchanged action")
-            .expect("action exists");
-        assert_eq!(current.state, ExecutionState::Dispatching);
-        assert!(current.terminal_evidence.is_none());
-    }
+            .finalize_pre_dispatch_failure(&prepared.preparation.action_id, &lease, &failure)
+            .is_err(),
+        "lifecycle-only terminalization must reject a mismatched failure proof"
+    );
+    let current = harness
+        .actions()
+        .load_action(&prepared.preparation.action_id)
+        .expect("load unchanged action")
+        .expect("action exists");
+    assert_eq!(current.state, ExecutionState::Dispatching);
+    assert!(current.terminal_evidence.is_none());
 
     harness.advance_store_clock(10);
     assert!(matches!(
@@ -912,95 +894,6 @@ where
     run_effect_store_observation_conformance::<H>();
     run_effect_store_stale_worker_conformance::<H>();
     run_effect_store_reconciliation_conformance::<H>();
-}
-
-#[derive(Clone, Copy)]
-enum ActionBindingField {
-    ActionId,
-    IdempotencyKey,
-    GrantDigest,
-    PrincipalId,
-    TenantId,
-    RuntimeId,
-    RuntimeBindingDigest,
-    CapabilityId,
-    CapabilityGeneration,
-    RegistrationDigest,
-    Operation,
-    ExecutionClass,
-    ArgsDigest,
-    RouteDigest,
-    AdmissionId,
-    PolicyVersion,
-    PolicyEpoch,
-}
-
-impl ActionBindingField {
-    const ALL: [Self; 17] = [
-        Self::ActionId,
-        Self::IdempotencyKey,
-        Self::GrantDigest,
-        Self::PrincipalId,
-        Self::TenantId,
-        Self::RuntimeId,
-        Self::RuntimeBindingDigest,
-        Self::CapabilityId,
-        Self::CapabilityGeneration,
-        Self::RegistrationDigest,
-        Self::Operation,
-        Self::ExecutionClass,
-        Self::ArgsDigest,
-        Self::RouteDigest,
-        Self::AdmissionId,
-        Self::PolicyVersion,
-        Self::PolicyEpoch,
-    ];
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::ActionId => "action_id",
-            Self::IdempotencyKey => "idempotency_key",
-            Self::GrantDigest => "grant_digest",
-            Self::PrincipalId => "principal_id",
-            Self::TenantId => "tenant_id",
-            Self::RuntimeId => "runtime_id",
-            Self::RuntimeBindingDigest => "runtime_binding_digest",
-            Self::CapabilityId => "capability_id",
-            Self::CapabilityGeneration => "capability_generation",
-            Self::RegistrationDigest => "registration_digest",
-            Self::Operation => "operation",
-            Self::ExecutionClass => "execution_class",
-            Self::ArgsDigest => "args_digest",
-            Self::RouteDigest => "route_digest",
-            Self::AdmissionId => "admission_id",
-            Self::PolicyVersion => "policy_version",
-            Self::PolicyEpoch => "policy_epoch",
-        }
-    }
-
-    fn mutate(self, receipt: &mut ReceiptRecord) {
-        match self {
-            Self::ActionId => receipt.action_id = "other-action".into(),
-            Self::IdempotencyKey => receipt.idempotency_key = "other-idempotency".into(),
-            Self::GrantDigest => receipt.grant_digest = "other-grant".into(),
-            Self::PrincipalId => receipt.principal_id = "mallory".into(),
-            Self::TenantId => receipt.tenant_id = Some("other-tenant".into()),
-            Self::RuntimeId => receipt.runtime_id = "other-runtime".into(),
-            Self::RuntimeBindingDigest => {
-                receipt.runtime_binding_digest = "other-runtime-binding".into()
-            }
-            Self::CapabilityId => receipt.capability_id = "other-capability".into(),
-            Self::CapabilityGeneration => receipt.capability_generation += 1,
-            Self::RegistrationDigest => receipt.registration_digest = "other-registration".into(),
-            Self::Operation => receipt.operation = "other-operation".into(),
-            Self::ExecutionClass => receipt.execution_class = "CRITICAL".into(),
-            Self::ArgsDigest => receipt.args_digest = "other-args".into(),
-            Self::RouteDigest => receipt.route_digest = "other-route".into(),
-            Self::AdmissionId => receipt.admission_id = "other-admission".into(),
-            Self::PolicyVersion => receipt.policy_version = "other-policy".into(),
-            Self::PolicyEpoch => receipt.policy_epoch = "other-epoch".into(),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
