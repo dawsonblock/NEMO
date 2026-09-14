@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "platform": "macOS-26.2-arm64-arm-64bit",
   "machine": "arm64",
   "tools": {
@@ -16,5 +16,6 @@
     "cargo-deny": "cargo-deny 0.20.2",
     "cargo-audit": "cargo-audit-audit 0.22.2",
     "cargo-about": "cargo-about 0.9.1"
-  }
+  },
+  "postgres_server_version": "14.20 (Homebrew)"
 }

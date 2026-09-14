@@ -3,28 +3,31 @@
   "qualification_level": "E2_LOCAL",
   "release_version": "0.9.1-rc.4",
   "profile": "full",
-  "overall": "FAIL",
-  "promotion": "DEV",
-  "qualification_status": "INVALIDATED",
-  "invalidation_reason": "SOURCE_TREE_CHANGED_AFTER_QUALIFICATION",
+  "overall": "PASS",
+  "promotion": "QUALIFIED_LOCAL",
+  "qualification_status": "VALID",
   "checks": {
-    "source-stability": "FAIL",
+    "source-cleanliness": "PASS",
     "rust-format": "PASS",
     "clippy": "PASS",
     "rust-tests": "PASS",
     "rust-doc-tests": "PASS",
     "effect-contracts": "PASS",
+    "postgres-effect-store": "PASS",
+    "postgres-concurrency": "PASS",
+    "postgres-restart": "PASS",
     "cargo-deny": "PASS",
     "cargo-audit": "PASS",
     "python-tests": "PASS",
     "node-tests": "PASS",
     "go-tests": "PASS",
-    "sbom": "PASS"
+    "sbom": "PASS",
+    "source-stability": "PASS"
   },
   "check_details": {
-    "source-stability": {
-      "status": "FAIL",
-      "reason": "current source no longer matches the source manifest qualified by this report"
+    "source-cleanliness": {
+      "status": "PASS",
+      "reason": "source tree was clean before qualification began"
     },
     "rust-format": {
       "status": "PASS",
@@ -43,6 +46,18 @@
       "reason": "command completed successfully"
     },
     "effect-contracts": {
+      "status": "PASS",
+      "reason": "command completed successfully"
+    },
+    "postgres-effect-store": {
+      "status": "PASS",
+      "reason": "command completed successfully"
+    },
+    "postgres-concurrency": {
+      "status": "PASS",
+      "reason": "command completed successfully"
+    },
+    "postgres-restart": {
       "status": "PASS",
       "reason": "command completed successfully"
     },
@@ -69,28 +84,33 @@
     "sbom": {
       "status": "PASS",
       "reason": "cargo-about inventory converted to SPDX 2.3"
+    },
+    "source-stability": {
+      "status": "PASS",
+      "reason": "source tree remained identical throughout qualification"
     }
   },
   "provenance": {
-    "source_tree_sha256": "017a2fbd1e2234572dcc97a846389844eb94bd83a809c3e9a1962aa74acf6d96",
-    "source_archive_sha256": null,
-    "release_archive_sha256": null,
-    "environment_sha256": "3df3c8bc5dac9ad45562ccecbe4b4d0890a491112251fa84fec0cf84b0ef58d5",
+    "source_tree_sha256": "68abe542bf00e1f02477578ca006c9575027ae51fba2d52ecb74c5373a5f2c3e",
+    "source_archive_sha256": "dce7ce88fe3ac48b8897b27143ed9e5724418696728c0c3ca71f3bec689ed133",
+    "release_archive_sha256": "dce7ce88fe3ac48b8897b27143ed9e5724418696728c0c3ca71f3bec689ed133",
+    "environment_sha256": "2b595972d57babd9a7bb88f6b3c91e765544948acddbe574f4e19510c81feb79",
     "lockfiles": {
       "Cargo.lock": "sha256:df7d61c497e91eb2be39b2480e4a93fe1f07da437d0092be02b9a5c6a10e17d0",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
       "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "6149fda63f78095ccb9f703b2a9ea3fe64d222e8",
-      "tree": "4ea2826168e64679de03c50bb4e061e607529b9d",
-      "source_tree_sha256": "017a2fbd1e2234572dcc97a846389844eb94bd83a809c3e9a1962aa74acf6d96",
+      "commit": "3bab2caf80a3c65dad5aab5a78d741b625b902dd",
+      "tree": "e22a6063e255896f79fefd648ea4fb56203dcb1b",
+      "source_tree_sha256": "68abe542bf00e1f02477578ca006c9575027ae51fba2d52ecb74c5373a5f2c3e",
       "status": []
     }
   },
   "notes": [
-    "Qualification was invalidated because this source tree changed after the recorded qualification run.",
     "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
+    "The source manifest is verified both before and after checks; source changes invalidate qualification.",
+    "Live PostgreSQL conformance, concurrency, and restart checks are required for a PASS qualification.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
     "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
     "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result."

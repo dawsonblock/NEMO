@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-e1045840c2c351a4)
+
+running 2 tests
+test postgres::tests::concurrent_idempotency_claims_create_one_logical_action ... ok
+test postgres::tests::concurrent_identical_finalizers_commit_one_primary_receipt ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.08s

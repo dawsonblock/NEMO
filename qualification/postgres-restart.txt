@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-e1045840c2c351a4)
+
+running 1 test
+test postgres::tests::action_state_survives_a_fresh_pool_and_store_instance ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.03s

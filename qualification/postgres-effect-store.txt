@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-e1045840c2c351a4)
+
+running 8 tests
+test postgres::tests::action_state_survives_a_fresh_pool_and_store_instance ... ok
+test postgres::tests::concurrent_idempotency_claims_create_one_logical_action ... ok
+test postgres::tests::concurrent_identical_finalizers_commit_one_primary_receipt ... ok
+test postgres::tests::lifecycle_only_failure_never_creates_a_receipt_backed_terminal_state ... ok
+test postgres::tests::postgres_action_store_passes_generic_conformance ... ok
+test postgres::tests::postgres_effect_store_passes_generic_conformance ... ok
+test postgres::tests::rejects_unsafe_schema_names ... ok
+test postgres::tests::terminal_transaction_rolls_back_receipt_when_revision_is_exhausted ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.37s
