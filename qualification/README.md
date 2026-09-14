@@ -24,6 +24,8 @@ bind archive metadata to that exact unchanged source tree without overwriting
 the recorded check logs. A source-only edit invalidates the existing
 certificate and requires a new full qualification; provenance refresh never
 reuses a prior `PASS` for modified source.
+The refresh also preserves the environment record from the full run, including
+the PostgreSQL server version used by live database gates.
 
 The generated `source-manifest.json` excludes build products and generated
 qualification output (`.git`, `target`, `node_modules`, `coverage`, and

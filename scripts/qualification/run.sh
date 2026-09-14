@@ -146,7 +146,7 @@ fi
 # Capture a canonical source-tree manifest before running any checks. This is
 # independent of Git commit metadata, so an extracted archive can still bind
 # evidence to the exact files that were tested.
-python3 - "${repo_root}" "${output_dir}" <<'PY'
+python3 - "${repo_root}" "${output_dir}" "${mode}" <<'PY'
 import hashlib
 import json
 import os
@@ -158,6 +158,7 @@ import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
 out = pathlib.Path(sys.argv[2]).resolve()
+mode = sys.argv[3]
 out.mkdir(parents=True, exist_ok=True)
 
 
@@ -268,36 +269,46 @@ if release_archive_value:
 else:
     (out / "release-archive.sha256").write_text("NOT_PROVIDED\n")
 
-environment = {
-    "schema_version": 3,
-    "platform": platform.platform(),
-    "machine": platform.machine(),
-    "tools": {
-        "rustc": first_line(["rustc", "--version"]),
-        "cargo": first_line(["cargo", "--version"]),
-        "node": first_line(["node", "--version"]),
-        "npm": first_line(["npm", "--version"]),
-        "python": first_line(["python3", "--version"]),
-        "uv": first_line(["uv", "--version"]),
-        "go": first_line(["go", "version"]),
-        "protoc": first_line(["protoc", "--version"]),
-        "just": first_line(["just", "--version"]),
-        "cargo-nextest": first_line(["cargo", "nextest", "--version"]),
-        "cargo-deny": first_line(["cargo", "deny", "--version"]),
-        "cargo-audit": first_line(["cargo", "audit", "--version"]),
-        "cargo-about": first_line(["cargo-about", "--version"]),
-    },
-    "postgres_server_version": postgres_server_version(),
-}
-environment_bytes = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
-environment_sha256 = hashlib.sha256(environment_bytes).hexdigest()
-(out / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
-(out / "environment-sha256.txt").write_text(environment_sha256 + "\n")
-(out / "environment-lock.json").write_text(json.dumps({
-    "schema_version": 1,
-    "environment_sha256": environment_sha256,
-    "environment": environment,
-}, indent=2) + "\n")
+environment_path = out / "environment.json"
+environment_sha_path = out / "environment-sha256.txt"
+environment_lock_path = out / "environment-lock.json"
+if mode == "provenance" and environment_path.is_file() and environment_sha_path.is_file() and environment_lock_path.is_file():
+    # Archive binding must not replace the environment that actually ran the
+    # full test matrix. In particular, a release host need not have the live
+    # PostgreSQL test URL that was used for the qualification gate.
+    environment = json.loads(environment_path.read_text())
+    environment_sha256 = environment_sha_path.read_text().strip()
+else:
+    environment = {
+        "schema_version": 3,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "tools": {
+            "rustc": first_line(["rustc", "--version"]),
+            "cargo": first_line(["cargo", "--version"]),
+            "node": first_line(["node", "--version"]),
+            "npm": first_line(["npm", "--version"]),
+            "python": first_line(["python3", "--version"]),
+            "uv": first_line(["uv", "--version"]),
+            "go": first_line(["go", "version"]),
+            "protoc": first_line(["protoc", "--version"]),
+            "just": first_line(["just", "--version"]),
+            "cargo-nextest": first_line(["cargo", "nextest", "--version"]),
+            "cargo-deny": first_line(["cargo", "deny", "--version"]),
+            "cargo-audit": first_line(["cargo", "audit", "--version"]),
+            "cargo-about": first_line(["cargo-about", "--version"]),
+        },
+        "postgres_server_version": postgres_server_version(),
+    }
+    environment_bytes = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
+    environment_sha256 = hashlib.sha256(environment_bytes).hexdigest()
+    environment_path.write_text(json.dumps(environment, indent=2) + "\n")
+    environment_sha_path.write_text(environment_sha256 + "\n")
+    environment_lock_path.write_text(json.dumps({
+        "schema_version": 1,
+        "environment_sha256": environment_sha256,
+        "environment": environment,
+    }, indent=2) + "\n")
 
 locks = {}
 for name in ["Cargo.lock", "package-lock.json", "uv.lock"]:
