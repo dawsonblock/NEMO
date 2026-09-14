@@ -171,6 +171,24 @@ def first_line(command):
     return output[0] if output else None
 
 
+def postgres_server_version():
+    connection = os.environ.get("NEMO_RELAY_TEST_POSTGRES_URL")
+    if not connection or shutil.which("psql") is None:
+        return None
+    result = subprocess.run(
+        ["psql", connection, "--tuples-only", "--no-align", "--command", "SHOW server_version"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip().splitlines()
+    return output[0] if output else None
+
+
 def git_output(arguments):
     if shutil.which("git") is None:
         return None
@@ -251,7 +269,7 @@ else:
     (out / "release-archive.sha256").write_text("NOT_PROVIDED\n")
 
 environment = {
-    "schema_version": 2,
+    "schema_version": 3,
     "platform": platform.platform(),
     "machine": platform.machine(),
     "tools": {
@@ -269,6 +287,7 @@ environment = {
         "cargo-audit": first_line(["cargo", "audit", "--version"]),
         "cargo-about": first_line(["cargo-about", "--version"]),
     },
+    "postgres_server_version": postgres_server_version(),
 }
 environment_bytes = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
 environment_sha256 = hashlib.sha256(environment_bytes).hexdigest()
