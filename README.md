@@ -348,7 +348,7 @@ just provenance-check
 # Run the full pinned matrix in the devcontainer.
 just qualification
 
-# Refresh only source/environment evidence when no full matrix is available.
+# Bind the final archive to an unchanged valid full qualification.
 just qualification provenance
 ```
 
@@ -364,10 +364,11 @@ just qualification provenance
 just provenance-check
 ```
 
-The resulting archive has normalized paths, timestamps, and permissions. It is
-an evidence-bound source candidate; it is not a production certificate until
-the complete Rust, Python, Node, Go, security, provider, and recovery gates
-actually pass.
+Packaging refuses a missing, invalid, or source-mismatched qualification
+record. The resulting archive has normalized paths, timestamps, and
+permissions. It is an evidence-bound source candidate; it is not a production
+certificate until the complete Rust, Python, Node, Go, security, provider, and
+recovery gates actually pass.
 
 ## Documentation and contribution
 

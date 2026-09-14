@@ -1,11 +1,14 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "qualification_level": "E2_LOCAL",
   "release_version": "0.9.1-rc.4",
   "profile": "full",
-  "overall": "PASS",
-  "promotion": "QUALIFIED_LOCAL",
+  "overall": "FAIL",
+  "promotion": "DEV",
+  "qualification_status": "INVALIDATED",
+  "invalidation_reason": "SOURCE_TREE_CHANGED_AFTER_QUALIFICATION",
   "checks": {
+    "source-stability": "FAIL",
     "rust-format": "PASS",
     "clippy": "PASS",
     "rust-tests": "PASS",
@@ -19,6 +22,10 @@
     "sbom": "PASS"
   },
   "check_details": {
+    "source-stability": {
+      "status": "FAIL",
+      "reason": "current source no longer matches the source manifest qualified by this report"
+    },
     "rust-format": {
       "status": "PASS",
       "reason": "command completed successfully"
@@ -82,6 +89,7 @@
     }
   },
   "notes": [
+    "Qualification was invalidated because this source tree changed after the recorded qualification run.",
     "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
     "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",

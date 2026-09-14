@@ -47,10 +47,13 @@ coalescing. Cache writes expose `flush_cache_writes()` and
 
 Qualification is provenance-bound. The harness writes `source-manifest.json`,
 `source-tree.sha256`, `environment-lock.json`, and lockfile digests before it
-runs checks. Missing prerequisites are recorded as `NOT_RUN` with a reason;
-they do not become a test failure or an implicit pass. A report with any
-`NOT_RUN` or `INCONCLUSIVE` check remains `DEV`/`INCONCLUSIVE` and is not a
-release certificate.
+runs checks, then verifies that same source manifest after the checks finish.
+A source change invalidates the certificate rather than inheriting a previous
+`PASS`. Missing prerequisites are recorded as `NOT_RUN` with a reason; they do
+not become a test failure or an implicit pass. A report with any `NOT_RUN` or
+`INCONCLUSIVE` check remains `DEV`/`INCONCLUSIVE` and is not a release
+certificate. A valid full qualification now also requires live PostgreSQL
+conformance, concurrency, and fresh-store restart checks.
 
 The authority, ledger, and executor crates provide experimental kernel
 contracts and adapter boundaries. Production authority enforcement, durable
@@ -195,6 +198,12 @@ against an isolated disposable schema with:
 ```bash
 NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-effect-store
+
+# Qualification records these gates separately.
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-effect-store-concurrency
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-effect-store-restart
 ```
 
 The adapter remains experimental and disabled by default. Passing this suite
@@ -218,8 +227,8 @@ The `unstable-hardening-testkit` feature exposes backend-independent store
 conformance runners. An adapter supplies a fresh aggregate effect store plus a
 controller for its store-owned test clock, then runs the same lifecycle, lease,
 idempotency, immutable-receipt, conflict-history, stale-worker, and
-reconciliation-revision cases as the in-memory reference store. The mutation
-matrix changes each bound action/evidence field independently and asserts that
+reconciliation-revision cases as the in-memory reference store. The generic
+mutation matrix exercises representative binding mismatches and asserts that
 rejected input cannot alter durable state or evidence history. Receipt replay
 and conflict tests independently mutate provider request identity, terminal
 state, and evidence digest. This suite is a contract gate; it does not by itself

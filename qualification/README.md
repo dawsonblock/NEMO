@@ -19,10 +19,11 @@ to include an archive digest when qualifying a packaged source tree. Use
 `scripts/qualification/run.sh manifest` when only provenance capture is
 possible; it intentionally reports checks as `NOT_RUN`.
 
-Use `scripts/qualification/run.sh provenance` to refresh only the source and
-environment digests without overwriting existing per-check logs. This is useful
-after a source-only edit when the full matrix must be rerun in the pinned
-environment before promotion.
+Use `scripts/qualification/run.sh provenance` only after a valid full run, to
+bind archive metadata to that exact unchanged source tree without overwriting
+the recorded check logs. A source-only edit invalidates the existing
+certificate and requires a new full qualification; provenance refresh never
+reuses a prior `PASS` for modified source.
 
 The generated `source-manifest.json` excludes build products and generated
 qualification output (`.git`, `target`, `node_modules`, `coverage`, and

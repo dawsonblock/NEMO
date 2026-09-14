@@ -1241,6 +1241,26 @@ test-postgres-effect-store:
         --features unstable-postgres,unstable-hardening-testkit \
         postgres::tests -- --include-ignored --test-threads=1
 
+# Exercise PostgreSQL contention behavior separately for release qualification.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
+test-postgres-effect-store-concurrency:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests::concurrent_ -- --include-ignored --test-threads=1
+
+# Exercise PostgreSQL persistence through a fresh pool/store instance separately.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
+test-postgres-effect-store-restart:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests::action_state_survives_a_fresh_pool_and_store_instance -- --include-ignored --test-threads=1
+
 # --set [output_dir=<path>] [ci=true|false]
 test-rust:
     #!/usr/bin/env bash

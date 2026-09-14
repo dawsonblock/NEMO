@@ -14,14 +14,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import pathlib
 import stat
 import subprocess
 import sys
 import zipfile
 from datetime import datetime, timezone
-
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 DEFAULT_ROOT = SCRIPT_DIR.parents[1]
@@ -84,18 +82,12 @@ def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:
     except (FileNotFoundError, subprocess.CalledProcessError):
         candidates = [path.relative_to(root) for path in root.rglob("*") if path.is_file()]
     else:
-        candidates = [
-            pathlib.Path(value.decode())
-            for value in result.stdout.split(b"\0")
-            if value
-        ]
+        candidates = [pathlib.Path(value.decode()) for value in result.stdout.split(b"\0") if value]
 
     paths = {
         relative
         for relative in candidates
-        if not is_excluded(relative)
-        and (root / relative).is_file()
-        and not (root / relative).is_symlink()
+        if not is_excluded(relative) and (root / relative).is_file() and not (root / relative).is_symlink()
     }
     return sorted(paths, key=lambda path: path.as_posix())
 
@@ -105,9 +97,7 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def canonical_tree(files: list[pathlib.Path], root: pathlib.Path) -> tuple[str, dict[str, str]]:
-    hashes = {
-        relative.as_posix(): sha256_bytes((root / relative).read_bytes()) for relative in files
-    }
+    hashes = {relative.as_posix(): sha256_bytes((root / relative).read_bytes()) for relative in files}
     canonical = "".join(f"{name}\t{digest}\n" for name, digest in hashes.items()).encode()
     return sha256_bytes(canonical), hashes
 
@@ -145,11 +135,48 @@ def write_archive(
             )
 
 
+def qualified_source_tree(
+    root: pathlib.Path, qualification_dir: pathlib.Path, actual_source_tree_sha256: str
+) -> dict[str, object]:
+    """Require a valid qualification record for exactly the source being packaged."""
+
+    report_path = qualification_dir / "qualification.json"
+    source_manifest_path = qualification_dir / "source-manifest.json"
+    if not report_path.is_file() or not source_manifest_path.is_file():
+        raise ValueError("missing qualification.json or source-manifest.json; run full qualification before packaging")
+
+    try:
+        report = json.loads(report_path.read_text())
+        source_manifest = json.loads(source_manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid qualification evidence: {error}") from error
+
+    if report.get("overall") != "PASS" or report.get("qualification_status") != "VALID":
+        raise ValueError("qualification report is not a valid PASS certificate")
+
+    qualified_digest = source_manifest.get("root_digest")
+    report_digest = report.get("provenance", {}).get("source_tree_sha256")
+    if not isinstance(qualified_digest, str) or qualified_digest != report_digest:
+        raise ValueError("qualification report and source manifest do not agree on the source tree")
+    if qualified_digest != actual_source_tree_sha256:
+        raise ValueError("source tree changed after qualification; rerun full qualification before packaging")
+    return {
+        "source_tree_sha256": qualified_digest,
+        "qualification_report": str(report_path.relative_to(root)),
+        "source_manifest": str(source_manifest_path.relative_to(root)),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=pathlib.Path, default=DEFAULT_ROOT)
     parser.add_argument("--version", help="release version; defaults to Cargo.toml")
     parser.add_argument("--output", type=pathlib.Path, help="archive output path")
+    parser.add_argument(
+        "--qualification-dir",
+        type=pathlib.Path,
+        help="directory containing a valid qualification.json and source-manifest.json",
+    )
     args = parser.parse_args()
 
     root = args.repo_root.resolve()
@@ -158,6 +185,11 @@ def main() -> int:
     archive = archive.resolve()
     files = tracked_paths(root)
     source_tree_sha256, file_hashes = canonical_tree(files, root)
+    qualification_dir = (args.qualification_dir or root / "qualification").resolve()
+    try:
+        qualification = qualified_source_tree(root, qualification_dir, source_tree_sha256)
+    except ValueError as error:
+        parser.error(str(error))
     write_archive(archive, root, version, files)
     archive_sha256 = sha256_bytes(archive.read_bytes())
 
@@ -167,10 +199,13 @@ def main() -> int:
     manifest.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "release_version": version,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "source_tree_sha256": source_tree_sha256,
+                "qualified_source_tree_sha256": qualification["source_tree_sha256"],
+                "qualification_report": qualification["qualification_report"],
+                "qualification_source_manifest": qualification["source_manifest"],
                 "archive_sha256": archive_sha256,
                 "archive_filename": archive.name,
                 "algorithm": "sha256",
