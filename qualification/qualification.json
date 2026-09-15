@@ -13,6 +13,7 @@
     "rust-tests": "PASS",
     "rust-doc-tests": "PASS",
     "effect-contracts": "PASS",
+    "postgres-transport-security": "PASS",
     "postgres-effect-store": "PASS",
     "postgres-concurrency": "PASS",
     "postgres-restart": "PASS",
@@ -47,6 +48,10 @@
       "reason": "command completed successfully"
     },
     "effect-contracts": {
+      "status": "PASS",
+      "reason": "command completed successfully"
+    },
+    "postgres-transport-security": {
       "status": "PASS",
       "reason": "command completed successfully"
     },
@@ -96,19 +101,19 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe",
-    "source_archive_sha256": "85db834ab37914c4b1d83e0c830543cb7c11b0d33a056db9ca303b6243e75e8f",
-    "release_archive_sha256": "85db834ab37914c4b1d83e0c830543cb7c11b0d33a056db9ca303b6243e75e8f",
+    "source_tree_sha256": "8b51087f67fb4b355e36f546fce05a89313b1dbbbd25bab866b1da83b5a5e7c6",
+    "source_archive_sha256": "e6177d3aca8ed8d72cd51b583e606294c44f94880987c5396be9b6ad6091c8f2",
+    "release_archive_sha256": "e6177d3aca8ed8d72cd51b583e606294c44f94880987c5396be9b6ad6091c8f2",
     "environment_sha256": "2b595972d57babd9a7bb88f6b3c91e765544948acddbe574f4e19510c81feb79",
     "lockfiles": {
-      "Cargo.lock": "sha256:7cc39b32d86e8db2709c23ef20a06ffca551626e912f2e0030c966f6dae43d79",
+      "Cargo.lock": "sha256:520e039071882fbeffcc0eb2deaaea362c202288cd1ab2223b3235a95d5f6f83",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
       "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "750f19df51b00ba46ef9c15d1e20ed3fdd1d20fa",
-      "tree": "171c39c25c2cf88790b9f847660be744cde252f9",
-      "source_tree_sha256": "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe",
+      "commit": "de4dabd18b3d4112ca9a87a75d9927d49679cb24",
+      "tree": "0d34543e342caec54b4c85ddba33d140216847d7",
+      "source_tree_sha256": "8b51087f67fb4b355e36f546fce05a89313b1dbbbd25bab866b1da83b5a5e7c6",
       "status": []
     }
   },

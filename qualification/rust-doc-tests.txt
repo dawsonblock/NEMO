@@ -5,15 +5,14 @@ warning: doc tests are not supported for crate type(s) `cdylib` in package `nemo
    Compiling pyo3-async-runtimes v0.29.0
    Compiling pythonize v0.29.0
    Compiling nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Finished `test` profile [unoptimized] target(s) in 13.63s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.36s
    Doc-tests nemo_relay
-
 running 1 test
 test crates/core/src/api/runtime/scope_stack.rs - api::runtime::scope_stack::fork_scope_stack (line 614) - compile ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.77s; merged doctests compilation took 0.48s
+all doctests ran in 0.76s; merged doctests compilation took 0.48s
    Doc-tests nemo_relay_adaptive
 
 running 4 tests
@@ -24,12 +23,13 @@ test crates/adaptive/src/acg/types.rs - acg::types::AgentIdentity (line 360) ...
 
 test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.97s; merged doctests compilation took 0.69s
+all doctests ran in 0.99s; merged doctests compilation took 0.72s
    Doc-tests nemo_relay_authority
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
    Doc-tests nemo_relay_cli
 
 running 0 tests

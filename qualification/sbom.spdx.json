@@ -1594,6 +1594,40 @@
       ]
     },
     {
+      "SPDXID": "SPDXRef-Package-43695325fbe300d9",
+      "name": "foreign-types",
+      "versionInfo": "0.3.2",
+      "downloadLocation": "registry+https://github.com/rust-lang/crates.io-index",
+      "licenseConcluded": "MIT OR Apache-2.0",
+      "licenseDeclared": "MIT OR Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:cargo/foreign-types@0.3.2"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-2594f1581890dcb6",
+      "name": "foreign-types-shared",
+      "versionInfo": "0.1.1",
+      "downloadLocation": "registry+https://github.com/rust-lang/crates.io-index",
+      "licenseConcluded": "MIT OR Apache-2.0",
+      "licenseDeclared": "MIT OR Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:cargo/foreign-types-shared@0.1.1"
+        }
+      ]
+    },
+    {
       "SPDXID": "SPDXRef-Package-555bcf16e0713b32",
       "name": "form_urlencoded",
       "versionInfo": "1.2.2",
@@ -3447,6 +3481,40 @@
       ]
     },
     {
+      "SPDXID": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "name": "openssl",
+      "versionInfo": "0.10.81",
+      "downloadLocation": "registry+https://github.com/rust-lang/crates.io-index",
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:cargo/openssl@0.10.81"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-abff2c92b12f685b",
+      "name": "openssl-macros",
+      "versionInfo": "0.1.1",
+      "downloadLocation": "registry+https://github.com/rust-lang/crates.io-index",
+      "licenseConcluded": "MIT OR Apache-2.0",
+      "licenseDeclared": "MIT OR Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:cargo/openssl-macros@0.1.1"
+        }
+      ]
+    },
+    {
       "SPDXID": "SPDXRef-Package-f38491b34fe50ad3",
       "name": "openssl-probe",
       "versionInfo": "0.2.1",
@@ -3460,6 +3528,23 @@
           "referenceCategory": "PACKAGE-MANAGER",
           "referenceType": "purl",
           "referenceLocator": "pkg:cargo/openssl-probe@0.2.1"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-a45c6588c948e017",
+      "name": "openssl-sys",
+      "versionInfo": "0.9.117",
+      "downloadLocation": "registry+https://github.com/rust-lang/crates.io-index",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:cargo/openssl-sys@0.9.117"
         }
       ]
     },
@@ -6333,6 +6418,23 @@
           "referenceCategory": "PACKAGE-MANAGER",
           "referenceType": "purl",
           "referenceLocator": "pkg:cargo/value-bag@1.13.0"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-769c0475a5fa67f7",
+      "name": "vcpkg",
+      "versionInfo": "0.2.15",
+      "downloadLocation": "registry+https://github.com/rust-lang/crates.io-index",
+      "licenseConcluded": "MIT OR Apache-2.0",
+      "licenseDeclared": "MIT OR Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:cargo/vcpkg@0.2.15"
         }
       ]
     },
@@ -9313,6 +9415,11 @@
       "relatedSpdxElement": "SPDXRef-Package-f674d9fc993655a5"
     },
     {
+      "spdxElementId": "SPDXRef-Package-43695325fbe300d9",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-2594f1581890dcb6"
+    },
+    {
       "spdxElementId": "SPDXRef-Package-555bcf16e0713b32",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-9472d0b58d49994a"
@@ -12158,6 +12265,16 @@
       "relatedSpdxElement": "SPDXRef-Package-0d2e17785281de3b"
     },
     {
+      "spdxElementId": "SPDXRef-Package-07067d04146419e6",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-66e30ce2f8e5b6dc"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-07067d04146419e6",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-2e3b6fe130e26400"
+    },
+    {
       "spdxElementId": "SPDXRef-Package-4e7f76840acf5525",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-3519045bb4b8a247"
@@ -12891,6 +13008,76 @@
       "spdxElementId": "SPDXRef-Package-4a678fe26ea416ea",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-ba521ee1e8caa353"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-7349c857697938c6"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-56635a2c4fd7b2df"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-a45c6588c948e017"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-43695325fbe300d9"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-a733304fa0307800"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-66e30ce2f8e5b6dc",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-abff2c92b12f685b"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-abff2c92b12f685b",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-de579e35607e37bb"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-abff2c92b12f685b",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-f98078fec332daf1"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-abff2c92b12f685b",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-8cd45cef09a0cb20"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-a45c6588c948e017",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-ec19ad5720327a07"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-a45c6588c948e017",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-a733304fa0307800"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-a45c6588c948e017",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-9398a681ede43bae"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-a45c6588c948e017",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-f8d8ace627fecf64"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-a45c6588c948e017",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-769c0475a5fa67f7"
     },
     {
       "spdxElementId": "SPDXRef-Package-9e2cc3d59aa192e9",
@@ -14121,6 +14308,11 @@
       "spdxElementId": "SPDXRef-Package-2e3b6fe130e26400",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-ddcd16772ed5fcf7"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-2e3b6fe130e26400",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-66e30ce2f8e5b6dc"
     },
     {
       "spdxElementId": "SPDXRef-Package-2e3b6fe130e26400",
@@ -15681,6 +15873,11 @@
       "spdxElementId": "SPDXRef-Package-707e7c302eff1799",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-0d6fd23bacabf807"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-707e7c302eff1799",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-66e30ce2f8e5b6dc"
     },
     {
       "spdxElementId": "SPDXRef-Package-707e7c302eff1799",
@@ -17591,6 +17788,11 @@
       "spdxElementId": "SPDXRef-Package-c5493bb832e5f037",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-f1b6b08c4e86e45a"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-769c0475a5fa67f7",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-a54446e6cbf60495"
     },
     {
       "spdxElementId": "SPDXRef-Package-d050924b1f91c784",

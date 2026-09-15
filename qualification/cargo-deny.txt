@@ -1,8 +1,8 @@
 warning[duplicate]: found 2 duplicate entries for crate 'rand'
-    ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/Cargo.lock:254:1
+    ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/Cargo.lock:259:1
     │  
-254 │ ╭ rand 0.9.4 registry+https://github.com/rust-lang/crates.io-index
-255 │ │ rand 0.10.1 registry+https://github.com/rust-lang/crates.io-index
+259 │ ╭ rand 0.9.4 registry+https://github.com/rust-lang/crates.io-index
+260 │ │ rand 0.10.1 registry+https://github.com/rust-lang/crates.io-index
     │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
     │  
     ├ rand v0.9.4
@@ -53,10 +53,10 @@ warning[duplicate]: found 2 duplicate entries for crate 'rand'
               └── nemo-relay-python v0.9.1-rc.4 (*)
 
 warning[duplicate]: found 2 duplicate entries for crate 'winnow'
-    ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/Cargo.lock:416:1
+    ┌─ /Users/dawsonblock/Downloads/NeMo-Relay-main/Cargo.lock:422:1
     │  
-416 │ ╭ winnow 0.7.15 registry+https://github.com/rust-lang/crates.io-index
-417 │ │ winnow 1.0.3 registry+https://github.com/rust-lang/crates.io-index
+422 │ ╭ winnow 0.7.15 registry+https://github.com/rust-lang/crates.io-index
+423 │ │ winnow 1.0.3 registry+https://github.com/rust-lang/crates.io-index
     │ ╰──────────────────────────────────────────────────────────────────┘ lock entries
     │  
     ├ winnow v0.7.15

@@ -1,6 +1,6 @@
    Compiling pyo3-ffi v0.29.0
    Compiling pyo3 v0.29.0
-    Checking pyo3-async-runtimes v0.29.0
     Checking pythonize v0.29.0
+    Checking pyo3-async-runtimes v0.29.0
     Checking nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Finished `dev` profile [unoptimized] target(s) in 11.19s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.26s
