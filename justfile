@@ -1231,6 +1231,13 @@ test-effect-contracts:
     cargo test --locked -p nemo-relay-ledger --features unstable-hardening-testkit --lib
     cargo test --locked -p nemo-relay --features unstable-hardening --lib kernel::tests
 
+# Verify PostgreSQL transport policy and certificate/hostname failure handling.
+# This uses loopback TLS fixtures and does not require a live PostgreSQL server.
+test-postgres-transport-security:
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::transport_tests
+
 # Run the durable EffectStore conformance suite against a live PostgreSQL database.
 # Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
 test-postgres-effect-store:

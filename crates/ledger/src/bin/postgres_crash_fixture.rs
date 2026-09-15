@@ -10,7 +10,7 @@ use nemo_relay_ledger::unstable::{
 };
 
 fn connect(connection: &str, schema: &str) -> PostgresEffectStore {
-    PostgresEffectStore::connect(
+    PostgresEffectStore::connect_insecure_local_for_tests(
         connection,
         schema,
         LeaseConfiguration {

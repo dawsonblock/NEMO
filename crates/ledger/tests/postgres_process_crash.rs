@@ -37,7 +37,7 @@ impl TestSchema {
     }
 
     fn store(&self) -> PostgresEffectStore {
-        PostgresEffectStore::connect(
+        PostgresEffectStore::connect_insecure_local_for_tests(
             &self.connection,
             &self.name,
             LeaseConfiguration {

@@ -379,7 +379,7 @@ if [[ "${mode}" == "provenance" ]]; then
     :
 elif [[ "${mode}" == "manifest" ]]; then
     # Manifest-only mode is useful when the host cannot run the full matrix.
-    for check in rust-format clippy rust-tests rust-doc-tests effect-contracts cargo-deny cargo-audit \
+    for check in rust-format clippy rust-tests rust-doc-tests effect-contracts postgres-transport-security cargo-deny cargo-audit \
         postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery \
         python-tests node-tests go-tests sbom; do
         not_run "${check}" "qualification checks intentionally skipped in manifest-only mode"
@@ -402,6 +402,8 @@ else
         run_if_available rust-doc-tests cargo cargo test --doc --workspace
         run_if_available effect-contracts just just test-effect-contracts
     fi
+
+    run_if_available postgres-transport-security just just test-postgres-transport-security
 
     if [[ -n "${NEMO_RELAY_TEST_POSTGRES_URL:-}" ]]; then
         run_check postgres-effect-store just test-postgres-effect-store
@@ -511,7 +513,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 
 required = [
     "source-cleanliness", "source-stability", "rust-format", "clippy", "rust-tests", "rust-doc-tests",
-    "effect-contracts", "postgres-effect-store", "postgres-concurrency", "postgres-restart",
+    "effect-contracts", "postgres-transport-security", "postgres-effect-store", "postgres-concurrency", "postgres-restart",
     "postgres-crash-recovery",
     "cargo-deny", "cargo-audit", "python-tests", "node-tests", "go-tests", "sbom",
 ]

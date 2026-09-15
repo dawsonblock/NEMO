@@ -198,8 +198,27 @@ bounded connection pool and an idempotent migration for actions, primary
 receipts, and deduplicated conflicts. It locks the action row before lifecycle
 writes, uses `clock_timestamp()` for lease decisions, reads evidence under one
 repeatable-read snapshot, and commits terminal receipt, action state, lease
-release, and evidence revision in one transaction. Run the same generic suite
-against an isolated disposable schema with:
+release, and evidence revision in one transaction.
+
+Transport construction is explicit and fail-closed. `connect_verified_tls`
+requires a configured CA bundle, TCP hostname verification, and TLS 1.2 or
+newer. `connect_mutual_tls` adds a PKCS #12 client identity. Neither path honors
+a connection-string request to disable TLS. Plaintext is available only through
+`connect_local_socket` on Unix or the deliberately named
+`connect_insecure_local_for_tests`; the latter rejects every TCP host and
+`hostaddr` that is not loopback. There is no generic constructor that can
+silently downgrade a remote connection to plaintext. Certificate, hostname,
+expiry, and plaintext-endpoint behavior can be checked without a live database:
+
+```bash
+just test-postgres-transport-security
+```
+
+These connector tests establish local TLS policy and cryptographic handshake
+behavior. They do not yet qualify a deployed PostgreSQL TLS endpoint, certificate
+rotation, revocation, or the wider E3 distributed failure matrix.
+
+Run the same generic store suite against an isolated disposable schema with:
 
 ```bash
 NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \

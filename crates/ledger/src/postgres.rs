@@ -10,12 +10,16 @@
 //! held open.
 
 use crate::unstable::*;
-use postgres::{GenericClient, IsolationLevel, NoTls, Row};
+use native_tls::{Certificate, Identity, Protocol, TlsConnector};
+use postgres::config::{Host, SslMode, SslNegotiation};
+use postgres::{Client, Config, GenericClient, IsolationLevel, NoTls, Row};
+use postgres_native_tls::{MakeTlsConnector, set_postgresql_alpn};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 #[cfg(feature = "unstable-hardening-testkit")]
@@ -39,7 +43,196 @@ fn pause_at_test_crash_point(point: &str) {
 #[cfg(not(feature = "unstable-hardening-testkit"))]
 fn pause_at_test_crash_point(_point: &str) {}
 
-type Manager = PostgresConnectionManager<NoTls>;
+type PlainManager = PostgresConnectionManager<NoTls>;
+type TlsManager = PostgresConnectionManager<MakeTlsConnector>;
+
+const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+enum PostgresPool {
+    Plain(Pool<PlainManager>),
+    Tls(Pool<TlsManager>),
+}
+
+enum PostgresConnection {
+    Plain(PooledConnection<PlainManager>),
+    Tls(PooledConnection<TlsManager>),
+}
+
+fn validate_store_configuration(
+    schema: &str,
+    maximum_pool_size: u32,
+) -> Result<(), PostgresEffectStoreError> {
+    validate_schema_name(schema)?;
+    if maximum_pool_size == 0 {
+        return Err(PostgresEffectStoreError::InvalidPoolSize(0));
+    }
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_local_target(
+    configuration: &Config,
+    allow_loopback_tcp: bool,
+) -> Result<(), PostgresEffectStoreError> {
+    if configuration.get_hosts().is_empty() {
+        return Err(PostgresEffectStoreError::InvalidTransport(
+            "plaintext connections require an explicit Unix socket or loopback host".to_owned(),
+        ));
+    }
+
+    for host in configuration.get_hosts() {
+        match host {
+            Host::Tcp(host) if allow_loopback_tcp && is_loopback_host(host) => {}
+            Host::Tcp(host) if allow_loopback_tcp => {
+                return Err(PostgresEffectStoreError::InvalidTransport(format!(
+                    "plaintext TCP host {host:?} is not loopback"
+                )));
+            }
+            Host::Tcp(host) => {
+                return Err(PostgresEffectStoreError::InvalidTransport(format!(
+                    "local-socket transport cannot use TCP host {host:?}"
+                )));
+            }
+            #[cfg(unix)]
+            Host::Unix(_) => {}
+        }
+    }
+
+    if !allow_loopback_tcp && !configuration.get_hostaddrs().is_empty() {
+        return Err(PostgresEffectStoreError::InvalidTransport(
+            "local-socket transport cannot use hostaddr".to_owned(),
+        ));
+    }
+    if allow_loopback_tcp
+        && configuration
+            .get_hostaddrs()
+            .iter()
+            .any(|address| !address.is_loopback())
+    {
+        return Err(PostgresEffectStoreError::InvalidTransport(
+            "plaintext hostaddr is not loopback".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tls_target(configuration: &Config) -> Result<(), PostgresEffectStoreError> {
+    if configuration.get_hosts().is_empty() {
+        return Err(PostgresEffectStoreError::InvalidTransport(
+            "verified TLS requires an explicit TCP hostname".to_owned(),
+        ));
+    }
+    for host in configuration.get_hosts() {
+        match host {
+            Host::Tcp(host) if !host.trim().is_empty() => {}
+            Host::Tcp(_) => {
+                return Err(PostgresEffectStoreError::InvalidTransport(
+                    "verified TLS requires a non-empty TCP hostname".to_owned(),
+                ));
+            }
+            #[cfg(unix)]
+            Host::Unix(path) => {
+                return Err(PostgresEffectStoreError::InvalidTransport(format!(
+                    "verified TLS cannot use Unix socket {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verified_tls_connector(
+    configuration: &Config,
+    root_ca_pem: &[u8],
+    identity: Option<Identity>,
+) -> Result<MakeTlsConnector, PostgresEffectStoreError> {
+    verified_native_tls_connector(configuration, root_ca_pem, identity).map(MakeTlsConnector::new)
+}
+
+fn verified_native_tls_connector(
+    configuration: &Config,
+    root_ca_pem: &[u8],
+    identity: Option<Identity>,
+) -> Result<TlsConnector, PostgresEffectStoreError> {
+    validate_tls_target(configuration)?;
+    if root_ca_pem.is_empty() {
+        return Err(PostgresEffectStoreError::InvalidTransport(
+            "verified TLS requires at least one trusted CA certificate".to_owned(),
+        ));
+    }
+
+    let root_certificates = Certificate::stack_from_pem(root_ca_pem)?;
+    if root_certificates.is_empty() {
+        return Err(PostgresEffectStoreError::InvalidTransport(
+            "verified TLS requires at least one trusted CA certificate".to_owned(),
+        ));
+    }
+
+    let mut builder = TlsConnector::builder();
+    builder
+        .disable_built_in_roots(true)
+        .min_protocol_version(Some(Protocol::Tlsv12));
+    for certificate in root_certificates {
+        builder.add_root_certificate(certificate);
+    }
+    if let Some(identity) = identity {
+        builder.identity(identity);
+    }
+    if configuration.get_ssl_negotiation() == SslNegotiation::Direct {
+        set_postgresql_alpn(&mut builder);
+    }
+    Ok(builder.build()?)
+}
+
+fn build_plain_pool(
+    manager: PlainManager,
+    maximum_pool_size: u32,
+) -> Result<Pool<PlainManager>, PostgresEffectStoreError> {
+    Pool::builder()
+        .max_size(maximum_pool_size)
+        .connection_timeout(POOL_CONNECTION_TIMEOUT)
+        .build(manager)
+        .map_err(Into::into)
+}
+
+fn build_tls_pool(
+    manager: TlsManager,
+    maximum_pool_size: u32,
+) -> Result<Pool<TlsManager>, PostgresEffectStoreError> {
+    Pool::builder()
+        .max_size(maximum_pool_size)
+        .connection_timeout(POOL_CONNECTION_TIMEOUT)
+        .build(manager)
+        .map_err(Into::into)
+}
+
+impl Deref for PostgresConnection {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Plain(connection) => connection,
+            Self::Tls(connection) => connection,
+        }
+    }
+}
+
+impl DerefMut for PostgresConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Plain(connection) => connection,
+            Self::Tls(connection) => connection,
+        }
+    }
+}
 
 const MIGRATION: &str = include_str!("../migrations/0001_effect_store.sql");
 
@@ -50,6 +243,10 @@ pub enum PostgresEffectStoreError {
     InvalidSchemaName(String),
     /// A connection pool must contain at least one connection.
     InvalidPoolSize(u32),
+    /// The connection target is incompatible with the selected transport.
+    InvalidTransport(String),
+    /// TLS trust material or a client identity could not be loaded.
+    Tls(native_tls::Error),
     /// A connection could not be checked out from the bounded pool.
     Pool(r2d2::Error),
     /// PostgreSQL rejected a query or transaction.
@@ -73,6 +270,10 @@ impl std::fmt::Display for PostgresEffectStoreError {
             Self::InvalidPoolSize(size) => {
                 write!(formatter, "invalid PostgreSQL pool size: {size}")
             }
+            Self::InvalidTransport(message) => {
+                write!(formatter, "invalid PostgreSQL transport: {message}")
+            }
+            Self::Tls(error) => write!(formatter, "PostgreSQL TLS configuration error: {error}"),
             Self::Pool(error) => write!(formatter, "PostgreSQL pool error: {error}"),
             Self::Database(error) => write!(formatter, "PostgreSQL error: {error}"),
             Self::Serialization(error) => write!(formatter, "durable JSON error: {error}"),
@@ -93,10 +294,12 @@ impl std::error::Error for PostgresEffectStoreError {
         match self {
             Self::Pool(error) => Some(error),
             Self::Database(error) => Some(error),
+            Self::Tls(error) => Some(error),
             Self::Serialization(error) => Some(error),
             Self::Contract(error) => Some(error),
             Self::InvalidSchemaName(_)
             | Self::InvalidPoolSize(_)
+            | Self::InvalidTransport(_)
             | Self::CorruptData(_)
             | Self::IntegerOutOfRange(_) => None,
         }
@@ -115,6 +318,12 @@ impl From<postgres::Error> for PostgresEffectStoreError {
     }
 }
 
+impl From<native_tls::Error> for PostgresEffectStoreError {
+    fn from(error: native_tls::Error) -> Self {
+        Self::Tls(error)
+    }
+}
+
 impl From<serde_json::Error> for PostgresEffectStoreError {
     fn from(error: serde_json::Error) -> Self {
         Self::Serialization(error)
@@ -130,31 +339,124 @@ impl From<ReferenceStoreError> for PostgresEffectStoreError {
 /// Pooled PostgreSQL authority over one durable effect-store schema.
 #[derive(Clone)]
 pub struct PostgresEffectStore {
-    pool: Pool<Manager>,
+    pool: PostgresPool,
     schema: String,
     lease_configuration: LeaseConfiguration,
 }
 
 impl PostgresEffectStore {
-    /// Create a bounded PostgreSQL connection pool.
-    pub fn connect(
+    /// Create a plaintext pool for an explicitly local development or test target.
+    ///
+    /// Every configured host must be a Unix socket or a loopback TCP address.
+    /// Production callers should use [`Self::connect_local_socket`],
+    /// [`Self::connect_verified_tls`], or [`Self::connect_mutual_tls`].
+    pub fn connect_insecure_local_for_tests(
         connection_string: &str,
         schema: &str,
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
     ) -> Result<Self, PostgresEffectStoreError> {
-        validate_schema_name(schema)?;
-        if maximum_pool_size == 0 {
-            return Err(PostgresEffectStoreError::InvalidPoolSize(0));
-        }
-        let configuration = connection_string.parse()?;
+        let mut configuration: Config = connection_string.parse()?;
+        validate_local_target(&configuration, true)?;
+        configuration.ssl_mode(SslMode::Disable);
+        Self::from_plain_configuration(
+            configuration,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+        )
+    }
+
+    /// Create a plaintext pool connected exclusively through Unix sockets.
+    #[cfg(unix)]
+    pub fn connect_local_socket(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+    ) -> Result<Self, PostgresEffectStoreError> {
+        let mut configuration: Config = connection_string.parse()?;
+        validate_local_target(&configuration, false)?;
+        configuration.ssl_mode(SslMode::Disable);
+        Self::from_plain_configuration(
+            configuration,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+        )
+    }
+
+    /// Create a TLS-required pool that verifies the server certificate and hostname.
+    pub fn connect_verified_tls(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+        root_ca_pem: &[u8],
+    ) -> Result<Self, PostgresEffectStoreError> {
+        let configuration: Config = connection_string.parse()?;
+        let connector = verified_tls_connector(&configuration, root_ca_pem, None)?;
+        Self::from_tls_configuration(
+            configuration,
+            connector,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+        )
+    }
+
+    /// Create a TLS-required pool with a verified server and PKCS #12 client identity.
+    pub fn connect_mutual_tls(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+        root_ca_pem: &[u8],
+        client_identity_pkcs12: &[u8],
+        client_identity_password: &str,
+    ) -> Result<Self, PostgresEffectStoreError> {
+        let configuration: Config = connection_string.parse()?;
+        let identity = Identity::from_pkcs12(client_identity_pkcs12, client_identity_password)?;
+        let connector = verified_tls_connector(&configuration, root_ca_pem, Some(identity))?;
+        Self::from_tls_configuration(
+            configuration,
+            connector,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+        )
+    }
+
+    fn from_plain_configuration(
+        configuration: Config,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+    ) -> Result<Self, PostgresEffectStoreError> {
+        validate_store_configuration(schema, maximum_pool_size)?;
         let manager = PostgresConnectionManager::new(configuration, NoTls);
-        let pool = Pool::builder()
-            .max_size(maximum_pool_size)
-            .connection_timeout(Duration::from_secs(5))
-            .build(manager)?;
+        let pool = build_plain_pool(manager, maximum_pool_size)?;
         Ok(Self {
-            pool,
+            pool: PostgresPool::Plain(pool),
+            schema: schema.to_owned(),
+            lease_configuration,
+        })
+    }
+
+    fn from_tls_configuration(
+        mut configuration: Config,
+        connector: MakeTlsConnector,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+    ) -> Result<Self, PostgresEffectStoreError> {
+        validate_store_configuration(schema, maximum_pool_size)?;
+        validate_tls_target(&configuration)?;
+        configuration.ssl_mode(SslMode::Require);
+        let manager = PostgresConnectionManager::new(configuration, connector);
+        let pool = build_tls_pool(manager, maximum_pool_size)?;
+        Ok(Self {
+            pool: PostgresPool::Tls(pool),
             schema: schema.to_owned(),
             lease_configuration,
         })
@@ -167,8 +469,14 @@ impl PostgresEffectStore {
         Ok(())
     }
 
-    fn connection(&self) -> Result<PooledConnection<Manager>, PostgresEffectStoreError> {
-        self.pool.get().map_err(Into::into)
+    fn connection(&self) -> Result<PostgresConnection, PostgresEffectStoreError> {
+        match &self.pool {
+            PostgresPool::Plain(pool) => pool
+                .get()
+                .map(PostgresConnection::Plain)
+                .map_err(Into::into),
+            PostgresPool::Tls(pool) => pool.get().map(PostgresConnection::Tls).map_err(Into::into),
+        }
     }
 
     fn quoted_schema(&self) -> String {
@@ -1173,6 +1481,243 @@ fn canonical_digest<T: Serialize>(value: &T) -> Result<String, PostgresEffectSto
         .collect())
 }
 
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use native_tls::TlsAcceptor;
+    use openssl::pkcs12::Pkcs12;
+    use openssl::pkey::PKey;
+    use openssl::x509::X509;
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose, date_time_ymd,
+    };
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    struct TestPki {
+        ca_pem: String,
+        server_identity: Identity,
+        client_identity_pkcs12: Vec<u8>,
+        client_identity_password: String,
+    }
+
+    fn pkcs12_identity(
+        certificate_der: &[u8],
+        private_key_der: &[u8],
+        password: &str,
+    ) -> (Vec<u8>, Identity) {
+        let certificate = X509::from_der(certificate_der).expect("parse X.509 certificate");
+        let private_key =
+            PKey::private_key_from_pkcs8(private_key_der).expect("parse PKCS #8 private key");
+        let archive = Pkcs12::builder()
+            .name("NEMO test identity")
+            .pkey(&private_key)
+            .cert(&certificate)
+            .build2(password)
+            .expect("build PKCS #12 identity")
+            .to_der()
+            .expect("serialize PKCS #12 identity");
+        let identity = Identity::from_pkcs12(&archive, password).expect("load PKCS #12 identity");
+        (archive, identity)
+    }
+
+    fn test_pki(hostname: &str, expired: bool) -> TestPki {
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca_parameters = CertificateParams::default();
+        ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_parameters.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca = ca_parameters.self_signed(&ca_key).expect("create CA");
+
+        let server_key = KeyPair::generate().expect("generate server key");
+        let mut server_parameters =
+            CertificateParams::new(vec![hostname.to_owned()]).expect("server parameters");
+        server_parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        if expired {
+            server_parameters.not_before = date_time_ymd(2019, 1, 1);
+            server_parameters.not_after = date_time_ymd(2020, 1, 1);
+        }
+        let server = server_parameters
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("sign server certificate");
+        let (_, server_identity) = pkcs12_identity(
+            server.der().as_ref(),
+            &server_key.serialize_der(),
+            "server-test",
+        );
+
+        let client_key = KeyPair::generate().expect("generate client key");
+        let mut client_parameters =
+            CertificateParams::new(Vec::<String>::new()).expect("client parameters");
+        client_parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client = client_parameters
+            .signed_by(&client_key, &ca, &ca_key)
+            .expect("sign client certificate");
+
+        let client_identity_password = "client-test".to_owned();
+        let (client_identity_pkcs12, _) = pkcs12_identity(
+            client.der().as_ref(),
+            &client_key.serialize_der(),
+            &client_identity_password,
+        );
+
+        TestPki {
+            ca_pem: ca.pem(),
+            server_identity,
+            client_identity_pkcs12,
+            client_identity_password,
+        }
+    }
+
+    fn tls_handshake(
+        connector: &TlsConnector,
+        server_name: &str,
+        server_identity: Identity,
+    ) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS test server");
+        let address = listener.local_addr().expect("TLS test address");
+        let server = thread::spawn(move || {
+            let acceptor = TlsAcceptor::new(server_identity).expect("build TLS acceptor");
+            let (stream, _) = listener.accept().expect("accept TLS test connection");
+            acceptor.accept(stream).is_ok()
+        });
+        let stream = TcpStream::connect(address).expect("connect TLS test server");
+        let client_succeeded = connector.connect(server_name, stream).is_ok();
+        let _ = server.join().expect("join TLS test server");
+        client_succeeded
+    }
+
+    #[test]
+    fn plaintext_transport_rejects_non_loopback_tcp() {
+        let error = PostgresEffectStore::connect_insecure_local_for_tests(
+            "host=db.example.test user=nemo",
+            "nemo",
+            LeaseConfiguration::default(),
+            1,
+        )
+        .err()
+        .expect("remote plaintext must be rejected before pool construction");
+        assert!(matches!(
+            error,
+            PostgresEffectStoreError::InvalidTransport(_)
+        ));
+    }
+
+    #[test]
+    fn plaintext_test_transport_accepts_only_local_targets() {
+        let loopback: Config = "host=127.0.0.1 user=nemo".parse().unwrap();
+        validate_local_target(&loopback, true).expect("loopback TCP is allowed in tests");
+
+        let remote_address: Config = "host=localhost hostaddr=192.0.2.1 user=nemo"
+            .parse()
+            .unwrap();
+        assert!(validate_local_target(&remote_address, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_socket_transport_rejects_tcp() {
+        let socket: Config = "host=/var/run/postgresql user=nemo".parse().unwrap();
+        validate_local_target(&socket, false).expect("Unix socket is local");
+
+        let loopback: Config = "host=localhost user=nemo".parse().unwrap();
+        assert!(validate_local_target(&loopback, false).is_err());
+    }
+
+    #[test]
+    fn verified_tls_accepts_a_trusted_ca_and_matching_hostname() {
+        let pki = test_pki("localhost", false);
+        let configuration: Config = "host=localhost user=nemo".parse().unwrap();
+        let connector = verified_native_tls_connector(&configuration, pki.ca_pem.as_bytes(), None)
+            .expect("build verified TLS connector");
+        assert!(tls_handshake(&connector, "localhost", pki.server_identity));
+    }
+
+    #[test]
+    fn verified_tls_rejects_an_untrusted_ca() {
+        let server_pki = test_pki("localhost", false);
+        let untrusted_pki = test_pki("localhost", false);
+        let configuration: Config = "host=localhost user=nemo".parse().unwrap();
+        let connector =
+            verified_native_tls_connector(&configuration, untrusted_pki.ca_pem.as_bytes(), None)
+                .expect("build TLS connector with unrelated CA");
+        assert!(!tls_handshake(
+            &connector,
+            "localhost",
+            server_pki.server_identity
+        ));
+    }
+
+    #[test]
+    fn verified_tls_rejects_a_wrong_hostname() {
+        let pki = test_pki("localhost", false);
+        let configuration: Config = "host=localhost user=nemo".parse().unwrap();
+        let connector = verified_native_tls_connector(&configuration, pki.ca_pem.as_bytes(), None)
+            .expect("build verified TLS connector");
+        assert!(!tls_handshake(
+            &connector,
+            "wrong.example.test",
+            pki.server_identity
+        ));
+    }
+
+    #[test]
+    fn verified_tls_rejects_an_expired_certificate() {
+        let pki = test_pki("localhost", true);
+        let configuration: Config = "host=localhost user=nemo".parse().unwrap();
+        let connector = verified_native_tls_connector(&configuration, pki.ca_pem.as_bytes(), None)
+            .expect("build verified TLS connector");
+        assert!(!tls_handshake(&connector, "localhost", pki.server_identity));
+    }
+
+    #[test]
+    fn verified_tls_rejects_a_plaintext_endpoint() {
+        let pki = test_pki("localhost", false);
+        let configuration: Config = "host=localhost user=nemo".parse().unwrap();
+        let connector = verified_native_tls_connector(&configuration, pki.ca_pem.as_bytes(), None)
+            .expect("build verified TLS connector");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind plaintext test server");
+        let address = listener.local_addr().expect("plaintext test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept plaintext connection");
+            stream.write_all(b"not tls\n").expect("write plaintext");
+        });
+        let stream = TcpStream::connect(address).expect("connect plaintext test server");
+        assert!(connector.connect("localhost", stream).is_err());
+        server.join().expect("join plaintext test server");
+    }
+
+    #[test]
+    fn mutual_tls_accepts_a_valid_pkcs12_client_identity() {
+        let pki = test_pki("localhost", false);
+        let configuration: Config = "host=localhost user=nemo".parse().unwrap();
+        let identity =
+            Identity::from_pkcs12(&pki.client_identity_pkcs12, &pki.client_identity_password)
+                .expect("load PKCS #12 client identity");
+        verified_native_tls_connector(&configuration, pki.ca_pem.as_bytes(), Some(identity))
+            .expect("build mutual TLS connector");
+    }
+
+    #[test]
+    fn verified_tls_rejects_unix_socket_targets() {
+        #[cfg(unix)]
+        {
+            let configuration: Config = "host=/var/run/postgresql user=nemo".parse().unwrap();
+            let pki = test_pki("localhost", false);
+            assert!(
+                verified_native_tls_connector(&configuration, pki.ca_pem.as_bytes(), None,)
+                    .is_err()
+            );
+        }
+    }
+}
+
 #[cfg(all(test, feature = "unstable-hardening-testkit"))]
 mod tests {
     use super::*;
@@ -1204,7 +1749,7 @@ mod tests {
     }
 
     fn create_store(connection_string: &str, schema: &str) -> PostgresEffectStore {
-        let effects = PostgresEffectStore::connect(
+        let effects = PostgresEffectStore::connect_insecure_local_for_tests(
             connection_string,
             schema,
             LeaseConfiguration {
@@ -1343,7 +1888,7 @@ mod tests {
         assert!(validate_schema_name("NEMO").is_err());
         assert!(validate_schema_name("nemo;drop schema public").is_err());
         assert!(matches!(
-            PostgresEffectStore::connect(
+            PostgresEffectStore::connect_insecure_local_for_tests(
                 "host=/tmp dbname=postgres",
                 "nemo_effects",
                 LeaseConfiguration::default(),
