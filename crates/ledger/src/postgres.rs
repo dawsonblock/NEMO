@@ -1489,8 +1489,8 @@ mod transport_tests {
     use openssl::pkey::PKey;
     use openssl::x509::X509;
     use rcgen::{
-        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-        KeyUsagePurpose, date_time_ymd,
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair, KeyUsagePurpose, date_time_ymd,
     };
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
@@ -1526,6 +1526,10 @@ mod transport_tests {
     fn test_pki(hostname: &str, expired: bool) -> TestPki {
         let ca_key = KeyPair::generate().expect("generate CA key");
         let mut ca_parameters = CertificateParams::default();
+        ca_parameters.distinguished_name = DistinguishedName::new();
+        ca_parameters
+            .distinguished_name
+            .push(DnType::CommonName, "NEMO transport test root");
         ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_parameters.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
@@ -1537,6 +1541,10 @@ mod transport_tests {
         let server_key = KeyPair::generate().expect("generate server key");
         let mut server_parameters =
             CertificateParams::new(vec![hostname.to_owned()]).expect("server parameters");
+        server_parameters.distinguished_name = DistinguishedName::new();
+        server_parameters
+            .distinguished_name
+            .push(DnType::CommonName, hostname);
         server_parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         if expired {
             server_parameters.not_before = date_time_ymd(2019, 1, 1);
@@ -1554,6 +1562,10 @@ mod transport_tests {
         let client_key = KeyPair::generate().expect("generate client key");
         let mut client_parameters =
             CertificateParams::new(Vec::<String>::new()).expect("client parameters");
+        client_parameters.distinguished_name = DistinguishedName::new();
+        client_parameters
+            .distinguished_name
+            .push(DnType::CommonName, "NEMO transport test client");
         client_parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let client = client_parameters
             .signed_by(&client_key, &ca, &ca_key)
