@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "8b51087f67fb4b355e36f546fce05a89313b1dbbbd25bab866b1da83b5a5e7c6",
+  "root_digest": "2de9d1c36d904005c2b426f848a9da059e670228172e52d5220f7713303ee9e0",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -627,7 +627,7 @@
     "crates/ledger/src/bin/postgres_crash_fixture.rs": "63dc9f7329de1d528399e3908963eea31ea513cddd65149d5ca0b7c8097c463c",
     "crates/ledger/src/conformance.rs": "a8771159e0ef3445d5d76156478e667267ccad91faf6dc0d2c5acfb4ee573d11",
     "crates/ledger/src/lib.rs": "3ddc2eb8da0a8d6685eebdd3aa375f6a2c3f456fe9e73c411234a8a05f25caf1",
-    "crates/ledger/src/postgres.rs": "ebf25278d2488f07180c18f06180f86906d0a8db832fd274fb906466b275fce9",
+    "crates/ledger/src/postgres.rs": "d31de6d276ec9c2e4e6d30014ea69db0023bb82ef1056ae92330a0d527589bc4",
     "crates/ledger/tests/postgres_process_crash.rs": "672821f67de2349e2fd4bb79876c4bd3be129a849cdcce47cbdf6b294bdf98b1",
     "crates/node/Cargo.toml": "7fcdb1fa79845584cacc805879f9a208a2844cae3635bd4cd8d67509dc91d341",
     "crates/node/README.md": "d99acaf3bf89aff377415a6e174c701d484fd435bccc1f8a6d46ef0dff08b1a7",
@@ -1326,17 +1326,17 @@
     "build",
     "dist"
   ],
-  "source_archive_sha256": "e6177d3aca8ed8d72cd51b583e606294c44f94880987c5396be9b6ad6091c8f2",
-  "release_archive_sha256": "e6177d3aca8ed8d72cd51b583e606294c44f94880987c5396be9b6ad6091c8f2",
+  "source_archive_sha256": "c5f17df89ecb0cede967e57d1abd6afea3403aee01e1b79a98ebf2e14a3a65fe",
+  "release_archive_sha256": "c5f17df89ecb0cede967e57d1abd6afea3403aee01e1b79a98ebf2e14a3a65fe",
   "lockfiles": {
     "Cargo.lock": "sha256:520e039071882fbeffcc0eb2deaaea362c202288cd1ab2223b3235a95d5f6f83",
     "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
     "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
   },
   "git": {
-    "commit": "de4dabd18b3d4112ca9a87a75d9927d49679cb24",
-    "tree": "0d34543e342caec54b4c85ddba33d140216847d7",
-    "source_tree_sha256": "8b51087f67fb4b355e36f546fce05a89313b1dbbbd25bab866b1da83b5a5e7c6",
+    "commit": "a98b97255be8de0d9910de9dbef1b94ee52b5553",
+    "tree": "1bac02b4342188c6c835bd8ef864d881046260cc",
+    "source_tree_sha256": "2de9d1c36d904005c2b426f848a9da059e670228172e52d5220f7713303ee9e0",
     "status": []
   }
 }

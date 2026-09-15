@@ -10,7 +10,7 @@ test postgres::tests::postgres_effect_store_passes_generic_conformance ... ok
 test postgres::tests::rejects_unsafe_schema_names ... ok
 test postgres::tests::terminal_transaction_rolls_back_receipt_when_revision_is_exhausted ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.43s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.79s
 
      Running unittests src/bin/postgres_crash_fixture.rs (target/debug/deps/nemo_postgres_crash_fixture-43a66aeec816511a)
 
