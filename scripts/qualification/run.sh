@@ -380,7 +380,8 @@ if [[ "${mode}" == "provenance" ]]; then
 elif [[ "${mode}" == "manifest" ]]; then
     # Manifest-only mode is useful when the host cannot run the full matrix.
     for check in rust-format clippy rust-tests rust-doc-tests effect-contracts cargo-deny cargo-audit \
-        postgres-effect-store postgres-concurrency postgres-restart python-tests node-tests go-tests sbom; do
+        postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery \
+        python-tests node-tests go-tests sbom; do
         not_run "${check}" "qualification checks intentionally skipped in manifest-only mode"
     done
 else
@@ -406,10 +407,12 @@ else
         run_check postgres-effect-store just test-postgres-effect-store
         run_check postgres-concurrency just test-postgres-effect-store-concurrency
         run_check postgres-restart just test-postgres-effect-store-restart
+        run_check postgres-crash-recovery just test-postgres-crash-recovery
     else
         not_run postgres-effect-store "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-concurrency "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-restart "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run postgres-crash-recovery "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
     fi
 
     run_cargo_subcommand cargo-deny deny check
@@ -509,6 +512,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 required = [
     "source-cleanliness", "source-stability", "rust-format", "clippy", "rust-tests", "rust-doc-tests",
     "effect-contracts", "postgres-effect-store", "postgres-concurrency", "postgres-restart",
+    "postgres-crash-recovery",
     "cargo-deny", "cargo-audit", "python-tests", "node-tests", "go-tests", "sbom",
 ]
 for name in required:
@@ -537,7 +541,7 @@ report = {
     "notes": [
         "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
         "The source manifest is verified both before and after checks; source changes invalidate qualification.",
-        "Live PostgreSQL conformance, concurrency, and restart checks are required for a PASS qualification.",
+        "Live PostgreSQL conformance, concurrency, restart, and process-crash checks are required for a PASS qualification.",
         "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
         "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
         "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result.",

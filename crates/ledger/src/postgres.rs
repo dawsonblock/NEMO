@@ -18,6 +18,27 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+#[cfg(feature = "unstable-hardening-testkit")]
+fn pause_at_test_crash_point(point: &str) {
+    use std::io::Write;
+
+    if std::env::var("NEMO_RELAY_POSTGRES_CRASH_POINT").as_deref() != Ok(point) {
+        return;
+    }
+    let marker = std::env::var("NEMO_RELAY_POSTGRES_CRASH_MARKER")
+        .expect("crash test marker path must be configured");
+    let mut file = std::fs::File::create(marker).expect("create crash test marker");
+    file.write_all(point.as_bytes())
+        .expect("write crash test marker");
+    file.sync_all().expect("sync crash test marker");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(not(feature = "unstable-hardening-testkit"))]
+fn pause_at_test_crash_point(_point: &str) {}
+
 type Manager = PostgresConnectionManager<NoTls>;
 
 const MIGRATION: &str = include_str!("../migrations/0001_effect_store.sql");
@@ -297,6 +318,7 @@ impl PostgresEffectStore {
         let (mut action, revision) = self
             .load_action_with(&mut transaction, action_id, true)?
             .ok_or_else(|| ReferenceStoreError::ActionMissing(action_id.to_owned()))?;
+        pause_at_test_crash_point("after_action_lock");
         let evidence = TerminalEvidence::Receipt(receipt.identity());
         if !evidence
             .binds_action(&action.preparation)
@@ -369,11 +391,15 @@ impl PostgresEffectStore {
             self.table("effect_receipts")
         );
         transaction.execute(&insert, &[&action_id, &identity, &receipt_json])?;
+        pause_at_test_crash_point("after_receipt_insert");
         action.terminal_evidence = Some(evidence);
         action.state = receipt.final_state;
         action.lease = None;
         self.update_action(&mut transaction, &action, checked_revision(revision)?)?;
+        pause_at_test_crash_point("after_action_update");
+        pause_at_test_crash_point("before_commit");
         transaction.commit()?;
+        pause_at_test_crash_point("after_commit");
         Ok(EffectFinalizeResult::Finalized(receipt.clone()))
     }
 

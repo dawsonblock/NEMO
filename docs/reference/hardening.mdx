@@ -53,8 +53,12 @@ A source change invalidates the certificate rather than inheriting a previous
 not become a test failure or an implicit pass. A report with any `NOT_RUN` or
 `INCONCLUSIVE` check remains `DEV`/`INCONCLUSIVE` and is not a release
 certificate. A valid full qualification now also requires live PostgreSQL
-conformance, concurrency, and fresh-store restart checks. When a PostgreSQL
-test URL is supplied, the qualification environment record captures the server
+conformance, concurrency, fresh-store restart, and process-kill recovery
+checks. The crash gate kills a child process after the action lock, receipt
+insertion, action update, immediately before commit, and immediately after
+commit. Recovery from a fresh process must observe either the complete
+pre-transaction state or the complete committed state. When a PostgreSQL test
+URL is supplied, the qualification environment record captures the server
 version used for those gates.
 
 The authority, ledger, and executor crates provide experimental kernel
@@ -206,11 +210,15 @@ NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-effect-store-concurrency
 NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-effect-store-restart
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-crash-recovery
 ```
 
-The adapter remains experimental and disabled by default. Passing this suite
-alone does not establish restart, crash-matrix, load, real-provider, or release
-qualification.
+The adapter remains experimental and disabled by default. The process-crash
+gate establishes atomic terminal-state recovery at the named PostgreSQL
+transaction boundaries. It does not establish the wider machine-reboot, OOM,
+network-loss, long-running provider, recovery-discovery, load, or real-provider
+crash matrix.
 
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live

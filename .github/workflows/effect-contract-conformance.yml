@@ -23,6 +23,7 @@ on:
     branches:
       - 'hardening/**'
       - 'feat/effect-contract-*'
+      - 'codex/production-effect-store-*'
     paths:
       - 'crates/authority/**'
       - 'crates/core/**'
@@ -109,3 +110,8 @@ jobs:
         env:
           NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: just test-postgres-effect-store
+
+      - name: Run PostgreSQL process crash recovery
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-crash-recovery

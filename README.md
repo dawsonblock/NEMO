@@ -131,6 +131,10 @@ terminalization locks the action row and commits receipt, terminal state, lease
 release, and evidence revision together. Run its isolated-schema certification
 against a disposable database with
 `NEMO_RELAY_TEST_POSTGRES_URL=... just test-postgres-effect-store`.
+The distinct `just test-postgres-crash-recovery` gate kills a child process at
+the terminal transaction boundaries and verifies recovery from a fresh process;
+it is intentionally narrower than full machine, network, and provider chaos
+qualification.
 
 `BackendRouter` is deliberately a post-binding component, not a public
 harness entry point. Correct-Once and Effect Fabric implementations plug into
