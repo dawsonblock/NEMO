@@ -16,6 +16,7 @@
     "postgres-effect-store": "PASS",
     "postgres-concurrency": "PASS",
     "postgres-restart": "PASS",
+    "postgres-crash-recovery": "PASS",
     "cargo-deny": "PASS",
     "cargo-audit": "PASS",
     "python-tests": "PASS",
@@ -61,6 +62,10 @@
       "status": "PASS",
       "reason": "command completed successfully"
     },
+    "postgres-crash-recovery": {
+      "status": "PASS",
+      "reason": "command completed successfully"
+    },
     "cargo-deny": {
       "status": "PASS",
       "reason": "command completed successfully"
@@ -91,26 +96,26 @@
     }
   },
   "provenance": {
-    "source_tree_sha256": "68abe542bf00e1f02477578ca006c9575027ae51fba2d52ecb74c5373a5f2c3e",
-    "source_archive_sha256": "dce7ce88fe3ac48b8897b27143ed9e5724418696728c0c3ca71f3bec689ed133",
-    "release_archive_sha256": "dce7ce88fe3ac48b8897b27143ed9e5724418696728c0c3ca71f3bec689ed133",
+    "source_tree_sha256": "7a81da5cc31e46c3cb6f9ab6f32e278636699e5131e303eac2345d28b5b4d1de",
+    "source_archive_sha256": "e110cc2f8ccb8a2bf8be83adc9424ab49ae21d8e53012e34120df41e63b21ff2",
+    "release_archive_sha256": "e110cc2f8ccb8a2bf8be83adc9424ab49ae21d8e53012e34120df41e63b21ff2",
     "environment_sha256": "2b595972d57babd9a7bb88f6b3c91e765544948acddbe574f4e19510c81feb79",
     "lockfiles": {
-      "Cargo.lock": "sha256:df7d61c497e91eb2be39b2480e4a93fe1f07da437d0092be02b9a5c6a10e17d0",
+      "Cargo.lock": "sha256:7cc39b32d86e8db2709c23ef20a06ffca551626e912f2e0030c966f6dae43d79",
       "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
       "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
     },
     "git": {
-      "commit": "3bab2caf80a3c65dad5aab5a78d741b625b902dd",
-      "tree": "e22a6063e255896f79fefd648ea4fb56203dcb1b",
-      "source_tree_sha256": "68abe542bf00e1f02477578ca006c9575027ae51fba2d52ecb74c5373a5f2c3e",
+      "commit": "aa95ee55324a358a1c67bbf599b75baf9c0032b5",
+      "tree": "edf3ef781731b52d8abbb34ae55bb9635a950abd",
+      "source_tree_sha256": "7a81da5cc31e46c3cb6f9ab6f32e278636699e5131e303eac2345d28b5b4d1de",
       "status": []
     }
   },
   "notes": [
     "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
     "The source manifest is verified both before and after checks; source changes invalidate qualification.",
-    "Live PostgreSQL conformance, concurrency, and restart checks are required for a PASS qualification.",
+    "Live PostgreSQL conformance, concurrency, restart, and process-crash checks are required for a PASS qualification.",
     "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
     "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
     "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result."

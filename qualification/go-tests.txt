@@ -1,4 +1,31 @@
-    Finished `release` profile [optimized] target(s) in 0.28s
+   Compiling aws-lc-sys v0.45.0
+   Compiling aws-lc-rs v1.18.1
+   Compiling rustls v0.23.45
+   Compiling getrandom v0.3.4
+   Compiling tempfile v3.27.0
+   Compiling prost-build v0.14.3
+   Compiling tonic-prost-build v0.14.6
+   Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
+   Compiling cbindgen v0.29.2
+   Compiling nemo-relay-ffi v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ffi)
+   Compiling rustls-webpki v0.103.15
+   Compiling tokio-rustls v0.26.4
+   Compiling tonic v0.14.5
+   Compiling hyper-rustls v0.27.9
+   Compiling tonic-prost v0.14.5
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling reqwest v0.13.4
+   Compiling opentelemetry-proto v0.32.0
+   Compiling opentelemetry-http v0.32.0
+   Compiling tonic-types v0.14.5
+   Compiling tungstenite v0.27.0
+   Compiling tokio-tungstenite v0.27.0
+   Compiling opentelemetry-otlp v0.32.0
+   Compiling reqwest v0.12.28
+   Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
+   Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
+   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
+    Finished `release` profile [optimized] target(s) in 2m 00s
 === RUN   TestTopLevelPluginValidationAndLifecycle
 --- PASS: TestTopLevelPluginValidationAndLifecycle (0.01s)
 === RUN   TestPluginHelperConstructorsAndRegistryListing
