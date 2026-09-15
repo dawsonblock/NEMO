@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "root_digest": "7a81da5cc31e46c3cb6f9ab6f32e278636699e5131e303eac2345d28b5b4d1de",
+  "root_digest": "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe",
   "files": {
     ".agents/plugins/marketplace.json": "1be08f598b2dcc3a4bcf7e734aed323062184521cfc7c719ae35a8bcf9f0db5d",
     ".agents/skills/README.md": "50a53f309bfaf9eb2493b87f3bc49aeea0a1cd6e78ab1db0d583baf1d5a3faef",
@@ -67,7 +67,7 @@
     ".github/workflows/ci_python.yml": "ff059a9fb01232a10a7badb28b7aee5d36103f3798db6ab7c50f191990a453dd",
     ".github/workflows/ci_rust.yml": "d8a7c849bedab8e36df3cc75b9ee437997fb7cc72deebafef53eb622c33bd63c",
     ".github/workflows/dependency-gates.yml": "d7b681e30710ff0cf6b66a547b8f3d019957a7ef14f5afefa4b28ad94d4f52cb",
-    ".github/workflows/effect-contract-conformance.yml": "0da856c7bdebc9c2d3df980ce6d97948ac2defdf579b5cf3ab05946c8189828d",
+    ".github/workflows/effect-contract-conformance.yml": "cb531a8704ba35e0e093f4ad4e76ccef092c9405ec0f5569708da94afec23deb",
     ".github/workflows/fern-docs.yml": "921b13d81684578c99b1db36b42256f1eddbc4d633dc87dc0a7d79557fd451d0",
     ".github/workflows/nightly-alpha-tag.yaml": "cb0e7817a77442f34c4e17437a78ff50ed74753102f334ae9944ff17001a3b55",
     ".github/workflows/node-24-runtime.yml": "85f4c8df72a14450d5a7b8925b6308d05d78750f45e73891b7703a32cb8efc17",
@@ -1326,17 +1326,17 @@
     "build",
     "dist"
   ],
-  "source_archive_sha256": "e110cc2f8ccb8a2bf8be83adc9424ab49ae21d8e53012e34120df41e63b21ff2",
-  "release_archive_sha256": "e110cc2f8ccb8a2bf8be83adc9424ab49ae21d8e53012e34120df41e63b21ff2",
+  "source_archive_sha256": "85db834ab37914c4b1d83e0c830543cb7c11b0d33a056db9ca303b6243e75e8f",
+  "release_archive_sha256": "85db834ab37914c4b1d83e0c830543cb7c11b0d33a056db9ca303b6243e75e8f",
   "lockfiles": {
     "Cargo.lock": "sha256:7cc39b32d86e8db2709c23ef20a06ffca551626e912f2e0030c966f6dae43d79",
     "package-lock.json": "sha256:e53a090f5b553ccef443b257a38a06610173276695e319159bdd17adb4d76125",
     "uv.lock": "sha256:7951ad08421af208c71ef491584c4ca40e5c35010ba75d969b7ca736ba4879b4"
   },
   "git": {
-    "commit": "aa95ee55324a358a1c67bbf599b75baf9c0032b5",
-    "tree": "edf3ef781731b52d8abbb34ae55bb9635a950abd",
-    "source_tree_sha256": "7a81da5cc31e46c3cb6f9ab6f32e278636699e5131e303eac2345d28b5b4d1de",
+    "commit": "750f19df51b00ba46ef9c15d1e20ed3fdd1d20fa",
+    "tree": "171c39c25c2cf88790b9f847660be744cde252f9",
+    "source_tree_sha256": "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe",
     "status": []
   }
 }

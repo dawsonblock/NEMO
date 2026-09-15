@@ -1,29 +1,11 @@
 warning: doc tests are not supported for crate type(s) `cdylib` in package `nemo-relay-node`
-   Compiling tokio-rustls v0.26.4
-   Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
-   Compiling tonic v0.14.5
-   Compiling hyper-rustls v0.27.9
-   Compiling reqwest v0.13.4
-   Compiling tonic-prost v0.14.5
-   Compiling tonic-types v0.14.5
-   Compiling opentelemetry-proto v0.32.0
-   Compiling opentelemetry-http v0.32.0
-   Compiling object_store v0.14.1
-   Compiling opentelemetry-otlp v0.32.0
-   Compiling reqwest v0.12.28
-   Compiling tokio-tungstenite v0.27.0
-   Compiling nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
    Compiling pyo3-ffi v0.29.0
-   Compiling pyo3 v0.29.0
    Compiling nemo-relay-ffi v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ffi)
-   Compiling pythonize v0.29.0
+   Compiling pyo3 v0.29.0
    Compiling pyo3-async-runtimes v0.29.0
-   Compiling nemo-relay-worker v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker)
-   Compiling nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
-   Compiling nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
-   Compiling nemo-relay-cli v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/cli)
+   Compiling pythonize v0.29.0
    Compiling nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Finished `test` profile [unoptimized] target(s) in 38.00s
+    Finished `test` profile [unoptimized] target(s) in 13.63s
    Doc-tests nemo_relay
 
 running 1 test
@@ -31,7 +13,7 @@ test crates/core/src/api/runtime/scope_stack.rs - api::runtime::scope_stack::for
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.74s; merged doctests compilation took 0.46s
+all doctests ran in 0.77s; merged doctests compilation took 0.48s
    Doc-tests nemo_relay_adaptive
 
 running 4 tests
@@ -42,7 +24,7 @@ test crates/adaptive/src/acg/types.rs - acg::types::AgentIdentity (line 360) ...
 
 test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-all doctests ran in 0.85s; merged doctests compilation took 0.57s
+all doctests ran in 0.97s; merged doctests compilation took 0.69s
    Doc-tests nemo_relay_authority
 
 running 0 tests

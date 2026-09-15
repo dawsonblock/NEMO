@@ -1,5 +1,4 @@
-   Compiling nemo-relay-ledger v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ledger)
-    Finished `test` profile [unoptimized] target(s) in 2.29s
+    Finished `test` profile [unoptimized] target(s) in 0.11s
      Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-e1045840c2c351a4)
 
 running 8 tests
@@ -12,7 +11,7 @@ test postgres::tests::postgres_effect_store_passes_generic_conformance ... ok
 test postgres::tests::rejects_unsafe_schema_names ... ok
 test postgres::tests::terminal_transaction_rolls_back_receipt_when_revision_is_exhausted ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.40s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.38s
 
      Running unittests src/bin/postgres_crash_fixture.rs (target/debug/deps/nemo_postgres_crash_fixture-37fd859ff53037ef)
 

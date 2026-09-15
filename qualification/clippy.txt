@@ -1,40 +1,6 @@
-   Compiling aws-lc-sys v0.45.0
-   Compiling aws-lc-rs v1.18.1
-   Compiling rustls v0.23.45
-   Compiling getrandom v0.3.4
-   Compiling tempfile v3.27.0
-   Compiling prost-build v0.14.3
-   Compiling tonic-prost-build v0.14.6
-   Compiling nemo-relay-worker-proto v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker-proto)
-    Checking nemo-relay-ledger v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ledger)
-    Checking nemo-relay-executor v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/executor)
-    Checking nemo-relay-authority v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/authority)
    Compiling pyo3-ffi v0.29.0
    Compiling pyo3 v0.29.0
-   Compiling cbindgen v0.29.2
-   Compiling nemo-relay-ffi v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/ffi)
     Checking pyo3-async-runtimes v0.29.0
     Checking pythonize v0.29.0
-    Checking rustls-webpki v0.103.15
-    Checking tokio-rustls v0.26.4
-    Checking rustls-platform-verifier v0.7.0
-    Checking tungstenite v0.27.0
-    Checking tonic v0.14.5
-    Checking hyper-rustls v0.27.9
-    Checking reqwest v0.13.4
-    Checking tonic-prost v0.14.5
-    Checking opentelemetry-http v0.32.0
-    Checking opentelemetry-proto v0.32.0
-    Checking tonic-types v0.14.5
-    Checking opentelemetry-otlp v0.32.0
-    Checking object_store v0.14.1
-    Checking reqwest v0.12.28
-    Checking tokio-tungstenite v0.27.0
-    Checking nemo-relay-worker v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/worker)
-    Checking nemo-relay v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/core)
-    Checking nemo-relay-adaptive v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/adaptive)
-    Checking nemo-relay-pii-redaction v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/pii-redaction)
-    Checking nemo-relay-cli v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/cli)
     Checking nemo-relay-python v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/python)
-    Checking nemo-relay-node v0.9.1-rc.4 (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/node)
-    Finished `dev` profile [unoptimized] target(s) in 1m 15s
+    Finished `dev` profile [unoptimized] target(s) in 11.19s
