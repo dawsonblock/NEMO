@@ -1774,7 +1774,6 @@ dependencies = [
  "nemo-relay-ledger",
  "postgres",
  "serde_json",
- "uuid",
 ]
 
 [[package]]
