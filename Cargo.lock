@@ -2028,6 +2028,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-recovery"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay-ledger",
+]
+
+[[package]]
+name = "nemo-relay-runtime"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay-executor",
+ "nemo-relay-ledger",
+ "nemo-relay-recovery",
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "nemo-relay-types"
 version = "0.9.1-rc.4"
 dependencies = [

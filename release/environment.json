@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "captured_at": null,
+  "tools": {
+    "python": null,
+    "rustc": null,
+    "cargo": null,
+    "node": null,
+    "npm": null,
+    "go": null,
+    "uv": null,
+    "postgres_client": null,
+    "postgres_server": null
+  },
+  "platform": {
+    "os": null,
+    "architecture": null,
+    "image_digest": null
+  }
+}

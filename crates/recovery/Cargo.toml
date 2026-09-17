@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Production recovery controller scaffolding for durable effect reconciliation."
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+unstable-hardening = ["dep:nemo-relay-ledger"]
+
+[dependencies]
+nemo-relay-ledger = { workspace = true, features = ["unstable-hardening"], optional = true }

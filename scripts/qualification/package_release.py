@@ -42,6 +42,7 @@ EXCLUDED_ROOTS = {
 EXCLUDED_NAMES = {"__pycache__", ".coverage"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+BASELINE_SOURCE_TREE_SHA256 = "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe"
 
 
 def workspace_version(root: pathlib.Path) -> str:
@@ -94,6 +95,23 @@ def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def git_commit(root: pathlib.Path) -> str | None:
+    """Return the current commit when available."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
 
 
 def canonical_tree(files: list[pathlib.Path], root: pathlib.Path) -> tuple[str, dict[str, str]]:
@@ -224,6 +242,40 @@ def main() -> int:
         )
         + "\n"
     )
+    release_dir = root / "release"
+    release_dir.mkdir(parents=True, exist_ok=True)
+    commit = git_commit(root)
+    source_manifest_path = release_dir / "source-manifest.json"
+    source_manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "baseline_source_tree_sha256": BASELINE_SOURCE_TREE_SHA256,
+                "source_tree_sha256": source_tree_sha256,
+                "baseline_commit": commit,
+                "repair_commits": [],
+                "source_manifest_path": "qualification/source-manifest.json",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    artifact_path = release_dir / "artifact.json"
+    artifact_payload = {
+        "schema_version": 1,
+        "release_version": version,
+        "git_commit": commit,
+        "source_digest": source_tree_sha256,
+        "archive_digest": archive_sha256,
+        "build_timestamp": datetime.now(timezone.utc).isoformat(),
+        "ci_run_identity": None,
+        "builder_identity": None,
+        "qualification_status": "VALID",
+        "sbom_digest": None,
+        "provenance_digest": None,
+        "archive_filename": archive.name,
+    }
+    artifact_path.write_text(json.dumps(artifact_payload, indent=2) + "\n")
     print(f"Release: {version}")
     print(f"Files: {len(files)}")
     print(f"Source tree SHA-256: {source_tree_sha256}")

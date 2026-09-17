@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Production runtime composition root for durable EffectStore execution."
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+production = [
+    "dep:nemo-relay-executor",
+    "dep:nemo-relay-ledger",
+    "dep:nemo-relay-recovery",
+    "dep:serde",
+    "dep:thiserror",
+    "dep:uuid",
+]
+
+[dependencies]
+nemo-relay-executor = { workspace = true, features = ["unstable-hardening"], optional = true }
+nemo-relay-ledger = { workspace = true, features = ["unstable-hardening", "unstable-postgres"], optional = true }
+nemo-relay-recovery = { workspace = true, features = ["unstable-hardening"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+thiserror = { version = "2", optional = true }
+uuid = { workspace = true, features = ["v7"], optional = true }
+
+[[bin]]
+name = "nemo-relay-runtime"
+path = "src/main.rs"
+required-features = ["production"]

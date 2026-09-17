@@ -12,7 +12,9 @@ members = [
     "crates/pii-redaction",
     "crates/authority",
     "crates/ledger",
+    "crates/recovery",
     "crates/executor",
+    "crates/runtime",
     "crates/isolation",
   "crates/dlp",
     "crates/cli",
@@ -42,7 +44,9 @@ nemo-relay-ffi = { version = "0.9.1-rc.4", path = "crates/ffi" }
 nemo-relay-cli = { version = "0.9.1-rc.4", path = "crates/cli" }
 nemo-relay-authority = { version = "0.9.1-rc.4", path = "crates/authority" }
 nemo-relay-ledger = { version = "0.9.1-rc.4", path = "crates/ledger" }
+nemo-relay-recovery = { version = "0.9.1-rc.4", path = "crates/recovery" }
 nemo-relay-executor = { version = "0.9.1-rc.4", path = "crates/executor" }
+nemo-relay-runtime = { version = "0.9.1-rc.4", path = "crates/runtime" }
 nemo-relay-isolation = { version = "0.9.1-rc.4", path = "crates/isolation" }
 nemo-relay-dlp = { version = "0.9.1-rc.4", path = "crates/dlp" }
 opentelemetry = { version = "0.32", default-features = false }
