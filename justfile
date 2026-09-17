@@ -1222,6 +1222,62 @@ latency-benchmark *benchmark_args:
 test-latency-benchmark:
     uv run --locked python -m pytest scripts/latency_benchmark/tests
 
+# Compile and exercise the opt-in hardening ABI that the regular Rust suite does not enable.
+test-effect-contracts:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo test --locked -p nemo-relay-authority --features unstable-hardening --lib
+    cargo test --locked -p nemo-relay-executor --features unstable-hardening --lib
+    cargo test --locked -p nemo-relay-ledger --features unstable-hardening-testkit --lib
+    cargo test --locked -p nemo-relay --features unstable-hardening --lib kernel::tests
+
+# Verify PostgreSQL transport policy and certificate/hostname failure handling.
+# This uses loopback TLS fixtures and does not require a live PostgreSQL server.
+test-postgres-transport-security:
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::transport_tests
+
+# Run the durable EffectStore conformance suite against a live PostgreSQL database.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
+test-postgres-effect-store:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests -- --include-ignored --test-threads=1
+
+# Exercise PostgreSQL contention behavior separately for release qualification.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
+test-postgres-effect-store-concurrency:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests::concurrent_ -- --include-ignored --test-threads=1
+
+# Exercise PostgreSQL persistence through a fresh pool/store instance separately.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
+test-postgres-effect-store-restart:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests::action_state_survives_a_fresh_pool_and_store_instance -- --include-ignored --test-threads=1
+
+# Kill a child process at PostgreSQL terminal transaction boundaries and verify recovery.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL; each crash case uses and removes an isolated schema.
+test-postgres-crash-recovery:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        --test postgres_process_crash -- --include-ignored --test-threads=1
+
 # --set [output_dir=<path>] [ci=true|false]
 test-rust:
     #!/usr/bin/env bash
@@ -1636,6 +1692,10 @@ test-all: test-rust test-python test-python-langchain test-go test-node test-ope
 # Generate reproducible qualification artifacts. Use `quick` for a bounded local pass.
 qualification mode="full":
     scripts/qualification/run.sh "{{ mode }}"
+
+# Verify source, lockfile, Git, and archive digests against qualification evidence.
+provenance-check:
+    python3 scripts/qualification/provenance_check.py
 
 # [version] or --set ref_name=<version>
 set-version version="":

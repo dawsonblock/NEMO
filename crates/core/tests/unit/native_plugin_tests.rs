@@ -4077,6 +4077,12 @@ fn native_timestamp_scope_type_and_error_mappings_cover_variants() {
             NemoRelayStatus::Backpressured,
         ),
         (
+            FlowError::Timeout {
+                resource: "provider_admission",
+            },
+            NemoRelayStatus::Backpressured,
+        ),
+        (
             FlowError::Internal("internal".into()),
             NemoRelayStatus::Internal,
         ),

@@ -10,7 +10,7 @@ use std::sync::{Arc, Once};
 use crate::acg::profile::{BlockStabilityScore, StabilityClass};
 use crate::acg::prompt_ir::SpanId;
 use crate::acg::stability::StabilityAnalysisResult;
-use crate::config::{BackendSpec, StateConfig};
+use crate::config::{BackendSpec, SingleFlightLimits, StateConfig};
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
 use crate::response_cache::config::ToolCacheConfig;
 use crate::trie::accumulator::AccumulatorState;
@@ -743,7 +743,7 @@ async fn adaptive_runtime_register_is_idempotent_for_active_features() {
     let registrations_after_first = runtime.registrations.len();
     runtime.register().await.unwrap();
 
-    assert_eq!(registrations_after_first, 2);
+    assert_eq!(registrations_after_first, 5);
     assert_eq!(runtime.registrations.len(), registrations_after_first);
 
     runtime.deregister().unwrap();
@@ -852,7 +852,7 @@ async fn adaptive_runtime_helper_methods_cover_report_wait_for_idle_and_feature_
 
     assert_eq!(runtime_without_backend.agent_id(), "explicit-agent");
     assert!(!runtime_without_backend.report().has_errors());
-    assert_eq!(runtime_without_backend.pending_features("agent-a").len(), 2);
+    assert_eq!(runtime_without_backend.pending_features("agent-a").len(), 3);
     assert_eq!(
         build_learners(
             "agent-a",
@@ -882,7 +882,7 @@ async fn adaptive_runtime_helper_methods_cover_report_wait_for_idle_and_feature_
     })
     .await
     .unwrap();
-    assert_eq!(runtime_with_backend.pending_features("agent-a").len(), 4);
+    assert_eq!(runtime_with_backend.pending_features("agent-a").len(), 5);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1080,6 +1080,7 @@ async fn response_cache_feature_registers_llm_stream_and_enabled_tool_intercepts
             }),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let execution_name = feature.name.clone();
@@ -1110,7 +1111,8 @@ async fn response_cache_feature_propagates_invalid_store_configuration() {
         ..ResponseCacheConfig::default()
     };
     config.backend.kind = "unsupported-store".into();
-    let mut feature = ResponseCacheFeature::new(config, Uuid::now_v7());
+    let mut feature =
+        ResponseCacheFeature::new(config, SingleFlightLimits::default(), Uuid::now_v7());
     let mut runtime = AdaptiveRuntime::new(AdaptiveConfig::default())
         .await
         .unwrap();
@@ -1139,6 +1141,7 @@ async fn response_cache_feature_cleans_up_when_llm_registration_conflicts() {
             namespace: "response-cache-execution-conflict".into(),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let name = feature.name.clone();
@@ -1169,6 +1172,7 @@ async fn response_cache_feature_cleans_up_when_stream_registration_conflicts() {
             namespace: "response-cache-stream-conflict".into(),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let execution_name = feature.name.clone();
@@ -1209,6 +1213,7 @@ async fn response_cache_feature_cleans_up_when_tool_registration_conflicts() {
             }),
             ..ResponseCacheConfig::default()
         },
+        SingleFlightLimits::default(),
         Uuid::now_v7(),
     );
     let execution_name = feature.name.clone();
@@ -1337,10 +1342,12 @@ async fn response_cache_store_initialization_failure_fails_open() {
     runtime.register().await.unwrap();
 
     assert!(runtime.registered);
-    assert!(
-        runtime.registrations.is_empty(),
-        "an unavailable optional cache must not install intercepts"
+    assert_eq!(
+        runtime.registrations.len(),
+        3,
+        "an unavailable cache must retain bounded LLM, stream, and tool admission"
     );
+    runtime.deregister().unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

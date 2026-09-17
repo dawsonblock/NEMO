@@ -1,7 +1,7 @@
 ---
 title: "Adaptive Configuration"
 sidebar-title: "Configuration"
-description: "Configure the Adaptive component, including state, telemetry, hints, ACG, and response caching."
+description: "Configure the Adaptive component, including state, telemetry, hints, ACG, provider admission, and response caching."
 position: 2
 ---
 {/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -34,6 +34,7 @@ The top-level adaptive object contains:
 | `tool_parallelism` | Tool scheduling observation or scheduling behavior. |
 | `acg` | Adaptive Cache Governor prompt-cache planning. |
 | `response_cache` | Opt-in cache for repeated LLM responses and classified tool results. |
+| `provider_admission` | Always-on provider concurrency, pending-work, and admission-timeout limits. These apply whether response caching is enabled or not. |
 | `policy` | Adaptive-local handling for unknown fields and unsupported values. |
 
 Dedicated pages cover [Adaptive Cache Governor (ACG)](/configure-plugins/adaptive/acg),
@@ -48,6 +49,8 @@ policy remain whole-plugin settings:
 - Keep `tool_parallelism.mode = "observe_only"` until scheduling behavior has
   been validated.
 - Keep `policy.unsupported_value = "error"` for rollout safety.
+- Tune `provider_admission` independently when provider capacity or pending work
+  must be bounded without enabling response caching.
 
 ## `plugins.toml` Example
 
@@ -90,6 +93,14 @@ priority = 50
 stable_threshold = 0.95
 semi_stable_threshold = 0.50
 min_observations_for_full_confidence = 20
+
+[components.config.provider_admission]
+max_global_provider_concurrency = 512
+max_provider_concurrency = 128
+max_model_concurrency = 64
+max_pending_provider_requests = 2048
+max_pending_provider_per_provider = 512
+provider_admission_timeout_ms = 30000
 
 [components.config.policy]
 unknown_component = "warn"

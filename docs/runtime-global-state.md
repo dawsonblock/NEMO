@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Runtime global-state inventory
 
 This inventory covers mutable state whose lifetime can outlive one scope or
-one request. It is part of the `0.9.1-rc.2` lifecycle audit. Static schemas,
+one request. It is part of the `0.9.1-rc.3` lifecycle audit. Static schemas,
 constants, and immutable codec descriptors are intentionally omitted except
 where they explain ownership; test-only state is listed separately.
 

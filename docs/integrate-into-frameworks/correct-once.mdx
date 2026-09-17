@@ -1,0 +1,42 @@
+---
+title: NEMO Correct-Once execution boundary
+description: Bind NEMO capabilities and arguments to Function Hooks and Effect Fabric grants.
+---
+
+# NEMO Correct-Once execution boundary
+
+The Node integration in `integrations/correct-once` routes capability classes to
+the appropriate execution boundary:
+
+```text
+PURE / READ  -> Function Hooks
+MUTATION     -> Effect Fabric
+CRITICAL     -> Correct-Once Gateway approval and reconciliation
+```
+
+The integration signs versioned `coap3` grants. A grant covers one subject, one
+registry admission, one operation, one action ID, one idempotency key, and one
+canonical argument digest. The receiver recomputes the digest from the received
+arguments and rejects a mismatch before invoking code or making an external
+request.
+
+The reference package includes deterministic local capabilities for JSON
+digests, bounded file reads, atomic file writes, and approved file deletion.
+Run its tests with:
+
+```bash
+npm test --workspace=nemo-relay-correct-once
+```
+
+Capability schemas are enforced before a grant is created. Registration rejects
+inconsistent execution classes, and `critical` is reserved for
+approval-required mutations with an explicit Correct-Once server/tool route.
+Idempotency keys are request-bound: reusing a key for a different capability,
+action, or argument digest fails with a conflict. The runtime subject is fixed
+when the integration is created and cannot be supplied by an individual call.
+
+Use a separate approval authority for critical grants. Do not send the approval
+signing secret to the NEMO runtime or to a worker handling the external effect.
+The integration records Effect Fabric receipts and supports idempotent replay of
+completed local mutations. Provider-specific ambiguous-effect reconciliation
+remains the responsibility of Correct-Once.

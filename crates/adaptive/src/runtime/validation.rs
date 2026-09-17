@@ -89,6 +89,7 @@ pub fn validate_config(config: &AdaptiveConfig) -> ConfigReport {
     if let Some(response_cache) = &config.response_cache {
         validate_response_cache(&mut report, response_cache);
     }
+    validate_provider_admission(&mut report, &config.provider_admission);
 
     report
 }
@@ -212,6 +213,40 @@ fn validate_response_cache(report: &mut ConfigReport, config: &ResponseCacheConf
     }
 }
 
+fn validate_provider_admission(report: &mut ConfigReport, limits: &SingleFlightLimits) {
+    for (field, value) in [
+        (
+            "max_global_provider_concurrency",
+            limits.max_global_provider_concurrency,
+        ),
+        ("max_provider_concurrency", limits.max_provider_concurrency),
+        ("max_model_concurrency", limits.max_model_concurrency),
+        (
+            "max_pending_provider_requests",
+            limits.max_pending_provider_requests,
+        ),
+        (
+            "max_pending_provider_per_provider",
+            limits.max_pending_provider_per_provider,
+        ),
+    ] {
+        if value == 0 {
+            report.diagnostics.push(provider_admission_error(
+                "provider_admission.invalid_limit",
+                Some("provider_admission"),
+                format!("provider_admission.{field} must be greater than 0"),
+            ));
+        }
+    }
+    if limits.provider_admission_timeout_ms == 0 {
+        report.diagnostics.push(provider_admission_error(
+            "provider_admission.invalid_limit",
+            Some("provider_admission"),
+            "provider_admission.provider_admission_timeout_ms must be greater than 0".into(),
+        ));
+    }
+}
+
 fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlightLimits) {
     for (field, value) in [
         ("max_active_keys", limits.max_active_keys),
@@ -223,6 +258,14 @@ fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlight
         ),
         ("max_provider_concurrency", limits.max_provider_concurrency),
         ("max_model_concurrency", limits.max_model_concurrency),
+        (
+            "max_pending_provider_requests",
+            limits.max_pending_provider_requests,
+        ),
+        (
+            "max_pending_provider_per_provider",
+            limits.max_pending_provider_per_provider,
+        ),
     ] {
         if value == 0 {
             report.diagnostics.push(response_cache_error(
@@ -231,6 +274,13 @@ fn validate_singleflight_limits(report: &mut ConfigReport, limits: &SingleFlight
                 format!("singleflight.{field} must be greater than 0"),
             ));
         }
+    }
+    if limits.provider_admission_timeout_ms == 0 {
+        report.diagnostics.push(response_cache_error(
+            "response_cache.invalid_singleflight_limit",
+            Some("singleflight"),
+            "singleflight.provider_admission_timeout_ms must be greater than 0".into(),
+        ));
     }
 }
 
@@ -431,6 +481,16 @@ fn validate_tool_policy(
 
 fn response_cache_error(code: &str, field: Option<&str>, message: String) -> ConfigDiagnostic {
     response_cache_diag(DiagnosticLevel::Error, code, field, message)
+}
+
+fn provider_admission_error(code: &str, field: Option<&str>, message: String) -> ConfigDiagnostic {
+    ConfigDiagnostic {
+        level: DiagnosticLevel::Error,
+        code: code.to_string(),
+        component: Some("provider_admission".to_string()),
+        field: field.map(str::to_string),
+        message,
+    }
 }
 
 fn response_cache_diag(

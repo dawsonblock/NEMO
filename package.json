@@ -3,11 +3,12 @@
   "private": true,
   "packageManager": "npm@11.11.0",
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=24.0.0 <25.0.0"
   },
   "workspaces": [
     "crates/node",
     "examples/language-binding-plugin/node",
+    "integrations/correct-once",
     "integrations/openclaw",
     "integrations/pi"
   ],

@@ -27,10 +27,14 @@ pub use crate::config::{ResponseCacheConfig, SingleFlightLimits};
 pub use crate::response_cache::config::{
     BackendConfig, CacheShareScope, ResponseCacheKeyStrategy, ToolCacheConfig,
 };
+pub(crate) use crate::response_cache::intercept::{
+    make_admission_intercept, make_admission_stream_intercept,
+};
 pub(crate) use crate::response_cache::intercept::{make_intercept, make_stream_intercept};
 pub use crate::response_cache::mark::RESPONSE_CACHE_MARK;
 pub(crate) use crate::response_cache::store::build_store;
 #[doc(hidden)]
 pub use crate::response_cache::store::check_backend_health;
 pub use crate::response_cache::store::{flush_cache_writes, wait_for_cache_idle};
+pub(crate) use crate::response_cache::tool::make_admission_tool_intercept;
 pub(crate) use crate::response_cache::tool::make_tool_intercept;

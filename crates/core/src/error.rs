@@ -116,6 +116,13 @@ pub enum FlowError {
         limit: usize,
     },
 
+    /// A bounded wait for a runtime resource exceeded its deadline.
+    #[error("timeout waiting for resource: {resource}")]
+    Timeout {
+        /// Stable identifier for the resource whose wait expired.
+        resource: &'static str,
+    },
+
     /// The scope stack is empty.
     ///
     /// This should not occur under normal operation because the root scope is
@@ -165,6 +172,7 @@ impl FlowError {
             Self::NotFound(_) => "not_found",
             Self::InvalidArgument(_) => "invalid_argument",
             Self::ResourceExhausted { .. } => "resource_exhausted",
+            Self::Timeout { .. } => "timeout",
             Self::ScopeStackEmpty => "scope_stack_empty",
             Self::GuardrailRejected(_) => "guardrail_rejected",
             Self::Upstream(failure) => match failure.class {

@@ -207,6 +207,7 @@ fn validate_adaptive_plugin_config_with_policy(
             "tool_parallelism",
             "acg",
             "response_cache",
+            "provider_admission",
             "policy",
         ],
     );
@@ -280,6 +281,29 @@ fn validate_adaptive_plugin_config_with_policy(
     }
 
     validate_response_cache_section(&mut diagnostics, &config.policy, plugin_config);
+
+    if let Some(provider_admission_json) = plugin_config
+        .get("provider_admission")
+        .and_then(Json::as_object)
+    {
+        validate_unknown_fields(
+            &mut diagnostics,
+            &config.policy,
+            Some("provider_admission".to_string()),
+            provider_admission_json,
+            &[
+                "max_active_keys",
+                "max_waiters_per_key",
+                "max_global_waiters",
+                "max_global_provider_concurrency",
+                "max_provider_concurrency",
+                "max_model_concurrency",
+                "max_pending_provider_requests",
+                "max_pending_provider_per_provider",
+                "provider_admission_timeout_ms",
+            ],
+        );
+    }
 
     diagnostics.extend(AdaptiveRuntime::validate_config(&config).diagnostics);
     diagnostics
@@ -386,6 +410,9 @@ fn validate_response_cache_section(
                 "max_global_provider_concurrency",
                 "max_provider_concurrency",
                 "max_model_concurrency",
+                "max_pending_provider_requests",
+                "max_pending_provider_per_provider",
+                "provider_admission_timeout_ms",
             ],
         );
     }

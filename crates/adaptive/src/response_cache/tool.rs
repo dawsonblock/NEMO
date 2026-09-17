@@ -251,6 +251,23 @@ pub(crate) fn make_tool_intercept(
     })
 }
 
+/// Build the runtime admission intercept used for live tool calls when the
+/// optional response cache is disabled or unavailable.
+pub(crate) fn make_admission_tool_intercept(
+    concurrency: Arc<ProviderConcurrency>,
+) -> ToolExecutionFn {
+    Arc::new(move |name: &str, args: Json, next: ToolExecutionNextFn| {
+        let concurrency = Arc::clone(&concurrency);
+        let provider = format!("tool:{name}");
+        Box::pin(async move {
+            concurrency
+                .execute(&provider, None, next(args))
+                .await
+                .map(Into::into)
+        })
+    })
+}
+
 async fn run_tool_cache_with_singleflight(
     name: String,
     args: Json,

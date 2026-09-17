@@ -19,7 +19,7 @@ request-specific middleware, or production trace debugging.
 
 - Adaptive tuning is a top-level plugin component with kind `adaptive`.
 - The adaptive object contains `version`, `agent_id`, `state`, `telemetry`,
-  `adaptive_hints`, `tool_parallelism`, `acg`, and `policy`.
+  `adaptive_hints`, `tool_parallelism`, `acg`, `provider_admission`, and `policy`.
 - Wrap the adaptive object in an adaptive `ComponentSpec`, insert it into the
   shared plugin config `components` list, validate the plugin config, then
   initialize the plugin system.
@@ -58,6 +58,8 @@ request-specific middleware, or production trace debugging.
   window `100`.
 - Redis-backed state is for persistence or cross-worker sharing, not the first
   local rollout.
+- `provider_admission` is always-on and independent of `response_cache`; use it
+  to bound live provider concurrency and pending work even when caching is off.
 
 ## Failure Modes To Avoid
 

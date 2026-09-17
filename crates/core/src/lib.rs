@@ -60,6 +60,8 @@ pub mod config_editor;
 mod context;
 pub mod error;
 pub mod json;
+#[cfg(feature = "unstable-hardening")]
+pub mod kernel;
 pub mod logging;
 pub mod observability;
 pub mod plugin;

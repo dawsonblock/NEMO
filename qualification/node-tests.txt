@@ -1,1 +1,663 @@
-quick profile excludes Node.js binding tests
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+────────────
+ Nextest run ID ddaf926d-384a-4cac-a891-fb3fdd673784 with nextest profile: ci
+    Starting 2 tests across 1 binary
+        PASS [   0.014s] (1/2) nemo-relay-node api::conditional_gate_tests::conditional_gate_result_wait_is_bounded
+        PASS [   0.020s] (2/2) nemo-relay-node promise_call::tests::execution_next_context_restores_scope
+────────────
+     Summary [   0.021s] 2 tests run: 2 passed, 0 skipped
+
+up to date, audited 399 packages in 654ms
+
+107 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+
+> nemo-relay-node@0.9.1-rc.4 pretest
+> npm run build-debug
+
+
+> nemo-relay-node@0.9.1-rc.4 build-debug
+> napi build --platform --dts index.d.ts
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+
+> nemo-relay-node@0.9.1-rc.4 test
+> node --test --test-force-exit tests/*.mjs
+
+▶ adaptive runtime bridge
+  ✔ validates config through the native adaptive runtime (6.114ms)
+  ✔ rejects a tool listed in multiple classes (4.830542ms)
+  ✔ builds cache telemetry events from one options object (2.305834ms)
+  ✔ returns null when cache telemetry lacks prompt tokens (0.126041ms)
+  ✔ registers an owned runtime and builds cache request facts (7.596875ms)
+  ✔ rejects invalid latency sensitivity values (0.724542ms)
+✔ adaptive runtime bridge (22.707375ms)
+▶ core plugins
+  ✔ reports active config and lists registered plugin kinds (17.695083ms)
+  ✔ routes validation diagnostics through a registered JS plugin (0.316042ms)
+  ✔ validates a registered JS plugin during asynchronous initialization (8.630833ms)
+  ✔ treats implicit undefined plugin validation as no diagnostics (0.536833ms)
+  ✔ reports throwing async plugin validation without terminating Node (3.767125ms)
+  ✔ invokes top-level plugin registration during plugin configuration (2.861708ms)
+internal error: plugin request intercept boom
+  ✔ turns plugin request-intercept throws into catchable errors (3.501ms)
+  ✔ snapshotted plugin execution intercepts survive configuration teardown (8.385291ms)
+✔ core plugins (46.993083ms)
+Node conditional middleware guardrail failed open: GenericFailure, internal error: conditional middleware guardrail: expected gate failure
+▶ plugin context conditional middleware guardrails
+  ✔ fails open and is removed during clear (3.646625ms)
+  ✔ rolls back a gate when plugin registration throws (1.918042ms)
+✔ plugin context conditional middleware guardrails (5.898ms)
+▶ adaptive helpers
+  ✔ builds a redis backend with the default key prefix (0.301709ms)
+  ✔ builds an acg config with nested stability-threshold defaults (0.21575ms)
+  ✔ keeps response-cache helpers camelCase and serializes plugin config (0.205ms)
+  ✔ serializes nested tool-cache config (0.138667ms)
+  ✔ exports and serializes response-cache key strategy values (0.047ms)
+  ✔ serializes response-cache config at both native boundaries (0.273458ms)
+  ✔ serializes independent provider-admission limits (0.045458ms)
+✔ adaptive helpers (1.635334ms)
+▶ AtifExporter
+  ✔ registers, exports, clears, and deregisters lifecycle events (19.877083ms)
+✔ AtifExporter (20.34525ms)
+▶ AtofExporter
+  ✔ constructs with defaults and rejects invalid mode (10.992375ms)
+  ✔ returns null path for a stream sink (196.468667ms)
+  ✔ writes raw ATOF JSONL events and supports lifecycle methods (3.113625ms)
+  ✔ supports append and overwrite modes (2.402041ms)
+✔ AtofExporter (213.573125ms)
+internal error: JS LLM sanitize request callback failed: failed to deserialize LlmRequest: missing field `headers`
+2026-09-15T23:49:18.748Z ERROR root=01a0a779 target=nemo_relay.runtime event=llm_request_sanitizer_failed sanitizer=node_llm_san_req_public_error LLM request sanitizer failed; omitting the observability payload
+▶ callback error helpers
+  ✔ getLastCallbackError and clearLastCallbackError expose malformed sanitize-request failures (18.433167ms)
+  ✔ closed tool sanitize callbacks preserve the original payload and record the queue failure (0.712792ms)
+  ✔ closed llm sanitize-request callbacks omit the payload and record the queue failure (0.160958ms)
+  ✔ closed llm sanitize-response callbacks omit the payload and record the queue failure (0.101541ms)
+  ✔ closed collector callbacks surface the queue failure and record it (0.280792ms)
+internal error: failed to queue JS tool callback: Closing
+nemo_relay: failed to queue JS LLM sanitize request callback
+nemo_relay: failed to queue JS LLM sanitize response callback
+nemo_relay: failed to queue JS collector callback: Closing
+nemo_relay: failed to queue JS finalizer callback: Closing
+  ✔ closed finalizer callbacks throw and record the queue failure (0.164167ms)
+  ✔ closed PromiseAwareFn calls reject with the closed threadsafe-function error (1.248292ms)
+  ✔ PromiseAwareFn argument conversion failures reject without invoking the callback (0.7835ms)
+✔ callback error helpers (22.894667ms)
+▶ Codec pipeline integration
+  ✔ intercept receives annotated when codec is active (16.675458ms)
+  ✔ intercept modifications to annotated flow through encode (3.461958ms)
+  ✔ rejects raw request content edits before provider execution (2.605ms)
+  ✔ different codec functions produce different results (2.132791ms)
+✔ Codec pipeline integration (25.817042ms)
+▶ Context isolation
+  ✔ createScopeStack returns a ScopeStack (3.090083ms)
+  ✔ creates an imported stack with the propagated parent on top (3.557041ms)
+  ✔ serializes and validates propagation contexts for transport (5.270209ms)
+  ✔ captures a rooted context by default and supports explicit rootless capture (2.153792ms)
+  ✔ restores the surrounding stack after withScopeStack (0.321417ms)
+  ✔ keeps withScopeStack active until an async callback settles (4.032625ms)
+  ✔ currentScopeStack returns same in same context (0.122041ms)
+  ✔ setThreadScopeStack isolates scopes (0.178ms)
+  ✔ scopeStackActive returns true after setThreadScopeStack (0.081709ms)
+  ✔ two scope stacks are independent (0.224083ms)
+✔ Context isolation (19.922584ms)
+▶ Deregister nonexistent
+  ✔ tool guardrails (1.780917ms)
+  ✔ tool intercepts (0.695292ms)
+  ✔ llm guardrails (0.3ms)
+  ✔ llm intercepts (0.484708ms)
+  ✔ subscriber (0.179417ms)
+✔ Deregister nonexistent (4.799458ms)
+▶ dynamic plugin host
+  ✔ rejects empty specs without taking over static initialization (2.957958ms)
+  ✔ layers plugins.toml static base components with dynamic plugins (372.392792ms)
+  ✔ owns native managed callbacks until idempotent close (10.950375ms)
+  ✔ supports structured async disposal when the managed scope throws (8.03275ms)
+  ✔ owns worker managed callbacks until close (542.875166ms)
+  ✔ keeps every concurrent close pending until the shared teardown completes (482.48425ms)
+  ✔ preserves manifest and validation diagnostics in rejected promises (4.934875ms)
+  ✔ defensively clears a native activation during garbage collection (45.437875ms)
+  ✔ never waits for worker teardown on the JavaScript thread during garbage collection (1165.988542ms)
+✔ dynamic plugin host (2637.263667ms)
+internal error: node injector failure
+2026-09-15T23:49:18.750Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=node-event-metadata-global injector=node-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: node injector failure
+internal error: invalid JavaScript event metadata injector result: invalid type: sequence, expected a map
+2026-09-15T23:49:18.751Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=node-event-metadata-global injector=node-event-metadata-invalid Event metadata injector failed; omitting its attributes: internal error: invalid JavaScript event metadata injector result: invalid type: sequence, expected a map
+▶ event metadata injector bindings
+  ✔ preserves insertion order while isolating callback failures and invalid output (21.975166ms)
+  ✔ applies and deregisters scope-local callbacks (2.713334ms)
+  ✔ accepts numeric arrays with integer and fractional values at runtime (2.511458ms)
+  ✔ cleans up plugin-owned callbacks (6.144292ms)
+✔ event metadata injector bindings (34.015834ms)
+▶ event sanitizer registries
+  ✔ orders mark sanitizers and supports field removal (20.867583ms)
+  ✔ sanitizes scope start/end data, category profile, and metadata (3.164709ms)
+  ✔ awaits Promise-returning mark sanitizers without making event() asynchronous (1.251458ms)
+  ✔ publishes nested Promise sanitizer events before already queued events (2.424167ms)
+  ✔ preserves the emitting scope stack across queued sanitizer awaits (2.959042ms)
+  ✔ preserves the ending scope across an async scope-end sanitizer (1.585333ms)
+  ✔ preserves snapshotted sanitizers after deregistration (2.469833ms)
+  ✔ waits for an in-flight sanitizer when flushed externally (2.198208ms)
+  ✔ queues managed event sanitizers without blocking execution (5.091583ms)
+internal error: invalid JS event sanitizer result: event sanitizer must return an object
+2026-09-15T23:49:18.779Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-event-invalid-scalar sanitizer=node-event-invalid-scalar Event sanitizer failed; clearing observability fields
+internal error: invalid JS event sanitizer result: event sanitizer must return at least one sanitizer field
+2026-09-15T23:49:18.781Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-event-invalid-emptyObject sanitizer=node-event-invalid-emptyObject Event sanitizer failed; clearing observability fields
+internal error: invalid JS event sanitizer result: event sanitizer must return an object
+2026-09-15T23:49:18.782Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-event-invalid-array sanitizer=node-event-invalid-array Event sanitizer failed; clearing observability fields
+internal error: invalid JS event sanitizer result: event sanitizer must return an object
+2026-09-15T23:49:18.785Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-event-invalid-promise sanitizer=node-event-invalid-promise Event sanitizer failed; clearing observability fields
+  ✔ fails closed and records invalid sanitizer results (9.21625ms)
+  ✔ uses the thread-safe callback path for managed tool events (5.208666ms)
+internal error: invalid JS event sanitizer result: event sanitizer must return at least one sanitizer field
+2026-09-15T23:49:18.793Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-background-invalid-emptyObject sanitizer=node-background-invalid-emptyObject Event sanitizer failed; clearing observability fields
+internal error: invalid JS event sanitizer result: event sanitizer must return an object
+2026-09-15T23:49:18.794Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-background-invalid-array sanitizer=node-background-invalid-array Event sanitizer failed; clearing observability fields
+internal error: invalid JS event sanitizer result: event sanitizer must return an object
+2026-09-15T23:49:18.797Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=node-background-invalid-promise sanitizer=node-background-invalid-promise Event sanitizer failed; clearing observability fields
+  ✔ fails closed and records invalid queued sanitizer results (7.113917ms)
+internal error: background sanitizer boom
+2026-09-15T23:49:18.801Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=background-throw-tool sanitizer=node-background-throw Event sanitizer failed; clearing observability fields
+  ✔ fails closed when a queued sanitizer throws (3.305167ms)
+  ✔ inherits and cleans up scope-local mark sanitizers (1.544042ms)
+  ✔ cleans up plugin-owned event sanitizers (6.435334ms)
+internal error: plugin sanitizer boom
+2026-09-15T23:49:18.815Z ERROR root=01a0a779 target=nemo_relay.runtime event=event_sanitizer_failed event_name=plugin-throw sanitizer=nemo-relay-plugin.v1.node.test.event-sanitize-throw.1789516158810:1:mark Event sanitizer failed; clearing observability fields
+  ✔ fails closed when a plugin-owned sanitizer throws (5.5625ms)
+✔ event sanitizer registries (82.272209ms)
+▶ index.js loader
+  ✔ loads local binary branches for supported platforms (7.247125ms)
+  ✔ loads package branches for supported platforms (5.152791ms)
+  ✔ covers linux musl branches using both process.report and ldd fallback (0.964833ms)
+  ✔ falls back from darwin universal to arch-specific binaries (1.539333ms)
+  ✔ throws unsupported platform and architecture errors (2.074625ms)
+  ✔ throws the captured load error when binding resolution fails (2.532458ms)
+  ✔ covers remaining linux loader error branches (7.239042ms)
+  ✔ throws a generic error when resolution returns no binding and no load error (0.38825ms)
+✔ index.js loader (28.07525ms)
+▶ LLM lifecycle
+  ✔ llm call and end (1.347834ms)
+  ✔ llm call with attributes (0.151041ms)
+  ✔ llm call with parent (0.193583ms)
+  ✔ llm call with data/metadata (0.1275ms)
+  ✔ llm call generates events (3.406583ms)
+✔ LLM lifecycle (7.126208ms)
+▶ LLM execute
+  ✔ basic execute (3.288792ms)
+  ✔ treats implicit undefined llm results as null (1.748208ms)
+  ✔ sync execute rejects thrown callbacks without terminating Node (2.394125ms)
+  ✔ sync and async execute reject invalid JSON results without terminating Node (16.745042ms)
+  ✔ execute records OTEL status metadata on end events (2.715667ms)
+  ✔ async execute awaits Promise-returning callbacks (1.164417ms)
+  ✔ async execute surfaces plain string rejections (3.022709ms)
+✔ LLM execute (32.253625ms)
+▶ LLM guardrails
+  ✔ contextual sanitizers receive payload first and codec context second (3.0375ms)
+  ✔ rejects incomplete request codec callback pairs (1.064167ms)
+  ✔ resolved sanitizer codecs expose directional operations (5.00225ms)
+  ✔ streaming sanitizers resolve codecs only during callbacks and can omit the final payload (6.648708ms)
+internal error: nemo_relay: JS finalizer callback failed: finalizer exploded
+  ✔ surfaces JavaScript finalizer exceptions as terminal stream errors (2.797083ms)
+  ✔ stream response sanitizers preserve the invocation scope across await (5.39375ms)
+  ✔ stream response sanitizers can flush subscribers without deadlocking (6.595916ms)
+  ✔ releases custom stream codec references safely after early garbage collection (75.847833ms)
+  ✔ sanitize request guardrail (0.224292ms)
+  ✔ manual async sanitizers can flush subscribers without deadlocking (1.695ms)
+  ✔ sanitize request guardrail rewrites start event payload (1.701708ms)
+  ✔ sanitize request guardrail can omit the observability payload (0.696125ms)
+internal error: unknown error
+2026-09-15T23:49:18.959Z ERROR root=01a0a779 target=nemo_relay.runtime event=llm_request_sanitizer_failed sanitizer=node_llm_san_req_throw LLM request sanitizer failed; omitting the observability payload
+  ✔ sanitize request guardrail failures omit the payload and remain usable (1.84525ms)
+internal error: JS LLM conditional callback failed: expected string or null, got Object {"blocked": Bool(true)}
+  ✔ conditional guardrail rejects non-string return values (0.564375ms)
+  ✔ sanitize response guardrail (0.081ms)
+  ✔ sanitize response guardrail rewrites end event payload (1.633166ms)
+internal error: response sanitizer boom
+2026-09-15T23:49:18.964Z ERROR root=01a0a779 target=nemo_relay.runtime event=llm_response_sanitizer_failed sanitizer=node_llm_san_resp_throw LLM response sanitizer failed; omitting the observability payload
+  ✔ sanitize response guardrail failures omit the payload and remain usable (2.397875ms)
+  ✔ conditional guardrail (allow) (0.094333ms)
+  ✔ conditional guardrail awaits a Promise result (0.950833ms)
+  ✔ conditional guardrail treats implicit undefined as allow (0.988333ms)
+internal error: llm guardrail boom
+  ✔ conditional guardrail throws a catchable error without terminating Node (0.977667ms)
+  ✔ conditional guardrail (block) (0.069167ms)
+  ✔ duplicate guardrail fails (0.087583ms)
+✔ LLM guardrails (122.850208ms)
+▶ LLM intercepts
+  ✔ execution callbacks preserve the managed propagation parent across await (2.933292ms)
+  ✔ execution callbacks preserve an imported trace root (1.233ms)
+  ✔ request intercept (0.114375ms)
+  ✔ execution intercept (0.056875ms)
+  ✔ stream execution intercept (0.0465ms)
+  ✔ request intercept with break_chain (0.03775ms)
+  ✔ duplicate intercept fails (0.069375ms)
+  ✔ request intercept modifies request (1.280292ms)
+  ✔ request intercept awaits a Promise result (1.098542ms)
+internal error: llm request intercept boom
+  ✔ request intercept throws a catchable error without terminating Node (1.573875ms)
+internal error: invalid JS LLM request intercept outcome: invalid type: null, expected struct JsOutcome
+  ✔ request intercept rejects malformed return values (0.372709ms)
+  ✔ execution intercept composes with next (1.070917ms)
+  ✔ execution intercept rejects a detached next call after settlement (0.692209ms)
+  ✔ execution intercept aborts an already-started async provider after settlement (0.874125ms)
+  ✔ execution intercept rejects invalid next request payloads (0.8125ms)
+  ✔ execution intercept preserves primitive rejection values (0.51875ms)
+  ✔ async execute preserves primitive rejection values (0.647917ms)
+  ✔ execution intercept rejects non-JSON next arguments without aborting Node (0.63575ms)
+  ✔ stream execution intercept composes with next (1.4875ms)
+  ✔ stream execution intercept rejects a detached next call after its output closes (1.236542ms)
+  ✔ stream execution next retains the captured scope after the callback resolves (2.728334ms)
+  ✔ stream execution intercept preserves first-chunk delivery before completion (1.367542ms)
+  ✔ stream execution intercept applies backpressure to its async iterable (24.353958ms)
+  ✔ stream execution intercept closes a transformed downstream stream early (15.346708ms)
+  ✔ stream execution intercept closes its iterator after a chunk conversion error (0.983708ms)
+  ✔ stream execution intercept close waits for iterator cleanup (11.788833ms)
+  ✔ stream execution intercept rejects non-iterable results (0.639958ms)
+  ✔ default lazy stream preserves the managed parent context (0.913875ms)
+  ✔ default lazy stream expires its callback context when the provider ends (0.4175ms)
+  ✔ stream execution next honors concurrent per-call scope-stack replacements (1.214833ms)
+  ✔ stream execution intercept rejects non-JSON next arguments without aborting Node (0.46675ms)
+  ✔ snapshotted stream execution intercept survives deregistration (1.07925ms)
+  ✔ completed deregistered stream intercepts do not keep Node alive (33.696375ms)
+  ✔ stream execution intercept rejects invalid next request payloads (0.910208ms)
+  ✔ standalone request intercepts helper applies intercept chain (0.967125ms)
+  ✔ generated request-intercept declarations reference the canonical open optimization type (0.472084ms)
+  ✔ generated LLM sanitizer declarations expose directional codec contexts (0.264125ms)
+  ✔ generated middleware declarations expose Promise-aware callback types (1.240833ms)
+  ✔ plugin declarations expose Promise middleware and the implemented stream contract (0.293542ms)
+  ✔ standalone conditional execution helper throws on rejection (1.186ms)
+  ✔ standalone conditional execution helper resolves when allowed (0.320834ms)
+✔ LLM intercepts (118.335459ms)
+▶ LLM event fields
+  ✔ subscriber receives modelName and payload fields (0.728334ms)
+✔ LLM event fields (0.786625ms)
+▶ operational logging
+  ✔ initializes from the logging environment (39.841666ms)
+  ✔ disables stderr logging from the environment (39.408917ms)
+  ✔ rejects an invalid logging environment (37.353041ms)
+  ✔ flushes file sinks during environment cleanup (38.990875ms)
+  ✔ keeps logging active while another Node environment remains (65.934125ms)
+✔ operational logging (222.197875ms)
+▶ model pricing plugin helpers
+  ✔ builds defaults and plugin component shape (0.719833ms)
+  ✔ builds file sources and threshold rate schedules (0.110875ms)
+  ✔ lists builtin pricing kind and validates config (0.808458ms)
+✔ model pricing plugin helpers (2.122125ms)
+▶ observability plugin helpers
+  ✔ builds defaults and plugin component shape (0.895125ms)
+  ✔ builds OTLP log and metric sections with signal defaults (0.350375ms)
+  ✔ initializes a version 4 log and metric configuration without exporting signals (9.171ms)
+  ✔ lists builtin observability kind and validates bad values (0.676541ms)
+  ✔ serializes ATOF stream sinks (0.092917ms)
+  ✔ passes through mixed ATIF remote storage config (0.091166ms)
+  ✔ activates ATOF and ATIF file sinks (13.829917ms)
+  ✔ splits ATIF files for multiple top-level agent scopes (18.166459ms)
+✔ observability plugin helpers (44.190792ms)
+▶ OpenTelemetrySubscriber openinference projection
+  ✔ constructs from a mutable config object and supports lifecycle methods (3.58125ms)
+  ✔ rejects invalid config values (0.916708ms)
+  ✔ exports scope push/pop and mark events end to end (72.2155ms)
+✔ OpenTelemetrySubscriber openinference projection (77.672458ms)
+▶ OpenTelemetrySubscriber
+  ✔ constructs from a mutable config object and supports lifecycle methods (5.538708ms)
+  ✔ rejects invalid config values (0.9375ms)
+  ✔ exports scope push/pop and mark events end to end (73.507792ms)
+  ✔ rejects header_env names that collide with static headers ignoring case (0.282666ms)
+  ✔ rejects unset, blank, and invalid header_env values without exposing secrets (0.263334ms)
+  ✔ exports the GenAI agent projection end to end (64.110875ms)
+✔ OpenTelemetrySubscriber (145.5575ms)
+▶ OpenTelemetry log and metric subscribers
+  ✔ constructs signal-specific subscribers and supports lifecycle methods (3.207ms)
+  ✔ validates signal-specific limits (0.272542ms)
+  ✔ exports logs to the logs signal path (55.670084ms)
+  ✔ exports metrics to the metrics signal path (53.730834ms)
+✔ OpenTelemetry log and metric subscribers (113.138625ms)
+▶ pii_redaction plugin helpers
+  ✔ builds defaults and plugin component shape (0.684208ms)
+  ✔ lists builtin pii_redaction kind and validates bad values (0.623167ms)
+✔ pii_redaction plugin helpers (1.777167ms)
+▶ conditional middleware guardrails
+  ✔ discovers and dynamically toggles an existing registration (4.866625ms)
+Node conditional middleware guardrail failed open: GenericFailure, internal error: conditional middleware guardrail: expected gate failure
+  ✔ fails open when the JavaScript gate throws (1.931542ms)
+  ✔ treats an implicit undefined result as enabled (1.953292ms)
+✔ conditional middleware guardrails (9.845542ms)
+▶ Scope-local guardrail registration and execution
+  ✔ register and deregister scope-local tool sanitize request guardrail (1.934542ms)
+  ✔ register and deregister scope-local tool sanitize response guardrail (0.191666ms)
+  ✔ register and deregister scope-local tool conditional execution guardrail (0.143209ms)
+  ✔ scope-local sanitize request guardrail modifies tool args (3.340583ms)
+  ✔ scope-local sanitize response guardrail modifies tool result (11.9095ms)
+  ✔ scope-local conditional guardrail blocks execution (2.064917ms)
+internal error: scope guardrail boom
+  ✔ scope-local conditional guardrail throws a catchable error (1.289958ms)
+  ✔ duplicate scope-local guardrail name fails (0.623334ms)
+  ✔ deregister nonexistent scope-local guardrail returns false (0.168166ms)
+  ✔ register and deregister scope-local llm sanitize request guardrail (0.183875ms)
+  ✔ scope-local llm sanitize request guardrail rewrites start event payload (14.992583ms)
+  ✔ register and deregister scope-local llm sanitize response guardrail (0.47975ms)
+  ✔ scope-local llm sanitize response guardrail rewrites end event payload (14.215583ms)
+  ✔ register and deregister scope-local llm conditional execution guardrail (0.640709ms)
+  ✔ scope-local llm conditional guardrail blocks execution (1.9595ms)
+  ✔ duplicate scope-local llm guardrail name fails (0.323542ms)
+  ✔ deregister nonexistent scope-local llm guardrail returns false (0.104584ms)
+✔ Scope-local guardrail registration and execution (56.162875ms)
+▶ Scope-local auto-cleanup on scope pop
+  ✔ scope-local guardrail is cleaned up when scope is popped (2.571625ms)
+  ✔ scope-local intercept is cleaned up when scope is popped (2.060792ms)
+  ✔ scope-local subscriber is cleaned up when scope is popped (209.459792ms)
+  ✔ scope-local llm request intercept is cleaned up when scope is popped (0.917167ms)
+  ✔ scope-local tool execution intercept is cleaned up when scope is popped (0.487083ms)
+  ✔ scope-local llm execution intercept is cleaned up when scope is popped (0.57475ms)
+  ✔ scope-local llm stream execution intercept is cleaned up when scope is popped (0.822792ms)
+  ✔ nested scope cleanup does not affect parent scope-local middleware (0.774792ms)
+✔ Scope-local auto-cleanup on scope pop (217.959ms)
+▶ Priority merge of global and scope-local middleware
+  ✔ global and scope-local sanitize request guardrails both run (12.086416ms)
+  ✔ global and scope-local request intercepts both run with priority ordering (0.77525ms)
+internal error: scope tool request intercept boom
+  ✔ scope-local tool request intercept throws a catchable error (0.413458ms)
+  ✔ scope-local execution intercept and global intercept merge (0.8885ms)
+  ✔ snapshotted scope-local execution intercept survives deregistration (0.698417ms)
+  ✔ global and scope-local llm request intercepts both run with priority ordering (0.727917ms)
+  ✔ scope-local llm execution intercept and global intercept merge (0.836583ms)
+✔ Priority merge of global and scope-local middleware (16.637125ms)
+▶ Scope-local LLM intercepts
+  ✔ register and deregister scope-local llm request intercept (0.161041ms)
+  ✔ scope-local llm request intercept modifies request (1.439625ms)
+internal error: invalid JS LLM request intercept outcome: invalid type: null, expected struct JsOutcome
+  ✔ scope-local llm request intercept rejects malformed return values (0.529041ms)
+  ✔ register and deregister scope-local llm execution intercept (0.146625ms)
+  ✔ scope-local llm execution intercept composes with next (0.704041ms)
+  ✔ scope-local llm execution intercept rejects invalid next request payloads (0.545583ms)
+  ✔ register and deregister scope-local llm stream execution intercept (0.113708ms)
+  ✔ scope-local llm stream execution intercept composes with next (0.994209ms)
+  ✔ scope-local llm stream execution intercept rejects invalid next request payloads (0.654791ms)
+  ✔ duplicate scope-local llm stream execution intercept fails (0.189625ms)
+  ✔ deregister nonexistent scope-local llm stream execution intercept returns false (0.178875ms)
+✔ Scope-local LLM intercepts (5.884791ms)
+▶ Scope-local subscriber receives events
+  ✔ scope-local subscriber captures scope lifecycle events (10.715959ms)
+  ✔ scope-local subscriber captures mark events (10.759625ms)
+  ✔ scope-local subscriber event has expected properties (11.477833ms)
+  ✔ duplicate scope-local subscriber name fails (0.259042ms)
+  ✔ deregister nonexistent scope-local subscriber returns false (0.088334ms)
+  ✔ scope-local subscriber captures llm events from the same scope (11.911917ms)
+  ✔ invalid scope UUID is rejected for scope-local wrappers (0.619625ms)
+✔ Scope-local subscriber receives events (46.028209ms)
+✔ exposes bounded subscriber queue metrics (0.484875ms)
+▶ Scope operations
+  ✔ getHandle returns root (0.606166ms)
+  ✔ push and pop scope (1.564541ms)
+  ✔ scope with attributes (0.219ms)
+  ✔ scope with parent (0.161166ms)
+  ✔ scope nesting (0.163333ms)
+  ✔ all scope types (0.388375ms)
+  ✔ popScope merges end metadata over scope metadata (3.971583ms)
+✔ Scope operations (7.417166ms)
+▶ withScope
+  ✔ passes handle info to callback and auto-pops scope (1.469416ms)
+  ✔ callback receives a reusable ScopeHandle (6.511166ms)
+  ✔ returns callback result (1.582084ms)
+  ✔ returns async callback result (11.818375ms)
+  ✔ records OK status metadata on successful auto-pop (1.903458ms)
+  ✔ pops scope on synchronous throw (1.984917ms)
+  ✔ pops scope on async rejection (12.644708ms)
+  ✔ records ERROR status metadata on failed auto-pop (3.787667ms)
+  ✔ surfaces primitive rejection values and still pops the scope (1.607ms)
+  ✔ nested withScope calls (2.407834ms)
+✔ withScope (46.638291ms)
+▶ Events
+  ✔ basic event (0.132875ms)
+  ✔ event with data (0.061042ms)
+  ✔ event with parent (0.0985ms)
+  ✔ event accepts a data schema and typed log severity (3.003667ms)
+  ✔ event serializes representative log severities (0.988208ms)
+  ✔ metric emits a validated metric mark (0.616708ms)
+  ✔ metric rejects invalid measurements atomically (0.891584ms)
+✔ Events (6.054625ms)
+▶ Subscribers
+  ✔ register and deregister (0.405333ms)
+  ✔ duplicate subscriber fails (0.130375ms)
+  ✔ deregister nonexistent (0.040208ms)
+  ✔ subscriber receives events (1.384ms)
+  ✔ flushSubscribers asynchronously drains the native dispatcher (0.416334ms)
+  ✔ flushSubscribers waits for JavaScript callbacks without inspecting their return values (0.591792ms)
+  ✔ flushSubscribers waits for a fulfilled JavaScript subscriber promise (0.589375ms)
+nemo_relay: JS event subscriber 'node_flush_js_failure' failed: flush failure
+  ✔ flushSubscribers settles after a subscriber callback failure (0.733708ms)
+  ✔ isolates a synchronous global subscriber throw (38.294667ms)
+  ✔ isolates a rejected global subscriber promise (36.13925ms)
+  ✔ uses the safe adapter for scope-local subscribers (34.653375ms)
+  ✔ uses the safe adapter for plugin subscribers (35.452208ms)
+  ✔ subscriber event properties (0.988875ms)
+  ✔ mark events (0.34225ms)
+✔ Subscribers (150.573875ms)
+▶ runtime surface
+  ✔ does not expose manual runtime control helpers (0.324041ms)
+✔ runtime surface (0.748208ms)
+✔ manual lifecycle APIs accept optional timestamp arguments (4.369ms)
+✔ manual lifecycle APIs reject invalid timestamp microseconds (3.2095ms)
+▶ Tool lifecycle
+  ✔ tool call and end (1.473292ms)
+  ✔ tool call with attributes (0.167458ms)
+  ✔ tool call with data/metadata (0.138458ms)
+  ✔ tool call with parent (0.189916ms)
+  ✔ tool call generates events (3.323ms)
+  ✔ tool call event exposes toolCallId and payload fields (2.153917ms)
+✔ Tool lifecycle (8.568667ms)
+▶ Tool execute
+  ✔ basic execute (1.591083ms)
+  ✔ rejects legacy raw tool results from sync and async producers (3.998834ms)
+  ✔ sync execute rejects thrown callbacks without terminating Node (2.043917ms)
+  ✔ sync and async execute reject invalid JSON results without terminating Node (12.722625ms)
+  ✔ sync and async execute reject circular results without terminating Node (1.782166ms)
+  ✔ sync and async execute read stateful getter results once (1.305208ms)
+  ✔ sync and async execute serialize arrays by index instead of their iterator (0.908167ms)
+  ✔ execute with attributes (0.685667ms)
+  ✔ execute records OTEL status metadata on end events (1.739667ms)
+  ✔ async execute awaits Promise-returning callbacks and records tool call IDs (0.892041ms)
+  ✔ generated execute declarations expose an additive trailing toolCallId (0.380416ms)
+  ✔ async execute surfaces plain string rejections (0.89225ms)
+✔ Tool execute (29.530042ms)
+▶ Tool guardrails
+  ✔ sanitize request guardrail (0.140167ms)
+  ✔ sanitize request guardrail rewrites start event payload (1.291166ms)
+  ✔ sanitize response guardrail (0.074875ms)
+  ✔ sanitize response guardrail rewrites end event payload (1.006708ms)
+  ✔ conditional guardrail (allow) (0.105542ms)
+  ✔ conditional guardrail awaits a Promise result (1.015458ms)
+  ✔ Promise middleware preserves its invocation scope before and after await (1.209791ms)
+internal error: guardrail rejected promise
+  ✔ conditional guardrail propagates a rejected Promise (0.447666ms)
+  ✔ conditional guardrail treats implicit undefined as allow (0.6025ms)
+internal error: guardrail boom
+  ✔ conditional guardrail throws a catchable error without terminating Node (0.670375ms)
+internal error: sanitize boom
+2026-09-15T23:49:18.973Z ERROR root=01a0a779 target=nemo_relay.runtime event=tool_request_sanitizer_failed sanitizer=node_tool_san_throw tool_name=tool_sanitize_throw Tool request sanitizer failed; omitting the observability payload
+  ✔ sanitize guardrail failures omit the observable payload (1.354958ms)
+  ✔ manual async sanitizers can flush subscribers without deadlocking (1.267542ms)
+  ✔ conditional guardrail (block) (0.07625ms)
+internal error: JS tool conditional callback failed: expected string or null, got Object {"blocked": Bool(true)}
+  ✔ conditional guardrail rejects non-string return values (0.973792ms)
+  ✔ duplicate guardrail fails (0.145666ms)
+✔ Tool guardrails (10.710458ms)
+▶ Tool intercepts
+  ✔ request intercept register/deregister (0.157541ms)
+  ✔ execution intercept register/deregister (0.051167ms)
+  ✔ request intercept with break_chain (0.042792ms)
+  ✔ duplicate intercept fails (0.0645ms)
+  ✔ request intercept modifies args (1.620958ms)
+  ✔ request intercept awaits a Promise result (0.57325ms)
+internal error: request intercept rejected promise
+  ✔ request intercept propagates a rejected Promise (0.327542ms)
+internal error: tool request intercept boom
+  ✔ request intercept throws a catchable error without terminating Node (0.642209ms)
+  ✔ request intercept can return null JSON (0.793041ms)
+  ✔ execution intercept composes with next (1.513083ms)
+  ✔ execution intercept can remove a downstream annotation (1.30975ms)
+  ✔ normalizes a JSON-null annotation to absence (1.264667ms)
+  ✔ execution callbacks preserve the managed propagation parent across await (2.228916ms)
+  ✔ execution settlement expires scope replacements inherited by detached work (0.909917ms)
+  ✔ execution intercept rejects a detached next call after settlement (1.197417ms)
+  ✔ execution intercept aborts an already-started async provider after settlement (1.072792ms)
+  ✔ execution intercept isolates concurrent next scope branches (1.151458ms)
+  ✔ execution intercept isolates concurrent branch scope-stack replacements (1.206583ms)
+  ✔ execution intercept rejects non-JSON next arguments without aborting Node (0.696167ms)
+  ✔ execution intercept next preserves the invocation scope across the chain (1.093917ms)
+  ✔ snapshotted execution intercept survives deregistration (0.81125ms)
+  ✔ execution intercept propagates Error messages (0.364667ms)
+  ✔ execution intercept rejects legacy raw results with forwarding guidance (0.344042ms)
+  ✔ execution intercept may directly forward the canonical Node result (0.391833ms)
+  ✔ execution intercept rejects unknown pending-mark fields (0.2675ms)
+  ✔ async execute preserves primitive rejection values (0.2785ms)
+  ✔ standalone request intercepts helper applies intercept chain (0.4015ms)
+  ✔ standalone conditional execution helper throws on rejection (0.322041ms)
+  ✔ standalone conditional execution helper resolves when allowed (0.224583ms)
+✔ Tool intercepts (21.85025ms)
+▶ JsonPassthrough
+  ✔ toJson returns same value (0.33325ms)
+  ✔ fromJson returns same value (0.076292ms)
+  ✔ dispatches non-annotated codec payloads through the plain encode path (0.492ms)
+✔ JsonPassthrough (1.397375ms)
+▶ adaptive typed helpers
+  ✔ keeps adaptive helpers out of typed.js (0.088625ms)
+  ✔ build default adaptive config and components (0.55225ms)
+  ✔ configures adaptive through the core plugin system (3.045917ms)
+✔ adaptive typed helpers (3.832958ms)
+▶ typedToolExecute
+  ✔ basic roundtrip with JsonPassthrough (1.758917ms)
+  ✔ preserves annotations while codecs transform only the result (2.122917ms)
+  ✔ rejects legacy raw typed-tool results from sync and async producers (1.3945ms)
+  ✔ custom codec transforms args and result (0.974333ms)
+  ✔ envelope codec wraps/unwraps (0.92125ms)
+  ✔ intercepts operate on JSON (1.784875ms)
+  ✔ with options (attributes, data, metadata) (0.74175ms)
+  ✔ records toolCallId from typed options on managed lifecycle events (0.742666ms)
+  ✔ preserves falsy metadata/model options and uses non-null request data (0.971625ms)
+  ✔ awaits async tool functions before re-encoding results (1.179209ms)
+  ✔ forwards continuation cancellation to typed tool providers (1.258542ms)
+✔ typedToolExecute (14.544041ms)
+▶ typedLlmExecute
+  ✔ basic roundtrip with JsonPassthrough (0.710375ms)
+  ✔ custom codec for response (0.487666ms)
+  ✔ with modelName option (0.603292ms)
+  ✔ awaits async llm functions before re-encoding responses (0.457292ms)
+  ✔ forwards continuation cancellation to typed LLM providers (1.685833ms)
+  ✔ passes OpenAI Chat request codec through typedLlmExecute (1.886958ms)
+  ✔ decodes Anthropic responses through typedLlmExecute responseCodec (2.052708ms)
+✔ typedLlmExecute (8.117584ms)
+▶ typedLlmStreamExecute
+  ✔ basic stream with JsonPassthrough (2.015125ms)
+  ✔ close waits for async-generator cleanup and exhausts subsequent reads (1.842709ms)
+  ✔ stream with envelopeCodec for chunks and response (1.016958ms)
+  ✔ stream with pointCodec for chunks and response (0.757708ms)
+  ✔ supports OpenAI Responses request and response codecs in typedLlmStreamExecute (3.0075ms)
+decodeResponseWithCodec failed {
+  error: Error: bad response codec
+      at Object.decodeResponse (file:///Users/dawsonblock/Downloads/NeMo-Relay-main/crates/node/tests/typed_tests.mjs:1048:21)
+      at decodeResponseWithCodec (/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/node/typed.js:78:37)
+      at /Users/dawsonblock/Downloads/NeMo-Relay-main/crates/node/typed.js:298:40,
+  response: { malformed: true }
+}
+  ✔ treats response codec decode failures as non-fatal in typedLlmStreamExecute (2.411ms)
+✔ typedLlmStreamExecute (11.273417ms)
+▶ typedToolExecute — mixed codecs
+  ✔ pointCodec for args and envelopeCodec for result (0.696917ms)
+  ✔ envelopeCodec for args and pointCodec for result (0.892167ms)
+✔ typedToolExecute — mixed codecs (1.771833ms)
+▶ typedToolExecute — sync function
+  ✔ sync function with custom codec works correctly (0.664625ms)
+  ✔ sync function with envelope codec (0.986666ms)
+✔ typedToolExecute — sync function (1.768583ms)
+▶ typedLlmExecute — sync function
+  ✔ sync function with custom codec works correctly (0.789167ms)
+  ✔ sync function with envelope codec (0.5605ms)
+✔ typedLlmExecute — sync function (1.437542ms)
+▶ Type constants
+  ✔ exports canonical non-Js binding names (0.341125ms)
+  ✔ scope type enum values (0.107417ms)
+  ✔ type-checks the public API fixtures (413.787292ms)
+✔ Type constants (414.808459ms)
+▶ LlmRequest
+  ✔ construction and getters (1.096292ms)
+  ✔ coerces non-object headers to an empty object (0.09525ms)
+✔ LlmRequest (1.301917ms)
+▶ ScopeStack
+  ✔ constructs a scope stack instance (0.168625ms)
+✔ ScopeStack (0.22475ms)
+▶ OCIGenAIChatCodec
+  ✔ instantiates (0.103625ms)
+  ✔ decode returns an AnnotatedLLMRequest with model and params (0.318416ms)
+  ✔ encode is an identity for an unedited annotation (0.329875ms)
+  ✔ encode applies edited messages and keeps unmodeled fields (0.2535ms)
+  ✔ decodeResponse extracts text, finish reason, and usage (0.1265ms)
+✔ OCIGenAIChatCodec (1.259916ms)
+▶ GeminiGenerateContentCodec
+  ✔ instantiates (0.082833ms)
+  ✔ decode returns an AnnotatedLLMRequest with messages and no params (0.193708ms)
+  ✔ decode captures generationConfig into params (0.082333ms)
+  ✔ encode round-trips extra fields (0.134084ms)
+  ✔ decodeResponse extracts text and finish reason (0.148167ms)
+  ✔ decodeResponse maps functionCall id correctly (0.105375ms)
+  ✔ decode throws for malformed Gemini requests (0.208209ms)
+  ✔ encode throws for malformed annotated requests and codec failures (0.226166ms)
+  ✔ decodeResponse throws for malformed Gemini responses (0.097666ms)
+✔ GeminiGenerateContentCodec (1.378958ms)
+ℹ tests 413
+ℹ suites 54
+ℹ pass 413
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 5522.761167
+
+> nemo-relay-node-language-binding-plugin-example@0.1.0 pretest
+> npm run build-debug --workspace=nemo-relay-node
+
+
+> nemo-relay-node@0.9.1-rc.4 build-debug
+> napi build --platform --dts index.d.ts
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+
+> nemo-relay-node-language-binding-plugin-example@0.1.0 test
+> node --test test-plugin.mjs
+
+✔ validation accepts a supported mode (1.379042ms)
+✔ default registration control is disabled and valid (0.163625ms)
+✔ validation rejects an unsupported mode (0.1175ms)
+✔ validation rejects a wrong type (0.097958ms)
+✔ validation reports a non-object configuration (0.062417ms)
+✔ validation rejects an empty tag (0.092917ms)
+✔ validation rejects an empty requests.header_name (0.058375ms)
+✔ validation rejects an empty requests.header_value (0.052ms)
+✔ validation rejects an empty registration_control.kinds (0.076625ms)
+✔ validation rejects an empty registration_control.registration_name (0.093834ms)
+✔ validation rejects an empty registration_control.reason (0.059417ms)
+✔ validation warns about an unknown field (0.062541ms)
+✔ disabled invalid configuration is still validated (3.325291ms)
+✔ registers every safe plugin surface (0.255625ms)
+✔ registration control is owned by activation (12.605916ms)
+✔ activation reports no diagnostics (1.192625ms)
+✔ tool requests are rewritten (3.135542ms)
+✔ tool policy blocks the configured tool (0.074166ms)
+✔ LLM requests are rewritten (2.539584ms)
+✔ LLM policy blocks the configured model (0.084167ms)
+✔ LLM stream chunks are transformed (0.143333ms)
+✔ subscriber observes an emitted event (1.425083ms)
+✔ runtime controls emit a mark and an isolated scope only when enabled (5.121208ms)
+✔ runtime controls do not depend on request rewriting (2.140459ms)
+✔ teardown removes the plugin kind (0.905583ms)
+✔ registration rejects a duplicate kind and missing deregistration is false (0.492208ms)
+ℹ tests 26
+ℹ suites 0
+ℹ pass 26
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1112.674333

@@ -1143,6 +1143,9 @@ fn translate_runtime_error(error: FlowError) -> CliError {
     match error {
         FlowError::GuardrailRejected(reason) => CliError::GuardrailRejected(reason),
         FlowError::Upstream(failure) => CliError::ProviderFailure(failure),
+        FlowError::ResourceExhausted { .. } | FlowError::Timeout { .. } => {
+            CliError::Overloaded(error.to_string())
+        }
         other => CliError::InvalidPayload(other.to_string()),
     }
 }

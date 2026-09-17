@@ -142,6 +142,40 @@ pub(crate) fn make_intercept(
     )
 }
 
+/// Build the runtime admission intercept used when response caching is not
+/// enabled. Provider admission is a runtime safety boundary; it must remain
+/// active even when the optional cache feature is absent or unavailable.
+pub(crate) fn make_admission_intercept(concurrency: Arc<ProviderConcurrency>) -> LlmExecutionFn {
+    Arc::new(
+        move |provider: &str, request: LlmRequest, next: LlmExecutionNextFn| {
+            let concurrency = Arc::clone(&concurrency);
+            let provider = provider.to_string();
+            Box::pin(async move {
+                let model = request_model(&request);
+                concurrency
+                    .execute(&provider, model.as_deref(), next(request))
+                    .await
+            })
+        },
+    )
+}
+
+/// Build the streaming counterpart of [`make_admission_intercept`].
+pub(crate) fn make_admission_stream_intercept(
+    concurrency: Arc<ProviderConcurrency>,
+) -> LlmStreamExecutionFn {
+    Arc::new(
+        move |provider: &str, request: LlmRequest, next: LlmStreamExecutionNextFn| {
+            let concurrency = Arc::clone(&concurrency);
+            let provider = provider.to_string();
+            Box::pin(async move {
+                let model = request_model(&request);
+                execute_stream(&concurrency, &provider, model.as_deref(), next, request).await
+            })
+        },
+    )
+}
+
 /// Builds the streaming LLM execution intercept for the response cache.
 ///
 /// On a miss it tees the live stream — forwarding chunks while feeding them to

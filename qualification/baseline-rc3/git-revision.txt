@@ -1,0 +1,5 @@
+commit=df99fabf2f97ae12e10e5732e8c033c51b47db21
+tree=b308e852bdf8723b8aae04b46b909960adea8d0c
+branch=hardening/rc3-runtime-admission
+baseline=pre-rc3-hardening
+qualification_status=stale-until-rerun

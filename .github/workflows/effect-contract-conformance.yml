@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Effect contract conformance
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'crates/authority/**'
+      - 'crates/core/**'
+      - 'crates/executor/**'
+      - 'crates/ledger/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'justfile'
+      - 'scripts/qualification/run.sh'
+      - 'docs/reference/hardening.mdx'
+      - '.github/actions/load-ci-tool-versions/**'
+      - '.github/workflows/effect-contract-conformance.yml'
+  push:
+    branches:
+      - 'hardening/**'
+      - 'feat/effect-contract-*'
+      - 'feat/effect-store-*'
+      - 'codex/production-effect-store-*'
+    paths:
+      - 'crates/authority/**'
+      - 'crates/core/**'
+      - 'crates/executor/**'
+      - 'crates/ledger/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'justfile'
+      - 'scripts/qualification/run.sh'
+      - 'docs/reference/hardening.mdx'
+      - '.github/actions/load-ci-tool-versions/**'
+      - '.github/workflows/effect-contract-conformance.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: effect-contract-conformance-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: unstable-hardening contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17.6-alpine@sha256:747d5ed1fdeeb124b880fbe3d7c6557d2c4064ae41d6b6297d417882effce4be
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          components: clippy,rustfmt
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-effect-contracts-${{ steps.ci-config.outputs.rust_version }}
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install just
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: just@${{ steps.ci-config.outputs.just_version }}
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint contract crates
+        run: |
+          cargo clippy --locked -p nemo-relay-authority --all-targets --features unstable-hardening -- -D warnings
+          cargo clippy --locked -p nemo-relay-executor --all-targets --features unstable-hardening -- -D warnings
+          cargo clippy --locked -p nemo-relay-ledger --all-targets --features unstable-hardening-testkit,unstable-postgres -- -D warnings
+          cargo clippy --locked -p nemo-relay --all-targets --features unstable-hardening -- -D warnings
+
+      - name: Run hardening contract conformance
+        run: just test-effect-contracts
+
+      - name: Run PostgreSQL transport security tests
+        run: just test-postgres-transport-security
+
+      - name: Run PostgreSQL EffectStore conformance
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-effect-store
+
+      - name: Run PostgreSQL process crash recovery
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-crash-recovery
