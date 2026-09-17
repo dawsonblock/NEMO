@@ -172,6 +172,38 @@ def first_line(command):
     return output[0] if output else None
 
 
+def python_runtime(executable):
+    if not executable:
+        return None
+    result = subprocess.run(
+        [str(executable), "-c", "import json,platform,sys;print(json.dumps({"
+         "'executable':sys.executable,'version':sys.version,'implementation':platform.python_implementation(),"
+         "'machine':platform.machine()}))"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return json.loads(result.stdout)
+
+
+def project_python_runtime():
+    if shutil.which("uv") is None:
+        return None
+    result = subprocess.run(
+        ["uv", "python", "find"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return python_runtime(result.stdout.strip())
+
+
 def postgres_server_version():
     connection = os.environ.get("NEMO_RELAY_TEST_POSTGRES_URL")
     if not connection or shutil.which("psql") is None:
@@ -298,6 +330,8 @@ else:
             "cargo-audit": first_line(["cargo", "audit", "--version"]),
             "cargo-about": first_line(["cargo-about", "--version"]),
         },
+        "qualification_python_runtime": python_runtime(shutil.which("python3")),
+        "project_test_python_runtime": project_python_runtime(),
         "postgres_server_version": postgres_server_version(),
     }
     environment_bytes = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
