@@ -1,20 +1,20 @@
 cargo test --locked -p nemo-relay-ledger --features unstable-postgres,unstable-hardening-testkit postgres::transport_tests
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
      Running unittests src/lib.rs (target/debug/deps/nemo_relay_ledger-ec3dba80fc9fe285)
 
 running 10 tests
-test postgres::transport_tests::local_socket_transport_rejects_tcp ... ok
-test postgres::transport_tests::plaintext_transport_rejects_non_loopback_tcp ... ok
 test postgres::transport_tests::plaintext_test_transport_accepts_only_local_targets ... ok
+test postgres::transport_tests::plaintext_transport_rejects_non_loopback_tcp ... ok
+test postgres::transport_tests::local_socket_transport_rejects_tcp ... ok
 test postgres::transport_tests::verified_tls_rejects_a_plaintext_endpoint ... ok
 test postgres::transport_tests::verified_tls_rejects_unix_socket_targets ... ok
 test postgres::transport_tests::verified_tls_rejects_an_expired_certificate ... ok
-test postgres::transport_tests::verified_tls_accepts_a_trusted_ca_and_matching_hostname ... ok
 test postgres::transport_tests::verified_tls_rejects_a_wrong_hostname ... ok
+test postgres::transport_tests::verified_tls_accepts_a_trusted_ca_and_matching_hostname ... ok
 test postgres::transport_tests::mutual_tls_accepts_a_valid_pkcs12_client_identity ... ok
 test postgres::transport_tests::verified_tls_rejects_an_untrusted_ca ... ok
 
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 1.56s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 1.86s
 
      Running unittests src/bin/postgres_crash_fixture.rs (target/debug/deps/nemo_postgres_crash_fixture-43a66aeec816511a)
 

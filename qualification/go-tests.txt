@@ -1,4 +1,4 @@
-    Finished `release` profile [optimized] target(s) in 0.29s
+    Finished `release` profile [optimized] target(s) in 0.34s
 === RUN   TestTopLevelPluginValidationAndLifecycle
 --- PASS: TestTopLevelPluginValidationAndLifecycle (0.01s)
 === RUN   TestPluginHelperConstructorsAndRegistryListing
@@ -46,7 +46,7 @@
 === RUN   TestValidatePluginConfigWarnsMissingStateForTelemetry
 --- PASS: TestValidatePluginConfigWarnsMissingStateForTelemetry (0.00s)
 === RUN   TestConfigureAdaptiveComponentLifecycle
---- PASS: TestConfigureAdaptiveComponentLifecycle (0.00s)
+--- PASS: TestConfigureAdaptiveComponentLifecycle (0.03s)
 === RUN   TestNewAtofExporterConfigDefaults
 --- PASS: TestNewAtofExporterConfigDefaults (0.00s)
 === RUN   TestAtofSinkConfigConstructorsSerializeTheirDiscriminators
@@ -174,12 +174,12 @@
 === RUN   TestSanitizeGuardrailAffectsEventInput
 --- PASS: TestSanitizeGuardrailAffectsEventInput (0.00s)
 === RUN   TestEventMetadataInjectorGlobalScopeLocalAndFailureBehavior
-2026-09-14T07:26:35.757Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
-2026-09-14T07:26:35.757Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
-2026-09-14T07:26:35.758Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-mark injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
-2026-09-14T07:26:35.758Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-mark injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
-2026-09-14T07:26:35.758Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
-2026-09-14T07:26:35.758Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-17T22:23:56.090Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-17T22:23:56.090Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-17T22:23:56.090Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-mark injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-17T22:23:56.090Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-mark injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
+2026-09-17T22:23:56.090Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_metadata_injector_failed event_name=go-event-metadata-scope injector=go-event-metadata-failure Event metadata injector failed; omitting its attributes: internal error: expected Go injector failure
+2026-09-17T22:23:56.090Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_metadata_injector_invalid_output event_name=go-event-metadata-scope injector=go-event-metadata-mixed-values Event metadata injector returned invalid attributes; omitting them: attribute `go.invalid.mixed_values` must be a primitive or homogeneous primitive list
 --- PASS: TestEventMetadataInjectorGlobalScopeLocalAndFailureBehavior (0.00s)
 === RUN   TestPluginContextEventMetadataInjectorLifecycle
 --- PASS: TestPluginContextEventMetadataInjectorLifecycle (0.00s)
@@ -190,7 +190,7 @@
 === RUN   TestEventSanitizerRegistries
 --- PASS: TestEventSanitizerRegistries (0.00s)
 === RUN   TestEventSanitizerMarshalFailureClearsObservabilityFields
-2026-09-14T07:26:35.760Z ERROR root=01a09ecf target=nemo_relay.runtime event=event_sanitizer_failed event_name=invalid-sanitizer sanitizer=go-mark-sanitize-invalid Event sanitizer failed; clearing observability fields
+2026-09-17T22:23:56.092Z ERROR root=01a0b178 target=nemo_relay.runtime event=event_sanitizer_failed event_name=invalid-sanitizer sanitizer=go-mark-sanitize-invalid Event sanitizer failed; clearing observability fields
 --- PASS: TestEventSanitizerMarshalFailureClearsObservabilityFields (0.00s)
 === RUN   TestScopeLocalEventSanitizerInheritanceAndCleanup
 --- PASS: TestScopeLocalEventSanitizerInheritanceAndCleanup (0.00s)
@@ -313,11 +313,11 @@
 === RUN   TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings
 --- PASS: TestObservabilityOpenTelemetryEndpointPreservesExplicitZeroBatchSettings (0.00s)
 === RUN   TestObservabilityPluginAtofAndAtifFiles
---- PASS: TestObservabilityPluginAtofAndAtifFiles (0.02s)
+--- PASS: TestObservabilityPluginAtofAndAtifFiles (0.01s)
 === RUN   TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics
 --- PASS: TestObservabilityPluginActivatesDerivedLogsAndExplicitMetrics (0.00s)
 === RUN   TestObservabilityPluginAtifSplitsMultipleTopLevelAgents
---- PASS: TestObservabilityPluginAtifSplitsMultipleTopLevelAgents (0.01s)
+--- PASS: TestObservabilityPluginAtifSplitsMultipleTopLevelAgents (0.04s)
 === RUN   TestObservabilityPluginValidationRejectsBadValues
 --- PASS: TestObservabilityPluginValidationRejectsBadValues (0.00s)
 === RUN   TestObservabilityPluginListKindIsAutomatic
@@ -419,11 +419,11 @@
 === RUN   TestNilPluginActivationCloseIsSafe
 --- PASS: TestNilPluginActivationCloseIsSafe (0.00s)
 === RUN   TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo
---- PASS: TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo (0.38s)
+--- PASS: TestInitializeWithDynamicPluginsLoadsNativePluginThroughCgo (0.31s)
 === RUN   TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig
 --- PASS: TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig (0.01s)
 === RUN   TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo
---- PASS: TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo (0.51s)
+--- PASS: TestInitializeWithDynamicPluginsLoadsWorkerPluginThroughCgo (0.49s)
 === RUN   TestPluginActivationFinalizerReleasesHostOwnership
 --- PASS: TestPluginActivationFinalizerReleasesHostOwnership (0.00s)
 === RUN   TestWorkspaceVersionFromCargoTOML
@@ -646,7 +646,7 @@
 === RUN   TestAtifExporterLifecycleAndFiltering
 --- PASS: TestAtifExporterLifecycleAndFiltering (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	4.434s
 === RUN   TestConfigBuilders
 --- PASS: TestConfigBuilders (0.00s)
 === RUN   TestRedisBackendAndComponentSpecBuilders
@@ -658,35 +658,35 @@ ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay	(cached)
 === RUN   TestAdaptivePackageRuntimeHelpers
 --- PASS: TestAdaptivePackageRuntimeHelpers (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/adaptive	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/adaptive	3.320s
 === RUN   TestGuardrailShorthandsGlobal
---- PASS: TestGuardrailShorthandsGlobal (0.00s)
+--- PASS: TestGuardrailShorthandsGlobal (0.01s)
 === RUN   TestGuardrailShorthandsScopeLocal
 --- PASS: TestGuardrailShorthandsScopeLocal (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/guardrails	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/guardrails	3.322s
 === RUN   TestInterceptShorthandsGlobal
 --- PASS: TestInterceptShorthandsGlobal (0.00s)
 === RUN   TestInterceptShorthandsScopeLocal
 --- PASS: TestInterceptShorthandsScopeLocal (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/intercepts	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/intercepts	3.320s
 === RUN   TestLlmShorthands
 --- PASS: TestLlmShorthands (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/llm	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/llm	3.319s
 === RUN   TestPricingPackageHelpers
 --- PASS: TestPricingPackageHelpers (0.00s)
 === RUN   TestPricingPackageSourceAndRateHelpers
 --- PASS: TestPricingPackageSourceAndRateHelpers (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/model_pricing	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/model_pricing	3.318s
 === RUN   TestPiiRedactionShorthandHelpers
 --- PASS: TestPiiRedactionShorthandHelpers (0.00s)
 === RUN   TestPiiRedactionComponentSpecAndLocalModelHelpers
 --- PASS: TestPiiRedactionComponentSpecAndLocalModelHelpers (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	3.317s
 === RUN   TestWithScopeCleanupNoopsWhenPushFails
 --- PASS: TestWithScopeCleanupNoopsWhenPushFails (0.00s)
 === RUN   TestWithScopeNormalReturn
@@ -712,14 +712,14 @@ ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/pii_redaction	(cached)
 === RUN   TestScopeShorthandsForwardTimestamps
 --- PASS: TestScopeShorthandsForwardTimestamps (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/scope	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/scope	3.320s
 === RUN   TestSubscriberShorthands
 --- PASS: TestSubscriberShorthands (0.00s)
 === RUN   TestScopeSubscriberShorthands
 --- PASS: TestScopeSubscriberShorthands (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/subscribers	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/subscribers	3.317s
 === RUN   TestToolShorthands
 --- PASS: TestToolShorthands (0.00s)
 PASS
-ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/tools	(cached)
+ok  	github.com/NVIDIA/NeMo-Relay/go/nemo_relay/tools	3.319s

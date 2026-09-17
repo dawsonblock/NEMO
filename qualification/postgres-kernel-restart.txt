@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running tests/postgres_kernel_restart.rs (target/debug/deps/postgres_kernel_restart-deec00c2a2b33b14)
+
+running 2 tests
+test fixture_rejects_missing_qualification_acknowledgement ... ok
+test process_crash_after_provider_commit_recovers_without_redispatch ... {"output":{"value":1},"outcome_certainty":"CONFIRMED_SUCCESS","receipt_digest":null,"receipt":null}
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
