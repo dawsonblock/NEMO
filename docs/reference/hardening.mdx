@@ -231,13 +231,22 @@ NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-effect-store-restart
 NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-crash-recovery
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-kernel-restart
 ```
 
 The adapter remains experimental and disabled by default. The process-crash
 gate establishes atomic terminal-state recovery at the named PostgreSQL
 transaction boundaries. It does not establish the wider machine-reboot, OOM,
-network-loss, long-running provider, recovery-discovery, load, or real-provider
-crash matrix.
+network-loss, long-running provider, load, or real-provider crash matrix.
+The separate `nemo-effect-qualification-fixture` constructs the real kernel and
+PostgreSQL store with a qualification-only authority and persistent provider
+simulator. Its process-restart test kills execution after provider commit but
+before terminal receipt persistence, then uses a bounded store-owned candidate
+scan and fenced kernel recovery to reconcile without another provider effect.
+The fixture requires an explicit qualification acknowledgement and permits only
+local test PostgreSQL connections. It is not a production composition root,
+Correct-Once adapter, autonomous recovery service, or general deployment gate.
 
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live

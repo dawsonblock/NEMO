@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-effect-qualification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Non-production process-restart qualification fixture for NEMO effects."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+nemo-relay = { workspace = true, features = ["unstable-hardening"] }
+nemo-relay-authority = { workspace = true, features = ["unstable-hardening"] }
+nemo-relay-executor = { workspace = true, features = ["unstable-hardening"] }
+nemo-relay-ledger = { workspace = true, features = ["unstable-postgres"] }
+postgres = { version = "0.19.14", features = ["with-serde_json-1"] }
+serde_json = "1"
+uuid = { workspace = true, features = ["v7"] }
+
+[[bin]]
+name = "nemo-effect-qualification-fixture"
+path = "src/main.rs"

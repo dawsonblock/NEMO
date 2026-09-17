@@ -380,7 +380,7 @@ if [[ "${mode}" == "provenance" ]]; then
 elif [[ "${mode}" == "manifest" ]]; then
     # Manifest-only mode is useful when the host cannot run the full matrix.
     for check in rust-format clippy rust-tests rust-doc-tests effect-contracts postgres-transport-security cargo-deny cargo-audit \
-        postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery \
+        postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery postgres-kernel-restart \
         python-tests node-tests go-tests sbom; do
         not_run "${check}" "qualification checks intentionally skipped in manifest-only mode"
     done
@@ -410,11 +410,13 @@ else
         run_check postgres-concurrency just test-postgres-effect-store-concurrency
         run_check postgres-restart just test-postgres-effect-store-restart
         run_check postgres-crash-recovery just test-postgres-crash-recovery
+        run_check postgres-kernel-restart just test-postgres-kernel-restart
     else
         not_run postgres-effect-store "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-concurrency "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-restart "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-crash-recovery "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run postgres-kernel-restart "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
     fi
 
     run_cargo_subcommand cargo-deny deny check
@@ -514,7 +516,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 required = [
     "source-cleanliness", "source-stability", "rust-format", "clippy", "rust-tests", "rust-doc-tests",
     "effect-contracts", "postgres-transport-security", "postgres-effect-store", "postgres-concurrency", "postgres-restart",
-    "postgres-crash-recovery",
+    "postgres-crash-recovery", "postgres-kernel-restart",
     "cargo-deny", "cargo-audit", "python-tests", "node-tests", "go-tests", "sbom",
 ]
 for name in required:

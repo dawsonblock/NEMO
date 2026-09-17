@@ -12,6 +12,7 @@ on:
       - 'crates/core/**'
       - 'crates/executor/**'
       - 'crates/ledger/**'
+      - 'crates/effect-qualification/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
@@ -30,6 +31,7 @@ on:
       - 'crates/core/**'
       - 'crates/executor/**'
       - 'crates/ledger/**'
+      - 'crates/effect-qualification/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
@@ -104,6 +106,7 @@ jobs:
           cargo clippy --locked -p nemo-relay-executor --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-relay-ledger --all-targets --features unstable-hardening-testkit,unstable-postgres -- -D warnings
           cargo clippy --locked -p nemo-relay --all-targets --features unstable-hardening -- -D warnings
+          cargo clippy --locked -p nemo-effect-qualification --all-targets -- -D warnings
 
       - name: Run hardening contract conformance
         run: just test-effect-contracts
@@ -120,3 +123,8 @@ jobs:
         env:
           NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: just test-postgres-crash-recovery
+
+      - name: Run kernel and provider process restart
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-kernel-restart

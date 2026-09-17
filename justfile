@@ -1278,6 +1278,15 @@ test-postgres-crash-recovery:
         --features unstable-postgres,unstable-hardening-testkit \
         --test postgres_process_crash -- --include-ignored --test-threads=1
 
+# Run the qualification-only kernel + PostgreSQL + provider process-restart fixture.
+# Requires a disposable, local PostgreSQL instance; this is not a production runtime.
+test-postgres-kernel-restart:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-effect-qualification \
+        --test postgres_kernel_restart -- --include-ignored --test-threads=1
+
 # --set [output_dir=<path>] [ci=true|false]
 test-rust:
     #!/usr/bin/env bash

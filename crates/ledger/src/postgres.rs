@@ -469,6 +469,28 @@ impl PostgresEffectStore {
         Ok(())
     }
 
+    /// Discover bounded, unowned or expired consequential work for a recovery worker.
+    ///
+    /// This is only a candidate query. The kernel must still acquire the
+    /// current fenced lease before inspecting evidence or reconciling.
+    pub fn recoverable_action_ids(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<String>, PostgresEffectStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = format!(
+            "select action_id from {}.effect_actions \
+             where state in ('DISPATCHING', 'UNKNOWN', 'RECONCILING') \
+             and (lease_expires_at is null or lease_expires_at <= clock_timestamp()) \
+             order by updated_at, action_id limit $1",
+            self.quoted_schema()
+        );
+        let rows = self.connection()?.query(&query, &[&i64::from(limit)])?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
     fn connection(&self) -> Result<PostgresConnection, PostgresEffectStoreError> {
         match &self.pool {
             PostgresPool::Plain(pool) => pool
