@@ -100,11 +100,7 @@ impl RuntimeConfig {
                     "production requires durability_enabled=true".to_owned(),
                 ));
             }
-            if self
-                .identity
-                .runtime_id
-                .as_deref()
-                .unwrap_or_default()
+                .trim()
                 .is_empty()
             {
                 return Err(ConfigError::Invalid(
