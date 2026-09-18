@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import source_tree  # noqa: E402
 from package_release import canonical_tree, is_excluded, qualified_source_tree, tracked_paths
 
 
@@ -25,14 +26,15 @@ def test_filesystem_fallback_ignores_generated_python_artifacts(tmp_path: Path) 
     (tmp_path / "__pycache__" / "lib.cpython-313.pyc").write_bytes(b"generated")
     (tmp_path / "src" / "module.pyc").write_bytes(b"generated")
 
-    assert tracked_paths(tmp_path) == [Path("Cargo.toml"), Path("src/lib.rs")]
+    assert tracked_paths(source_tree.enumerate_tree(tmp_path)) == [Path("Cargo.toml"), Path("src/lib.rs")]
 
 
 def test_packaging_requires_a_matching_valid_qualification(tmp_path: Path) -> None:
     qualification = tmp_path / "qualification"
     qualification.mkdir()
     (tmp_path / "Cargo.toml").write_text('[workspace.package]\nversion = "0.9.1-rc.4"\n')
-    digest, _ = canonical_tree(tracked_paths(tmp_path), tmp_path)
+    enumeration = source_tree.enumerate_tree(tmp_path)
+    digest, _ = canonical_tree(tracked_paths(enumeration), enumeration)
     (qualification / "source-manifest.json").write_text('{"root_digest": "%s"}\n' % digest)
     (qualification / "qualification.json").write_text(
         '{"overall": "PASS", "qualification_status": "VALID", "provenance": {"source_tree_sha256": "%s"}}\n' % digest

@@ -51,7 +51,7 @@ def is_excluded(relative: pathlib.Path) -> bool:
     return source_tree.statically_excluded(pathlib.PurePosixPath(relative.as_posix()))
 
 
-def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:
+def tracked_paths(enumeration: "source_tree.Enumeration") -> list[pathlib.Path]:
     """Return the source entries the qualification manifest describes.
 
     Release packaging and provenance verification share one enumeration so a
@@ -59,7 +59,6 @@ def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:
     qualified it.
     """
 
-    enumeration = source_tree.enumerate_tree(root)
     return [
         pathlib.Path(path)
         for path, entry in enumeration.entries.items()
@@ -71,10 +70,10 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def canonical_tree(files: list[pathlib.Path], root: pathlib.Path) -> tuple[str, dict[str, str]]:
+def canonical_tree(files: list[pathlib.Path], enumeration: "source_tree.Enumeration") -> tuple[str, dict[str, str]]:
     """Return the typed tree digest plus the flat file digests."""
 
-    entries = source_tree.enumerate_tree(root).entries
+    entries = enumeration.entries
     hashes = {
         relative.as_posix(): entries[relative.as_posix()].get("sha256", "")
         for relative in files
@@ -170,8 +169,9 @@ def main() -> int:
     version = args.version or workspace_version(root)
     archive = args.output or root / "release" / "artifacts" / f"NEMO-{version}-source.zip"
     archive = archive.resolve()
-    files = tracked_paths(root)
-    source_tree_sha256, file_hashes = canonical_tree(files, root)
+    enumeration = source_tree.enumerate_tree(root)
+    files = tracked_paths(enumeration)
+    source_tree_sha256, file_hashes = canonical_tree(files, enumeration)
     qualification_dir = (args.qualification_dir or root / "qualification").resolve()
     try:
         qualification = qualified_source_tree(root, qualification_dir, source_tree_sha256)

@@ -81,7 +81,10 @@ def verify_lockfiles(root: pathlib.Path, manifest: dict, findings: list[str]) ->
     """Confirm every recorded lockfile digest still matches."""
 
     for lockfile, recorded in (manifest.get("lockfiles") or {}).items():
-        path = root / lockfile
+        path = (root / lockfile).resolve()
+        if not path.is_relative_to(root):
+            findings.append(f"lockfile path escapes the source tree: {lockfile}")
+            continue
         actual = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}" if path.is_file() else None
         if actual != recorded:
             findings.append(f"lockfile digest differs: {lockfile}")
@@ -129,10 +132,11 @@ def verify_policy(manifest: dict, enumeration: "source_tree.Enumeration", findin
         findings.append(f"source exclusion policy differs from the manifest: {', '.join(differing)}")
 
 
-def verify(root: pathlib.Path, manifest_path: pathlib.Path) -> list[str]:
+def verify(root: pathlib.Path, manifest_path: pathlib.Path) -> tuple[list[str], int]:
     """Return every discrepancy between a manifest and the tree it claims.
 
-    An empty list means the evidence describes this exact tree.
+    An empty findings list means the evidence describes this exact tree.
+    The second element is the verified entry count from the enumeration.
     """
 
     root = pathlib.Path(root).resolve()
@@ -142,11 +146,11 @@ def verify(root: pathlib.Path, manifest_path: pathlib.Path) -> list[str]:
     try:
         manifest = source_tree.load_manifest(manifest_path)
     except source_tree.SourceTreeError as error:
-        return [str(error)]
+        return [str(error)], 0
     try:
         enumeration = source_tree.enumerate_tree(root)
     except source_tree.SourceTreeError as error:
-        return [str(error)]
+        return [str(error)], 0
 
     expected = manifest["entries"]
     actual = enumeration.entries
@@ -161,7 +165,7 @@ def verify(root: pathlib.Path, manifest_path: pathlib.Path) -> list[str]:
     verify_git(root, manifest, actual_digest, findings)
     verify_archive(root, manifest.get("source_archive_sha256"), "source", findings)
     verify_archive(root, manifest.get("release_archive_sha256"), "release", findings)
-    return findings
+    return findings, len(enumeration.entries)
 
 
 def main() -> int:
@@ -185,10 +189,9 @@ def main() -> int:
         os.environ.get("NEMO_RELAY_SOURCE_MANIFEST", root / "qualification" / "source-manifest.json")
     )
 
-    findings = verify(root, manifest_path)
+    findings, entries = verify(root, manifest_path)
     if findings:
         return report_failure(findings)
-    entries = len(source_tree.enumerate_tree(root).entries)
     print(f"PROVENANCE PASS\n{entries} source entries match the qualification manifest")
     return 0
 

@@ -149,6 +149,26 @@ jobs:
           NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: just test-postgres-crash-recovery
 
+      - name: Run PostgreSQL migration integrity
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-migration-integrity
+
+      - name: Run database failure boundary tests
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-db-failure-boundaries
+
+      - name: Run runtime composition tests
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-runtime-composition
+
+      - name: Run physical schema verification
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-schema-verification
+
       - name: Run kernel and provider process restart
         env:
           NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres

@@ -272,10 +272,79 @@ def verify(
     findings.extend(bundle.verify(qualification_dir.parent, qualification_dir))
     findings.extend(self_reference_findings(artifact, attestation_path))
 
-    if attestation.get("promotion", "").startswith("PRODUCTION") and (
-        attestation.get("signing", {}).get("status") != "SIGNED"
-    ):
+    is_production = attestation.get("promotion", "").startswith("PRODUCTION")
+    signing = attestation.get("signing", {})
+
+    if is_production and signing.get("status") != "SIGNED":
         findings.append(f"promotion {attestation.get('promotion')} requires a signed release attestation")
+
+    if signing.get("status") == "SIGNED":
+        findings.extend(verify_attestation_signature(artifact, attestation, attestation_path))
+    return findings
+
+
+def verify_attestation_signature(
+    artifact: pathlib.Path,
+    attestation: dict,
+    attestation_path: pathlib.Path,
+) -> list[str]:
+    """Cryptographically verify the signed DSSE envelope and cosign bundle."""
+
+    findings: list[str] = []
+    if shutil.which("cosign") is None:
+        return ["attestation is recorded as SIGNED but cosign is unavailable to verify it"]
+
+    envelope = attestation.get("dsse") or {}
+    if envelope.get("payloadType") != DSSE_PAYLOAD_TYPE:
+        findings.append(f"unexpected attestation DSSE payload type: {envelope.get('payloadType')!r}")
+        return findings
+
+    statement_bytes = base64.b64decode(envelope.get("payload", ""))
+    expected_statement = {
+        "_type": IN_TOTO_STATEMENT_TYPE,
+        "subject": [
+            {
+                "name": artifact.name,
+                "digest": {"sha256": attestation.get("artifact", {}).get("sha256", "")},
+            }
+        ],
+        "predicateType": PREDICATE_TYPE,
+        "predicate": {
+            "source_tree_sha256": attestation.get("source_tree_sha256"),
+            "environment_sha256": attestation.get("environment_sha256"),
+            "evidence_manifest_sha256": attestation.get("evidence", {}).get("manifest_sha256"),
+            "artifact_set_sha256": attestation.get("evidence", {}).get("artifact_set_sha256"),
+            "qualification_level": attestation.get("qualification_level"),
+            "promotion": attestation.get("promotion"),
+            "release_version": attestation.get("release_version"),
+            "ci_identity": attestation.get("ci_identity"),
+            "evidence_signing": attestation.get("evidence_signing"),
+        },
+    }
+    expected_bytes = json.dumps(expected_statement, sort_keys=True, separators=(",", ":")).encode()
+    if statement_bytes != expected_bytes:
+        findings.append("attestation DSSE payload does not match the canonical statement for this artifact")
+
+    bundle_name = attestation.get("signing", {}).get("bundle", "")
+    bundle_path = attestation_path.parent / bundle_name if bundle_name else None
+    if not bundle_path or not bundle_path.is_file():
+        findings.append("attestation is recorded as SIGNED but the signature bundle is missing")
+        return findings
+
+    payload_path = attestation_path.parent / (bundle_name + ".verify-payload")
+    payload_path.write_bytes(bundle.pre_authentication_encoding(DSSE_PAYLOAD_TYPE, statement_bytes))
+    try:
+        result = subprocess.run(
+            ["cosign", "verify-blob", "--bundle", str(bundle_path), str(payload_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        payload_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        detail = (result.stderr.strip().splitlines() or ["unknown error"])[-1]
+        findings.append(f"attestation signature verification failed: {detail}")
     return findings
 
 

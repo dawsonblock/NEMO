@@ -339,7 +339,13 @@ def verify_signature(qualification_dir: pathlib.Path, evidence: dict) -> list[st
     if not envelope_path.is_file() or not bundle_path.is_file():
         return ["evidence is recorded as SIGNED but the envelope or bundle is missing"]
     envelope = json.loads(envelope_path.read_text())
+    if envelope.get("payloadType") != DSSE_PAYLOAD_TYPE:
+        return [f"unexpected DSSE payload type: {envelope.get('payloadType')!r}"]
     statement_bytes = base64.b64decode(envelope["payload"])
+    expected_bytes = json.dumps(build_statement(evidence), sort_keys=True, separators=(",", ":")).encode()
+    findings: list[str] = []
+    if statement_bytes != expected_bytes:
+        findings.append("DSSE payload does not match the canonical evidence statement")
     payload_path = qualification_dir / "evidence-manifest.dsse-payload.bin"
     payload_path.write_bytes(pre_authentication_encoding(envelope["payloadType"], statement_bytes))
     try:
@@ -353,8 +359,8 @@ def verify_signature(qualification_dir: pathlib.Path, evidence: dict) -> list[st
         payload_path.unlink(missing_ok=True)
     if result.returncode != 0:
         detail = (result.stderr.strip().splitlines() or ["unknown error"])[-1]
-        return [f"evidence signature verification failed: {detail}"]
-    return []
+        findings.append(f"evidence signature verification failed: {detail}")
+    return findings
 
 
 def main() -> int:

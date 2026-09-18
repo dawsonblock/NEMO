@@ -43,7 +43,7 @@ def tree(tmp_path: pathlib.Path) -> pathlib.Path:
     (root / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
     (root / ".gitignore").write_text("target/\n*.tmp\n")
     capture_provenance.capture(root, root / "qualification", "full")
-    assert provenance_check.verify(root, EVIDENCE) == []
+    assert provenance_check.verify(root, EVIDENCE)[0] == []
     return root
 
 
@@ -65,7 +65,7 @@ def test_stale_manifest_cannot_verify_a_tree_with_new_effect_runtime_files(
     (tree / "crates" / "effect-runtime" / "Cargo.toml").write_text("[package]\nname = 'x'\n")
     (tree / "crates" / "effect-runtime" / "src" / "lib.rs").write_text("// runtime\n")
 
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert findings
     assert expected_substring(findings, "2 tree entry(s) absent from the manifest")
     assert expected_substring(findings, "crates/effect-runtime/src/lib.rs")
@@ -81,7 +81,7 @@ def test_manifest_from_an_older_schema_is_rejected(tmp_path: pathlib.Path) -> No
     evidence.parent.mkdir()
     evidence.write_text(json.dumps({"schema_version": 1, "files": {"hello.txt": "abc"}}))
 
-    findings = provenance_check.verify(root, EVIDENCE)
+    findings, _ = provenance_check.verify(root, EVIDENCE)
     assert expected_substring(findings, "schema_version is 1")
 
 
@@ -90,7 +90,7 @@ def test_manifest_from_an_older_schema_is_rejected(tmp_path: pathlib.Path) -> No
 
 def test_new_unmanifested_rust_file_fails(tree: pathlib.Path) -> None:
     (tree / "crates" / "core" / "src" / "runtime.rs").write_text("// new\n")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "absent from the manifest")
     assert expected_substring(findings, "crates/core/src/runtime.rs")
 
@@ -99,26 +99,26 @@ def test_new_executable_shell_script_fails(tree: pathlib.Path) -> None:
     script = tree / "scripts" / "deploy.sh"
     script.write_text("#!/bin/sh\necho deploy\n")
     script.chmod(0o755)
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "scripts/deploy.sh")
 
 
 def test_new_configuration_file_fails(tree: pathlib.Path) -> None:
     (tree / "deny.toml").write_text("[advisories]\n")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "deny.toml")
 
 
 def test_deleted_known_file_fails(tree: pathlib.Path) -> None:
     (tree / "crates" / "core" / "src" / "kernel.rs").unlink()
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "missing from the tree")
     assert expected_substring(findings, "crates/core/src/kernel.rs")
 
 
 def test_modified_known_file_fails(tree: pathlib.Path) -> None:
     (tree / "Cargo.toml").write_text("[workspace]\nmembers = ['evil']\n")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "content mismatch")
     assert expected_substring(findings, "Cargo.toml")
 
@@ -127,7 +127,7 @@ def test_regular_file_replaced_by_symlink_fails(tree: pathlib.Path) -> None:
     target = tree / "Cargo.toml"
     target.unlink()
     os.symlink("crates/core/src/kernel.rs", target)
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "type mismatch")
     assert expected_substring(findings, "Cargo.toml")
 
@@ -137,11 +137,11 @@ def test_symlink_replaced_by_regular_file_fails(tree: pathlib.Path) -> None:
     os.symlink("AGENTS.md", link)
     (tree / "AGENTS.md").write_text("# agents\n")
     capture_provenance.capture(tree, tree / "qualification", "full")
-    assert provenance_check.verify(tree, EVIDENCE) == []
+    assert provenance_check.verify(tree, EVIDENCE)[0] == []
 
     link.unlink()
     link.write_text("# agents\n")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "type mismatch")
     assert expected_substring(findings, "CLAUDE.md")
 
@@ -151,18 +151,18 @@ def test_symlink_target_change_fails(tree: pathlib.Path) -> None:
     (tree / "OTHER.md").write_text("# other\n")
     os.symlink("AGENTS.md", tree / "CLAUDE.md")
     capture_provenance.capture(tree, tree / "qualification", "full")
-    assert provenance_check.verify(tree, EVIDENCE) == []
+    assert provenance_check.verify(tree, EVIDENCE)[0] == []
 
     (tree / "CLAUDE.md").unlink()
     os.symlink("OTHER.md", tree / "CLAUDE.md")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "symlink target mismatch")
     assert expected_substring(findings, "CLAUDE.md")
 
 
 def test_executable_bit_change_fails(tree: pathlib.Path) -> None:
     (tree / "scripts" / "release.sh").chmod(0o644)
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "mode mismatch")
     assert expected_substring(findings, "scripts/release.sh")
 
@@ -171,13 +171,13 @@ def test_nested_unexpected_directory_and_file_fails(tree: pathlib.Path) -> None:
     nested = tree / "crates" / "core" / "src" / "internal" / "deep"
     nested.mkdir(parents=True)
     (nested / "secret.rs").write_text("// hidden\n")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "crates/core/src/internal/deep/secret.rs")
 
 
 def test_nested_unexpected_empty_directory_fails(tree: pathlib.Path) -> None:
     (tree / "crates" / "unexpected").mkdir()
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "crates/unexpected")
 
 
@@ -187,7 +187,7 @@ def test_path_traversal_attempt_in_manifest_is_rejected(tree: pathlib.Path) -> N
     manifest["entries"]["../escape.rs"] = {"kind": "file", "sha256": "0" * 64, "mode": "0644"}
     evidence.write_text(json.dumps(manifest))
 
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "traversal segment")
 
 
@@ -197,7 +197,7 @@ def test_absolute_manifest_path_is_rejected(tree: pathlib.Path) -> None:
     manifest["entries"]["/etc/passwd"] = {"kind": "file", "sha256": "0" * 64, "mode": "0644"}
     evidence.write_text(json.dumps(manifest))
 
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "absolute")
 
 
@@ -207,7 +207,7 @@ def test_absolute_symlink_target_is_rejected(tree: pathlib.Path) -> None:
     manifest["entries"]["CLAUDE.md"] = {"kind": "symlink", "target": "/etc/passwd", "mode": "0777"}
     evidence.write_text(json.dumps(manifest))
 
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "prohibited absolute target")
 
 
@@ -217,7 +217,7 @@ def test_escaping_symlink_target_is_rejected(tree: pathlib.Path) -> None:
     manifest["entries"]["CLAUDE.md"] = {"kind": "symlink", "target": "../../outside", "mode": "0777"}
     evidence.write_text(json.dumps(manifest))
 
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "escapes the source root")
 
 
@@ -230,14 +230,14 @@ def test_ignored_build_output_does_not_invalidate(tree: pathlib.Path) -> None:
     (tree / "target").mkdir()
     (tree / "target" / "debug.bin").write_bytes(b"\x00")
     (tree / "scratch.tmp").write_text("temporary\n")
-    assert provenance_check.verify(tree, EVIDENCE) == []
+    assert provenance_check.verify(tree, EVIDENCE)[0] == []
 
 
 def test_changing_gitignore_invalidates(tree: pathlib.Path) -> None:
     """Ignore rules are source content, so editing them is a source change."""
 
     (tree / ".gitignore").write_text("target/\n*.tmp\n*.bak\n")
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, ".gitignore")
 
 
@@ -290,7 +290,7 @@ def test_policy_version_change_invalidates_older_manifests(tree: pathlib.Path) -
     manifest = json.loads(evidence.read_text())
     manifest["enumeration_policy_version"] = "nemo-source-tree-v0"
     evidence.write_text(json.dumps(manifest))
-    findings = provenance_check.verify(tree, EVIDENCE)
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
     assert expected_substring(findings, "enumeration_policy_version")
 
 
