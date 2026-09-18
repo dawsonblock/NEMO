@@ -1,9 +1,11 @@
 -- SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-create schema if not exists __SCHEMA__;
-
-create table if not exists __SCHEMA__.effect_actions (
+-- These objects are owned by this migration. They are created without
+-- IF NOT EXISTS on purpose: adopting a pre-existing object of unknown shape is
+-- exactly how a migration ledger blesses a schema it did not build. A
+-- conflicting object fails the migration and rolls the transaction back.
+create table __SCHEMA__.effect_actions (
     action_id text primary key,
     tenant_id text,
     tenant_scope text generated always as (coalesce(tenant_id, '')) stored,
@@ -43,10 +45,10 @@ create table if not exists __SCHEMA__.effect_actions (
     )
 );
 
-create index if not exists effect_actions_recovery_idx
+create index effect_actions_recovery_idx
     on __SCHEMA__.effect_actions (state, lease_expires_at);
 
-create table if not exists __SCHEMA__.effect_receipts (
+create table __SCHEMA__.effect_receipts (
     action_id text primary key
         references __SCHEMA__.effect_actions (action_id) on delete restrict,
     receipt_identity text not null,
@@ -58,7 +60,7 @@ create table if not exists __SCHEMA__.effect_receipts (
     )
 );
 
-create table if not exists __SCHEMA__.effect_receipt_conflicts (
+create table __SCHEMA__.effect_receipt_conflicts (
     conflict_digest text primary key,
     action_id text not null
         references __SCHEMA__.effect_actions (action_id) on delete restrict,
@@ -69,5 +71,19 @@ create table if not exists __SCHEMA__.effect_receipt_conflicts (
     )
 );
 
-create index if not exists effect_receipt_conflicts_action_idx
+create index effect_receipt_conflicts_action_idx
     on __SCHEMA__.effect_receipt_conflicts (action_id, observed_at, conflict_digest);
+
+-- Expected physical schema. This row is data, not structure, so recording the
+-- expected description here does not make verification self-referential: the
+-- digest covers catalogs, and the row holding it is written after the digest is
+-- computed. `schema_model` keeps the full canonical description so a mismatch
+-- can report what drifted rather than only that a hash changed.
+create table __SCHEMA__.effect_schema_state (
+    id boolean primary key default true check (id),
+    model_version integer not null,
+    server_major integer not null,
+    schema_fingerprint text not null,
+    schema_model jsonb not null,
+    recorded_at timestamptz not null default clock_timestamp()
+);

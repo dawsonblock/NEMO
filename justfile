@@ -1259,6 +1259,54 @@ test-postgres-effect-store-concurrency:
         --features unstable-postgres,unstable-hardening-testkit \
         postgres::tests::concurrent_ -- --include-ignored --test-threads=1
 
+# E3-011 migration integrity: concurrent migrators, a process killed between DDL
+# and the ledger record, retry after failure, damaged history, a runtime
+# credential that must not be able to rewrite the ledger it trusts, and the
+# eight-point migration crash matrix.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL.
+test-postgres-migration-integrity:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        --test postgres_migration_integrity -- --include-ignored --test-threads=1
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        --test postgres_migration_crash_matrix -- --include-ignored --test-threads=1
+
+# Additional mandatory E3.1 invariant: database-failure ambiguity semantics.
+# Proves the four boundaries around external dispatch, including that a
+# provider effect with a failed terminal write becomes UNKNOWN and reconciles
+# rather than being retried.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL.
+test-postgres-db-failure-boundaries:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-effect-qualification \
+        --test postgres_db_failure_boundaries -- --include-ignored --test-threads=1
+
+# E3-012 physical schema verification: catalog fingerprint plus destructive
+# drift that leaves the migration ledger untouched. When
+# NEMO_RELAY_SCHEMA_EVIDENCE_DIR is set, the canonical schema description of a
+# freshly migrated database is emitted there as reviewable evidence.
+# Requires NEMO_RELAY_TEST_POSTGRES_URL.
+test-postgres-schema-verification:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NEMO_RELAY_TEST_POSTGRES_URL:?NEMO_RELAY_TEST_POSTGRES_URL is required}"
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests::schema_ -- --include-ignored --test-threads=1
+    cargo test --locked -p nemo-relay-ledger \
+        --features unstable-postgres,unstable-hardening-testkit \
+        postgres::tests::migration_refuses -- --include-ignored --test-threads=1
+    if [[ -n "${NEMO_RELAY_SCHEMA_EVIDENCE_DIR:-}" ]]; then
+        cargo run --quiet --locked -p nemo-relay-ledger --features unstable-postgres \
+            --bin nemo-effect-schema -- "${NEMO_RELAY_SCHEMA_EVIDENCE_DIR}"
+    fi
+
 # Exercise PostgreSQL persistence through a fresh pool/store instance separately.
 # Requires NEMO_RELAY_TEST_POSTGRES_URL; each test uses and removes an isolated schema.
 test-postgres-effect-store-restart:
@@ -1703,9 +1751,33 @@ test-all: test-rust test-python test-python-langchain test-go test-node test-ope
 qualification mode="full":
     scripts/qualification/run.sh "{{ mode }}"
 
+# Print the canonical source tree digest, derived from the filesystem.
+qualification-digest:
+    python3 scripts/qualification/source_tree.py --root "{{ NEMO_RELAY_REPO_ROOT }}" --entries
+
+# Run the mandatory provenance, tier, and evidence-bundle test suites.
+test-qualification-scripts:
+    uv run --locked python -m pytest scripts/qualification -q
+
 # Verify source, lockfile, Git, and archive digests against qualification evidence.
 provenance-check:
     python3 scripts/qualification/provenance_check.py
+
+# Verify every digest bound into the qualification evidence bundle.
+evidence-verify:
+    python3 scripts/qualification/build_evidence_manifest.py --verify
+
+# Bind a final release artifact to its evidence from outside the artifact.
+attest-release artifact:
+    python3 scripts/qualification/attest_release.py \
+        --qualification-dir "{{ NEMO_RELAY_REPO_ROOT }}/qualification" \
+        --release-artifact "{{ artifact }}" --require-signed
+
+# Verify an external release attestation against its artifact and evidence.
+verify-release-attestation artifact:
+    python3 scripts/qualification/attest_release.py --verify \
+        --qualification-dir "{{ NEMO_RELAY_REPO_ROOT }}/qualification" \
+        --release-artifact "{{ artifact }}"
 
 # [version] or --set ref_name=<version>
 set-version version="":

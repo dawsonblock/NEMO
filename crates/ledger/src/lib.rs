@@ -18,6 +18,10 @@ pub mod conformance;
 #[cfg(feature = "unstable-postgres")]
 pub mod postgres;
 
+/// Physical schema verification for the durable effect store.
+#[cfg(feature = "unstable-postgres")]
+pub mod schema;
+
 /// Opt-in experimental contracts.
 #[cfg(feature = "unstable-hardening")]
 pub mod unstable {

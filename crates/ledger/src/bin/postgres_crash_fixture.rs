@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Child-process fixture for PostgreSQL terminal-finalization crash tests.
+//! Child-process fixture for PostgreSQL crash tests.
+//!
+//! `prepare` and `finalize` cover terminal-finalization crashes. `migrate`
+//! covers a process dying after the schema DDL ran but before the migration
+//! version is recorded.
 
 use nemo_relay_ledger::conformance::{fixture_action, fixture_receipt};
 use nemo_relay_ledger::postgres::PostgresEffectStore;
@@ -97,6 +101,9 @@ fn main() {
     match mode.as_str() {
         "prepare" => prepare(&store),
         "finalize" => finalize(&store),
+        "migrate" => {
+            store.migrate().expect("migrate crash fixture store");
+        }
         _ => panic!("unknown fixture mode: {mode}"),
     }
 }

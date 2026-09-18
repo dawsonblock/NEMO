@@ -162,7 +162,15 @@ fn process_crash_after_provider_commit_recovers_without_redispatch() {
         "recovery failed: {}",
         String::from_utf8_lossy(&recovered.stderr)
     );
-    assert!(String::from_utf8_lossy(&recovered.stdout).contains("Committed"));
+    let recovery_report = String::from_utf8_lossy(&recovered.stdout).into_owned();
+    assert!(
+        recovery_report.contains("\"recovery\":\"recover_unknown\""),
+        "a crashed dispatch must be recovered as unknown: {recovery_report}"
+    );
+    assert!(
+        recovery_report.contains("\"reconciled_state\":\"COMMITTED\""),
+        "reconciliation must resolve the crashed action to committed: {recovery_report}"
+    );
     assert_recovered_action(&schema);
 
     let replay = schema

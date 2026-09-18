@@ -9,6 +9,12 @@
 
 use crate::unstable::*;
 
+// A conformance lease must survive multiple store calls. A few milliseconds is
+// not a meaningful cross-backend lease budget once a PostgreSQL adapter also
+// applies checked-out-session limits, especially on a contended CI host.
+const ACTIVE_LEASE_DURATION_MS: u64 = 100;
+const EXPIRED_LEASE_ADVANCE_MS: u64 = ACTIVE_LEASE_DURATION_MS + 1;
+
 /// Factory and deterministic-clock adapter for store conformance tests.
 pub trait StoreConformanceHarness: Sized {
     /// Action-state implementation under test.
@@ -166,7 +172,7 @@ where
             &action.preparation.action_id,
             ExecutionState::Prepared,
             "conformance-owner",
-            Some(10),
+            Some(ACTIVE_LEASE_DURATION_MS),
         )
         .expect("claim lease")
     {
@@ -338,7 +344,7 @@ where
                 &action.preparation.action_id,
                 ExecutionState::Dispatching,
                 "second-owner",
-                Some(10),
+                Some(ACTIVE_LEASE_DURATION_MS),
             )
             .expect("observe live lease"),
         LeaseAcquireResult::HeldByOther(_)
@@ -427,7 +433,7 @@ where
     assert_eq!(current.state, ExecutionState::Dispatching);
     assert!(current.terminal_evidence.is_none());
 
-    harness.advance_store_clock(10);
+    harness.advance_store_clock(EXPIRED_LEASE_ADVANCE_MS);
     assert!(matches!(
         harness
             .actions()
@@ -435,7 +441,7 @@ where
                 &prepared.preparation.action_id,
                 ExecutionState::Dispatching,
                 "recovery-owner",
-                Some(10),
+                Some(ACTIVE_LEASE_DURATION_MS),
             )
             .expect("reclaim expired lease"),
         LeaseAcquireResult::ExpiredReclaimed(_)
@@ -547,7 +553,12 @@ where
         .expect("prepare effect action");
     let lease = match harness
         .actions()
-        .claim_lease(&action.action_id, ExecutionState::Prepared, owner, Some(10))
+        .claim_lease(
+            &action.action_id,
+            ExecutionState::Prepared,
+            owner,
+            Some(ACTIVE_LEASE_DURATION_MS),
+        )
         .expect("claim dispatch lease")
     {
         LeaseAcquireResult::Acquired(lease) => lease,
@@ -717,7 +728,7 @@ where
             &action.action_id,
             ExecutionState::Prepared,
             "stale-worker-a",
-            Some(10),
+            Some(ACTIVE_LEASE_DURATION_MS),
         )
         .expect("claim worker A lease")
     {
@@ -733,14 +744,14 @@ where
             ExecutionState::Dispatching,
         )
         .expect("worker A enters dispatching");
-    stale.advance_store_clock(11);
+    stale.advance_store_clock(EXPIRED_LEASE_ADVANCE_MS);
     let lease_b = match stale
         .actions()
         .claim_lease(
             &action.action_id,
             ExecutionState::Dispatching,
             "recovery-worker-b",
-            Some(10),
+            Some(ACTIVE_LEASE_DURATION_MS),
         )
         .expect("reclaim expired lease")
     {
@@ -809,7 +820,7 @@ where
             &action.action_id,
             ExecutionState::Prepared,
             "reconciliation-dispatcher",
-            Some(10),
+            Some(ACTIVE_LEASE_DURATION_MS),
         )
         .expect("claim reconciliation dispatch lease")
     {
@@ -840,7 +851,7 @@ where
             &action.action_id,
             ExecutionState::Unknown,
             "reconciliation-worker",
-            Some(10),
+            Some(ACTIVE_LEASE_DURATION_MS),
         )
         .expect("claim reconciliation lease")
     {

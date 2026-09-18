@@ -50,3 +50,8 @@ rcgen = "0.13.2"
 name = "nemo-postgres-crash-fixture"
 path = "src/bin/postgres_crash_fixture.rs"
 required-features = ["unstable-postgres", "unstable-hardening-testkit"]
+
+[[bin]]
+name = "nemo-effect-schema"
+path = "src/bin/nemo_effect_schema.rs"
+required-features = ["unstable-postgres"]

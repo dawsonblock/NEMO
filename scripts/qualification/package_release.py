@@ -14,34 +14,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import stat
-import subprocess
 import sys
 import zipfile
 from datetime import datetime, timezone
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 DEFAULT_ROOT = SCRIPT_DIR.parents[1]
-GENERATED_PREFIX = ("release", "artifacts")
-EXCLUDED_ROOTS = {
-    ".git",
-    "target",
-    "node_modules",
-    "coverage",
-    "qualification",
-    ".venv",
-    ".uv-cache",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    "build",
-    "dist",
-}
-EXCLUDED_NAMES = {"__pycache__", ".coverage"}
-EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import source_tree  # noqa: E402  (local module)
 
 
 def workspace_version(root: pathlib.Path) -> str:
@@ -59,37 +46,21 @@ def workspace_version(root: pathlib.Path) -> str:
 
 
 def is_excluded(relative: pathlib.Path) -> bool:
-    if not relative.parts:
-        return False
-    if relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX:
-        return True
-    if any(part in EXCLUDED_NAMES for part in relative.parts):
-        return True
-    return relative.suffix in EXCLUDED_SUFFIXES
+    """Return whether the static source policy excludes a path."""
+
+    return source_tree.statically_excluded(pathlib.PurePosixPath(relative.as_posix()))
 
 
 def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:
-    """Return source files using the same source selection as qualification."""
+    """Return the source entries the qualification manifest describes.
 
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            cwd=root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        candidates = [path.relative_to(root) for path in root.rglob("*") if path.is_file()]
-    else:
-        candidates = [pathlib.Path(value.decode()) for value in result.stdout.split(b"\0") if value]
+    Release packaging and provenance verification share one enumeration so a
+    packaged archive cannot contain a different entry set than the manifest that
+    qualified it.
+    """
 
-    paths = {
-        relative
-        for relative in candidates
-        if not is_excluded(relative) and (root / relative).is_file() and not (root / relative).is_symlink()
-    }
-    return sorted(paths, key=lambda path: path.as_posix())
+    enumeration = source_tree.enumerate_tree(root)
+    return [pathlib.Path(path) for path in enumeration.entries]
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -97,16 +68,26 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def canonical_tree(files: list[pathlib.Path], root: pathlib.Path) -> tuple[str, dict[str, str]]:
-    hashes = {relative.as_posix(): sha256_bytes((root / relative).read_bytes()) for relative in files}
-    canonical = "".join(f"{name}\t{digest}\n" for name, digest in hashes.items()).encode()
-    return sha256_bytes(canonical), hashes
+    """Return the typed tree digest plus the flat file digests."""
+
+    entries = source_tree.enumerate_tree(root).entries
+    hashes = {
+        relative.as_posix(): entries[relative.as_posix()].get("sha256", "")
+        for relative in files
+        if entries.get(relative.as_posix(), {}).get("kind") == source_tree.KIND_FILE
+    }
+    return source_tree.entries_digest(entries), hashes
 
 
 def zip_info(name: str, source: pathlib.Path) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(name, date_time=ZIP_TIMESTAMP)
-    # Preserve executability while normalizing every other permission bit.
-    mode = 0o755 if source.stat().st_mode & stat.S_IXUSR else 0o644
-    info.external_attr = (stat.S_IFREG | mode) << 16
+    if source.is_symlink():
+        # A flattened symlink would change the entry type the manifest verified.
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    else:
+        # Preserve executability while normalizing every other permission bit.
+        mode = 0o755 if source.stat().st_mode & stat.S_IXUSR else 0o644
+        info.external_attr = (stat.S_IFREG | mode) << 16
     info.create_system = 3
     return info
 
@@ -127,9 +108,11 @@ def write_archive(
         strict_timestamps=True,
     ) as handle:
         for relative in files:
+            source = root / relative
+            payload = os.readlink(source).encode() if source.is_symlink() else source.read_bytes()
             handle.writestr(
-                zip_info(prefix + relative.as_posix(), root / relative),
-                (root / relative).read_bytes(),
+                zip_info(prefix + relative.as_posix(), source),
+                payload,
                 compress_type=zipfile.ZIP_DEFLATED,
                 compresslevel=9,
             )
@@ -216,9 +199,10 @@ def main() -> int:
                     "timestamp": "1980-01-01T00:00:00Z",
                     "path_prefix": f"NEMO-{version}/",
                 },
-                "excluded_roots": sorted(EXCLUDED_ROOTS),
-                "excluded_prefixes": ["/".join(GENERATED_PREFIX)],
+                "excluded_roots": sorted(source_tree.ROOT_ONLY_PRUNED),
+                "excluded_prefixes": ["/".join(source_tree.GENERATED_PREFIX)],
                 "files": file_hashes,
+                "entries": len(files),
             },
             indent=2,
         )

@@ -9,6 +9,7 @@
 //! outside this module and therefore cannot occur while a SQL transaction is
 //! held open.
 
+use crate::schema;
 use crate::unstable::*;
 use native_tls::{Certificate, Identity, Protocol, TlsConnector};
 use postgres::config::{Host, SslMode, SslNegotiation};
@@ -20,7 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ops::{Deref, DerefMut};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "unstable-hardening-testkit")]
 fn pause_at_test_crash_point(point: &str) {
@@ -42,6 +43,21 @@ fn pause_at_test_crash_point(point: &str) {
 
 #[cfg(not(feature = "unstable-hardening-testkit"))]
 fn pause_at_test_crash_point(_point: &str) {}
+
+/// Fail a durable operation at a named boundary, for qualification tests.
+///
+/// This exists so boundary semantics can be proven deterministically instead of
+/// with sleeps or timing assumptions. It is inert unless the testkit feature is
+/// enabled *and* the process was started with the matching fault point, so a
+/// production build cannot reach it.
+fn injected_database_failure(point: &str) -> Result<(), PostgresEffectStoreError> {
+    #[cfg(feature = "unstable-hardening-testkit")]
+    if std::env::var("NEMO_RELAY_POSTGRES_FAULT_POINT").as_deref() == Ok(point) {
+        return Err(PostgresEffectStoreError::InjectedFailure(point.to_owned()));
+    }
+    let _ = point;
+    Ok(())
+}
 
 type PlainManager = PostgresConnectionManager<NoTls>;
 type TlsManager = PostgresConnectionManager<MakeTlsConnector>;
@@ -99,6 +115,53 @@ impl Default for PostgresOperationBudgets {
 }
 
 impl PostgresOperationBudgets {
+    /// Numerator of the share of a remaining action budget a lock wait may use.
+    pub const LOCK_BUDGET_NUMERATOR: u32 = 1;
+    /// Denominator of the share of a remaining action budget a lock wait may use.
+    pub const LOCK_BUDGET_DENOMINATOR: u32 = 3;
+
+    /// Derive session budgets from the remaining trusted action budget.
+    ///
+    /// The configured values stay maximum bounds. Each operation is instead
+    /// bounded by what is left of the caller's trusted deadline, so a database
+    /// wait can never outlive the action it belongs to:
+    ///
+    /// ```text
+    /// lock_timeout      = min(configured_lock,      remaining / 3)
+    /// statement_timeout = min(configured_statement, remaining)
+    /// ```
+    ///
+    /// A zero or exhausted remaining budget is rejected rather than silently
+    /// falling back to the static maximum.
+    pub fn for_remaining(&self, remaining: Duration) -> Result<Self, PostgresEffectStoreError> {
+        if remaining.is_zero() {
+            return Err(PostgresEffectStoreError::InvalidOperationBudget(
+                "remaining action budget",
+            ));
+        }
+        let lock_share = remaining / Self::LOCK_BUDGET_DENOMINATOR;
+        let derived = Self {
+            pool_acquire: self.pool_acquire.min(remaining),
+            lock: self.lock.min(lock_share),
+            statement: self.statement.min(remaining),
+            idle_in_transaction: self.idle_in_transaction.min(remaining),
+        };
+        derived.validate()?;
+        Ok(derived)
+    }
+
+    /// Return the PostgreSQL session settings for these budgets.
+    fn session_settings(&self) -> [(&'static str, u128); 3] {
+        [
+            ("lock_timeout", self.lock.as_millis()),
+            ("statement_timeout", self.statement.as_millis()),
+            (
+                "idle_in_transaction_session_timeout",
+                self.idle_in_transaction.as_millis(),
+            ),
+        ]
+    }
+
     fn validate(&self) -> Result<(), PostgresEffectStoreError> {
         for (name, duration) in [
             ("pool_acquire", self.pool_acquire),
@@ -307,6 +370,12 @@ impl DerefMut for PostgresConnection {
     }
 }
 
+/// One immutable effect-store migration.
+///
+/// `sql` is the authoritative definition; the ledger records its SHA-256 as
+/// `checksum`, so a rewritten migration file is detected rather than trusted.
+/// `application_version` records the release that first applied the migration
+/// and is never updated by a later runtime that merely observes it.
 struct Migration {
     version: i64,
     name: &'static str,
@@ -326,7 +395,87 @@ fn migration_checksum(sql: &str) -> String {
         .collect()
 }
 
-fn schema_query_error(error: postgres::Error) -> PostgresEffectStoreError {
+/// Expected shape of the migration ledger, verified before it is trusted.
+const MIGRATION_LEDGER_SHAPE: &[(&str, &str, bool)] = &[
+    ("version", "bigint", true),
+    ("name", "text", true),
+    ("checksum", "text", true),
+    ("application_version", "text", true),
+    ("applied_at", "timestamp with time zone", true),
+];
+
+/// Apply bounded PostgreSQL session budgets to one checked-out connection.
+/// One fenced terminalization: which action, under which lease, with which
+/// evidence, bounded by which trusted budget.
+struct Terminalization<'a> {
+    action_id: &'a str,
+    expected: ExecutionState,
+    lease: &'a ActionLease,
+    expected_evidence_revision: Option<u64>,
+    receipt: &'a ReceiptRecord,
+    remaining_action_budget: Option<Duration>,
+    failure_point: &'a str,
+}
+
+/// Return the time left before a trusted action deadline.
+fn remaining_deadline(deadline: Instant) -> Result<Duration, PostgresEffectStoreError> {
+    deadline.checked_duration_since(Instant::now()).ok_or(
+        PostgresEffectStoreError::InvalidOperationBudget("remaining action budget"),
+    )
+}
+
+fn apply_operation_budgets(
+    connection: &mut PostgresConnection,
+    budgets: &PostgresOperationBudgets,
+) -> Result<(), PostgresEffectStoreError> {
+    for (name, milliseconds) in budgets.session_settings() {
+        connection.query_one(
+            "select set_config($1, $2, false)",
+            &[&name, &milliseconds.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// Reject a pre-existing migration ledger whose shape is not this contract.
+///
+/// `create table if not exists` cannot prove that an object it skipped is the
+/// object this runtime needs. Verifying the columns immediately afterwards
+/// closes that gap, so a mismatched ledger fails before any migration version is
+/// recorded against it.
+fn validate_migration_ledger_shape(
+    client: &mut impl GenericClient,
+    schema: &str,
+) -> Result<(), PostgresEffectStoreError> {
+    let rows = client
+        .query(
+            "select a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull \
+             from pg_attribute a \
+             join pg_class c on c.oid = a.attrelid \
+             join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = $1 and c.relname = 'effect_schema_migrations' \
+             and a.attnum > 0 and not a.attisdropped \
+             order by a.attnum",
+            &[&schema],
+        )
+        .map_err(schema_query_error)?;
+    let actual: Vec<(String, String, bool)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let expected: Vec<(String, String, bool)> = MIGRATION_LEDGER_SHAPE
+        .iter()
+        .map(|(name, data_type, not_null)| ((*name).to_owned(), (*data_type).to_owned(), *not_null))
+        .collect();
+    if actual != expected {
+        return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+            "effect_schema_migrations has an unexpected shape: expected {expected:?}, found {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn schema_query_error(error: postgres::Error) -> PostgresEffectStoreError {
     if error
         .as_db_error()
         .is_some_and(|database| matches!(database.code().code(), "42P01" | "3F000"))
@@ -340,6 +489,63 @@ fn schema_query_error(error: postgres::Error) -> PostgresEffectStoreError {
 }
 
 /// Failure returned by [`PostgresEffectStore`].
+/// Which schema object a physical drift was attributed to.
+///
+/// Readiness failures stay specific so a release gate can say *what* drifted
+/// instead of collapsing every database problem into one opaque error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectKind {
+    /// A contract table is absent.
+    MissingTable,
+    /// A table exists that the recorded schema does not describe.
+    UnexpectedTable,
+    /// A column was added, removed, retyped, re-moded, or changed its expression.
+    Column,
+    /// A constraint was added, removed, or changed.
+    Constraint,
+    /// An index was added, removed, or changed.
+    Index,
+    /// A trigger was added, removed, or changed.
+    Trigger,
+    /// The canonical digests differ without a first structural difference.
+    DigestOnly,
+}
+
+impl std::fmt::Display for SchemaObjectKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::MissingTable => "missing table",
+            Self::UnexpectedTable => "unexpected table",
+            Self::Column => "column mismatch",
+            Self::Constraint => "constraint mismatch",
+            Self::Index => "index mismatch",
+            Self::Trigger => "trigger mismatch",
+            Self::DigestOnly => "schema digest mismatch",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// PostgreSQL settings production readiness observes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresDatabaseSettings {
+    /// Full server version string.
+    pub server_version: String,
+    /// Server major version number.
+    pub server_major: i32,
+    /// `synchronous_commit`, which governs durability of a committed write.
+    pub synchronous_commit: String,
+    /// `default_transaction_isolation`.
+    pub transaction_isolation: String,
+    /// `statement_timeout` as configured for the server default.
+    pub statement_timeout: String,
+    /// `idle_in_transaction_session_timeout` as configured by default.
+    pub idle_in_transaction_session_timeout: String,
+    /// `TimeZone` the session runs in.
+    pub timezone: String,
+}
+
+/// Failures the PostgreSQL durable-effect adapter can report.
 #[derive(Debug)]
 pub enum PostgresEffectStoreError {
     /// The configured schema identifier is not a safe lowercase SQL identifier.
@@ -358,6 +564,29 @@ pub enum PostgresEffectStoreError {
     Database(postgres::Error),
     /// Applied migrations did not match the versioned effect-store contract.
     SchemaMismatch(String),
+    /// The migration ledger disagrees with the migrations this runtime knows.
+    MigrationHistoryMismatch(String),
+    /// The physical schema does not match the description recorded for it.
+    SchemaFingerprintMismatch(String),
+    /// A specific schema object drifted from the recorded description.
+    SchemaObjectMismatch {
+        /// Which kind of object drifted.
+        kind: SchemaObjectKind,
+        /// What was observed.
+        detail: String,
+    },
+    /// The database credential holds privileges a production runtime must not have.
+    DatabasePrivilegeViolation {
+        /// Role the runtime connected as.
+        role: String,
+        /// Privileges that must not be granted to a runtime role.
+        privileges: String,
+    },
+    /// A qualification test injected a durable-operation failure at a boundary.
+    ///
+    /// Only produced when the testkit feature is enabled and the process was
+    /// started with `NEMO_RELAY_POSTGRES_FAULT_POINT` set to a matching name.
+    InjectedFailure(String),
     /// A durable JSON value could not be encoded or decoded.
     Serialization(serde_json::Error),
     /// A database value violated the durable-effect representation.
@@ -392,6 +621,24 @@ impl std::fmt::Display for PostgresEffectStoreError {
                     "PostgreSQL effect-store schema mismatch: {message}"
                 )
             }
+            Self::MigrationHistoryMismatch(message) => write!(
+                formatter,
+                "PostgreSQL migration history mismatch: {message}"
+            ),
+            Self::SchemaFingerprintMismatch(message) => {
+                write!(formatter, "PostgreSQL physical schema mismatch: {message}")
+            }
+            Self::SchemaObjectMismatch { kind, detail } => {
+                write!(formatter, "PostgreSQL {kind}: {detail}")
+            }
+            Self::DatabasePrivilegeViolation { role, privileges } => write!(
+                formatter,
+                "runtime role {role} can modify the effect-store schema and must be \
+                 restricted to data privileges: {privileges}"
+            ),
+            Self::InjectedFailure(point) => {
+                write!(formatter, "injected durable-operation failure at {point}")
+            }
             Self::Serialization(error) => write!(formatter, "durable JSON error: {error}"),
             Self::CorruptData(message) => write!(formatter, "corrupt effect-store data: {message}"),
             Self::IntegerOutOfRange(field) => {
@@ -418,6 +665,11 @@ impl std::error::Error for PostgresEffectStoreError {
             | Self::InvalidOperationBudget(_)
             | Self::InvalidTransport(_)
             | Self::SchemaMismatch(_)
+            | Self::MigrationHistoryMismatch(_)
+            | Self::SchemaFingerprintMismatch(_)
+            | Self::SchemaObjectMismatch { .. }
+            | Self::DatabasePrivilegeViolation { .. }
+            | Self::InjectedFailure(_)
             | Self::CorruptData(_)
             | Self::IntegerOutOfRange(_) => None,
         }
@@ -461,6 +713,12 @@ pub struct PostgresEffectStore {
     schema: String,
     lease_configuration: LeaseConfiguration,
     budgets: PostgresOperationBudgets,
+    /// Trusted action deadline this handle is scoped to, when one was supplied.
+    ///
+    /// The configured `budgets` stay maximum bounds. When a deadline is present
+    /// every checked-out session is instead bounded by what is left of it, so no
+    /// database wait can outlive the action it serves.
+    deadline: Option<Instant>,
 }
 
 impl PostgresEffectStore {
@@ -646,6 +904,7 @@ impl PostgresEffectStore {
             schema: schema.to_owned(),
             lease_configuration,
             budgets,
+            deadline: None,
         })
     }
 
@@ -667,6 +926,7 @@ impl PostgresEffectStore {
             schema: schema.to_owned(),
             lease_configuration,
             budgets,
+            deadline: None,
         })
     }
 
@@ -675,7 +935,17 @@ impl PostgresEffectStore {
     /// This method is for a dedicated migration role. Normal runtime workers
     /// should call [`Self::verify_schema`] and fail closed when the schema is
     /// absent, old, newer than their contract, or checksum-mismatched.
+    ///
+    /// The migration owns its objects. DDL runs without `IF NOT EXISTS`, so a
+    /// pre-existing object of unknown shape fails the migration instead of
+    /// being silently adopted, and the physical schema is fingerprinted inside
+    /// the same transaction before the migration version is recorded.
     pub fn migrate(&self) -> Result<(), PostgresEffectStoreError> {
+        // Deterministic crash boundaries for the migration crash matrix. Points
+        // 01-07 must leave no committed migration; point 08 is the opposite
+        // ambiguity, where PostgreSQL made the migration durable but the client
+        // never observed the commit.
+        pause_at_test_crash_point("mig_crash_01_before_advisory_lock");
         let mut connection = self.connection()?;
         let mut transaction = connection.transaction()?;
         // Serialize migrations per schema so a concurrent deployment cannot
@@ -686,6 +956,8 @@ impl PostgresEffectStore {
             "select pg_advisory_xact_lock(hashtext($1))",
             &[&migration_lock],
         )?;
+        pause_at_test_crash_point("mig_crash_02_after_advisory_lock");
+        pause_at_test_crash_point("mig_crash_03_before_ddl");
         transaction.batch_execute(&format!(
             "create schema if not exists {}",
             self.quoted_schema()
@@ -693,9 +965,14 @@ impl PostgresEffectStore {
         transaction.batch_execute(&format!(
             "create table if not exists {}.effect_schema_migrations (\
              version bigint primary key, name text not null, checksum text not null, \
+             application_version text not null, \
              applied_at timestamptz not null default clock_timestamp())",
             self.quoted_schema()
         ))?;
+        // `if not exists` above is only acceptable because the shape is verified
+        // immediately. A pre-existing table with a different shape cannot be
+        // used to record a migration, so it must not be blessed.
+        validate_migration_ledger_shape(&mut transaction, &self.schema)?;
         let rows = transaction.query(
             &format!(
                 "select version, name, checksum from {}.effect_schema_migrations order by version",
@@ -714,6 +991,22 @@ impl PostgresEffectStore {
                 )));
             }
         }
+        if rows.is_empty() {
+            // The migration owns the schema it builds, so it refuses to claim a
+            // schema that already contains objects it did not create. Later runs
+            // skip this: by then the schema legitimately contains the effect
+            // store, and `create table` without IF NOT EXISTS still refuses to
+            // adopt anything unexpected.
+            let foreign = schema::foreign_relations(&mut transaction, &self.schema)?;
+            if !foreign.is_empty() {
+                return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                    "schema {} already contains objects this migration does not own: {}",
+                    self.schema,
+                    foreign.join(", ")
+                )));
+            }
+        }
+        let mut pending: Vec<&Migration> = Vec::new();
         for migration in MIGRATIONS {
             let checksum = migration_checksum(migration.sql);
             let applied = rows
@@ -732,22 +1025,64 @@ impl PostgresEffectStore {
             }
             transaction
                 .batch_execute(&migration.sql.replace("__SCHEMA__", &self.quoted_schema()))?;
+            pause_at_test_crash_point("mig_crash_04_after_ddl");
+            pending.push(migration);
+        }
+        if !pending.is_empty() {
+            // Record what the migration actually produced before the ledger
+            // admits that the migration ran. Both happen in one transaction, so
+            // a mismatch or a crash leaves neither the objects nor the record.
+            let live = schema::capture(&mut transaction, &self.schema)?;
+            schema::record(&mut transaction, &self.schema, &live)?;
+        }
+        pause_at_test_crash_point("mig_crash_05_before_ledger_insert");
+        for migration in &pending {
+            let checksum = migration_checksum(migration.sql);
             transaction.execute(
                 &format!(
-                    "insert into {}.effect_schema_migrations (version, name, checksum) values ($1, $2, $3)",
+                    "insert into {}.effect_schema_migrations \
+                     (version, name, checksum, application_version) values ($1, $2, $3, $4)",
                     self.quoted_schema()
                 ),
-                &[&migration.version, &migration.name, &checksum],
+                &[
+                    &migration.version,
+                    &migration.name,
+                    &checksum,
+                    // The release that first applied this migration, not the
+                    // runtime that later observes it. A newer runtime must not
+                    // rewrite this row.
+                    &env!("CARGO_PKG_VERSION"),
+                ],
             )?;
+            pause_at_test_crash_point("mig_crash_06_after_ledger_insert");
         }
+        pause_at_test_crash_point("mig_crash_07_before_commit");
         transaction.commit()?;
+        pause_at_test_crash_point("mig_crash_08_after_commit");
         Ok(())
     }
 
     /// Verify that this store's schema exactly matches the runtime contract.
+    ///
+    /// Two independent facts are required. The migration ledger must record
+    /// exactly the migrations this runtime knows, with matching names and
+    /// checksums; and the *physical* schema must match the fingerprint recorded
+    /// when those migrations ran. A correct ledger over a structurally altered
+    /// database fails here.
+    ///
+    /// This is the convenience combination of
+    /// [`Self::verify_migration_history`] and [`Self::verify_physical_schema`].
+    /// Production readiness uses [`Self::verify_database_readiness`], which adds
+    /// role permissions and database settings.
     pub fn verify_schema(&self) -> Result<(), PostgresEffectStoreError> {
-        let rows = self
-            .connection()?
+        self.verify_migration_history()?;
+        self.verify_physical_schema()
+    }
+
+    /// Verify that the migration ledger records exactly this runtime's contract.
+    pub fn verify_migration_history(&self) -> Result<(), PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        let rows = connection
             .query(
                 &format!(
                     "select version, name, checksum from {}.effect_schema_migrations order by version",
@@ -756,31 +1091,201 @@ impl PostgresEffectStore {
                 &[],
             )
             .map_err(schema_query_error)?;
+        self.check_migration_rows(&rows)?;
+        Ok(())
+    }
+
+    /// Assert that a ledger row set is exactly the contract, in order.
+    fn check_migration_rows(&self, rows: &[postgres::Row]) -> Result<(), PostgresEffectStoreError> {
+        // A superset is not acceptable: an arbitrary extra migration means the
+        // database was written to by something this runtime does not know.
         if rows.len() != MIGRATIONS.len() {
-            return Err(PostgresEffectStoreError::SchemaMismatch(
-                "applied migration count does not match this runtime".into(),
-            ));
+            return Err(PostgresEffectStoreError::MigrationHistoryMismatch(format!(
+                "applied migration count {} does not match this runtime's {}",
+                rows.len(),
+                MIGRATIONS.len()
+            )));
         }
+        let mut previous = 0_i64;
         for migration in MIGRATIONS {
             let row = rows
                 .iter()
                 .find(|row| row.get::<_, i64>(0) == migration.version)
                 .ok_or_else(|| {
-                    PostgresEffectStoreError::SchemaMismatch(format!(
+                    PostgresEffectStoreError::MigrationHistoryMismatch(format!(
                         "required migration {} is missing",
                         migration.version
                     ))
                 })?;
+            let version: i64 = row.get(0);
+            if version <= previous {
+                return Err(PostgresEffectStoreError::MigrationHistoryMismatch(format!(
+                    "migration history is out of order at version {version}"
+                )));
+            }
+            previous = version;
             let name: String = row.get(1);
             let checksum: String = row.get(2);
-            if name != migration.name || checksum != migration_checksum(migration.sql) {
-                return Err(PostgresEffectStoreError::SchemaMismatch(format!(
-                    "migration {} has a different name or checksum",
+            if name != migration.name {
+                return Err(PostgresEffectStoreError::MigrationHistoryMismatch(format!(
+                    "migration {} is recorded as {name:?} but this runtime knows it as {:?}",
+                    migration.version, migration.name
+                )));
+            }
+            if checksum != migration_checksum(migration.sql) {
+                return Err(PostgresEffectStoreError::MigrationHistoryMismatch(format!(
+                    "migration {} has a different checksum than this runtime's SQL",
                     migration.version
                 )));
             }
         }
         Ok(())
+    }
+
+    /// Verify the physical schema against the description recorded for it.
+    ///
+    /// This is catalogue inspection, not bookkeeping: a dropped index, a
+    /// retyped column, a removed constraint, a changed generation expression, an
+    /// added trigger, or an unexpected table all fail here while the migration
+    /// ledger stays untouched.
+    pub fn verify_physical_schema(&self) -> Result<(), PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        let live = schema::capture(&mut *connection, &self.schema)?;
+        schema::verify(&mut *connection, &self.schema, &live)
+    }
+
+    /// Return the physical schema fingerprint of this database.
+    ///
+    /// Qualification records this value as machine-readable evidence that
+    /// schema verification inspected the catalog rather than only the ledger.
+    pub fn schema_fingerprint(&self) -> Result<String, PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        schema::capture(&mut *connection, &self.schema)?.digest()
+    }
+
+    /// Return the canonical, human-reviewable description of this database.
+    pub fn schema_model(&self) -> Result<schema::CanonicalSchema, PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        schema::capture(&mut *connection, &self.schema)
+    }
+
+    /// Return the PostgreSQL settings that govern durability and waiting.
+    pub fn database_settings(&self) -> Result<PostgresDatabaseSettings, PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        let row = connection.query_one(
+            "select current_setting('server_version'), \
+             current_setting('server_version_num')::integer / 10000, \
+             current_setting('synchronous_commit'), \
+             current_setting('default_transaction_isolation'), \
+             current_setting('statement_timeout'), \
+             current_setting('idle_in_transaction_session_timeout'), \
+             current_setting('TimeZone')",
+            &[],
+        )?;
+        Ok(PostgresDatabaseSettings {
+            server_version: row.get(0),
+            server_major: row.get(1),
+            synchronous_commit: row.get(2),
+            transaction_isolation: row.get(3),
+            statement_timeout: row.get(4),
+            idle_in_transaction_session_timeout: row.get(5),
+            timezone: row.get(6),
+        })
+    }
+
+    /// Run every database readiness check a production runtime must satisfy.
+    ///
+    /// Split from [`Self::verify_schema`] so qualification and operators get
+    /// specific diagnostics: history, physical structure, credential
+    /// privileges, and the settings that govern durability and waiting.
+    pub fn verify_database_readiness(
+        &self,
+    ) -> Result<PostgresDatabaseSettings, PostgresEffectStoreError> {
+        self.verify_migration_history()?;
+        self.verify_physical_schema()?;
+        self.verify_runtime_privileges()?;
+        self.database_settings()
+    }
+
+    /// Verify that the connected role cannot modify the schema or its ledger.
+    ///
+    /// The runtime identity must be a data-only role. A runtime credential that
+    /// can `CREATE` in the effect schema, or rewrite `effect_schema_migrations`
+    /// or `effect_schema_state`, can hide drift from every later verification,
+    /// so production readiness refuses to start with one.
+    pub fn verify_runtime_privileges(&self) -> Result<(), PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        let row = connection.query_one(
+            "select current_user, \
+             has_schema_privilege(current_user, $1, 'CREATE'), \
+             has_schema_privilege(current_user, $1, 'USAGE'), \
+             has_table_privilege(current_user, $2, 'INSERT'), \
+             has_table_privilege(current_user, $2, 'UPDATE'), \
+             has_table_privilege(current_user, $2, 'DELETE'), \
+             has_table_privilege(current_user, $2, 'TRUNCATE'), \
+             has_table_privilege(current_user, $3, 'INSERT'), \
+             has_table_privilege(current_user, $3, 'UPDATE'), \
+             has_table_privilege(current_user, $3, 'TRUNCATE')",
+            &[
+                &self.schema,
+                &self.table("effect_schema_migrations"),
+                &self.table("effect_schema_state"),
+            ],
+        )?;
+        let role: String = row.get(0);
+        let violations = [
+            ("CREATE on schema", row.get::<_, bool>(1)),
+            ("INSERT into effect_schema_migrations", row.get(3)),
+            ("UPDATE of effect_schema_migrations", row.get(4)),
+            ("DELETE from effect_schema_migrations", row.get(5)),
+            ("TRUNCATE of effect_schema_migrations", row.get(6)),
+            ("INSERT into effect_schema_state", row.get(7)),
+            ("UPDATE of effect_schema_state", row.get(8)),
+            ("TRUNCATE of effect_schema_state", row.get(9)),
+        ];
+        let granted: Vec<&str> = violations
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(name, _)| *name)
+            .collect();
+        if !granted.is_empty() {
+            return Err(PostgresEffectStoreError::DatabasePrivilegeViolation {
+                role,
+                privileges: granted.join(", "),
+            });
+        }
+        if !row.get::<_, bool>(2) {
+            return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                "runtime role {role} has no USAGE on schema {}",
+                self.schema
+            )));
+        }
+        Ok(())
+    }
+
+    /// Finalize a terminal receipt inside a trusted remaining action budget.
+    ///
+    /// The trait entry point uses the configured maximum budgets. Consequential
+    /// callers hold a trusted deadline, so they use this form: the store derives
+    /// `lock_timeout` and `statement_timeout` from what is left of that deadline
+    /// and never lets a PostgreSQL wait outlive it.
+    pub fn finalize_terminal_receipt_within_budget(
+        &self,
+        action_id: &str,
+        expected: ExecutionState,
+        lease: &ActionLease,
+        receipt: &ReceiptRecord,
+        remaining: Duration,
+    ) -> Result<EffectFinalizeResult, PostgresEffectStoreError> {
+        self.finalize_receipt_transaction(Terminalization {
+            action_id,
+            expected,
+            lease,
+            expected_evidence_revision: None,
+            receipt,
+            remaining_action_budget: Some(remaining),
+            failure_point: "terminal_finalization",
+        })
     }
 
     /// Discover bounded, unowned or expired consequential work for a recovery worker.
@@ -805,7 +1310,44 @@ impl PostgresEffectStore {
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 
+    /// Return a handle whose every store call is bounded by ``deadline``.
+    ///
+    /// This is how trusted execution context reaches the store without changing
+    /// the shared `ActionStore`/`EffectStore` traits: a clone of the store
+    /// shares the connection pool but carries the deadline, so every call made
+    /// through the returned handle derives its PostgreSQL budgets from what is
+    /// left of it. An already-exhausted deadline is rejected here rather than
+    /// silently falling back to the static maximum.
+    pub fn with_deadline(&self, deadline: Instant) -> Result<Self, PostgresEffectStoreError> {
+        if remaining_deadline(deadline)?.is_zero() {
+            return Err(PostgresEffectStoreError::InvalidOperationBudget(
+                "remaining action budget",
+            ));
+        }
+        Ok(Self {
+            deadline: Some(deadline),
+            ..self.clone()
+        })
+    }
+
+    /// Return the budgets this handle would apply to its next checkout.
+    pub fn effective_operation_budgets(
+        &self,
+    ) -> Result<PostgresOperationBudgets, PostgresEffectStoreError> {
+        match self.deadline {
+            Some(deadline) => self.budgets.for_remaining(remaining_deadline(deadline)?),
+            None => Ok(self.budgets.clone()),
+        }
+    }
+
     fn connection(&self) -> Result<PostgresConnection, PostgresEffectStoreError> {
+        self.connection_with_budget(self.effective_operation_budgets()?)
+    }
+
+    fn connection_with_budget(
+        &self,
+        budgets: PostgresOperationBudgets,
+    ) -> Result<PostgresConnection, PostgresEffectStoreError> {
         let mut connection = match &self.pool {
             PostgresPool::Plain(pool) => pool
                 .get()
@@ -816,26 +1358,20 @@ impl PostgresEffectStore {
                 .map(PostgresConnection::Tls)
                 .map_err(PostgresEffectStoreError::Pool),
         }?;
-        self.apply_operation_budgets(&mut connection)?;
+        apply_operation_budgets(&mut connection, &budgets)?;
         Ok(connection)
     }
 
-    fn apply_operation_budgets(
+    /// Derive the session budgets a remaining trusted action budget allows.
+    ///
+    /// The configured budgets stay maximum bounds. This returns the smaller of
+    /// each maximum and the caller's remaining deadline, so a caller can prove
+    /// that no PostgreSQL wait it starts can outlive the action it serves.
+    pub fn operation_budgets_for_remaining(
         &self,
-        connection: &mut PostgresConnection,
-    ) -> Result<(), PostgresEffectStoreError> {
-        for (name, duration) in [
-            ("lock_timeout", self.budgets.lock),
-            ("statement_timeout", self.budgets.statement),
-            (
-                "idle_in_transaction_session_timeout",
-                self.budgets.idle_in_transaction,
-            ),
-        ] {
-            let milliseconds = duration.as_millis().to_string();
-            connection.query_one("select set_config($1, $2, false)", &[&name, &milliseconds])?;
-        }
-        Ok(())
+        remaining: Duration,
+    ) -> Result<PostgresOperationBudgets, PostgresEffectStoreError> {
+        self.budgets.for_remaining(remaining)
     }
 
     fn quoted_schema(&self) -> String {
@@ -964,12 +1500,21 @@ impl PostgresEffectStore {
 
     fn finalize_receipt_transaction(
         &self,
-        action_id: &str,
-        expected: ExecutionState,
-        lease: &ActionLease,
-        expected_evidence_revision: Option<u64>,
-        receipt: &ReceiptRecord,
+        request: Terminalization<'_>,
     ) -> Result<EffectFinalizeResult, PostgresEffectStoreError> {
+        let Terminalization {
+            action_id,
+            expected,
+            lease,
+            expected_evidence_revision,
+            receipt,
+            remaining_action_budget,
+            failure_point,
+        } = request;
+        // Boundary C or D: the external effect may already exist when the
+        // terminal write fails. The caller must treat this as unknown, never as
+        // a failed effect.
+        injected_database_failure(failure_point)?;
         receipt
             .validate_terminal()
             .map_err(ReferenceStoreError::InvalidReceipt)?;
@@ -980,7 +1525,15 @@ impl PostgresEffectStore {
             .into());
         }
 
-        let mut connection = self.connection()?;
+        let mut connection = match remaining_action_budget {
+            // Deadline-aware: the terminal transaction is bounded by what is
+            // left of the caller's trusted action budget, or by the static
+            // maximum when no deadline is supplied.
+            Some(remaining) => {
+                self.connection_with_budget(self.budgets.for_remaining(remaining)?)?
+            }
+            None => self.connection()?,
+        };
         let mut transaction = connection.transaction()?;
         let (mut action, revision) = self
             .load_action_with(&mut transaction, action_id, true)?
@@ -1419,6 +1972,12 @@ impl ActionStore for PostgresEffectStore {
             }
             .into());
         }
+        if next == ExecutionState::Dispatching {
+            // Boundary A: the dispatch marker itself was not durably persisted,
+            // so no provider call can have happened through this path. A caller
+            // may classify this as an ordinary pre-dispatch failure.
+            injected_database_failure("dispatching_transition")?;
+        }
         let mut connection = self.connection()?;
         let mut transaction = connection.transaction()?;
         let (mut action, revision) = self
@@ -1644,13 +2203,17 @@ impl EffectStore for PostgresEffectStore {
         expected_evidence_revision: u64,
         receipt: &ReceiptRecord,
     ) -> Result<EffectFinalizeResult, Self::Error> {
-        self.finalize_receipt_transaction(
+        self.finalize_receipt_transaction(Terminalization {
             action_id,
-            ExecutionState::Reconciling,
+            expected: ExecutionState::Reconciling,
             lease,
-            Some(expected_evidence_revision),
+            expected_evidence_revision: Some(expected_evidence_revision),
             receipt,
-        )
+            remaining_action_budget: None,
+            // Boundary D: a failure here must leave the action unknown or
+            // reconciling so a later reconciliation can still finish.
+            failure_point: "reconciliation_finalization",
+        })
     }
 
     fn complete_reconciliation_unknown(
@@ -1659,6 +2222,9 @@ impl EffectStore for PostgresEffectStore {
         lease: &ActionLease,
         expected_evidence_revision: u64,
     ) -> Result<(), Self::Error> {
+        // Boundary D: the reconciliation outcome could not be persisted. The
+        // action must remain unknown rather than being resolved by inference.
+        injected_database_failure("reconciliation_completion")?;
         let mut connection = self.connection()?;
         let mut transaction = connection.transaction()?;
         let (mut action, revision) = self
@@ -1691,7 +2257,15 @@ impl EffectStore for PostgresEffectStore {
         lease: &ActionLease,
         receipt: &ReceiptRecord,
     ) -> Result<EffectFinalizeResult, Self::Error> {
-        self.finalize_receipt_transaction(action_id, expected, lease, None, receipt)
+        self.finalize_receipt_transaction(Terminalization {
+            action_id,
+            expected,
+            lease,
+            expected_evidence_revision: None,
+            receipt,
+            remaining_action_budget: None,
+            failure_point: "terminal_finalization",
+        })
     }
 }
 
@@ -2190,7 +2764,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             effects.verify_schema(),
-            Err(PostgresEffectStoreError::SchemaMismatch(_))
+            Err(PostgresEffectStoreError::MigrationHistoryMismatch(_))
         ));
         effects.drop_schema().unwrap();
     }
@@ -2542,5 +3116,461 @@ mod tests {
         let reopened = create_store(&connection_string, &schema);
         assert_eq!(reopened.load_action(&action.action_id).unwrap(), expected);
         reopened.drop_schema().unwrap();
+    }
+
+    // -- E3.1 physical schema verification ----------------------------------
+
+    fn migration_ledger(effects: &PostgresEffectStore) -> Vec<(i64, String, String)> {
+        effects
+            .connection()
+            .unwrap()
+            .query(
+                &format!(
+                    "select version, name, checksum from {}.effect_schema_migrations order by version",
+                    effects.quoted_schema()
+                ),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect()
+    }
+
+    /// Every case leaves `effect_schema_migrations` untouched on purpose: the
+    /// ledger alone must not be able to certify the database.
+    const DESTRUCTIVE_DRIFT: &[(&str, &str)] = &[
+        (
+            "drop_index",
+            r#"drop index "{schema}".effect_actions_recovery_idx"#,
+        ),
+        (
+            "alter_column_type",
+            r#"alter table "{schema}".effect_receipts
+               alter column receipt_identity type varchar(255)"#,
+        ),
+        (
+            "drop_constraint",
+            r#"alter table "{schema}".effect_actions
+               drop constraint effect_actions_lease_shape"#,
+        ),
+        (
+            "change_generated_expression",
+            r#"alter table "{schema}".effect_actions drop column tenant_scope;
+               alter table "{schema}".effect_actions add column tenant_scope text
+                 generated always as (coalesce(tenant_id, 'tampered')) stored"#,
+        ),
+        (
+            "remove_not_null",
+            r#"alter table "{schema}".effect_actions
+               alter column idempotency_key drop not null"#,
+        ),
+        ("drop_receipts", r#"drop table "{schema}".effect_receipts"#),
+        (
+            "add_unexpected_trigger",
+            r#"create function "{schema}".effect_unexpected_noop() returns trigger
+                 language plpgsql as $$ begin return new; end $$;
+               create trigger effect_actions_unexpected before update
+                 on "{schema}".effect_actions for each row
+                 execute function "{schema}".effect_unexpected_noop()"#,
+        ),
+        (
+            "modify_foreign_key",
+            r#"alter table "{schema}".effect_receipts
+                 drop constraint effect_receipts_action_id_fkey;
+               alter table "{schema}".effect_receipts
+                 add constraint effect_receipts_action_id_fkey
+                 foreign key (action_id) references "{schema}".effect_actions (action_id)
+                 on delete cascade"#,
+        ),
+        (
+            "drop_foreign_key",
+            r#"alter table "{schema}".effect_receipt_conflicts
+                 drop constraint effect_receipt_conflicts_action_id_fkey"#,
+        ),
+        (
+            "drop_check_constraint",
+            r#"alter table "{schema}".effect_actions
+                 drop constraint effect_actions_preparation_binding"#,
+        ),
+        (
+            "change_default",
+            r#"alter table "{schema}".effect_actions
+                 alter column lease_generation set default 5"#,
+        ),
+        (
+            "drop_conflicts",
+            r#"drop table "{schema}".effect_receipt_conflicts"#,
+        ),
+        (
+            "add_unexpected_writable_column",
+            r#"alter table "{schema}".effect_actions add column backdoor text"#,
+        ),
+        (
+            "change_index_predicate",
+            r#"drop index "{schema}".effect_actions_recovery_idx;
+               create index effect_actions_recovery_idx
+                 on "{schema}".effect_actions (state, lease_expires_at)
+                 where state <> 'COMMITTED'"#,
+        ),
+        (
+            "change_unique_constraint",
+            r#"alter table "{schema}".effect_actions
+                 drop constraint effect_actions_tenant_idempotency_key;
+               alter table "{schema}".effect_actions
+                 add constraint effect_actions_tenant_idempotency_key
+                 unique (tenant_scope, action_id)"#,
+        ),
+    ];
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn schema_verification_rejects_physical_drift_with_an_intact_ledger() {
+        for (name, template) in DESTRUCTIVE_DRIFT {
+            let connection_string = test_connection_string();
+            let schema = unique_schema();
+            let effects = create_store(&connection_string, &schema);
+            let ledger_before = migration_ledger(&effects);
+            assert!(!ledger_before.is_empty());
+
+            effects
+                .connection()
+                .unwrap()
+                .batch_execute(&template.replace("{schema}", &schema))
+                .expect("apply destructive drift");
+
+            let result = effects.verify_schema();
+            assert!(
+                matches!(
+                    &result,
+                    Err(PostgresEffectStoreError::SchemaObjectMismatch { .. })
+                ),
+                "{name}: physical drift was accepted or misreported: {result:?}"
+            );
+            // Drift must be attributed to a specific object kind, not collapsed
+            // into one opaque database error.
+            if let Err(PostgresEffectStoreError::SchemaObjectMismatch { kind, detail }) = &result {
+                assert_ne!(
+                    *kind,
+                    SchemaObjectKind::DigestOnly,
+                    "{name}: drift was not attributed to a schema object: {detail}"
+                );
+            }
+            assert_eq!(
+                migration_ledger(&effects),
+                ledger_before,
+                "{name}: drift test must not modify the migration ledger"
+            );
+            effects.drop_schema().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn schema_fingerprint_ignores_row_data() {
+        // The recorded expectation is data, so writing durable rows must not
+        // change the fingerprint. That is what keeps the check non-circular.
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+        let before = effects.schema_fingerprint().unwrap();
+
+        let action = fixture_action();
+        effects.claim_action(&action).unwrap();
+        effects
+            .authorize_action(&action.action_id, ExecutionState::Proposed, "grant", None)
+            .unwrap();
+
+        assert_eq!(effects.schema_fingerprint().unwrap(), before);
+        effects.verify_schema().unwrap();
+        effects.drop_schema().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn schema_verification_requires_a_recorded_fingerprint() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+        effects
+            .connection()
+            .unwrap()
+            .batch_execute(&format!("delete from \"{schema}\".effect_schema_state"))
+            .unwrap();
+        assert!(matches!(
+            effects.verify_schema(),
+            Err(PostgresEffectStoreError::SchemaFingerprintMismatch(_))
+        ));
+        effects.drop_schema().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn migration_refuses_to_adopt_a_pre_existing_object() {
+        // `create table if not exists` used to adopt whatever was already there.
+        // The migration now owns its objects and fails loudly instead.
+        let schema = unique_schema();
+        let connection_string = test_connection_string();
+        let effects = create_store(&connection_string, &schema);
+        effects.drop_schema().unwrap();
+
+        let mut client = postgres::Client::connect(&connection_string, NoTls).unwrap();
+        client
+            .batch_execute(&format!(
+                "create schema \"{schema}\";
+                 create table \"{schema}\".effect_actions (bogus integer)"
+            ))
+            .unwrap();
+
+        let reopened = create_store_after_migration_failure(&connection_string, &schema);
+        let failure = reopened.migrate();
+        assert!(
+            matches!(&failure, Err(PostgresEffectStoreError::Database(_))),
+            "a conflicting pre-existing object must fail the migration: {failure:?}"
+        );
+        // Nothing was recorded, and nothing was adopted.
+        let recorded: i64 = client
+            .query_one(
+                &format!(
+                    "select count(*) from information_schema.tables \
+                     where table_schema = '{schema}' and table_name = 'effect_schema_migrations'"
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            recorded, 0,
+            "a failed migration must not record its version"
+        );
+
+        // Removing the conflicting object makes the same migration succeed.
+        client
+            .batch_execute(&format!("drop table \"{schema}\".effect_actions"))
+            .unwrap();
+        reopened.migrate().unwrap();
+        reopened.verify_schema().unwrap();
+        assert_eq!(migration_ledger(&reopened).len(), 1);
+        reopened.drop_schema().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn migration_refuses_to_claim_a_schema_it_does_not_own() {
+        let schema = unique_schema();
+        let connection_string = test_connection_string();
+        let mut client = postgres::Client::connect(&connection_string, NoTls).unwrap();
+        client
+            .batch_execute(&format!(
+                "create schema \"{schema}\";
+                 create table \"{schema}\".unrelated_tenant_table (id integer)"
+            ))
+            .unwrap();
+
+        let store = create_store_after_migration_failure(&connection_string, &schema);
+        let failure = store.migrate();
+        assert!(
+            matches!(&failure, Err(PostgresEffectStoreError::SchemaMismatch(message))
+                if message.contains("unrelated_tenant_table")),
+            "migration must not claim a schema owned by another tenant: {failure:?}"
+        );
+        client
+            .batch_execute(&format!("drop schema \"{schema}\" cascade"))
+            .unwrap();
+    }
+
+    fn create_store_after_migration_failure(
+        connection_string: &str,
+        schema: &str,
+    ) -> PostgresEffectStore {
+        PostgresEffectStore::connect_insecure_local_for_tests(
+            connection_string,
+            schema,
+            LeaseConfiguration {
+                default_duration_ms: 100,
+                maximum_duration_ms: 10_000,
+                renewal_enabled: true,
+            },
+            4,
+        )
+        .expect("connect PostgreSQL effect store")
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn migration_rejects_unknown_future_and_damaged_history() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+
+        effects
+            .connection()
+            .unwrap()
+            .execute(
+                &format!(
+                    "insert into \"{schema}\".effect_schema_migrations \
+                     (version, name, checksum, application_version) \
+                     values (99, 'from_the_future', 'whatever', 'from_the_future')"
+                ),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            effects.migrate(),
+            Err(PostgresEffectStoreError::SchemaMismatch(_))
+        ));
+        effects
+            .connection()
+            .unwrap()
+            .execute(
+                &format!("delete from \"{schema}\".effect_schema_migrations where version = 99"),
+                &[],
+            )
+            .unwrap();
+
+        // A damaged ledger cannot re-run the migration over objects that are
+        // already present, because the migration does not use IF NOT EXISTS.
+        effects
+            .connection()
+            .unwrap()
+            .batch_execute(&format!(
+                "delete from \"{schema}\".effect_schema_migrations"
+            ))
+            .unwrap();
+        assert!(matches!(
+            effects.migrate(),
+            Err(PostgresEffectStoreError::Database(_))
+        ));
+        effects.drop_schema().unwrap();
+    }
+
+    // -- E3.1 verification split and ownership boundary ----------------------
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn verification_apis_report_which_fact_failed() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+
+        // Healthy: every split check passes independently.
+        effects.verify_migration_history().unwrap();
+        effects.verify_physical_schema().unwrap();
+        let settings = effects.database_settings().unwrap();
+        assert!(settings.server_major >= 12);
+        assert!(!settings.synchronous_commit.is_empty());
+        assert!(!settings.timezone.is_empty());
+        // This test connects as the schema owner, so aggregate readiness must
+        // reject the credential even though the schema itself is healthy. A
+        // data-only role passing readiness is covered by the migration-integrity
+        // integration suite.
+        assert!(matches!(
+            effects.verify_database_readiness(),
+            Err(PostgresEffectStoreError::DatabasePrivilegeViolation { .. })
+        ));
+
+        // Ledger damage is reported as history, not as a schema problem.
+        effects
+            .connection()
+            .unwrap()
+            .execute(
+                &format!(
+                    "update \"{schema}\".effect_schema_migrations set name = 'renamed' where version = 1"
+                ),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            effects.verify_migration_history(),
+            Err(PostgresEffectStoreError::MigrationHistoryMismatch(_))
+        ));
+        // ...and the physical schema check still passes on its own.
+        effects.verify_physical_schema().unwrap();
+        // ...while aggregate readiness fails closed.
+        assert!(effects.verify_database_readiness().is_err());
+        effects.drop_schema().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn physical_verification_is_scoped_to_contract_relations() {
+        // Ownership is precise: the effect-store schema is owned by the effect
+        // store, but a co-tenant relation that the contract does not claim must
+        // not make readiness fail. Schema exclusivity is enforced at migration
+        // time instead, where adopting a foreign object is still possible.
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+        effects
+            .connection()
+            .unwrap()
+            .batch_execute(&format!(
+                "create table \"{schema}\".unrelated_tenant_table (id integer)"
+            ))
+            .unwrap();
+
+        effects.verify_physical_schema().unwrap();
+        effects.verify_migration_history().unwrap();
+        effects.drop_schema().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn deadline_scoped_store_bounds_every_call() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+
+        // Without a deadline the configured maximum applies.
+        let unscoped = effects.effective_operation_budgets().unwrap();
+        assert_eq!(unscoped.statement, effects.budgets.statement);
+
+        // With a deadline the remaining trusted budget applies instead.
+        let scoped = effects
+            .with_deadline(Instant::now() + Duration::from_secs(6))
+            .unwrap();
+        let budgeted = scoped.effective_operation_budgets().unwrap();
+        assert!(budgeted.statement <= Duration::from_secs(6));
+        assert!(budgeted.lock <= budgeted.statement);
+        assert!(budgeted.statement < unscoped.statement);
+
+        // The scoped handle still performs real durable work.
+        let action = fixture_action();
+        scoped.claim_action(&action).unwrap();
+        assert!(scoped.load_action(&action.action_id).unwrap().is_some());
+
+        // An exhausted deadline is refused rather than falling back.
+        assert!(matches!(
+            effects.with_deadline(Instant::now() - Duration::from_millis(1)),
+            Err(PostgresEffectStoreError::InvalidOperationBudget(_))
+        ));
+        effects.drop_schema().unwrap();
+    }
+
+    // -- E3.1 operation budgets ---------------------------------------------
+
+    #[test]
+    fn remaining_action_budget_bounds_database_waits() {
+        let configured = PostgresOperationBudgets::default();
+        let remaining = Duration::from_secs(6);
+        let derived = configured.for_remaining(remaining).unwrap();
+
+        assert_eq!(derived.lock, Duration::from_secs(2));
+        assert_eq!(derived.statement, remaining);
+        assert_eq!(derived.idle_in_transaction, remaining);
+        assert!(derived.lock <= derived.statement);
+        assert!(derived.statement <= remaining);
+    }
+
+    #[test]
+    fn remaining_action_budget_never_exceeds_the_configured_maximum() {
+        let configured = PostgresOperationBudgets::default();
+        let derived = configured.for_remaining(Duration::from_secs(3600)).unwrap();
+        assert_eq!(derived.lock, configured.lock);
+        assert_eq!(derived.statement, configured.statement);
+        assert_eq!(derived.idle_in_transaction, configured.idle_in_transaction);
+    }
+
+    #[test]
+    fn exhausted_action_budget_is_rejected() {
+        let configured = PostgresOperationBudgets::default();
+        assert!(matches!(
+            configured.for_remaining(Duration::ZERO),
+            Err(PostgresEffectStoreError::InvalidOperationBudget(_))
+        ));
     }
 }

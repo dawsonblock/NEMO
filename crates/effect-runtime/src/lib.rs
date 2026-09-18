@@ -256,9 +256,21 @@ impl EffectRuntimeConfig {
             ),
         }
         .map_err(RuntimeReadinessError::Store)?;
+        // Physical schema verification, not just ledger verification. A
+        // database whose migration ledger is intact but whose tables, columns,
+        // constraints, indexes, or triggers have drifted must not start.
         store
             .verify_schema()
             .map_err(RuntimeReadinessError::Store)?;
+        if self.mode == RuntimeMode::Production {
+            // Production additionally requires a data-only credential and the
+            // database settings that govern durability and waiting. A runtime
+            // credential that can rewrite the ledger it just trusted can hide
+            // drift from every later verification.
+            store
+                .verify_database_readiness()
+                .map_err(RuntimeReadinessError::Store)?;
+        }
         Ok(store)
     }
 }

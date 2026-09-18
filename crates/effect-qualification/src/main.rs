@@ -18,7 +18,9 @@ use nemo_relay_executor::unstable::{
     ReconciliationRequest, ReconciliationResult, RuntimeIdentity,
 };
 use nemo_relay_ledger::postgres::PostgresEffectStore;
-use nemo_relay_ledger::unstable::{ExecutionState, LeaseConfiguration, ReceiptRecord};
+use nemo_relay_ledger::unstable::{
+    ActionStore, ExecutionState, LeaseAcquireResult, LeaseConfiguration, ReceiptRecord,
+};
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
 use std::error::Error;
@@ -334,28 +336,119 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             match kernel.begin(&invocation)? {
                 InvocationOutcome::Completed(result) => {
-                    println!("{}", serde_json::to_string(&result)?);
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "outcome": "completed",
+                            "output": result.output,
+                        }))?
+                    );
                 }
                 InvocationOutcome::ExistingAction(action) => {
-                    println!("existing action {} {:?}", action.action_id, action.state);
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "outcome": "existing_action",
+                            "action_id": action.action_id,
+                            "state": format!("{:?}", action.state).to_uppercase(),
+                        }))?
+                    );
                 }
-                InvocationOutcome::PendingApproval(_) => {
-                    return Err("qualification fixture unexpectedly requires approval".into());
+                InvocationOutcome::PendingApproval(action) => {
+                    // A failed dispatch-marker write leaves the action prepared
+                    // rather than unknown. Reporting that as a distinct outcome
+                    // is what lets a caller tell an ordinary pre-dispatch
+                    // failure apart from external ambiguity.
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "outcome": "pending",
+                            "action_id": action.action_id(),
+                            "state": "PREPARED",
+                        }))?
+                    );
                 }
             }
+        }
+        "prepare-dispatching" => {
+            // Model a worker that durably persisted the dispatch boundary and
+            // then died before touching any provider.
+            let store = runtime.effect_store();
+            let action = nemo_relay_ledger::conformance::fixture_action();
+            ActionStore::claim_action(store, &action)?;
+            ActionStore::authorize_action(
+                store,
+                &action.action_id,
+                ExecutionState::Proposed,
+                "qualification-grant",
+                None,
+            )?;
+            ActionStore::transition(
+                store,
+                &action.action_id,
+                Some(ExecutionState::Authorized),
+                ExecutionState::Prepared,
+            )?;
+            let lease = match ActionStore::claim_lease(
+                store,
+                &action.action_id,
+                ExecutionState::Prepared,
+                "qualification-pre-dispatch-worker",
+                Some(60_000),
+            )? {
+                LeaseAcquireResult::Acquired(lease) => lease,
+                other => return Err(format!("expected a pre-dispatch lease, got {other:?}").into()),
+            };
+            ActionStore::transition_with_lease(
+                store,
+                &action.action_id,
+                ExecutionState::Prepared,
+                &lease,
+                ExecutionState::Dispatching,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "outcome": "dispatching",
+                    "action_id": action.action_id,
+                }))?
+            );
         }
         "recover" => {
             for action_id in runtime.effect_store().recoverable_action_ids(64)? {
-                if matches!(
-                    kernel.recover(&action_id)?,
-                    RecoveryDecision::RecoverUnknown(_)
-                ) {
-                    let result = kernel.reconcile(&action_id)?;
-                    println!("recovered {} {:?}", action_id, result.state);
+                let decision = kernel.recover(&action_id)?;
+                let mut report = json!({
+                    "action_id": action_id,
+                    "recovery": match &decision {
+                        RecoveryDecision::RecoverUnknown(_) => "recover_unknown",
+                        RecoveryDecision::HeldByOther(_) => "held_by_other",
+                        RecoveryDecision::RecoverCommitted(_) => "recover_committed",
+                        RecoveryDecision::RecoverFailed(_) => "recover_failed",
+                        RecoveryDecision::RecoverCancelled(_) => "recover_cancelled",
+                        RecoveryDecision::RecoverRetry(_) => "recover_retry",
+                        RecoveryDecision::ContradictoryEvidence { .. } => {
+                            "contradictory_evidence"
+                        }
+                    },
+                });
+                if matches!(decision, RecoveryDecision::RecoverUnknown(_)) {
+                    // An indeterminate reconciliation is a legitimate outcome,
+                    // not a fixture failure: the action stays unknown and a
+                    // later reconciliation can still resolve it.
+                    match kernel.reconcile(&action_id) {
+                        Ok(result) => {
+                            report["reconciled_state"] =
+                                json!(format!("{:?}", result.state).to_uppercase());
+                        }
+                        Err(error) => {
+                            report["reconcile_error"] = json!(error.to_string());
+                        }
+                    }
                 }
+                println!("{}", serde_json::to_string(&report)?);
             }
         }
-        _ => return Err("mode must be invoke, invoke-fast, or recover".into()),
+        _ => return Err("unknown qualification fixture mode".into()),
     }
     Ok(())
 }
