@@ -13,6 +13,7 @@ on:
       - 'crates/executor/**'
       - 'crates/ledger/**'
       - 'crates/effect-qualification/**'
+      - 'crates/effect-runtime/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
@@ -32,6 +33,7 @@ on:
       - 'crates/executor/**'
       - 'crates/ledger/**'
       - 'crates/effect-qualification/**'
+      - 'crates/effect-runtime/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
@@ -107,6 +109,7 @@ jobs:
           cargo clippy --locked -p nemo-relay-ledger --all-targets --features unstable-hardening-testkit,unstable-postgres -- -D warnings
           cargo clippy --locked -p nemo-relay --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-effect-qualification --all-targets -- -D warnings
+          cargo clippy --locked -p nemo-effect-runtime --all-targets -- -D warnings
 
       - name: Run hardening contract conformance
         run: just test-effect-contracts

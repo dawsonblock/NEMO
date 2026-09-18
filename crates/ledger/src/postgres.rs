@@ -48,6 +48,75 @@ type TlsManager = PostgresConnectionManager<MakeTlsConnector>;
 
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Explicit bounded PostgreSQL budgets for durable-effect operations.
+///
+/// The store applies these values to every checked-out session. They bound
+/// database work only; callers must never treat a database timeout after
+/// external dispatch as permission to repeat the provider request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresOperationBudgets {
+    /// Maximum time spent waiting for a pooled connection.
+    pub pool_acquire: Duration,
+    /// Maximum time PostgreSQL may wait for a row or relation lock.
+    pub lock: Duration,
+    /// Maximum execution time for one PostgreSQL statement.
+    pub statement: Duration,
+    /// Maximum time a checked-out transaction may remain idle.
+    pub idle_in_transaction: Duration,
+}
+
+/// Client identity material for a mutual-TLS PostgreSQL connection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PostgresMutualTlsCredentials {
+    /// PEM-encoded trusted CA certificates.
+    pub root_ca_pem: Vec<u8>,
+    /// PKCS #12 client certificate and private key.
+    pub client_identity_pkcs12: Vec<u8>,
+    /// Password for the client identity.
+    pub client_identity_password: String,
+}
+
+impl std::fmt::Debug for PostgresMutualTlsCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresMutualTlsCredentials")
+            .field("root_ca_pem", &"[redacted]")
+            .field("client_identity_pkcs12", &"[redacted]")
+            .field("client_identity_password", &"[redacted]")
+            .finish()
+    }
+}
+
+impl Default for PostgresOperationBudgets {
+    fn default() -> Self {
+        Self {
+            pool_acquire: POOL_CONNECTION_TIMEOUT,
+            lock: Duration::from_secs(3),
+            statement: Duration::from_secs(10),
+            idle_in_transaction: Duration::from_secs(15),
+        }
+    }
+}
+
+impl PostgresOperationBudgets {
+    fn validate(&self) -> Result<(), PostgresEffectStoreError> {
+        for (name, duration) in [
+            ("pool_acquire", self.pool_acquire),
+            ("lock", self.lock),
+            ("statement", self.statement),
+            ("idle_in_transaction", self.idle_in_transaction),
+        ] {
+            if duration.is_zero() || duration.as_millis() > i64::MAX as u128 {
+                return Err(PostgresEffectStoreError::InvalidOperationBudget(name));
+            }
+        }
+        if self.lock > self.statement {
+            return Err(PostgresEffectStoreError::InvalidOperationBudget("lock"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 enum PostgresPool {
     Plain(Pool<PlainManager>),
@@ -62,11 +131,13 @@ enum PostgresConnection {
 fn validate_store_configuration(
     schema: &str,
     maximum_pool_size: u32,
+    budgets: &PostgresOperationBudgets,
 ) -> Result<(), PostgresEffectStoreError> {
     validate_schema_name(schema)?;
     if maximum_pool_size == 0 {
         return Err(PostgresEffectStoreError::InvalidPoolSize(0));
     }
+    budgets.validate()?;
     Ok(())
 }
 
@@ -195,10 +266,11 @@ fn verified_native_tls_connector(
 fn build_plain_pool(
     manager: PlainManager,
     maximum_pool_size: u32,
+    budgets: &PostgresOperationBudgets,
 ) -> Result<Pool<PlainManager>, PostgresEffectStoreError> {
     Pool::builder()
         .max_size(maximum_pool_size)
-        .connection_timeout(POOL_CONNECTION_TIMEOUT)
+        .connection_timeout(budgets.pool_acquire)
         .build(manager)
         .map_err(Into::into)
 }
@@ -206,10 +278,11 @@ fn build_plain_pool(
 fn build_tls_pool(
     manager: TlsManager,
     maximum_pool_size: u32,
+    budgets: &PostgresOperationBudgets,
 ) -> Result<Pool<TlsManager>, PostgresEffectStoreError> {
     Pool::builder()
         .max_size(maximum_pool_size)
-        .connection_timeout(POOL_CONNECTION_TIMEOUT)
+        .connection_timeout(budgets.pool_acquire)
         .build(manager)
         .map_err(Into::into)
 }
@@ -234,7 +307,37 @@ impl DerefMut for PostgresConnection {
     }
 }
 
-const MIGRATION: &str = include_str!("../migrations/0001_effect_store.sql");
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "initial_effect_store",
+    sql: include_str!("../migrations/0001_effect_store.sql"),
+}];
+
+fn migration_checksum(sql: &str) -> String {
+    Sha256::digest(sql.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn schema_query_error(error: postgres::Error) -> PostgresEffectStoreError {
+    if error
+        .as_db_error()
+        .is_some_and(|database| matches!(database.code().code(), "42P01" | "3F000"))
+    {
+        PostgresEffectStoreError::SchemaMismatch(
+            "migration ledger is not installed for this effect-store schema".into(),
+        )
+    } else {
+        PostgresEffectStoreError::Database(error)
+    }
+}
 
 /// Failure returned by [`PostgresEffectStore`].
 #[derive(Debug)]
@@ -243,6 +346,8 @@ pub enum PostgresEffectStoreError {
     InvalidSchemaName(String),
     /// A connection pool must contain at least one connection.
     InvalidPoolSize(u32),
+    /// A PostgreSQL execution budget was zero, out of range, or internally inconsistent.
+    InvalidOperationBudget(&'static str),
     /// The connection target is incompatible with the selected transport.
     InvalidTransport(String),
     /// TLS trust material or a client identity could not be loaded.
@@ -251,6 +356,8 @@ pub enum PostgresEffectStoreError {
     Pool(r2d2::Error),
     /// PostgreSQL rejected a query or transaction.
     Database(postgres::Error),
+    /// Applied migrations did not match the versioned effect-store contract.
+    SchemaMismatch(String),
     /// A durable JSON value could not be encoded or decoded.
     Serialization(serde_json::Error),
     /// A database value violated the durable-effect representation.
@@ -270,12 +377,21 @@ impl std::fmt::Display for PostgresEffectStoreError {
             Self::InvalidPoolSize(size) => {
                 write!(formatter, "invalid PostgreSQL pool size: {size}")
             }
+            Self::InvalidOperationBudget(name) => {
+                write!(formatter, "invalid PostgreSQL operation budget: {name}")
+            }
             Self::InvalidTransport(message) => {
                 write!(formatter, "invalid PostgreSQL transport: {message}")
             }
             Self::Tls(error) => write!(formatter, "PostgreSQL TLS configuration error: {error}"),
             Self::Pool(error) => write!(formatter, "PostgreSQL pool error: {error}"),
             Self::Database(error) => write!(formatter, "PostgreSQL error: {error}"),
+            Self::SchemaMismatch(message) => {
+                write!(
+                    formatter,
+                    "PostgreSQL effect-store schema mismatch: {message}"
+                )
+            }
             Self::Serialization(error) => write!(formatter, "durable JSON error: {error}"),
             Self::CorruptData(message) => write!(formatter, "corrupt effect-store data: {message}"),
             Self::IntegerOutOfRange(field) => {
@@ -299,7 +415,9 @@ impl std::error::Error for PostgresEffectStoreError {
             Self::Contract(error) => Some(error),
             Self::InvalidSchemaName(_)
             | Self::InvalidPoolSize(_)
+            | Self::InvalidOperationBudget(_)
             | Self::InvalidTransport(_)
+            | Self::SchemaMismatch(_)
             | Self::CorruptData(_)
             | Self::IntegerOutOfRange(_) => None,
         }
@@ -342,6 +460,7 @@ pub struct PostgresEffectStore {
     pool: PostgresPool,
     schema: String,
     lease_configuration: LeaseConfiguration,
+    budgets: PostgresOperationBudgets,
 }
 
 impl PostgresEffectStore {
@@ -356,6 +475,23 @@ impl PostgresEffectStore {
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
     ) -> Result<Self, PostgresEffectStoreError> {
+        Self::connect_insecure_local_for_tests_with_budgets(
+            connection_string,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+            PostgresOperationBudgets::default(),
+        )
+    }
+
+    /// Create a local-only plaintext pool with explicit database budgets.
+    pub fn connect_insecure_local_for_tests_with_budgets(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+        budgets: PostgresOperationBudgets,
+    ) -> Result<Self, PostgresEffectStoreError> {
         let mut configuration: Config = connection_string.parse()?;
         validate_local_target(&configuration, true)?;
         configuration.ssl_mode(SslMode::Disable);
@@ -364,6 +500,7 @@ impl PostgresEffectStore {
             schema,
             lease_configuration,
             maximum_pool_size,
+            budgets,
         )
     }
 
@@ -375,6 +512,24 @@ impl PostgresEffectStore {
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
     ) -> Result<Self, PostgresEffectStoreError> {
+        Self::connect_local_socket_with_budgets(
+            connection_string,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+            PostgresOperationBudgets::default(),
+        )
+    }
+
+    /// Create a Unix-socket pool with explicit database budgets.
+    #[cfg(unix)]
+    pub fn connect_local_socket_with_budgets(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+        budgets: PostgresOperationBudgets,
+    ) -> Result<Self, PostgresEffectStoreError> {
         let mut configuration: Config = connection_string.parse()?;
         validate_local_target(&configuration, false)?;
         configuration.ssl_mode(SslMode::Disable);
@@ -383,6 +538,7 @@ impl PostgresEffectStore {
             schema,
             lease_configuration,
             maximum_pool_size,
+            budgets,
         )
     }
 
@@ -394,6 +550,25 @@ impl PostgresEffectStore {
         maximum_pool_size: u32,
         root_ca_pem: &[u8],
     ) -> Result<Self, PostgresEffectStoreError> {
+        Self::connect_verified_tls_with_budgets(
+            connection_string,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+            root_ca_pem,
+            PostgresOperationBudgets::default(),
+        )
+    }
+
+    /// Create a verified TLS pool with explicit database budgets.
+    pub fn connect_verified_tls_with_budgets(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+        root_ca_pem: &[u8],
+        budgets: PostgresOperationBudgets,
+    ) -> Result<Self, PostgresEffectStoreError> {
         let configuration: Config = connection_string.parse()?;
         let connector = verified_tls_connector(&configuration, root_ca_pem, None)?;
         Self::from_tls_configuration(
@@ -402,6 +577,7 @@ impl PostgresEffectStore {
             schema,
             lease_configuration,
             maximum_pool_size,
+            budgets,
         )
     }
 
@@ -415,15 +591,43 @@ impl PostgresEffectStore {
         client_identity_pkcs12: &[u8],
         client_identity_password: &str,
     ) -> Result<Self, PostgresEffectStoreError> {
+        Self::connect_mutual_tls_with_budgets(
+            connection_string,
+            schema,
+            lease_configuration,
+            maximum_pool_size,
+            PostgresMutualTlsCredentials {
+                root_ca_pem: root_ca_pem.to_vec(),
+                client_identity_pkcs12: client_identity_pkcs12.to_vec(),
+                client_identity_password: client_identity_password.into(),
+            },
+            PostgresOperationBudgets::default(),
+        )
+    }
+
+    /// Create a mutual-TLS pool with explicit database budgets.
+    pub fn connect_mutual_tls_with_budgets(
+        connection_string: &str,
+        schema: &str,
+        lease_configuration: LeaseConfiguration,
+        maximum_pool_size: u32,
+        credentials: PostgresMutualTlsCredentials,
+        budgets: PostgresOperationBudgets,
+    ) -> Result<Self, PostgresEffectStoreError> {
         let configuration: Config = connection_string.parse()?;
-        let identity = Identity::from_pkcs12(client_identity_pkcs12, client_identity_password)?;
-        let connector = verified_tls_connector(&configuration, root_ca_pem, Some(identity))?;
+        let identity = Identity::from_pkcs12(
+            &credentials.client_identity_pkcs12,
+            &credentials.client_identity_password,
+        )?;
+        let connector =
+            verified_tls_connector(&configuration, &credentials.root_ca_pem, Some(identity))?;
         Self::from_tls_configuration(
             configuration,
             connector,
             schema,
             lease_configuration,
             maximum_pool_size,
+            budgets,
         )
     }
 
@@ -432,14 +636,16 @@ impl PostgresEffectStore {
         schema: &str,
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
+        budgets: PostgresOperationBudgets,
     ) -> Result<Self, PostgresEffectStoreError> {
-        validate_store_configuration(schema, maximum_pool_size)?;
+        validate_store_configuration(schema, maximum_pool_size, &budgets)?;
         let manager = PostgresConnectionManager::new(configuration, NoTls);
-        let pool = build_plain_pool(manager, maximum_pool_size)?;
+        let pool = build_plain_pool(manager, maximum_pool_size, &budgets)?;
         Ok(Self {
             pool: PostgresPool::Plain(pool),
             schema: schema.to_owned(),
             lease_configuration,
+            budgets,
         })
     }
 
@@ -449,23 +655,131 @@ impl PostgresEffectStore {
         schema: &str,
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
+        budgets: PostgresOperationBudgets,
     ) -> Result<Self, PostgresEffectStoreError> {
-        validate_store_configuration(schema, maximum_pool_size)?;
+        validate_store_configuration(schema, maximum_pool_size, &budgets)?;
         validate_tls_target(&configuration)?;
         configuration.ssl_mode(SslMode::Require);
         let manager = PostgresConnectionManager::new(configuration, connector);
-        let pool = build_tls_pool(manager, maximum_pool_size)?;
+        let pool = build_tls_pool(manager, maximum_pool_size, &budgets)?;
         Ok(Self {
             pool: PostgresPool::Tls(pool),
             schema: schema.to_owned(),
             lease_configuration,
+            budgets,
         })
     }
 
-    /// Install the idempotent schema migration used by this adapter.
+    /// Apply immutable versioned effect-store migrations.
+    ///
+    /// This method is for a dedicated migration role. Normal runtime workers
+    /// should call [`Self::verify_schema`] and fail closed when the schema is
+    /// absent, old, newer than their contract, or checksum-mismatched.
     pub fn migrate(&self) -> Result<(), PostgresEffectStoreError> {
-        let migration = MIGRATION.replace("__SCHEMA__", &self.quoted_schema());
-        self.connection()?.batch_execute(&migration)?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection.transaction()?;
+        // Serialize migrations per schema so a concurrent deployment cannot
+        // observe a partially recorded migration history. The lock is scoped
+        // to this transaction and is released automatically on rollback.
+        let migration_lock = format!("nemo-effect-store-migrations:{}", self.schema);
+        transaction.query_one(
+            "select pg_advisory_xact_lock(hashtext($1))",
+            &[&migration_lock],
+        )?;
+        transaction.batch_execute(&format!(
+            "create schema if not exists {}",
+            self.quoted_schema()
+        ))?;
+        transaction.batch_execute(&format!(
+            "create table if not exists {}.effect_schema_migrations (\
+             version bigint primary key, name text not null, checksum text not null, \
+             applied_at timestamptz not null default clock_timestamp())",
+            self.quoted_schema()
+        ))?;
+        let rows = transaction.query(
+            &format!(
+                "select version, name, checksum from {}.effect_schema_migrations order by version",
+                self.quoted_schema()
+            ),
+            &[],
+        )?;
+        for row in &rows {
+            let version: i64 = row.get(0);
+            if !MIGRATIONS
+                .iter()
+                .any(|migration| migration.version == version)
+            {
+                return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                    "database contains unsupported migration version {version}"
+                )));
+            }
+        }
+        for migration in MIGRATIONS {
+            let checksum = migration_checksum(migration.sql);
+            let applied = rows
+                .iter()
+                .find(|row| row.get::<_, i64>(0) == migration.version);
+            if let Some(applied) = applied {
+                let name: String = applied.get(1);
+                let applied_checksum: String = applied.get(2);
+                if name != migration.name || applied_checksum != checksum {
+                    return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                        "migration {} has a different name or checksum",
+                        migration.version
+                    )));
+                }
+                continue;
+            }
+            transaction
+                .batch_execute(&migration.sql.replace("__SCHEMA__", &self.quoted_schema()))?;
+            transaction.execute(
+                &format!(
+                    "insert into {}.effect_schema_migrations (version, name, checksum) values ($1, $2, $3)",
+                    self.quoted_schema()
+                ),
+                &[&migration.version, &migration.name, &checksum],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Verify that this store's schema exactly matches the runtime contract.
+    pub fn verify_schema(&self) -> Result<(), PostgresEffectStoreError> {
+        let rows = self
+            .connection()?
+            .query(
+                &format!(
+                    "select version, name, checksum from {}.effect_schema_migrations order by version",
+                    self.quoted_schema()
+                ),
+                &[],
+            )
+            .map_err(schema_query_error)?;
+        if rows.len() != MIGRATIONS.len() {
+            return Err(PostgresEffectStoreError::SchemaMismatch(
+                "applied migration count does not match this runtime".into(),
+            ));
+        }
+        for migration in MIGRATIONS {
+            let row = rows
+                .iter()
+                .find(|row| row.get::<_, i64>(0) == migration.version)
+                .ok_or_else(|| {
+                    PostgresEffectStoreError::SchemaMismatch(format!(
+                        "required migration {} is missing",
+                        migration.version
+                    ))
+                })?;
+            let name: String = row.get(1);
+            let checksum: String = row.get(2);
+            if name != migration.name || checksum != migration_checksum(migration.sql) {
+                return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                    "migration {} has a different name or checksum",
+                    migration.version
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -492,13 +806,36 @@ impl PostgresEffectStore {
     }
 
     fn connection(&self) -> Result<PostgresConnection, PostgresEffectStoreError> {
-        match &self.pool {
+        let mut connection = match &self.pool {
             PostgresPool::Plain(pool) => pool
                 .get()
                 .map(PostgresConnection::Plain)
-                .map_err(Into::into),
-            PostgresPool::Tls(pool) => pool.get().map(PostgresConnection::Tls).map_err(Into::into),
+                .map_err(PostgresEffectStoreError::Pool),
+            PostgresPool::Tls(pool) => pool
+                .get()
+                .map(PostgresConnection::Tls)
+                .map_err(PostgresEffectStoreError::Pool),
+        }?;
+        self.apply_operation_budgets(&mut connection)?;
+        Ok(connection)
+    }
+
+    fn apply_operation_budgets(
+        &self,
+        connection: &mut PostgresConnection,
+    ) -> Result<(), PostgresEffectStoreError> {
+        for (name, duration) in [
+            ("lock_timeout", self.budgets.lock),
+            ("statement_timeout", self.budgets.statement),
+            (
+                "idle_in_transaction_session_timeout",
+                self.budgets.idle_in_transaction,
+            ),
+        ] {
+            let milliseconds = duration.as_millis().to_string();
+            connection.query_one("select set_config($1, $2, false)", &[&name, &milliseconds])?;
         }
+        Ok(())
     }
 
     fn quoted_schema(&self) -> String {
@@ -1653,6 +1990,41 @@ mod transport_tests {
         assert!(validate_local_target(&remote_address, true).is_err());
     }
 
+    #[test]
+    fn operation_budgets_reject_zero_or_inverted_limits() {
+        let budgets = PostgresOperationBudgets {
+            lock: Duration::ZERO,
+            ..PostgresOperationBudgets::default()
+        };
+        assert!(matches!(
+            budgets.validate(),
+            Err(PostgresEffectStoreError::InvalidOperationBudget("lock"))
+        ));
+
+        let budgets = PostgresOperationBudgets {
+            lock: Duration::from_secs(11),
+            statement: Duration::from_secs(10),
+            ..PostgresOperationBudgets::default()
+        };
+        assert!(matches!(
+            budgets.validate(),
+            Err(PostgresEffectStoreError::InvalidOperationBudget("lock"))
+        ));
+    }
+
+    #[test]
+    fn mutual_tls_credentials_redact_debug_output() {
+        let credentials = PostgresMutualTlsCredentials {
+            root_ca_pem: b"root-ca-secret".to_vec(),
+            client_identity_pkcs12: b"client-identity-secret".to_vec(),
+            client_identity_password: "client-password-secret".into(),
+        };
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("root-ca-secret"));
+        assert!(!debug.contains("client-identity-secret"));
+        assert!(!debug.contains("client-password-secret"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_socket_transport_rejects_tcp() {
@@ -1796,6 +2168,31 @@ mod tests {
         .expect("connect PostgreSQL effect store");
         effects.migrate().expect("migrate PostgreSQL effect store");
         effects
+            .verify_schema()
+            .expect("fresh migrations must satisfy this runtime");
+        effects
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn schema_verification_rejects_modified_migration_checksums() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+        effects
+            .connection()
+            .unwrap()
+            .execute(
+                &format!(
+                    "update \"{schema}\".effect_schema_migrations set checksum = 'tampered' where version = 1"
+                ),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            effects.verify_schema(),
+            Err(PostgresEffectStoreError::SchemaMismatch(_))
+        ));
+        effects.drop_schema().unwrap();
     }
 
     fn dispatching_action(

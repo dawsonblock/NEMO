@@ -38,12 +38,75 @@ pub mod unstable {
         pub principal_id: String,
         /// Optional tenant or organization identity.
         pub tenant_id: Option<String>,
-        /// Stable runtime instance identity.
+        /// Stable logical deployment/runtime identity, never a per-process random ID.
         pub runtime_id: String,
         /// Deployment environment (for example `development` or `production`).
         pub environment: String,
         /// Optional authenticated session identity.
         pub session_id: Option<String>,
+    }
+
+    /// Failure returned when a host supplies an ambiguous durable runtime identity.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RuntimeIdentityError {
+        /// A required identity value was blank or contained surrounding whitespace.
+        InvalidField(&'static str),
+        /// An identity value exceeded the durable representation limit.
+        FieldTooLong(&'static str),
+    }
+
+    impl std::fmt::Display for RuntimeIdentityError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InvalidField(field) => {
+                    write!(
+                        formatter,
+                        "runtime identity field {field} must be non-empty and trimmed"
+                    )
+                }
+                Self::FieldTooLong(field) => {
+                    write!(
+                        formatter,
+                        "runtime identity field {field} exceeds 256 bytes"
+                    )
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for RuntimeIdentityError {}
+
+    impl RuntimeIdentity {
+        /// Validate the durable identity supplied by the trusted runtime host.
+        ///
+        /// The kernel hashes these values into the action and grant bindings,
+        /// so `None`, an empty string, and a whitespace-padded value must not
+        /// accidentally collapse into interchangeable principals or tenants.
+        pub fn validate(&self) -> Result<(), RuntimeIdentityError> {
+            validate_identity_field("principal_id", &self.principal_id)?;
+            validate_identity_field("runtime_id", &self.runtime_id)?;
+            validate_identity_field("environment", &self.environment)?;
+            if let Some(tenant_id) = &self.tenant_id {
+                validate_identity_field("tenant_id", tenant_id)?;
+            }
+            if let Some(session_id) = &self.session_id {
+                validate_identity_field("session_id", session_id)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn validate_identity_field(
+        field: &'static str,
+        value: &str,
+    ) -> Result<(), RuntimeIdentityError> {
+        if value.is_empty() || value.trim() != value {
+            return Err(RuntimeIdentityError::InvalidField(field));
+        }
+        if value.len() > 256 {
+            return Err(RuntimeIdentityError::FieldTooLong(field));
+        }
+        Ok(())
     }
 
     /// Immutable identity of a registered capability.
@@ -471,6 +534,38 @@ pub mod unstable {
                     "BACKEND_CLASS_MISMATCH"
                 );
                 assert!(effect.execute(&request).is_ok());
+            }
+        }
+
+        #[test]
+        fn runtime_identity_rejects_blank_or_noncanonical_durable_fields() {
+            let valid = RuntimeIdentity {
+                principal_id: "alice".into(),
+                tenant_id: Some("tenant".into()),
+                runtime_id: "deployment-a".into(),
+                environment: "production".into(),
+                session_id: None,
+            };
+            assert_eq!(valid.validate(), Ok(()));
+
+            for (field, value) in [
+                ("principal_id", " "),
+                ("tenant_id", " tenant"),
+                ("runtime_id", ""),
+                ("environment", "production "),
+            ] {
+                let mut identity = valid.clone();
+                match field {
+                    "principal_id" => identity.principal_id = value.into(),
+                    "tenant_id" => identity.tenant_id = Some(value.into()),
+                    "runtime_id" => identity.runtime_id = value.into(),
+                    "environment" => identity.environment = value.into(),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    identity.validate(),
+                    Err(RuntimeIdentityError::InvalidField(field))
+                );
             }
         }
     }

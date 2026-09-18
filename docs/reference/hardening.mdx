@@ -248,6 +248,23 @@ The fixture requires an explicit qualification acknowledgement and permits only
 local test PostgreSQL connections. It is not a production composition root,
 Correct-Once adapter, autonomous recovery service, or general deployment gate.
 
+### Durable runtime composition
+
+`nemo-effect-runtime` is the production composition boundary for deployments
+that supply real Correct-Once and Effect Fabric adapters. It constructs the
+kernel only after validating the stable runtime identity, connecting through a
+local Unix socket or verified TLS/mTLS, and verifying the versioned
+`effect_schema_migrations` ledger. Normal workers never call `migrate()`;
+that method is reserved for a dedicated migration role. Production mode rejects
+plaintext loopback PostgreSQL and identities whose environment is not
+`production`.
+
+The adapter sets bounded pool-acquire, lock, statement, and idle-transaction
+budgets on checked-out PostgreSQL sessions. A timeout after provider dispatch
+still means `UNKNOWN`/reconciliation rather than permission to redispatch.
+This composition crate is not itself a Correct-Once implementation, provider
+registry, recovery scheduler, or production daemon.
+
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live
 owner, fully bound terminal state, missing terminal evidence after lease

@@ -4,9 +4,10 @@
 //! Qualification-only executable: a real kernel and PostgreSQL effect store
 //! around a persistent, deterministic external-effect simulator.
 
+use nemo_effect_runtime::{DurableRuntime, EffectRuntimeConfig, PostgresTransport, RuntimeMode};
 use nemo_relay::kernel::{
-    BackendRouter, CapabilityDefinition, CapabilityRegistry, InvocationOutcome, InvocationRequest,
-    Kernel, RecoveryDecision,
+    CapabilityDefinition, CapabilityRegistry, InvocationOutcome, InvocationRequest,
+    RecoveryDecision,
 };
 use nemo_relay_authority::unstable::{
     AuthorityDecision, AuthorityProvider, AuthorityRequest, GrantVerifier, VerifiedGrant,
@@ -284,30 +285,39 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("invalid qualification schema or runtime ID".into());
     }
     let connection = std::env::var("NEMO_RELAY_TEST_POSTGRES_URL")?;
-    let store = PostgresEffectStore::connect_insecure_local_for_tests(
+    // Qualification owns schema setup. The runtime itself only verifies a
+    // migrated schema, mirroring the separate production migrator role.
+    let migrator = PostgresEffectStore::connect_insecure_local_for_tests(
         &connection,
         &schema,
         LeaseConfiguration::default(),
         4,
     )?;
-    store.migrate()?;
+    migrator.migrate()?;
     let provider = PersistentProviderSimulator::new(&connection, &schema)?;
-    let kernel = Kernel::new(
-        RuntimeIdentity {
-            principal_id: "qualification-principal".into(),
-            tenant_id: Some("qualification-tenant".into()),
-            runtime_id,
-            environment: "qualification".into(),
-            session_id: None,
+    let runtime = DurableRuntime::bootstrap(
+        EffectRuntimeConfig {
+            mode: RuntimeMode::Qualification,
+            runtime_identity: RuntimeIdentity {
+                principal_id: "qualification-principal".into(),
+                tenant_id: Some("qualification-tenant".into()),
+                runtime_id,
+                environment: "qualification".into(),
+                session_id: None,
+            },
+            database_url: connection,
+            schema,
+            maximum_pool_size: 4,
+            lease_configuration: LeaseConfiguration::default(),
+            operation_budgets: Default::default(),
+            database_transport: PostgresTransport::InsecureLoopbackForTests,
         },
         registry(),
-        BackendRouter::new(
-            QualificationAuthority,
-            FunctionHooksExecutionBackend::new(fast_hook),
-            provider,
-        ),
-        store.clone(),
-    );
+        QualificationAuthority,
+        FunctionHooksExecutionBackend::new(fast_hook),
+        provider,
+    )?;
+    let kernel = runtime.kernel();
     match mode.as_str() {
         "invoke" | "invoke-fast" => {
             let request_id = arguments.next().ok_or("missing request ID")?;
@@ -335,7 +345,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         "recover" => {
-            for action_id in store.recoverable_action_ids(64)? {
+            for action_id in runtime.effect_store().recoverable_action_ids(64)? {
                 if matches!(
                     kernel.recover(&action_id)?,
                     RecoveryDecision::RecoverUnknown(_)

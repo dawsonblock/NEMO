@@ -40,6 +40,9 @@ pub enum KernelError {
     /// A capability identifier was registered more than once.
     #[error("capability is already registered: {0}")]
     CapabilityAlreadyRegistered(String),
+    /// The trusted runtime host supplied an ambiguous durable identity.
+    #[error("runtime identity is invalid: {0}")]
+    RuntimeIdentityInvalid(String),
     /// Arguments did not satisfy the immutable capability schema.
     #[error("capability arguments failed schema validation: {0}")]
     SchemaValidationFailed(String),
@@ -701,7 +704,27 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
         }
     }
 
+    /// Construct a kernel after validating the trusted durable runtime identity.
+    ///
+    /// Production composition roots should use this fallible constructor so
+    /// an empty or whitespace-normalized tenant, principal, or runtime ID
+    /// cannot enter action, grant, or idempotency bindings.
+    pub fn try_new(
+        runtime: RuntimeIdentity,
+        registry: CapabilityRegistry,
+        router: BackendRouter<A, F, E>,
+        effect_store: ES,
+    ) -> Result<Self, KernelError> {
+        runtime
+            .validate()
+            .map_err(|error| KernelError::RuntimeIdentityInvalid(error.to_string()))?;
+        Ok(Self::new(runtime, registry, router, effect_store))
+    }
+
     fn bind(&self, invocation: &InvocationRequest) -> Result<BoundExecutionRequest, KernelError> {
+        self.runtime
+            .validate()
+            .map_err(|error| KernelError::RuntimeIdentityInvalid(error.to_string()))?;
         let registered = self.registry.resolve(&invocation.capability_id)?;
         if !registered.definition.admitted {
             return Err(KernelError::CapabilityNotAdmitted(
@@ -3472,6 +3495,45 @@ mod tests {
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 0);
         assert!(receipts.receipts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_runtime_identity_is_rejected_before_any_execution() {
+        let (mut runtime, read_registry, router, effects) = {
+            let authority = TestAuthority {
+                decision: Decision::Allow,
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            (
+                runtime(),
+                registry(ExecutionClass::Read),
+                BackendRouter::new(authority, TestBackend::default(), TestBackend::default()),
+                TestEffectStore::default(),
+            )
+        };
+        runtime.tenant_id = Some(" ".into());
+        assert!(matches!(
+            Kernel::try_new(runtime.clone(), read_registry, router, effects),
+            Err(KernelError::RuntimeIdentityInvalid(_))
+        ));
+
+        let kernel = Kernel::new(
+            runtime,
+            registry(ExecutionClass::Read),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::Allow,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                TestBackend::default(),
+            ),
+            TestEffectStore::default(),
+        );
+        assert!(matches!(
+            kernel.begin(&invocation()),
+            Err(KernelError::RuntimeIdentityInvalid(_))
+        ));
     }
 
     #[test]

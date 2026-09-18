@@ -1230,6 +1230,7 @@ test-effect-contracts:
     cargo test --locked -p nemo-relay-executor --features unstable-hardening --lib
     cargo test --locked -p nemo-relay-ledger --features unstable-hardening-testkit --lib
     cargo test --locked -p nemo-relay --features unstable-hardening --lib kernel::tests
+    cargo test --locked -p nemo-effect-runtime
 
 # Verify PostgreSQL transport policy and certificate/hostname failure handling.
 # This uses loopback TLS fixtures and does not require a live PostgreSQL server.

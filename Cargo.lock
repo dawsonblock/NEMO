@@ -1768,12 +1768,22 @@ dependencies = [
 name = "nemo-effect-qualification"
 version = "0.9.1-rc.4"
 dependencies = [
+ "nemo-effect-runtime",
  "nemo-relay",
  "nemo-relay-authority",
  "nemo-relay-executor",
  "nemo-relay-ledger",
  "postgres",
  "serde_json",
+]
+
+[[package]]
+name = "nemo-effect-runtime"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay",
+ "nemo-relay-executor",
+ "nemo-relay-ledger",
 ]
 
 [[package]]
