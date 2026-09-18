@@ -80,8 +80,14 @@ def verify_archive(root: pathlib.Path, recorded: str | None, label: str, finding
 def verify_lockfiles(root: pathlib.Path, manifest: dict, findings: list[str]) -> None:
     """Confirm every recorded lockfile digest still matches."""
 
+    root = root.resolve()
     for lockfile, recorded in (manifest.get("lockfiles") or {}).items():
-        path = (root / lockfile).resolve()
+        try:
+            validated = source_tree.validate_path(lockfile)
+        except source_tree.SourceTreeError as error:
+            findings.append(f"lockfile path is not a safe manifest path: {error}")
+            continue
+        path = (root / validated).resolve()
         if not path.is_relative_to(root):
             findings.append(f"lockfile path escapes the source tree: {lockfile}")
             continue

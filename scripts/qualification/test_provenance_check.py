@@ -221,6 +221,36 @@ def test_escaping_symlink_target_is_rejected(tree: pathlib.Path) -> None:
     assert expected_substring(findings, "escapes the source root")
 
 
+def test_lockfile_traversal_path_is_rejected(tree: pathlib.Path) -> None:
+    evidence = tree / EVIDENCE
+    manifest = json.loads(evidence.read_text())
+    manifest["lockfiles"] = {"../../outside-file": "sha256:" + "0" * 64}
+    evidence.write_text(json.dumps(manifest))
+
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
+    assert expected_substring(findings, "not a safe manifest path")
+
+
+def test_lockfile_absolute_path_is_rejected(tree: pathlib.Path) -> None:
+    evidence = tree / EVIDENCE
+    manifest = json.loads(evidence.read_text())
+    manifest["lockfiles"] = {"/etc/passwd": "sha256:" + "0" * 64}
+    evidence.write_text(json.dumps(manifest))
+
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
+    assert expected_substring(findings, "not a safe manifest path")
+
+
+def test_lockfile_noncanonical_path_is_rejected(tree: pathlib.Path) -> None:
+    evidence = tree / EVIDENCE
+    manifest = json.loads(evidence.read_text())
+    manifest["lockfiles"] = {"./Cargo.toml": "sha256:" + "0" * 64}
+    evidence.write_text(json.dumps(manifest))
+
+    findings, _ = provenance_check.verify(tree, EVIDENCE)
+    assert expected_substring(findings, "not a safe manifest path")
+
+
 # -- Exclusion policy --------------------------------------------------------
 
 
