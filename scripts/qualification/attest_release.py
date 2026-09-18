@@ -269,14 +269,7 @@ def verify(
     if attestation.get("artifact", {}).get("sha256") != actual_artifact:
         findings.append("release attestation is bound to a different artifact digest")
 
-    recorded_evidence = attestation.get("evidence", {}).get("manifest_sha256")
-    current_evidence = evidence_manifest_digest(qualification_dir)
-    if recorded_evidence != current_evidence:
-        findings.append("release attestation is bound to a different evidence manifest digest")
-
-    evidence = json.loads((qualification_dir / bundle.MANIFEST_NAME).read_text())
-    if attestation.get("source_tree_sha256") != evidence.get("source_tree_sha256"):
-        findings.append("release attestation is bound to a different source tree digest")
+    findings.extend(bundle.verify(qualification_dir.parent, qualification_dir))
     findings.extend(self_reference_findings(artifact, attestation_path))
 
     if attestation.get("promotion", "").startswith("PRODUCTION") and (
