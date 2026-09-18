@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "status": "PENDING",
+  "baseline_source_tree_sha256": "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe",
+  "baseline_commit": null,
+  "qualified_commits": [],
+  "evidence": {}
+}

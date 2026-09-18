@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "release_version": null,
+  "git_commit": null,
+  "source_digest": null,
+  "archive_digest": null,
+  "build_timestamp": null,
+  "ci_run_identity": null,
+  "builder_identity": null,
+  "qualification_status": "PENDING",
+  "sbom_digest": null,
+  "provenance_digest": null,
+  "signatures": []
+}

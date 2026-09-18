@@ -234,7 +234,24 @@ impl DerefMut for PostgresConnection {
     }
 }
 
-const MIGRATION: &str = include_str!("../migrations/0001_effect_store.sql");
+struct MigrationDefinition {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[MigrationDefinition] = &[
+    MigrationDefinition {
+        version: 1,
+        name: "0001_initial",
+        sql: include_str!("../migrations/0001_initial.sql"),
+    },
+    MigrationDefinition {
+        version: 2,
+        name: "0002_reconciliation_schedule",
+        sql: include_str!("../migrations/0002_reconciliation_schedule.sql"),
+    },
+];
 
 /// Failure returned by [`PostgresEffectStore`].
 #[derive(Debug)]
@@ -257,6 +274,8 @@ pub enum PostgresEffectStoreError {
     CorruptData(String),
     /// A Rust integer cannot be represented by the PostgreSQL schema.
     IntegerOutOfRange(&'static str),
+    /// The database schema is incompatible with the runtime binary.
+    SchemaMismatch(String),
     /// The shared effect-store contract rejected the operation.
     Contract(ReferenceStoreError),
 }
@@ -284,6 +303,7 @@ impl std::fmt::Display for PostgresEffectStoreError {
                     "value cannot be represented in PostgreSQL: {field}"
                 )
             }
+            Self::SchemaMismatch(message) => write!(formatter, "schema mismatch: {message}"),
             Self::Contract(error) => error.fmt(formatter),
         }
     }
@@ -301,7 +321,8 @@ impl std::error::Error for PostgresEffectStoreError {
             | Self::InvalidPoolSize(_)
             | Self::InvalidTransport(_)
             | Self::CorruptData(_)
-            | Self::IntegerOutOfRange(_) => None,
+            | Self::IntegerOutOfRange(_)
+            | Self::SchemaMismatch(_) => None,
         }
     }
 }
@@ -462,10 +483,127 @@ impl PostgresEffectStore {
         })
     }
 
-    /// Install the idempotent schema migration used by this adapter.
+    fn migration_table(&self) -> String {
+        self.table("effect_schema_migrations")
+    }
+
+    fn migration_ledger_bootstrap_sql(&self) -> String {
+        format!(
+            "create schema if not exists {schema};
+             create table if not exists {table_name} (
+                 version bigint primary key check (version > 0),
+                 name text not null,
+                 checksum text not null,
+                 applied_at timestamptz not null default clock_timestamp()
+             )",
+            schema = self.quoted_schema(),
+            table_name = self.migration_table(),
+        )
+    }
+
+    fn load_applied_migrations(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<std::collections::BTreeMap<i64, (String, String)>, PostgresEffectStoreError> {
+        let mut applied = std::collections::BTreeMap::new();
+        let sql = format!(
+            "select version, name, checksum from {} order by version",
+            self.migration_table()
+        );
+        for row in client.query(&sql, &[])? {
+            let version: i64 = row.get("version");
+            let name: String = row.get("name");
+            let checksum: String = row.get("checksum");
+            applied.insert(version, (name, checksum));
+        }
+        Ok(applied)
+    }
+
+    fn checksum(value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Install immutable versioned schema migrations.
     pub fn migrate(&self) -> Result<(), PostgresEffectStoreError> {
-        let migration = MIGRATION.replace("__SCHEMA__", &self.quoted_schema());
-        self.connection()?.batch_execute(&migration)?;
+        let mut connection = self.connection()?;
+        connection.batch_execute(&self.migration_ledger_bootstrap_sql())?;
+        let mut applied = self.load_applied_migrations(&mut *connection)?;
+
+        for migration in MIGRATIONS {
+            let expected_checksum = Self::checksum(migration.sql);
+            if let Some((applied_name, applied_checksum)) = applied.get(&migration.version) {
+                if applied_checksum != &expected_checksum {
+                    return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                        "migration {} ({}) checksum mismatch: expected {}, found {}",
+                        migration.version, applied_name, expected_checksum, applied_checksum
+                    )));
+                }
+                continue;
+            }
+
+            let migration_sql = migration.sql.replace("__SCHEMA__", &self.quoted_schema());
+            let mut transaction = connection.transaction()?;
+            transaction.batch_execute(&migration_sql)?;
+            let insert_sql = format!(
+                "insert into {} (version, name, checksum) values ($1, $2, $3)",
+                self.migration_table()
+            );
+            transaction.execute(
+                &insert_sql,
+                &[&migration.version, &migration.name, &expected_checksum],
+            )?;
+            transaction.commit()?;
+            applied.insert(
+                migration.version,
+                (migration.name.to_owned(), expected_checksum),
+            );
+        }
+        self.ensure_schema_compatible_exact()
+    }
+
+    /// Require the database to contain exactly the migrations known by this binary.
+    pub fn ensure_schema_compatible_exact(&self) -> Result<(), PostgresEffectStoreError> {
+        let mut connection = self.connection()?;
+        connection.batch_execute(&self.migration_ledger_bootstrap_sql())?;
+        let applied = self.load_applied_migrations(&mut *connection)?;
+        let expected_versions = MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .collect::<std::collections::BTreeSet<_>>();
+        let applied_versions = applied
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if let Some(version) = applied_versions.difference(&expected_versions).next() {
+            return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                "database schema is newer than runtime: found migration version {version}",
+            )));
+        }
+        if let Some(version) = expected_versions.difference(&applied_versions).next() {
+            return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                "database schema is older than runtime: missing migration version {version}",
+            )));
+        }
+
+        for migration in MIGRATIONS {
+            let expected_checksum = Self::checksum(migration.sql);
+            let Some((name, checksum)) = applied.get(&migration.version) else {
+                continue;
+            };
+            if name != migration.name || checksum != &expected_checksum {
+                return Err(PostgresEffectStoreError::SchemaMismatch(format!(
+                    "migration {} expected ({}, {}) but found ({}, {})",
+                    migration.version, migration.name, expected_checksum, name, checksum
+                )));
+            }
+        }
         Ok(())
     }
 
