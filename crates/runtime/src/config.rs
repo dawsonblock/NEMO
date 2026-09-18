@@ -100,6 +100,11 @@ impl RuntimeConfig {
                     "production requires durability_enabled=true".to_owned(),
                 ));
             }
+            if self
+                .identity
+                .runtime_id
+                .as_deref()
+                .unwrap_or_default()
                 .trim()
                 .is_empty()
             {
@@ -178,5 +183,22 @@ mod tests {
 
         config.identity.runtime_id = Some("runtime-production".into());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn production_rejects_whitespace_runtime_identity() {
+        let mut config = base();
+        config.profile = RuntimeProfile::Production;
+        config.durability_enabled = true;
+        config.database = Some(DatabaseConfig {
+            connection_string: "host=/tmp dbname=postgres".into(),
+            schema: "nemo_effects".into(),
+            pool_size: 8,
+            transport: DatabaseTransport::LocalSocket,
+            allow_migrations: false,
+        });
+        config.identity.runtime_id = Some("   ".into());
+
+        assert!(config.validate().is_err());
     }
 }

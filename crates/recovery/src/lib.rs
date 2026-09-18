@@ -64,6 +64,14 @@ pub mod unstable {
         /// Adapter-specific failure type.
         type Error;
 
+        /// Claim a durable reconciliation lease for an action.
+        fn claim_recovery_lease(
+            &self,
+            action_id: &str,
+            now_unix_ms: u64,
+            owner_id: &str,
+        ) -> Result<Option<ActionLease>, Self::Error>;
+
         /// Persist a deterministic update after one recovery attempt.
         fn record_attempt(
             &self,
@@ -129,15 +137,28 @@ pub mod unstable {
                 if !seen.insert(candidate.action_id.clone()) {
                     continue;
                 }
-                let lease = ActionLease {
-                    owner_id: owner_id.to_owned(),
-                    generation: candidate.reconciliation_attempts,
-                    expires_at_unix_ms: now_unix_ms.saturating_add(30_000),
+                let Some(lease) = self
+                    .scheduler
+                    .claim_recovery_lease(&candidate.action_id, now_unix_ms, owner_id)
+                    .map_err(|error| RecoveryError::Schedule(Box::new(error)))?
+                else {
+                    continue;
                 };
-                let disposition = self
-                    .kernel
-                    .recover_action(&candidate.action_id, &lease)
-                    .map_err(|error| RecoveryError::Recover(Box::new(error)))?;
+                let disposition = match self.kernel.recover_action(&candidate.action_id, &lease) {
+                    Ok(disposition) => disposition,
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        self.scheduler
+                            .record_attempt(
+                                &candidate.action_id,
+                                now_unix_ms,
+                                RecoveryDisposition::Inconclusive,
+                                Some(error_message.as_str()),
+                            )
+                            .map_err(|record_error| RecoveryError::Schedule(Box::new(record_error)))?;
+                        return Err(RecoveryError::Recover(Box::new(error)));
+                    }
+                };
                 self.scheduler
                     .record_attempt(&candidate.action_id, now_unix_ms, disposition, None)
                     .map_err(|error| RecoveryError::Schedule(Box::new(error)))?;

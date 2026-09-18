@@ -52,7 +52,7 @@ pub fn bootstrap(config: &RuntimeConfig) -> Result<RuntimeComposition, Bootstrap
 
     Ok(RuntimeComposition {
         readiness: RuntimeReadiness {
-            database_connected: durable_store.is_some(),
+            database_connected: !config.durability_enabled || durable_store.is_some(),
             schema_compatible: true,
             runtime_identity_valid: !runtime_identity.runtime_id.is_empty(),
             provider_configuration_valid: true,

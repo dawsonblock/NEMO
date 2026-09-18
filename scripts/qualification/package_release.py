@@ -24,6 +24,10 @@ from datetime import datetime, timezone
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 DEFAULT_ROOT = SCRIPT_DIR.parents[1]
 GENERATED_PREFIX = ("release", "artifacts")
+GENERATED_RELEASE_METADATA = {
+    ("release", "source-manifest.json"),
+    ("release", "artifact.json"),
+}
 EXCLUDED_ROOTS = {
     ".git",
     "target",
@@ -43,6 +47,7 @@ EXCLUDED_NAMES = {"__pycache__", ".coverage"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 BASELINE_SOURCE_TREE_SHA256 = "9a9541e839bbaa9bfe1c14f730c8a20f09495dd791c08bb43f7137edb2d0cfbe"
+BASELINE_COMMIT: str | None = None
 
 
 def workspace_version(root: pathlib.Path) -> str:
@@ -63,6 +68,8 @@ def is_excluded(relative: pathlib.Path) -> bool:
     if not relative.parts:
         return False
     if relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX:
+        return True
+    if relative.parts[:2] in GENERATED_RELEASE_METADATA:
         return True
     if any(part in EXCLUDED_NAMES for part in relative.parts):
         return True
@@ -252,9 +259,9 @@ def main() -> int:
                 "schema_version": 1,
                 "baseline_source_tree_sha256": BASELINE_SOURCE_TREE_SHA256,
                 "source_tree_sha256": source_tree_sha256,
-                "baseline_commit": commit,
-                "repair_commits": [],
-                "source_manifest_path": "qualification/source-manifest.json",
+                "baseline_commit": BASELINE_COMMIT,
+                "repair_commits": [commit] if commit and commit != BASELINE_COMMIT else [],
+                "source_manifest_path": "release/source-manifest.json",
             },
             indent=2,
         )

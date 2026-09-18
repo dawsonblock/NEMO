@@ -27,25 +27,37 @@ fn main() -> ExitCode {
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let database = std::env::var("NEMO_RELAY_POSTGRES_URL")
-        .ok()
-        .map(|connection_string| DatabaseConfig {
-            connection_string,
-            schema: std::env::var("NEMO_RELAY_POSTGRES_SCHEMA")
-                .unwrap_or_else(|_| "nemo_effects".to_owned()),
-            pool_size: std::env::var("NEMO_RELAY_POSTGRES_POOL_SIZE")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(8),
-            transport: std::env::var("NEMO_RELAY_POSTGRES_TRANSPORT")
+    let database = match std::env::var("NEMO_RELAY_POSTGRES_URL").ok() {
+        Some(connection_string) => {
+            let transport = match std::env::var("NEMO_RELAY_POSTGRES_TRANSPORT")
                 .ok()
                 .as_deref()
                 .map(database_transport)
-                .unwrap_or(DatabaseTransport::InsecureLocal),
-            allow_migrations: std::env::var("NEMO_RELAY_ALLOW_MIGRATIONS")
-                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-        });
+                .transpose()
+            {
+                Ok(Some(transport)) => transport,
+                Ok(None) => DatabaseTransport::InsecureLocal,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
+            };
+            Some(DatabaseConfig {
+                connection_string,
+                schema: std::env::var("NEMO_RELAY_POSTGRES_SCHEMA")
+                    .unwrap_or_else(|_| "nemo_effects".to_owned()),
+                pool_size: std::env::var("NEMO_RELAY_POSTGRES_POOL_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(8),
+                transport,
+                allow_migrations: std::env::var("NEMO_RELAY_ALLOW_MIGRATIONS")
+                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+            })
+        }
+        None => None,
+    };
 
     let config = RuntimeConfig {
         profile,
@@ -72,19 +84,22 @@ fn main() -> ExitCode {
     }
 }
 
-fn database_transport(value: &str) -> DatabaseTransport {
+fn database_transport(value: &str) -> Result<DatabaseTransport, String> {
     match value {
-        "local_socket" => DatabaseTransport::LocalSocket,
-        "verified_tls" => DatabaseTransport::VerifiedTls {
+        "local_socket" => Ok(DatabaseTransport::LocalSocket),
+        "verified_tls" => Ok(DatabaseTransport::VerifiedTls {
             ca_path: std::env::var("NEMO_RELAY_POSTGRES_TLS_CA").unwrap_or_default(),
-        },
-        "mutual_tls" => DatabaseTransport::MutualTls {
+        }),
+        "mutual_tls" => Ok(DatabaseTransport::MutualTls {
             ca_path: std::env::var("NEMO_RELAY_POSTGRES_TLS_CA").unwrap_or_default(),
             client_identity_path: std::env::var("NEMO_RELAY_POSTGRES_TLS_CLIENT_IDENTITY")
                 .unwrap_or_default(),
             client_identity_password: std::env::var("NEMO_RELAY_POSTGRES_TLS_CLIENT_PASSWORD")
                 .unwrap_or_default(),
-        },
-        _ => DatabaseTransport::InsecureLocal,
+        }),
+        "insecure_local" => Ok(DatabaseTransport::InsecureLocal),
+        _ => Err(format!(
+            "invalid NEMO_RELAY_POSTGRES_TRANSPORT: {value}; expected one of local_socket, verified_tls, mutual_tls, insecure_local"
+        )),
     }
 }

@@ -15,6 +15,8 @@ def test_generated_python_artifacts_are_excluded() -> None:
     assert is_excluded(Path("src/module.pyc"))
     assert is_excluded(Path(".coverage"))
     assert is_excluded(Path("build/output.bin"))
+    assert is_excluded(Path("release/source-manifest.json"))
+    assert is_excluded(Path("release/artifact.json"))
 
 
 def test_filesystem_fallback_ignores_generated_python_artifacts(tmp_path: Path) -> None:
