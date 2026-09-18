@@ -60,7 +60,11 @@ def tracked_paths(root: pathlib.Path) -> list[pathlib.Path]:
     """
 
     enumeration = source_tree.enumerate_tree(root)
-    return [pathlib.Path(path) for path in enumeration.entries]
+    return [
+        pathlib.Path(path)
+        for path, entry in enumeration.entries.items()
+        if entry.get("kind") in (source_tree.KIND_FILE, source_tree.KIND_SYMLINK)
+    ]
 
 
 def sha256_bytes(value: bytes) -> str:
