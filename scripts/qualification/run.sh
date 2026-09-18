@@ -191,7 +191,7 @@ if [[ "${mode}" == "provenance" ]]; then
 elif [[ "${mode}" == "manifest" ]]; then
     # Manifest-only mode is useful when the host cannot run the full matrix.
     for check in rust-format clippy rust-tests rust-doc-tests effect-contracts postgres-transport-security cargo-deny cargo-audit \
-        migration-integrity physical-schema-verification db-failure-boundaries \
+        migration-integrity physical-schema-verification db-failure-boundaries runtime-composition \
         postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery postgres-kernel-restart \
         python-tests node-tests go-tests sbom; do
         not_run "${check}" "qualification checks intentionally skipped in manifest-only mode"
@@ -228,6 +228,9 @@ else
         # not be allowed to decide, by itself, whether an external effect
         # happened.
         run_check db-failure-boundaries just test-postgres-db-failure-boundaries
+        # E3.2 evidence. Recorded as it lands, but not yet part of the frozen
+        # E3.1 matrix: gate E3-016 stays open until the whole slice completes.
+        run_check runtime-composition just test-runtime-composition
         run_check postgres-effect-store just test-postgres-effect-store
         run_check postgres-concurrency just test-postgres-effect-store-concurrency
         run_check postgres-restart just test-postgres-effect-store-restart
@@ -237,6 +240,7 @@ else
         not_run migration-integrity "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run physical-schema-verification "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run db-failure-boundaries "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run runtime-composition "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-effect-store "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-concurrency "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-restart "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"

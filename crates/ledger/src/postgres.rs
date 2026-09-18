@@ -44,6 +44,16 @@ fn pause_at_test_crash_point(point: &str) {
 #[cfg(not(feature = "unstable-hardening-testkit"))]
 fn pause_at_test_crash_point(_point: &str) {}
 
+impl crate::unstable::production_seal::Sealed for PostgresEffectStore {}
+
+impl crate::unstable::ProductionEffectStore for PostgresEffectStore {
+    type Error = PostgresEffectStoreError;
+
+    fn verify_production_readiness(&self) -> Result<(), Self::Error> {
+        Self::verify_production_readiness(self)
+    }
+}
+
 /// Fail a durable operation at a named boundary, for qualification tests.
 ///
 /// This exists so boundary semantics can be proven deterministically instead of
@@ -722,6 +732,15 @@ pub struct PostgresEffectStore {
 }
 
 impl PostgresEffectStore {
+    /// Attest that this database is ready to hold production durable effects.
+    ///
+    /// This is the readiness path a production kernel requires: migration
+    /// history, physical schema, credential privileges, and recorded database
+    /// settings must all hold before a kernel can be composed around it.
+    pub fn verify_production_readiness(&self) -> Result<(), PostgresEffectStoreError> {
+        self.verify_database_readiness().map(|_| ())
+    }
+
     /// Create a plaintext pool for an explicitly local development or test target.
     ///
     /// Every configured host must be a Unix socket or a loopback TCP address.

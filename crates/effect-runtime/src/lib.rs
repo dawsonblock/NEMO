@@ -296,13 +296,31 @@ where
         function_hooks: F,
         effect_fabric: E,
     ) -> Result<Self, RuntimeReadinessError> {
+        // Boot order: verify the durable substrate, then seal the capability
+        // registry, then compose the kernel. The kernel cannot be constructed
+        // before both, because the production constructor requires a sealed
+        // registry and a store that attested readiness.
         let store = config.connect_store()?;
-        let kernel = Kernel::try_new(
-            config.runtime_identity,
-            registry,
-            BackendRouter::new(authority, function_hooks, effect_fabric),
-            store.clone(),
-        )
+        let sealed = registry.seal().map_err(RuntimeReadinessError::Kernel)?;
+        let kernel = match config.mode {
+            RuntimeMode::Production => Kernel::new_production(
+                config.runtime_identity,
+                sealed,
+                BackendRouter::new(authority, function_hooks, effect_fabric),
+                store.clone(),
+            ),
+            RuntimeMode::Development | RuntimeMode::Qualification => {
+                // Non-production profiles may compose without a production
+                // runtime environment, but still receive a sealed registry and
+                // a store that passed the same schema verification.
+                Ok(Kernel::new_unchecked_for_tests(
+                    config.runtime_identity,
+                    sealed,
+                    BackendRouter::new(authority, function_hooks, effect_fabric),
+                    store.clone(),
+                ))
+            }
+        }
         .map_err(RuntimeReadinessError::Kernel)?;
         Ok(Self {
             kernel,

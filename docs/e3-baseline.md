@@ -322,11 +322,65 @@ deterministic and runs in the `physical-schema-verification` gate; only the
 comparison against a checked-in constant is deferred, for the reason given
 above.
 
-## Next: E3.2 - authoritative runtime
+## E3.2 - authoritative runtime (in progress)
 
-`nemo-effect-runtime` is still optional rather than the only supported
-production composition root, the capability registry is not sealed, identity is
-not canonicalized into typed values, and `Kernel::new()` remains a bypass.
-Recovery Supervisor work is deliberately blocked on E3.2, because building
-recovery on a runtime that can still bypass the authoritative composition root
-creates another path that has to be retrofitted later.
+Priority order for this slice: production construction ownership, sealed
+registry, consequential route enforcement, identity strong types, canonical ABI,
+cross-language vectors, Node lifecycle demotion.
+
+### Landed
+
+**Production construction ownership.** Kernel construction is split by trust
+level instead of one constructor:
+
+- `Kernel::new_development` validates the runtime identity and seals the
+  registry; it accepts any store, including an in-memory one.
+- `Kernel::new_production` requires a sealed registry, a `production`
+  environment, at least one admitted `MUTATION` or `CRITICAL` capability, and a
+  store that implements the sealed `ProductionEffectStore` trait and attests
+  readiness.
+- `Kernel::new_unchecked_for_tests` is the raw escape hatch, doc-hidden and named
+  so every use site is visible. An architectural test fails the build if a
+  user-facing crate (`cli`, `python`, `node`, `ffi`) reaches it, and a second
+  test asserts the composition root is its only non-test user.
+
+The load-bearing part is the store bound. `ProductionEffectStore` is declared
+with a supertrait whose module is private to the ledger crate, so no other crate
+can implement it for its own type: a harness cannot substitute an in-memory
+store and still compose a production kernel. That is compiler-enforced, not
+convention.
+
+**Sealed capability registry.** `CapabilityRegistry::seal` consumes the builder
+and returns `SealedCapabilityRegistry`, which exposes no mutation. A running
+kernel therefore cannot have a capability's execution class, route, generation,
+or admission changed after boot. Sealing computes one canonical digest over
+every security-relevant registration field (`capability_id`,
+`capability_generation`, `registration_digest`, `execution_class`, `operation`,
+`route_digest`, `admission_id`, `policy_version`, `policy_epoch`, `admitted`),
+exposed as `Kernel::registry_digest()`.
+
+**Fail-closed production startup.** A production kernel is refused when the
+environment is not `production`, when no consequential capability is registered,
+or when the store cannot attest production readiness — which for the durable
+store means migration history, physical schema, credential privileges, and
+recorded database settings all hold.
+
+### Still open in this slice
+
+- Consequential route enforcement: proving a `CRITICAL` registration cannot be
+  routed to function hooks, and that the harness cannot supply an execution
+  class.
+- Identity strong types and canonical ABI with cross-language vectors.
+- Node lifecycle demotion.
+
+Gate E3-016 and E3-017 stay open until those land. The evidence produced so far
+is recorded under the `runtime-composition` check and is deliberately not part
+of the frozen E3.1 matrix.
+
+### Observed flakiness
+
+`nemo-relay`'s `logging::tests::opentelemetry_batch_processor_logs_dropped_spans`
+fails intermittently when the library suite runs with default parallelism and
+passes in isolation and single-threaded. It is pre-existing, unrelated to the
+hardening work, and is exactly the class of result the plan says must be
+recorded as `PASS_WITH_FLAKE` rather than as a clean pass.

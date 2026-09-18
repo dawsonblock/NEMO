@@ -1287,6 +1287,12 @@ test-postgres-db-failure-boundaries:
     cargo test --locked -p nemo-effect-qualification \
         --test postgres_db_failure_boundaries -- --include-ignored --test-threads=1
 
+# E3.2 runtime composition: production construction ownership, registry sealing,
+# and fail-closed production startup. The two database-backed cases need
+# NEMO_RELAY_TEST_POSTGRES_URL; the architectural and sealing cases do not.
+test-runtime-composition:
+    cargo test --locked -p nemo-effect-runtime --test production_composition -- --include-ignored --test-threads=1
+
 # E3-012 physical schema verification: catalog fingerprint plus destructive
 # drift that leaves the migration ledger untouched. When
 # NEMO_RELAY_SCHEMA_EVIDENCE_DIR is set, the canonical schema description of a
