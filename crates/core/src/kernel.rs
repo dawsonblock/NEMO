@@ -43,6 +43,13 @@ pub enum KernelError {
     /// A production kernel was requested outside the production environment.
     #[error("production composition requires a production runtime environment")]
     ProductionEnvironmentMismatch,
+    /// A development kernel was requested with a production runtime identity.
+    ///
+    /// The profile decides which admission checks apply, so a caller must not
+    /// be able to hold a production identity while composing through the
+    /// development constructor and skipping them.
+    #[error("development composition cannot use a production runtime identity")]
+    DevelopmentEnvironmentMismatch,
     /// A production kernel was requested without any consequential capability.
     #[error(
         "production composition requires at least one admitted MUTATION or CRITICAL capability"
@@ -842,6 +849,9 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
     ) -> Result<Self, KernelError> {
         let sealed = registry.seal()?;
         Self::new_production_identity_check(&runtime)?;
+        if runtime.environment == "production" {
+            return Err(KernelError::DevelopmentEnvironmentMismatch);
+        }
         Ok(Self::assemble(runtime, sealed, router, effect_store))
     }
 
@@ -3740,6 +3750,33 @@ mod tests {
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
         let state = actions.states.lock().unwrap().values().copied().next();
         assert_eq!(state, Some(ExecutionState::Committed));
+    }
+
+    #[test]
+    fn development_composition_rejects_a_production_identity() {
+        // Without this, a caller could hold a production identity and still
+        // compose through the development constructor, which skips production
+        // admission. The profile has to be enforced where the kernel is built,
+        // not only where the runtime configuration is built.
+        let mut production = runtime();
+        production.environment = "production".into();
+        let result = Kernel::new_development(
+            production,
+            registry(ExecutionClass::Mutation),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::Allow,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                TestBackend::default(),
+            ),
+            TestEffectStore::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(KernelError::DevelopmentEnvironmentMismatch)
+        ));
     }
 
     #[test]
