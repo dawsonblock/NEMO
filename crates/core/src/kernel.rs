@@ -8,6 +8,7 @@
 //! external providers of the contracts defined by the hardening crates.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use nemo_relay_authority::unstable::{
     AuthorityDecision, AuthorityProvider, GrantVerifier, VerifiedGrant, request_from_identity,
@@ -1776,11 +1777,28 @@ where
                 "effect receipt does not bind to the execution identity".into(),
             ));
         }
-        let finalization = self.effect_store.finalize_terminal_receipt(
+        // Finalization is the last place a database wait can outlive the action
+        // it serves, so it is bounded by what is left of the trusted deadline
+        // rather than by the store's static maximum. An exhausted budget means
+        // the outcome cannot be persisted inside the action, which is exactly
+        // the case `UNKNOWN` plus reconciliation exists to cover.
+        let Some(remaining) =
+            remaining_action_budget(request.backend_request().identity.deadline_unix_ms)
+        else {
+            return Err(self.unknown_after_dispatching(
+                request,
+                lease,
+                "trusted action budget was exhausted before the terminal receipt could \
+                 be persisted"
+                    .into(),
+            ));
+        };
+        let finalization = self.effect_store.finalize_terminal_receipt_within_budget(
             &request.backend_request().identity.action_id,
             ExecutionState::Dispatching,
             lease,
             receipt,
+            remaining,
         );
         match finalization {
             Err(error) => {
@@ -2427,6 +2445,17 @@ fn kernel_deadline_unix_ms() -> u64 {
         .saturating_add(29_000)
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+/// Remaining trusted action budget, or `None` once the deadline has passed.
+///
+/// The store derives its PostgreSQL waits from this, so an exhausted budget has
+/// to be refused here rather than handed over as zero: a zero-budget store call
+/// would fail inside the transaction it was supposed to bound.
+fn remaining_action_budget(deadline_unix_ms: u64) -> Option<Duration> {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let remaining_ms = deadline_unix_ms.saturating_sub(now);
+    (remaining_ms > 0).then(|| Duration::from_millis(remaining_ms))
 }
 
 fn runtime_binding_digest(runtime: &RuntimeIdentity) -> String {
@@ -3750,6 +3779,28 @@ mod tests {
         assert_eq!(receipts.receipts.lock().unwrap().len(), 1);
         let state = actions.states.lock().unwrap().values().copied().next();
         assert_eq!(state, Some(ExecutionState::Committed));
+    }
+
+    #[test]
+    fn remaining_action_budget_is_none_once_the_deadline_has_passed() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+        assert!(remaining_action_budget(0).is_none());
+        assert!(remaining_action_budget(now.saturating_sub(1)).is_none());
+        assert!(remaining_action_budget(now).is_none());
+    }
+
+    #[test]
+    fn remaining_action_budget_reports_what_is_left() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+        let remaining = remaining_action_budget(now.saturating_add(5_000))
+            .expect("a future deadline has budget left");
+
+        // The clock moves between the two calls, so assert a window rather than
+        // an exact value.
+        assert!(remaining <= Duration::from_millis(5_000), "{remaining:?}");
+        assert!(remaining > Duration::from_millis(4_000), "{remaining:?}");
     }
 
     #[test]

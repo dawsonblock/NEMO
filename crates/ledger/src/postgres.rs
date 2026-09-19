@@ -2441,6 +2441,25 @@ impl EffectStore for PostgresEffectStore {
             failure_point: "terminal_finalization",
         })
     }
+
+    /// Route the shared trait's budget-aware form to the adapter's own one.
+    ///
+    /// This is the load-bearing half of the trusted deadline: the kernel holds a
+    /// deadline, the trait is what it can call, and only here does that deadline
+    /// become the PostgreSQL lock and statement timeouts derived by
+    /// [`PostgresEffectStore::for_remaining`].
+    fn finalize_terminal_receipt_within_budget(
+        &self,
+        action_id: &str,
+        expected: ExecutionState,
+        lease: &ActionLease,
+        receipt: &ReceiptRecord,
+        remaining: Duration,
+    ) -> Result<EffectFinalizeResult, Self::Error> {
+        PostgresEffectStore::finalize_terminal_receipt_within_budget(
+            self, action_id, expected, lease, receipt, remaining,
+        )
+    }
 }
 
 fn validate_schema_name(schema: &str) -> Result<(), PostgresEffectStoreError> {
@@ -2919,6 +2938,58 @@ mod tests {
             .verify_schema()
             .expect("fresh migrations must satisfy this runtime");
         effects
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn the_shared_trait_routes_finalization_through_the_trusted_budget() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+
+        // The kernel holds only the shared trait, so this is the path a trusted
+        // deadline actually takes. Exercising the inherent method would prove
+        // nothing about what the kernel can reach.
+        fn finalize_through_trait<E: EffectStore>(
+            store: &E,
+            action_id: &str,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+            remaining: Duration,
+        ) -> Result<EffectFinalizeResult, E::Error> {
+            store.finalize_terminal_receipt_within_budget(
+                action_id,
+                ExecutionState::Dispatching,
+                lease,
+                receipt,
+                remaining,
+            )
+        }
+
+        let mut action = fixture_action();
+        action.grant_digest = Some("grant".into());
+        let action_id = action.action_id.clone();
+        let receipt = fixture_receipt(&action, ExecutionState::Committed, "budget-routing");
+        let lease = ActionLease {
+            owner_id: "budget-routing".into(),
+            generation: 1,
+            expires_at_unix_ms: u64::MAX,
+        };
+
+        // The budget is validated before the action is loaded, so with the
+        // receipt correctly bound this is a statement about the budget rather
+        // than about a missing action. The default trait implementation ignores
+        // its budget and would instead report the action as missing, which is
+        // what makes the error variant the thing that distinguishes a wired
+        // budget from an ignored one.
+        let outcome =
+            finalize_through_trait(&effects, &action_id, &lease, &receipt, Duration::ZERO);
+        assert!(
+            matches!(
+                outcome,
+                Err(PostgresEffectStoreError::InvalidOperationBudget(_))
+            ),
+            "a zero trusted budget must be refused by the adapter: {outcome:?}"
+        );
     }
 
     #[test]

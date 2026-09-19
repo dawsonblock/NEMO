@@ -29,7 +29,7 @@ pub mod unstable {
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Seal for [`ProductionEffectStore`].
     ///
@@ -1315,6 +1315,31 @@ pub mod unstable {
             lease: &ActionLease,
             receipt: &ReceiptRecord,
         ) -> Result<EffectFinalizeResult, Self::Error>;
+
+        /// Finalize a terminal receipt inside a trusted remaining budget.
+        ///
+        /// Finalization is where a durable effect commits its outcome, and it is
+        /// the last place a database wait can outlive the action it serves. The
+        /// kernel therefore calls this form whenever it holds a trusted
+        /// deadline, and an adapter whose finalization can block on an external
+        /// system overrides it to bound its waits by what is left.
+        ///
+        /// The default implementation ignores the budget and delegates to
+        /// [`Self::finalize_terminal_receipt`], which is the correct behaviour
+        /// for a store that cannot block: a reference or in-memory store has no
+        /// wait to bound, so accepting a budget it does not use is honest,
+        /// whereas silently treating the budget as a timeout would not be.
+        fn finalize_terminal_receipt_within_budget(
+            &self,
+            action_id: &str,
+            expected: ExecutionState,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+            remaining: Duration,
+        ) -> Result<EffectFinalizeResult, Self::Error> {
+            let _ = remaining;
+            self.finalize_terminal_receipt(action_id, expected, lease, receipt)
+        }
     }
 
     /// Aggregate durable-effect authority consumed by the kernel.
