@@ -75,17 +75,23 @@ Measured with `cargo tree --all-features --locked`, and enforced by
 `security/tcb.toml`. That file records two tiers, because "code that enforces an
 invariant" and "code that can subvert one" are different questions:
 
+The numbers here are a snapshot, and the policy file is authoritative:
+`just tcb-report` prints the live values, so a difference means this file is
+stale rather than the policy being wrong. The policy previously caught exactly
+that drift — a ledger budget was raised while the table below still showed the
+old figure — which is why the two are stated as snapshot and source.
+
 | Tier | Crates | Lines | `unsafe` |
 |---|---|---|---|
-| Invariant-enforcing | 5 | 85,027 | 299 |
-| In-process | 12 | 114,091 | 617 |
+| Invariant-enforcing | 5 | 85,051 | 299 |
+| In-process | 12 | 114,115 | 617 |
 
 The five enforcing crates:
 
 | Crate | Files | Lines | `unsafe` | Direct deps | Transitive |
 |---|---|---|---|---|---|
 | `nemo-relay` | 74 | 71,190 | 299 | 39 | 264 |
-| `nemo-relay-ledger` | 6 | 9,152 | 0 | 9 | 106 |
+| `nemo-relay-ledger` | 6 | 9,176 | 0 | 9 | 106 |
 | `nemo-relay-types` | 13 | 3,681 | 0 | 7 | 25 |
 | `nemo-relay-executor` | 1 | 572 | 0 | 3 | 24 |
 | `nemo-relay-authority` | 1 | 432 | 0 | 3 | 25 |
@@ -120,19 +126,8 @@ CI record.
 
 ## Known failures
 
-Two, recorded so neither is mistaken for a regression introduced by the
+One, recorded so it is not mistaken for a regression introduced by the
 refactor:
-
-**`test_regenerated_evidence_breaks_the_attestation` fails.** In
-`scripts/qualification/test_attest_release.py`, the suite reports 9 passed and
-this one failed. `verify()` checks the artifact digest, the current evidence
-bundle, and the signature, but never compares the attestation's recorded
-evidence-manifest digest against the digest of the current evidence manifest.
-Evidence can therefore be regenerated after an attestation is issued without
-invalidating it. This predates the branch, was not introduced here, and remains
-a release blocker — but it was missing from the first version of this file,
-because the qualification script tests were not run when the baseline was
-captured.
 
 **`ty` type check fails on `scripts/check-version-consistency.py`.** The
 `pre-commit` hook `ty (type check)` reports two `invalid-argument-type`
@@ -141,6 +136,22 @@ diagnostics at
 `expected: str` but is called with a `list[str]`. This reproduces with the
 refactor changes stashed, so it predates them. It is unrelated to the trusted
 surface and is left unchanged rather than fixed inside this stage.
+
+## Fixed after this baseline was captured
+
+The attestation defect this file originally recorded is fixed.
+`verify()` compared the artifact digest, the current evidence bundle, and the
+signature, but never compared the attestation's recorded evidence-manifest
+digest against the digest of the current manifest, so evidence could be
+regenerated after an attestation was issued without invalidating it.
+`scripts/qualification/attest_release.py` now compares the two directly, and
+`scripts/qualification/test_attest_release.py` reports 10 passed where it
+previously reported 9 passed and 1 failed.
+
+It stays recorded here rather than deleted, because the frozen baseline below
+was captured while the defect was open. Note that it was missing from the first
+version of this file entirely: the qualification script tests were not run when
+the baseline was captured, only the Rust, Python, Node, Go, and TCB suites.
 
 ## Not captured
 

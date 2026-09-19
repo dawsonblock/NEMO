@@ -106,20 +106,30 @@ def capture(root: pathlib.Path) -> dict[str, dict]:
         "workspace_members": sorted(by_id[identifier]["name"] for identifier in metadata["workspace_members"]),
     }
 
+    # Freeze both tiers. The policy distinguishes code that enforces an
+    # invariant from code that can subvert one in the same process, so a
+    # baseline that records only the first is not freezing the attack surface
+    # the policy says matters.
+    logical = report.enforcement_crates(policy)
+    in_process = report.in_process_crates(policy)
+    crates = sorted(set(logical) | set(in_process))
+    identities = {crate: report.dependency_identities(root, crate) for crate in crates}
+    measured = {crate: vars(report.measure(metadata, identities[crate], crate)) for crate in crates}
+
     dependency = {
         "crate_graph": crate_graph(metadata),
-        "trusted_direct_dependencies": {
-            crate: report.direct_dependency_names(metadata, report.dependency_identities(root, crate), crate)
-            for crate in policy["trusted"]["crates"]
+        "direct_dependencies": {
+            crate: report.direct_dependency_names(metadata, identities[crate], crate) for crate in crates
         },
     }
 
-    identities = {crate: report.dependency_identities(root, crate) for crate in policy["trusted"]["crates"]}
     trusted = {
         "policy_version": policy["version"],
-        "crates": {
-            crate: vars(report.measure(metadata, identities[crate], crate)) for crate in policy["trusted"]["crates"]
-        },
+        "logical_tcb": {crate: measured[crate] for crate in logical},
+        # Disjoint from `logical_tcb` on purpose. The effective in-process tier
+        # is the union of the two, so recording the union under a second name
+        # would double count for anyone who added the sections together.
+        "additional_in_process": {crate: measured[crate] for crate in in_process if crate not in set(logical)},
     }
 
     return {
