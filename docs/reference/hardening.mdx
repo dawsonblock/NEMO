@@ -137,6 +137,29 @@ contracts and adapter boundaries. Production authority enforcement, durable
 action/receipt storage, isolation enforcement, and outbound DLP remain
 external and unconfigured in this development release.
 
+### Trusted computing base budget
+
+`security/tcb.toml` names the crates whose failure could directly violate the
+kernel guarantees - currently `nemo-relay` and `nemo-relay-types` - and records
+what they are allowed to reach. `just tcb-report` measures the resolved
+dependency tree with `cargo tree --all-features`, counts source lines and
+`unsafe` occurrences, and fails when a trusted crate reaches a database driver
+or a foreign-function binding, or when any budget grows. The budgets are a
+ratchet: raising one is an explicit edit to the policy file, so the trusted
+surface grows in review instead of as a side effect. Source counts are upper
+bounds that include inline test modules.
+
+`security/INVARIANTS.md` records the properties the kernel protects and where
+each one is enforced, including the ones that are not yet enforced. It is the
+reference for deciding what may move out of the kernel, since a component earns
+a place there only by enforcing one of those properties. `security/BASELINE.md`
+records the frozen revision and digests the refactor is measured against.
+
+`security/layers.toml` places every workspace crate in a layer, and
+`just layer-report` fails when a dependency points upward. Edges that point the
+wrong way today are recorded as grandfathered, so the check is green on arrival
+and the layer debt can only shrink.
+
 ## Experimental effect-state contracts
 
 The opt-in kernel contracts use one consequential-effect vocabulary:
@@ -328,7 +351,13 @@ local Unix socket or verified TLS/mTLS, and verifying the versioned
 `effect_schema_migrations` ledger. Normal workers never call `migrate()`;
 that method is reserved for a dedicated migration role. Production mode rejects
 plaintext loopback PostgreSQL and identities whose environment is not
-`production`.
+`production`. The profile is not a field a caller sets next to the evidence:
+configurations are built by `production`, `qualification`, or `development`,
+and each constructor pairs its profile with the evidence that justifies it. A
+deployment therefore cannot hold a production identity while declaring a
+profile that skips production admission, and no contradictory combination is
+representable. Every profile then composes the kernel through a checked
+constructor.
 
 The adapter sets bounded pool-acquire, lock, statement, and idle-transaction
 budgets on checked-out PostgreSQL sessions. A timeout after provider dispatch

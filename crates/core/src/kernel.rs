@@ -791,14 +791,14 @@ pub struct Kernel<A, F, E, ES> {
 }
 
 impl<A, F, E, ES> Kernel<A, F, E, ES> {
-    /// Construct a kernel from an already-sealed registry without readiness.
+    /// Assemble a kernel from an already-sealed registry.
     ///
-    /// This is the development and test construction path. It performs no
-    /// production readiness checks, so it is deliberately named to make its
-    /// trust level obvious at every call site, and production code is checked
-    /// for it by an architectural test.
-    #[doc(hidden)]
-    pub fn new_unchecked_for_tests(
+    /// This is the single assembly step behind every constructor, and it
+    /// performs no admission checks of its own. It stays private so the only
+    /// reachable entry points are [`Self::new_development`] and
+    /// [`Self::new_production`], each of which applies the rules for its
+    /// profile before assembling.
+    fn assemble(
         runtime: RuntimeIdentity,
         registry: SealedCapabilityRegistry,
         router: BackendRouter<A, F, E>,
@@ -810,6 +810,22 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
             router,
             effect_store,
         }
+    }
+
+    /// Assemble a kernel without any admission check.
+    ///
+    /// Unit tests use this to prove that later stages still reject what
+    /// composition would have rejected. It is compiled only for this crate's
+    /// own test builds, so no downstream crate can reach an unchecked
+    /// constructor.
+    #[cfg(test)]
+    fn new_unchecked_for_tests(
+        runtime: RuntimeIdentity,
+        registry: SealedCapabilityRegistry,
+        router: BackendRouter<A, F, E>,
+        effect_store: ES,
+    ) -> Self {
+        Self::assemble(runtime, registry, router, effect_store)
     }
 
     /// Construct a development kernel after validating the runtime identity.
@@ -826,12 +842,7 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
     ) -> Result<Self, KernelError> {
         let sealed = registry.seal()?;
         Self::new_production_identity_check(&runtime)?;
-        Ok(Self::new_unchecked_for_tests(
-            runtime,
-            sealed,
-            router,
-            effect_store,
-        ))
+        Ok(Self::assemble(runtime, sealed, router, effect_store))
     }
 
     fn new_production_identity_check(runtime: &RuntimeIdentity) -> Result<(), KernelError> {
@@ -883,12 +894,7 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
         effect_store
             .verify_production_readiness()
             .map_err(|error| KernelError::EffectStoreNotProductionReady(error.to_string()))?;
-        Ok(Self::new_unchecked_for_tests(
-            runtime,
-            registry,
-            router,
-            effect_store,
-        ))
+        Ok(Self::assemble(runtime, registry, router, effect_store))
     }
 
     fn bind(&self, invocation: &InvocationRequest) -> Result<BoundExecutionRequest, KernelError> {

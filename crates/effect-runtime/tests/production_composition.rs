@@ -136,9 +136,6 @@ fn runtime(environment: &str) -> RuntimeIdentity {
 /// Constructors that may only appear outside production code.
 const NON_PRODUCTION_CONSTRUCTORS: &[&str] = &["new_unchecked_for_tests"];
 
-/// Paths allowed to name a non-production constructor.
-const COMPOSITION_ROOT: &str = "crates/effect-runtime/";
-
 /// The file that defines the raw constructor, and therefore may mention it.
 const CONSTRUCTOR_DEFINITION: &str = "crates/core/src/kernel.rs";
 
@@ -206,7 +203,7 @@ fn production_crates_cannot_reach_a_non_production_constructor() {
 }
 
 #[test]
-fn the_composition_root_is_the_only_non_test_user_of_the_raw_constructor() {
+fn no_crate_reaches_the_unchecked_test_constructor() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -230,14 +227,14 @@ fn the_composition_root_is_the_only_non_test_user_of_the_raw_constructor() {
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .any(|line| line.contains("Kernel::new_unchecked_for_tests("));
-            if calls && !path.starts_with(COMPOSITION_ROOT) {
+            if calls {
                 offenders.push(path);
             }
         }
     }
     assert!(
         offenders.is_empty(),
-        "only {COMPOSITION_ROOT} may compose a kernel directly, found: {offenders:?}"
+        "no crate may compose a kernel through the unchecked test constructor, found: {offenders:?}"
     );
 }
 
