@@ -366,6 +366,29 @@ impl CompositionFixture {
         )
         .expect("connect composition owner store")
     }
+
+    /// Build the runtime store over a transport that may attest readiness.
+    ///
+    /// The fixture's own connection is the explicitly local test transport,
+    /// which is correct for creating the schema and the roles and can never
+    /// attest production readiness. Verified TLS is the transport a CI database
+    /// can actually serve, so this reads its trust root from
+    /// `NEMO_RELAY_TEST_POSTGRES_TLS_CA` and returns `None` when it is absent.
+    fn verified_runtime_store(&self) -> Option<PostgresEffectStore> {
+        let ca_path = std::env::var("NEMO_RELAY_TEST_POSTGRES_TLS_CA").ok()?;
+        let root_ca_pem = std::fs::read(ca_path).ok()?;
+        Some(
+            PostgresEffectStore::connect_verified_tls_with_budgets(
+                &self.runtime_url,
+                &self.schema,
+                LeaseConfiguration::default(),
+                4,
+                &root_ca_pem,
+                nemo_relay_ledger::postgres::PostgresOperationBudgets::default(),
+            )
+            .expect("connect verified TLS runtime store"),
+        )
+    }
 }
 
 impl Drop for CompositionFixture {
@@ -379,6 +402,36 @@ impl Drop for CompositionFixture {
             let _ = admin.batch_execute(&format!("drop role if exists \"{}\"", self.role));
         }
     }
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_verified_transport_composes_a_production_kernel() {
+    let Some(fixture) = CompositionFixture::create() else {
+        eprintln!("skipping: NEMO_RELAY_TEST_POSTGRES_URL or role creation unavailable");
+        return;
+    };
+    let Some(store) = fixture.verified_runtime_store() else {
+        eprintln!(
+            "skipping: set NEMO_RELAY_TEST_POSTGRES_TLS_CA to a trust root the server \
+             presents, so the transport can attest production readiness"
+        );
+        return;
+    };
+
+    // The negative cases prove a bad production composition is rejected. This
+    // one proves the path still exists at all: without it the suite would stay
+    // green if production startup became impossible in every configuration.
+    let kernel = Kernel::new_production(
+        runtime("production"),
+        registry(&[ExecutionClass::Mutation])
+            .seal()
+            .expect("seal registry"),
+        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        store,
+    )
+    .expect("a verified transport with a ready durable store must compose");
+    assert_eq!(kernel.registry_digest().len(), 64);
 }
 
 #[test]

@@ -1290,6 +1290,9 @@ test-postgres-db-failure-boundaries:
 # E3.2 runtime composition: production construction ownership, registry sealing,
 # and fail-closed production startup. The two database-backed cases need
 # NEMO_RELAY_TEST_POSTGRES_URL; the architectural and sealing cases do not.
+# The positive case also needs NEMO_RELAY_TEST_POSTGRES_TLS_CA, because the
+# transport has to be one that can attest production readiness; it skips with a
+# printed reason when that is unset.
 test-runtime-composition:
     cargo test --locked -p nemo-effect-runtime --test production_composition -- --include-ignored --test-threads=1
 
