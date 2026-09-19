@@ -29,21 +29,12 @@ use nemo_relay_ledger::unstable::{
     is_valid_pre_dispatch_failure_finalization,
 };
 
-/// Every lifecycle state.
+/// Every lifecycle state, taken from the enum's own enumeration.
 ///
-/// The exhaustive `name` match below fails to compile if a variant is added, so
-/// this array cannot silently fall behind the enum.
-const ALL: [ExecutionState; 9] = [
-    ExecutionState::Proposed,
-    ExecutionState::Authorized,
-    ExecutionState::Prepared,
-    ExecutionState::Dispatching,
-    ExecutionState::Committed,
-    ExecutionState::Failed,
-    ExecutionState::Unknown,
-    ExecutionState::Reconciling,
-    ExecutionState::Cancelled,
-];
+/// The list lives with the enum so the state space has one definition. The
+/// exhaustive `name` match below still fails to compile if a variant is added,
+/// which is what forces `ExecutionState::ALL` to be extended too.
+const ALL: [ExecutionState; 9] = ExecutionState::ALL;
 
 /// States that end the lifecycle.
 const TERMINAL: [ExecutionState; 3] = [

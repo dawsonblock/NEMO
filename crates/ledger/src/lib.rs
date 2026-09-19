@@ -80,6 +80,26 @@ pub mod unstable {
         Cancelled,
     }
 
+    impl ExecutionState {
+        /// Every lifecycle state, in lifecycle order.
+        ///
+        /// Exhaustive checks iterate this list instead of repeating it, so the
+        /// state space has exactly one definition. Adding a variant makes the
+        /// exhaustive match in those checks fail to compile, which is where
+        /// this array is noticed and extended.
+        pub const ALL: [ExecutionState; 9] = [
+            ExecutionState::Proposed,
+            ExecutionState::Authorized,
+            ExecutionState::Prepared,
+            ExecutionState::Dispatching,
+            ExecutionState::Committed,
+            ExecutionState::Failed,
+            ExecutionState::Unknown,
+            ExecutionState::Reconciling,
+            ExecutionState::Cancelled,
+        ];
+    }
+
     /// Return whether a transition exists in the abstract effect lifecycle.
     ///
     /// This describes the state graph only. Store methods must additionally
