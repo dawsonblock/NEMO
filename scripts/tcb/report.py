@@ -24,10 +24,10 @@ them, which reports coupling that no build actually links.
 Two resolution properties are pinned rather than only counted. The transitive
 metric counts *resolved identities* (name and version), so two versions of one
 package are two entries instead of collapsing to one name. Each crate's direct
-and transitive dependency *sets* are also hashed and compared against the
-recorded digest, so replacing a dependency with a different one cannot pass by
-keeping the count the same. The size budgets stay ceilings, and the policy file
-says so.
+and transitive dependency sets are also hashed and compared against the
+recorded digest, and those digests cover the resolved identities too, so neither
+replacing a dependency nor changing its version can pass by keeping the count
+the same. The size budgets stay ceilings, and the policy file says so.
 
 Source metrics cover every file under a crate's ``src`` directory, including
 inline test modules, and count every textual ``unsafe`` token without trying to
@@ -181,6 +181,11 @@ def measure(metadata: dict, identities: list[str], crate: str) -> Metrics:
     crate_dir = pathlib.Path(by_name[crate]["manifest_path"]).parent / "src"
     source_files, source_lines, unsafe_occurrences = source_metrics(crate_dir)
     direct = direct_dependency_names(metadata, identities, crate)
+    direct_names = set(direct)
+    # Pin the resolved identities, not just the package names. Hashing names
+    # alone would let a dependency change version without moving either the
+    # count or the digest, which is the whole point of pinning the set.
+    direct_identities = {identity for identity in identities if identity.split("@", 1)[0] in direct_names}
     return Metrics(
         crate=crate,
         source_files=source_files,
@@ -188,8 +193,8 @@ def measure(metadata: dict, identities: list[str], crate: str) -> Metrics:
         unsafe_occurrences=unsafe_occurrences,
         direct_dependencies=len(direct),
         transitive_packages=len(identities),
-        direct_dependency_digest=dependency_digest(set(direct)),
-        transitive_dependency_digest=dependency_digest(identity_names(identities)),
+        direct_dependency_digest=dependency_digest(direct_identities),
+        transitive_dependency_digest=dependency_digest(set(identities)),
     )
 
 

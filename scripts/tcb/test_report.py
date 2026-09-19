@@ -70,6 +70,32 @@ def test_dependency_digest_ignores_order_but_not_membership() -> None:
     assert report.dependency_digest({"a", "b"}) != report.dependency_digest({"a", "c"})
 
 
+def test_dependency_digest_distinguishes_versions() -> None:
+    # The digest is computed over resolved identities. Hashing the package names
+    # instead would make a version change invisible to both the count and the
+    # digest.
+    assert report.dependency_digest({"foo@1.0.0"}) != report.dependency_digest({"foo@2.0.0"})
+
+
+def test_a_transitive_version_change_fails_the_gate(tmp_path: pathlib.Path) -> None:
+    policy = {
+        "forbidden": {},
+        "limits": {
+            "nemo-relay": {
+                "transitive_dependency_digest": report.dependency_digest({"serde@1.0.0"}),
+            }
+        },
+    }
+
+    _, problems = report.find_violations(
+        metadata(tmp_path),
+        {"nemo-relay": ["serde@2.0.0"]},
+        policy,
+    )
+
+    assert any("transitive_dependency_digest changed" in item for item in problems)
+
+
 def test_a_swapped_direct_dependency_fails_even_though_the_count_matches(
     tmp_path: pathlib.Path,
 ) -> None:

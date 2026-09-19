@@ -87,9 +87,9 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 # and a gate that demands a file edit for every commit gets switched off.
 #
 # The `*_dependency_digest` fields are the ratchet that does not depend on the
-# counts. They pin the resolved dependency *sets*, so removing a harmless
-# package and adding a dangerous one cannot pass by keeping the count equal,
-# and shrinking a set also fails until the digest is refreshed here.
+# counts. They pin the resolved dependency sets *including versions*, so
+# removing a harmless package and adding a dangerous one cannot pass by keeping
+# the count equal, and a version change cannot pass at all.
 #
 # Source lines and `unsafe` tokens count every file under the crate's `src`,
 # including inline test modules, and count `unsafe` textually without trying to
@@ -100,93 +100,93 @@ max_direct_dependencies = 39
 max_transitive_packages = 264
 max_source_lines = 71190
 max_unsafe_occurrences = 299
-direct_dependency_digest = "67e12bc2c2eada037886632599a6ba0776437ccad20946f7391765e82fade065"
-transitive_dependency_digest = "9c50d4c299f763c50094e75aec0ddd53ce06e4c7c8ead62f30e111b4cc7c1678"
+direct_dependency_digest = "337262e231b6c5e7b0b994eb7f908a065c71eb704aeeabcd8aa1d30ce4b0c074"
+transitive_dependency_digest = "1f07d1eb5bb9bb7c4bef8388e67f6b0df3a7a892b31eb1ce4b388a164f6d76a3"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
 max_transitive_packages = 25
 max_source_lines = 3681
 max_unsafe_occurrences = 0
-direct_dependency_digest = "29b46ac95ea3299fa226b19057c808fa984d9cf9d80b6700d83e3212e71e1150"
-transitive_dependency_digest = "4091359e0342f78b247f613d90d2cd00b115de970924e85a7964a08e79347ae5"
+direct_dependency_digest = "11e4bcc51abb330176957e169b265053384410421ab598cf026210efe3e2cfb9"
+transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d92cc3dfc4d7fd800"
 
 [limits.nemo-relay-authority]
 max_direct_dependencies = 3
 max_transitive_packages = 25
 max_source_lines = 432
 max_unsafe_occurrences = 0
-direct_dependency_digest = "f2ca37b9e39b1cfbc63bad5592b355f3b1b2f863d73de53134852ef3a0638444"
-transitive_dependency_digest = "bb61c69b328c93a0a6296704471f8a0231bd4869f1d0dbb0253bd7358031366a"
+direct_dependency_digest = "9fae7fb7e93e5b7c52cec0724706e33f05c6661099a052e9a6396bb488c5e868"
+transitive_dependency_digest = "1bd38d02f0ff5a95879f297e80a1228e3134581b2259ef41b8e7b4d6afd5b56a"
 
 [limits.nemo-relay-executor]
 max_direct_dependencies = 3
 max_transitive_packages = 24
 max_source_lines = 572
 max_unsafe_occurrences = 0
-direct_dependency_digest = "01cf712eaa393dd8c669c3fbaeb2902df9eb36583b7ae3fc519c3cff0ddada35"
-transitive_dependency_digest = "58a6a3bf090457569441d5a6ba8d17ed2593d6d9f99fb8bf7c56c69306ab0973"
+direct_dependency_digest = "a90a24766158d1bb42a2f71ad6465fde07f0f1a4d25438094ac5a4e00e0de990"
+transitive_dependency_digest = "02727ca18aa700058735ed8fb9afc0fe4fec245d605ebbe94a6993cb74432d72"
 
 [limits.nemo-relay-ledger]
 max_direct_dependencies = 9
 max_transitive_packages = 106
 max_source_lines = 9176
 max_unsafe_occurrences = 0
-direct_dependency_digest = "92373a6c3c8a6312e1d3b64d981c2fe94cefeddbc6602b9f70fbe49b1bc4c811"
-transitive_dependency_digest = "157d7b132e3b799b50bbb6d84a2c39b4fe9efc85b9af1a48a1ce9ba92defb256"
+direct_dependency_digest = "02e902c5c51bdce194bcd36fc2a50e4af2468a338a405f1db48b6bc6dcbddcf2"
+transitive_dependency_digest = "1e5116e90ef0d74d6165fdbe239ac51fa536f8375be84749b3ba86fa0784d0ac"
 
 [limits.nemo-relay-plugin]
 max_direct_dependencies = 6
 max_transitive_packages = 39
 max_source_lines = 5055
 max_unsafe_occurrences = 315
-direct_dependency_digest = "6811b76e1df957ea814c8b9dae9ae9275ca5267b4488d2a926f891503e1a60fc"
-transitive_dependency_digest = "8383f9b4cf799ca37bab6f9e9755c0898b95a2e9cb6f262e3de2757d611b1030"
+direct_dependency_digest = "c86fd580622db0b895e08d9ac8092f41be20e3e1eb4767b7f1d6c22a989ab1ec"
+transitive_dependency_digest = "9bc8864a9ca6215adb9194008a652fee077ae25f65f56cd6a10e07b44c0ced92"
 
 [limits.nemo-relay-worker-proto]
 max_direct_dependencies = 5
 max_transitive_packages = 97
 max_source_lines = 63
 max_unsafe_occurrences = 0
-direct_dependency_digest = "5f7713816b1163f9df12be1a0bd1263f0d4be1c099c8062cd66894490c457527"
-transitive_dependency_digest = "fc7a3fbef166168eb8f67a6e46999a5990534e37dff425fc48b0eed554e17978"
+direct_dependency_digest = "312841b91a4e54c298b1c092e9747e6d2d89d09089899df908bc4703dc8e4bb7"
+transitive_dependency_digest = "f182378dd10c8c07d8544097889fd5fe3b308e626c30bf1970f7a9b2bd92a817"
 
 [limits.nemo-relay-adaptive]
 max_direct_dependencies = 16
 max_transitive_packages = 223
 max_source_lines = 18355
 max_unsafe_occurrences = 3
-direct_dependency_digest = "35dc3acb41d746d352d1ee8ee80e58d55ca8875af4f628a23be2db0ee15c6ce1"
-transitive_dependency_digest = "e8def58eb7843450d10b88609c5aa980511223ce106f5eb1bcd59dcb74c68e0b"
+direct_dependency_digest = "331568db3de0a45bb18a65209ac977b74010caa4f161552c292e5f42b79e2663"
+transitive_dependency_digest = "7e20f8d43536cbd956c28c621822ce6ecb33c20e2e84a3988b7dbe49e71aff87"
 
 [limits.nemo-relay-pii-redaction]
 max_direct_dependencies = 7
 max_transitive_packages = 214
 max_source_lines = 4869
 max_unsafe_occurrences = 0
-direct_dependency_digest = "b3585dc2c10e7c6afbafcc3ad2a161263afc69291b9e0440fb888b488f697e9e"
-transitive_dependency_digest = "8c659c02204278e6321b42f762cb57f51e34bb546931b0aaf101e768fb35bec8"
+direct_dependency_digest = "53d627f83c8ce0f7e8da4fa458a586b8353029500ba62c880d6bf34638c1811d"
+transitive_dependency_digest = "164b70b43bd34cc8ab70fc14b19ca28e2b5a99eded5a4183739c995532a66734"
 
 [limits.nemo-relay-dlp]
 max_direct_dependencies = 2
 max_transitive_packages = 11
 max_source_lines = 65
 max_unsafe_occurrences = 0
-direct_dependency_digest = "898bac892d25c49838080d7e439c23d722e5e4d5fc0c4cfd6f63f63bcf7c6d34"
-transitive_dependency_digest = "77761fa9f0e0a2c4600dfb2ba2b67ad2290342abea974d7c6fbbdabaef7d611a"
+direct_dependency_digest = "61f0d467ff7dcef34a5ee880322c96547f4afd65c3d7072d27aa790f26e4fd7e"
+transitive_dependency_digest = "daa262b6020edd226f6c6a617afacffcd16f230368b3bb4d02ce09204ebdc74d"
 
 [limits.nemo-relay-isolation]
 max_direct_dependencies = 1
 max_transitive_packages = 7
 max_source_lines = 68
 max_unsafe_occurrences = 0
-direct_dependency_digest = "8b917c4b6163bc82ef4aff025c6f5f4d54205232c4595f39b7b43008256a6cb7"
-transitive_dependency_digest = "655f113e247392496c052a121de3485f9417d60e3139501d04e61ac659dcbf02"
+direct_dependency_digest = "819e4805cffa04c184b80f3cdacbbcd43983a38650a417842ee7be4dadc1ea74"
+transitive_dependency_digest = "e0bbdf96638cc171acc2b9f7b95b4a34fb959a94d70849104e345c69c9471f7f"
 
 [limits.nemo-effect-runtime]
 max_direct_dependencies = 3
 max_transitive_packages = 243
 max_source_lines = 589
 max_unsafe_occurrences = 0
-direct_dependency_digest = "08d1bc4f247c4be48c173c4eb6dc4b89d148956e12f6abafab93bc080638a1a9"
-transitive_dependency_digest = "47e81cd70592777b4709e36bab7d2d6cb4e5ec8da2ea4570be0dae875f5f25e5"
+direct_dependency_digest = "59b383378c3be1f4d7e84e04ad1fc400c2233b2df975f3816d2d5948f5f73f98"
+transitive_dependency_digest = "f173d6a551bfb6ad9157f77ad07081ebe5aa4cce1c8ab378e6ecf844ab4ec85a"
