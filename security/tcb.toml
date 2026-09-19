@@ -106,7 +106,7 @@ transitive_dependency_digest = "1f07d1eb5bb9bb7c4bef8388e67f6b0df3a7a892b31eb1ce
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
 max_transitive_packages = 25
-max_source_lines = 3681
+max_source_lines = 3760
 max_unsafe_occurrences = 0
 direct_dependency_digest = "11e4bcc51abb330176957e169b265053384410421ab598cf026210efe3e2cfb9"
 transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d92cc3dfc4d7fd800"
@@ -120,28 +120,28 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 # documentation. That is the price of an upper bound that cannot hide a token,
 # and it means a prose change can move this number.
 [limits.nemo-relay-plugin-protocol]
-max_direct_dependencies = 2
-max_transitive_packages = 13
-max_source_lines = 383
+max_direct_dependencies = 3
+max_transitive_packages = 24
+max_source_lines = 561
 max_unsafe_occurrences = 3
-direct_dependency_digest = "bd4b7af49da2622c3f36b9bc8d284ffeb126deacce8fcd8113f73a335c542747"
-transitive_dependency_digest = "108e1b5b6140bdb66473662b39389eeec866f70fbe24b3cf1219afe41683175e"
+direct_dependency_digest = "162268fbc27e2215997bfa17dcb031b17721a67d59e8159c8f8ace95cd5ce9f8"
+transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
 
 [limits.nemo-relay-authority]
 max_direct_dependencies = 3
-max_transitive_packages = 25
+max_transitive_packages = 34
 max_source_lines = 432
 max_unsafe_occurrences = 0
 direct_dependency_digest = "9fae7fb7e93e5b7c52cec0724706e33f05c6661099a052e9a6396bb488c5e868"
-transitive_dependency_digest = "1bd38d02f0ff5a95879f297e80a1228e3134581b2259ef41b8e7b4d6afd5b56a"
+transitive_dependency_digest = "323f7d63c70c92c75627b285090fe8e2610565df92bff434c7bafd40e3901b0a"
 
 [limits.nemo-relay-executor]
-max_direct_dependencies = 3
-max_transitive_packages = 24
-max_source_lines = 572
+max_direct_dependencies = 4
+max_transitive_packages = 33
+max_source_lines = 555
 max_unsafe_occurrences = 0
-direct_dependency_digest = "a90a24766158d1bb42a2f71ad6465fde07f0f1a4d25438094ac5a4e00e0de990"
-transitive_dependency_digest = "02727ca18aa700058735ed8fb9afc0fe4fec245d605ebbe94a6993cb74432d72"
+direct_dependency_digest = "72f88f4f4d1c72fdb4c1a4f56afa48e9bbd07049aa83fc7131636693cf3b1bf5"
+transitive_dependency_digest = "1eef55b4e8ac605c5ce170bd8eb8604d56c35d9aa2f819f9c73723cc021c2df1"
 
 [limits.nemo-relay-ledger]
 max_direct_dependencies = 9

@@ -22,6 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
+
 /// Version of the wire contract.
 ///
 /// Bumped whenever any type below changes shape, because the two sides of the
@@ -151,6 +153,89 @@ pub struct PluginHostHealth {
     pub accepting_work: bool,
     /// Instances the host currently holds.
     pub loaded: Vec<PluginHandle>,
+}
+
+/// Identity, binding, and budget for one operation.
+///
+/// Every operation carries one of these, and the implementation is not free to
+/// invent its own: a process backend that derived its own deadline or frame
+/// budget from somewhere else would be enforcing a different contract than the
+/// in-process one, and the two would drift the first time either changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutionContext {
+    /// Correlation identifier for this operation.
+    ///
+    /// Host calls made by the plugin while it runs carry the same identifier, so
+    /// a call belongs to exactly one operation even when several are in flight.
+    pub request_id: String,
+    /// Protocol version the caller speaks.
+    pub protocol_version: u16,
+    /// Digest of the runtime identity this operation is bound to.
+    pub runtime_binding_digest: String,
+    /// Wall-clock deadline in milliseconds since the Unix epoch.
+    pub deadline_unix_ms: u64,
+    /// Largest response the caller will accept.
+    pub max_response_bytes: u32,
+}
+
+/// Result of one operation together with what is known about dispatch.
+///
+/// A failure alone is not enough to decide what happens next. If a plugin that
+/// performs a consequential external operation dies after dispatch, the effect
+/// may have happened, and the runtime has to record `UNKNOWN` rather than
+/// `FAILED`. Reporting dispatch alongside the result keeps that decision
+/// available instead of collapsing it into the failure enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutionOutcome {
+    /// Whether the plugin may have reached an external system.
+    pub dispatch: DispatchState,
+    /// Certainty about the outcome.
+    pub certainty: OutcomeCertainty,
+    /// The response, or the structured failure that replaced it.
+    pub result: Result<PluginResponse, PluginFailure>,
+}
+
+/// Something a plugin asks the host to do while it is running.
+///
+/// The native ABI hands plugins a table of host function pointers, so today
+/// these are direct calls. Across a process boundary each one becomes a
+/// correlated request, which is what makes it safe to interleave with the
+/// operation already in flight.
+///
+/// The ABI's string and memory helpers (`string_new`, `string_free`, and the
+/// data and length accessors) have no counterpart here. They exist because the
+/// in-process boundary passes raw pointers that someone has to own and free; a
+/// framed message carries its own bytes, so keeping them would be importing an
+/// artefact of the boundary that is being removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "capability")]
+pub enum HostCallCapability {
+    /// Read the scope stack the current operation runs inside.
+    ScopeStack,
+    /// Pull the next item of a downstream LLM stream.
+    DownstreamLlmStream,
+    /// Encode or decode an LLM request or response payload.
+    PayloadCodec,
+}
+
+/// A call from the plugin into the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCall {
+    /// Operation this call belongs to.
+    pub request_id: String,
+    /// What the plugin is asking for.
+    pub capability: HostCallCapability,
+    /// Canonical JSON arguments.
+    pub arguments: String,
+}
+
+/// The host's answer to a [`HostCall`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCallResponse {
+    /// The call this answers.
+    pub request_id: String,
+    /// Canonical JSON result, or a structured failure.
+    pub result: Result<String, PluginFailure>,
 }
 
 /// One request across the boundary.
@@ -299,9 +384,102 @@ pub fn check_frame_len(len: u64) -> Result<(), PluginProtocolError> {
     ))
 }
 
+/// Return whether `deadline_unix_ms` has passed at `now_unix_ms`.
+pub const fn deadline_expired(deadline_unix_ms: u64, now_unix_ms: u64) -> bool {
+    now_unix_ms >= deadline_unix_ms
+}
+
+/// Check a deadline against a supplied instant.
+///
+/// Split from the clock-reading form so the rule itself is testable. The
+/// boundary is inclusive at the deadline: at the deadline there is no time left,
+/// so the operation is refused rather than started and abandoned.
+pub fn check_deadline_at(
+    deadline_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<(), PluginProtocolError> {
+    if !deadline_expired(deadline_unix_ms, now_unix_ms) {
+        return Ok(());
+    }
+    Err(PluginProtocolError::new(
+        PluginFailureCode::DeadlineExceeded,
+        format!(
+            "the operation deadline ({deadline_unix_ms} ms since the epoch) had already \
+             passed at {now_unix_ms} ms"
+        ),
+    ))
+}
+
+/// Check a deadline against the wall clock.
+///
+/// The caller is expected to refuse the operation without invoking the backend
+/// when this fails, because an operation that is already out of time cannot
+/// produce a result anyone is still waiting for.
+pub fn check_deadline(deadline_unix_ms: u64) -> Result<(), PluginProtocolError> {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
+    check_deadline_at(deadline_unix_ms, now_unix_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deadline_is_refused_at_the_boundary_and_before_it() {
+        // At the deadline there is no time left, so the operation must not
+        // start. A comparison that allowed equality would start work that is
+        // already out of time.
+        assert!(check_deadline_at(1_000, 1_000).is_err());
+        assert!(check_deadline_at(1_000, 1_001).is_err());
+        assert!(check_deadline_at(1_000, 999).is_ok());
+    }
+
+    #[test]
+    fn an_expired_deadline_is_reported_as_a_deadline_and_not_a_crash() {
+        // A host killed because the deadline passed is still a deadline. Losing
+        // that distinction would make a timeout indistinguishable from a
+        // process that died on its own.
+        let failure = check_deadline_at(1_000, 1_000).expect_err("expired");
+        assert_eq!(failure.failure.code, PluginFailureCode::DeadlineExceeded);
+        assert_ne!(failure.failure.code, PluginFailureCode::HostCrashed);
+    }
+
+    #[test]
+    fn dispatch_certainty_travels_with_the_result() {
+        let outcome = PluginExecutionOutcome {
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+            result: Err(PluginFailure {
+                code: PluginFailureCode::HostCrashed,
+                message: "the plugin host exited during dispatch".into(),
+            }),
+        };
+
+        let encoded = serde_json::to_string(&outcome).expect("encode outcome");
+        let decoded: PluginExecutionOutcome = serde_json::from_str(&encoded).expect("decode");
+
+        assert_eq!(decoded, outcome);
+        // The point of the envelope: the failure is not reported as a definite
+        // outcome, so a caller cannot turn it into FAILED.
+        assert_eq!(decoded.certainty, OutcomeCertainty::Unknown);
+        assert_eq!(decoded.dispatch, DispatchState::DispatchAttempted);
+    }
+
+    #[test]
+    fn a_host_call_is_correlated_with_the_operation_that_made_it() {
+        let call = HostCall {
+            request_id: "operation-7".into(),
+            capability: HostCallCapability::DownstreamLlmStream,
+            arguments: "{}".into(),
+        };
+        let encoded = serde_json::to_string(&call).expect("encode host call");
+
+        assert!(encoded.contains(r#""request_id":"operation-7""#));
+        assert!(encoded.contains(r#""capability":"downstream_llm_stream""#));
+    }
 
     #[test]
     fn the_contract_speaks_one_version_and_accepts_it() {

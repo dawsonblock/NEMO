@@ -69,6 +69,61 @@ Each one leaves the repository buildable, and none of them is the endpoint.
    development and tests only, or removed. The layer gate is tightened so core
    cannot regain a dependency on the native implementation.
 
+## What the boundary actually has to carry
+
+Reconnaissance for increment 2 changed the shape of the work, and it is
+recorded here because it determines whether increments 3-5 are migrations or
+another redesign.
+
+**The native ABI is bidirectional and callback-based, not request/response.**
+`crates/plugin` defines a table of host functions the plugin calls while it
+runs (`NemoRelayNativeHostApiV1`, `V3`, `V4`) *and* callbacks the host re-enters
+(`NemoRelayNativePluginV1.register`, `validate`, `drop`, plus per-component
+callbacks for LLM execution, streaming, middleware, event subscription, and
+payload codecs). A protocol that only carries caller-to-plugin requests cannot
+express the majority of what native plugins do today.
+
+**Part of the host API is an artefact of the in-process boundary.**
+`string_new`, `string_data`, `string_len`, `string_free`, and the thread-local
+error accessors exist because raw pointers cross an FFI boundary and someone has
+to own and free them. A framed message carries its own bytes, so those have no
+counterpart in the contract, and the contract says so rather than importing
+them.
+
+**The loader's public surface is narrow; its integration is not.**
+`crates/core/src/plugin/dynamic/native.rs` exposes three items —
+`NativePluginLoadSpec`, `NativePluginActivation`, and `load_native_plugins` —
+and core imports the ABI crate in exactly one place, `native.rs:58`. But
+`load_native_plugins` registers an adapter that implements core's own `Plugin`
+trait, so a native plugin is currently an in-process Rust object with live
+callbacks rather than a remote endpoint. Moving the loader across a process
+boundary means replacing that object with an RPC-backed proxy implementing the
+same trait, which is a change to plugin semantics, not a file move.
+
+**The compatibility backend cannot be built before that.** The in-process
+backend is supposed to live outside core, but a crate implementing a core-owned
+trait must depend on core, and core depends on the ABI crate only because its
+own loader needs it. The loader therefore has to leave core at the same time the
+backend does, and core's plugin system has to reach it through injection rather
+than by calling it. Coupling increments 2 and 4 is the honest reading; the
+alternative is an in-process backend inside core, which is the thing this
+milestone exists to prevent.
+
+**Consumer classification**, before assuming compatibility is possible:
+
+| Consumer | Usage | Compatibility risk |
+|---|---|---|
+| `crates/node` | `DynamicPluginActivationSpec`, `DynamicPluginKind`, `PluginHostActivation` | Types only, re-exportable |
+| `crates/ffi` | `DynamicPluginActivationSpec`, `PluginHostActivation`, plus core's plugin registry API | Types only, re-exportable |
+| `crates/cli` | `load_native_plugins`, `load_worker_plugins`, `NativePluginLoadSpec`, `NativePluginActivation` | The only caller of the loader entry point outside core |
+| `crates/core/tests` | The same types and entry point | Test-only |
+
+No consumer constrains the loader's internals or pattern-matches on them, so a
+facade that re-exports *contract* types without re-exporting implementation
+types is viable. `cli` is the one place that has to move to the injected
+backend rather than to a re-export, because it is the only external caller of
+`load_native_plugins`.
+
 ## Acceptance gates
 
 - `nemo-relay` contains no native dynamic-loading implementation.
@@ -87,6 +142,37 @@ Each one leaves the repository buildable, and none of them is the endpoint.
 
 ## Status
 
-Increment 1 is complete. The next step is increment 2: take the interface into
-`nemo-relay` and route the existing loader behind it without changing behaviour,
-which is where the layer gate starts constraining the shape of the extraction.
+Increment 1 is complete. Increment 2 is started and its boundary design is in
+place:
+
+- `nemo-relay-plugin-protocol` now carries `PluginExecutionContext` (request
+  correlation, protocol version, runtime binding, deadline, response budget),
+  `PluginExecutionOutcome` (the result together with `DispatchState` and
+  `OutcomeCertainty`, so a plugin failure cannot pass for a definite outcome),
+  the `HostCall` direction the plugin uses to call back into the host, and the
+  deadline rules below.
+- `DispatchState` and `OutcomeCertainty` moved to `nemo-relay-types` and are
+  re-exported from `nemo-relay-executor`, because the contract needs that
+  vocabulary and a contract crate cannot depend on an adapter. Duplicating a
+  classification that decides whether an effect may be retried is how the two
+  copies drift apart.
+
+Deadline rules, defined before any implementation so the process backend cannot
+invent its own: a deadline that has already passed means the caller does not
+invoke the backend at all and reports `DeadlineExceeded`; a deadline that passes
+during execution is reported as `DeadlineExceeded`; and a host terminated
+*because* the deadline passed is still `DeadlineExceeded`, not `HostCrashed`,
+which is reserved for a host that ended on its own.
+
+The core-owned trait and the injected backend are deliberately not written yet.
+The finding above is the reason: a trait whose operations are
+load/invoke/inspect/health would omit the callback flows that most native
+plugins use, and its shape is what decides whether the remaining increments are
+migrations or a redesign. The next step is to model host-to-plugin callback
+delivery in the contract — correlated, bounded, and carrying the same dispatch
+vocabulary — and then design the trait against both directions at once.
+
+This increment does not move `kernel-process unsafe tokens`. That number is
+expected to fall when native loading physically crosses the process boundary in
+increments 4-5, and a reduction achieved by reclassifying crates would not mean
+anything.

@@ -13,6 +13,7 @@ description = "Stable contract for executing native plugins outside the kernel p
 workspace = true
 
 [dependencies]
+nemo-relay-types.workspace = true
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
