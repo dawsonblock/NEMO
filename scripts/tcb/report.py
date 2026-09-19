@@ -273,6 +273,7 @@ def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dic
         "",
         f"  {'tier':<26}{'crates':>7}{'lines':>10}{'unsafe':>9}",
     ]
+    kernel_process_unsafe = 0
     for label, crates in (
         ("invariant-enforcing", enforcement_crates(policy)),
         ("in-process", in_process_crates(policy)),
@@ -280,7 +281,14 @@ def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dic
         measured = [measure(metadata, identities[crate], crate) for crate in crates]
         total_lines = sum(item.source_lines for item in measured)
         total_unsafe = sum(item.unsafe_occurrences for item in measured)
+        if label == "in-process":
+            kernel_process_unsafe = total_unsafe
         rows.append(f"  {label:<26}{len(crates):>7}{total_lines:>10}{total_unsafe:>9}")
+    # The milestone that moves native plugin loading across a process boundary is
+    # measured by this number rather than by the total over the logical core
+    # crates. The question is what can corrupt the kernel, and a loader in a
+    # different crate inside the same process still can.
+    rows.extend(["", f"  kernel-process unsafe tokens: {kernel_process_unsafe}"])
     return "\n".join(rows)
 
 

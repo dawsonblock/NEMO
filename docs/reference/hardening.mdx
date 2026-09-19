@@ -190,6 +190,14 @@ A grandfathered entry that no longer describes a real edge fails too, so the
 layer debt can only shrink and an exception cannot be reused by a later
 regression.
 
+`security/PLUGIN-ISOLATION.md` records the milestone that moves native plugin
+loading across a process boundary. Almost all of the kernel's `unsafe` is the
+native plugin path, and relocating that loader to another crate would leave the
+same code in the same address space, so the milestone is judged on
+`kernel-process unsafe tokens` from `just tcb-report` rather than on crate
+organisation. The message contract already exists in
+`crates/plugin-protocol`; the kernel does not depend on it yet.
+
 ## Experimental effect-state contracts
 
 The opt-in kernel contracts use one consequential-effect vocabulary:
