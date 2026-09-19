@@ -25,10 +25,6 @@ const LOADER_PATHS: &[&str] = &["core:plugin/dynamic/native.rs"];
 const LOAD_CALL_PATHS: &[&str] = &[
     "core:plugin/dynamic/native.rs",
     "core:plugin/dynamic/host.rs",
-    // The CLI reaches the loader directly today. This is the exception the
-    // milestone's third increment removes, and it is listed rather than left
-    // implicit so the guard keeps meaning something for everyone else.
-    "cli:server/mod.rs",
 ];
 
 /// Tokens that only a native loader has any business containing.

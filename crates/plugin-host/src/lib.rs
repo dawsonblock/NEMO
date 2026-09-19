@@ -19,17 +19,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nemo_relay::plugin::dynamic::{
     NativePluginActivation, NativePluginLoadSpec, load_native_plugins,
 };
-use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFuture};
+use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFuture, PluginManager};
 use nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION;
 use nemo_relay_plugin_protocol::{
     PROTOCOL_VERSION, PluginDescriptor, PluginExecutionContext, PluginFailure, PluginFailureCode,
-    PluginHandle, PluginHostHealth, PluginInspectRequest, PluginLoadRequest, PluginProtocolError,
-    PluginUnloadRequest,
+    PluginHandle, PluginHostHealth, PluginInspectRequest, PluginLoadRequest, PluginLoadResponse,
+    PluginProtocolError, PluginUnloadRequest,
 };
 
 /// A plugin loaded through the in-process loader.
@@ -113,7 +113,7 @@ impl PluginExecutionBackend for InProcessPluginBackend {
         &'a self,
         request: PluginLoadRequest,
         _context: PluginExecutionContext,
-    ) -> PluginExecutionFuture<'a, PluginDescriptor> {
+    ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
         Box::pin(async move {
             if self.loaded().contains_key(&request.plugin_id) {
                 return Err(refused(format!(
@@ -141,18 +141,19 @@ impl PluginExecutionBackend for InProcessPluginBackend {
                     })
                     .collect(),
             };
+            let handle = PluginHandle {
+                plugin_id: request.plugin_id.clone(),
+                generation,
+            };
             self.loaded().insert(
                 request.plugin_id.clone(),
                 LoadedPlugin {
-                    handle: PluginHandle {
-                        plugin_id: request.plugin_id,
-                        generation,
-                    },
+                    handle: handle.clone(),
                     descriptor: descriptor.clone(),
                     _activation: activation,
                 },
             );
-            Ok(descriptor)
+            Ok(PluginLoadResponse { handle, descriptor })
         })
     }
 
@@ -228,6 +229,69 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 }
 
 pub mod conformance;
+
+/// Native plugins loaded through a backend, kept loaded for as long as this is held.
+///
+/// The direct loader returned an RAII guard whose `Drop` deregistered the plugin
+/// kinds, and callers arranged teardown around that: sessions close, subscribers
+/// flush, and only then does the guard drop, so a runtime callback cannot outlive
+/// the code behind it. This preserves that shape while the loader itself moves
+/// behind the backend — dropping this drops the backend, which drops the
+/// activations it holds and deregisters their kinds at the same point.
+pub struct LoadedPlugins {
+    backend: Arc<InProcessPluginBackend>,
+    handles: Vec<PluginHandle>,
+}
+
+impl LoadedPlugins {
+    /// Load every `(plugin id, artifact)` pair, or fail without leaving any loaded.
+    pub async fn load<I>(specs: I) -> Result<Self, PluginProtocolError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let backend = Arc::new(InProcessPluginBackend::new());
+        let manager = PluginManager::new(backend.clone());
+        let mut handles = Vec::new();
+        for (plugin_id, artifact) in specs {
+            let loaded = manager
+                .load(
+                    PluginLoadRequest {
+                        plugin_id,
+                        artifact,
+                    },
+                    context_with_live_deadline(),
+                )
+                .await?;
+            handles.push(loaded.handle);
+        }
+        Ok(Self { backend, handles })
+    }
+
+    /// Return whether nothing was loaded.
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// Return the identity of every loaded plugin.
+    pub fn handles(&self) -> &[PluginHandle] {
+        &self.handles
+    }
+
+    /// Return the backend holding the loaded plugins.
+    pub fn backend(&self) -> &Arc<InProcessPluginBackend> {
+        &self.backend
+    }
+}
+
+fn context_with_live_deadline() -> PluginExecutionContext {
+    PluginExecutionContext {
+        request_id: "in-process-load".into(),
+        protocol_version: PROTOCOL_VERSION,
+        runtime_binding_digest: "in-process".into(),
+        deadline_unix_ms: u64::MAX,
+        max_response_bytes: 1024,
+    }
+}
 
 #[cfg(test)]
 mod tests {

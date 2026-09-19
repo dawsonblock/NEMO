@@ -191,7 +191,32 @@ runtime's own machinery rather than exposing an endpoint, so there is nothing
 honest for an in-process backend to invoke yet, and a method whose only
 implementation refuses would be the temporary abstraction this milestone is
 supposed to avoid. `invoke` arrives with the process host that has to serve it.
-And the CLI still calls the loader directly — that is increment 3.
+And the CLI called the loader directly — increment 3 removed that, below.
+
+Increment 3 is largely complete:
+
+- The CLI is the only consumer that reached the loader directly, and it now goes
+  through `LoadedPlugins`, which holds the backend and therefore the activations
+  it loaded. Teardown is unchanged in shape: the activation guard used to
+  deregister plugin kinds when it dropped after sessions closed and subscribers
+  flushed, and dropping the backend does the same at the same point, so a
+  runtime callback still cannot outlive the code behind it.
+- `node` and `ffi` needed no change. They import configuration types
+  (`DynamicPluginActivationSpec`, `PluginHostActivation`, `DynamicPluginKind`),
+  not the loader, so no facade or re-export was needed to preserve their paths.
+- The architecture guard's CLI exception is gone, and the guard passes without
+  it. That is the check that increment 3 actually happened, rather than a claim
+  that it did.
+- Core's integration tests still call `load_native_plugins` directly. They are
+  the loader's own tests — they exercise the native ABI and the dynamic library
+  it loads — so they are the implementation's test surface rather than
+  consumers of it, and the guard deliberately scans shipped sources rather than
+  tests.
+
+Migrating the CLI also exposed a gap in the contract: `load` returned only a
+descriptor, and a caller that wanted to unload later had nothing to name. The
+response now carries the handle as well, because only the backend knows the
+generation it assigned.
 
 This increment does not move `kernel-process unsafe tokens`. That number is
 expected to fall when native loading physically crosses the process boundary in

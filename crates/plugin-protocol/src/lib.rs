@@ -256,6 +256,19 @@ pub enum PluginRequest {
     Health,
 }
 
+/// Result of loading a plugin.
+///
+/// The handle is returned rather than left for the caller to derive: only the
+/// backend knows the generation it assigned, and a handle without one would
+/// address nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLoadResponse {
+    /// Identity of the loaded instance.
+    pub handle: PluginHandle,
+    /// What the plugin declares about itself.
+    pub descriptor: PluginDescriptor,
+}
+
 /// One response across the boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
@@ -263,7 +276,7 @@ pub enum PluginResponse {
     /// Version negotiation reply.
     Handshake(PluginHandshake),
     /// A plugin is loaded.
-    Loaded(PluginDescriptor),
+    Loaded(PluginLoadResponse),
     /// A plugin is unloaded.
     Unloaded,
     /// An invocation produced output.

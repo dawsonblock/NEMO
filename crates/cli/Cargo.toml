@@ -31,6 +31,7 @@ __skip-implicit-config = ["nemo-relay/__skip-implicit-config"]
 nemo-relay = { workspace = true, features = ["guardrails-remote", "object-store", "worker-grpc"] }
 nemo-relay-adaptive = { workspace = true, features = ["redis-backend"] }
 nemo-relay-pii-redaction.workspace = true
+nemo-relay-plugin-host.workspace = true
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"

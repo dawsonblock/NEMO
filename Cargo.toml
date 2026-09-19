@@ -39,6 +39,7 @@ nemo-relay = { version = "0.9.1-rc.4", path = "crates/core", default-features = 
 nemo-relay-types = { version = "0.9.1-rc.4", path = "crates/types" }
 nemo-relay-plugin = { version = "0.9.1-rc.4", path = "crates/plugin" }
 nemo-relay-plugin-protocol = { version = "0.9.1-rc.4", path = "crates/plugin-protocol" }
+nemo-relay-plugin-host = { version = "0.9.1-rc.4", path = "crates/plugin-host" }
 nemo-relay-worker-proto = { version = "0.9.1-rc.4", path = "crates/worker-proto" }
 nemo-relay-worker = { version = "0.9.1-rc.4", path = "crates/worker" }
 nemo-relay-adaptive = { version = "0.9.1-rc.4", path = "crates/adaptive" }

@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use nemo_relay::plugin::dynamic::{
-    DynamicPluginKind, NativePluginActivation, NativePluginLoadSpec, WorkerPluginActivation,
-    WorkerPluginLoadSpec, load_native_plugins, load_worker_plugins,
+    DynamicPluginKind, NativePluginLoadSpec, WorkerPluginActivation, WorkerPluginLoadSpec,
+    load_worker_plugins,
 };
 use nemo_relay::plugin::{
     PluginComponentSpec, PluginConfig, clear_plugin_configuration,
@@ -29,6 +29,7 @@ use nemo_relay::plugin::{
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_plugin_host::LoadedPlugins;
 use reqwest::Client;
 use serde_json::Value;
 use subtle::ConstantTimeEq;
@@ -1024,7 +1025,7 @@ async fn initialize_plugin_host(
 
 struct PluginActivation {
     active: bool,
-    native: Option<NativePluginActivation>,
+    native: Option<LoadedPlugins>,
     worker: Option<WorkerPluginActivation>,
     _snapshots: Vec<Arc<DynamicPluginActivationSnapshot>>,
 }
@@ -1133,9 +1134,20 @@ impl PluginActivation {
             let native = if native_specs.is_empty() {
                 None
             } else {
-                Some(load_native_plugins(native_specs).map_err(|error| {
-                    CliError::Config(format!("native plugin load failed: {error}"))
-                })?)
+                // The native loader is reached through the composed backend
+                // rather than called here, so which implementation serves it is
+                // a composition decision instead of a call site.
+                Some(
+                    LoadedPlugins::load(
+                        native_specs
+                            .into_iter()
+                            .map(|spec| (spec.plugin_id, spec.manifest_ref)),
+                    )
+                    .await
+                    .map_err(|error| {
+                        CliError::Config(format!("native plugin load failed: {error}"))
+                    })?,
+                )
             };
             for plugin in &dynamic_plugins {
                 if let Some(snapshot) = plugin.activation_snapshot.as_ref() {

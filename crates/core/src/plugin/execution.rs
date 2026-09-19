@@ -32,7 +32,8 @@ use std::sync::Arc;
 use nemo_relay_plugin_protocol::{
     DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext,
     PluginExecutionOutcome, PluginFailureCode, PluginHostHealth, PluginInspectRequest,
-    PluginLoadRequest, PluginProtocolError, PluginResponse, PluginUnloadRequest, check_deadline,
+    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginResponse,
+    PluginUnloadRequest, check_deadline,
 };
 
 /// A plugin operation in progress.
@@ -57,7 +58,7 @@ pub trait PluginExecutionBackend: Send + Sync {
         &'a self,
         request: PluginLoadRequest,
         context: PluginExecutionContext,
-    ) -> PluginExecutionFuture<'a, PluginDescriptor>;
+    ) -> PluginExecutionFuture<'a, PluginLoadResponse>;
 
     /// Unload a plugin, releasing whatever the implementation holds for it.
     fn unload<'a>(
@@ -106,7 +107,7 @@ impl PluginManager {
         &self,
         request: PluginLoadRequest,
         context: PluginExecutionContext,
-    ) -> Result<PluginDescriptor, PluginProtocolError> {
+    ) -> Result<PluginLoadResponse, PluginProtocolError> {
         check_deadline(context.deadline_unix_ms)?;
         self.backend.load(request, context).await
     }
@@ -193,13 +194,19 @@ mod tests {
             &'a self,
             request: PluginLoadRequest,
             _context: PluginExecutionContext,
-        ) -> PluginExecutionFuture<'a, PluginDescriptor> {
+        ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                Ok(PluginDescriptor {
-                    name: request.plugin_id,
-                    abi_version: 1,
-                    capabilities: Vec::<PluginCapability>::new(),
+                Ok(PluginLoadResponse {
+                    handle: PluginHandle {
+                        plugin_id: request.plugin_id.clone(),
+                        generation: 1,
+                    },
+                    descriptor: PluginDescriptor {
+                        name: request.plugin_id,
+                        abi_version: 1,
+                        capabilities: Vec::<PluginCapability>::new(),
+                    },
                 })
             })
         }
