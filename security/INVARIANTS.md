@@ -176,14 +176,19 @@ matters because the kernel is constructible from outside the runtime layer, and
 the profile would otherwise be enforced only where the runtime configuration is
 built.
 
-**Known gap.** The `ProductionEffectStore` bound proves the store attests
-readiness, not that it was opened over a verified transport. All
-`PostgresEffectStore` instances carry the trait regardless of how they were
-constructed, so `Kernel::new_production` accepts a store opened with
-`connect_insecure_local_for_tests`. The runtime layer refuses that combination;
-the kernel does not. Closing it needs a distinct
-`ProductionPostgresEffectStore` type that only the verified-transport
-constructors can produce.
+The bound alone was not enough. Every `PostgresEffectStore` carried
+`ProductionEffectStore` regardless of how it was opened, so a store built with
+the explicitly local test transport could attest readiness and a production
+kernel could be composed around a connection that was never verified. The
+handle now records the transport it was opened with, and
+`verify_production_readiness` refuses to attest for the test-only transport, so
+`Kernel::new_production` rejects that combination directly rather than relying
+on the runtime layer to prevent it.
+
+**Remaining refinement.** The guarantee is enforced by a checked method rather
+than by the type. A distinct `ProductionPostgresEffectStore`, produced only by
+the verified-transport constructors, would make the bad combination
+unrepresentable instead of rejected, and is the type-level target.
 
 **Verified by** `a_production_kernel_composes_only_with_the_durable_store`,
 `production_composition_is_fail_closed`, and `the_production_store_trait_is_sealed`
