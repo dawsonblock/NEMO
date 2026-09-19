@@ -140,14 +140,19 @@ external and unconfigured in this development release.
 ### Trusted computing base budget
 
 `security/tcb.toml` names the crates whose failure could directly violate the
-kernel guarantees - currently `nemo-relay` and `nemo-relay-types` - and records
-what they are allowed to reach. `just tcb-report` measures the resolved
-dependency tree with `cargo tree --all-features`, counts source lines and
-`unsafe` occurrences, and fails when a trusted crate reaches a database driver
-or a foreign-function binding, or when any budget grows. The budgets are a
-ratchet: raising one is an explicit edit to the policy file, so the trusted
-surface grows in review instead of as a side effect. Source counts are upper
-bounds that include inline test modules.
+kernel guarantees and records what they are allowed to reach. It defines two
+tiers, because "code that enforces an invariant" and "code that can subvert one"
+are different questions: the crates that enforce an invariant, and every
+additional crate linked into the same process. Both are measured, since the
+second is the real attack surface until process isolation exists.
+
+`just tcb-report` measures the resolved dependency tree with
+`cargo tree --all-features`, counts source lines and `unsafe` occurrences, and
+fails when a trusted crate reaches a database driver or a foreign-function
+binding, or when any budget grows. Alongside the ceilings, each crate's direct
+and transitive dependency sets are pinned by digest, so swapping a harmless
+package for a dangerous one cannot pass by keeping the count the same. Source
+counts are upper bounds that include inline test modules.
 
 `security/INVARIANTS.md` records the properties the kernel protects and where
 each one is enforced, including the ones that are not yet enforced. It is the
@@ -157,8 +162,10 @@ records the frozen revision and digests the refactor is measured against.
 
 `security/layers.toml` places every workspace crate in a layer, and
 `just layer-report` fails when a dependency points upward. Edges that point the
-wrong way today are recorded as grandfathered, so the check is green on arrival
-and the layer debt can only shrink.
+wrong way today are recorded as grandfathered, so the check is green on arrival.
+A grandfathered entry that no longer describes a real edge fails too, so the
+layer debt can only shrink and an exception cannot be reused by a later
+regression.
 
 ## Experimental effect-state contracts
 

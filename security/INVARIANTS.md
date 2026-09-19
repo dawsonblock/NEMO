@@ -163,12 +163,27 @@ discouraged.
 
 ## K-011 — Production kernel construction requires verified components
 
-**Enforced by** `Kernel::new_production` (`crates/core/src/kernel.rs:878`),
-which requires a sealed registry containing at least one admitted consequential
+**Enforced by** `Kernel::new_production` (`crates/core/src/kernel.rs`), which
+requires a sealed registry containing at least one admitted consequential
 capability, a `production` environment, and a store bound by the sealed
-`ProductionEffectStore` trait that attests readiness. The sealed trait's
-supertrait lives in a private module, so no other crate can implement it for its
-own type.
+`ProductionEffectStore` trait that attests readiness. The sealed supertrait
+lives in a private module, so no other crate can implement it for its own type.
+
+The other direction is enforced too: `Kernel::new_development` rejects a
+production runtime identity, so a caller cannot hold production evidence and
+compose through the development constructor to skip production admission. That
+matters because the kernel is constructible from outside the runtime layer, and
+the profile would otherwise be enforced only where the runtime configuration is
+built.
+
+**Known gap.** The `ProductionEffectStore` bound proves the store attests
+readiness, not that it was opened over a verified transport. All
+`PostgresEffectStore` instances carry the trait regardless of how they were
+constructed, so `Kernel::new_production` accepts a store opened with
+`connect_insecure_local_for_tests`. The runtime layer refuses that combination;
+the kernel does not. Closing it needs a distinct
+`ProductionPostgresEffectStore` type that only the verified-transport
+constructors can produce.
 
 **Verified by** `a_production_kernel_composes_only_with_the_durable_store`,
 `production_composition_is_fail_closed`, and `the_production_store_trait_is_sealed`
@@ -246,12 +261,18 @@ the kernel.
   the layering in `security/layers.toml`, five of those six point upward, so the
   invariants live across four crates rather than one auditable core. K-008
   through K-014 are enforced in code the kernel does not own. `just layer-report`
-  fails if a new upward edge appears, and lists these five so the debt stays
-  visible while it shrinks.
-- **The kernel is not `unsafe`-free.** 299 `unsafe` occurrences are recorded
-  against `nemo-relay`, dominated by the dynamic native plugin loader. That
-  loader enforces none of these invariants and is the clearest extraction
-  candidate.
+  fails if a new upward edge appears, and fails on a grandfathered entry that no
+  longer exists, so the five can only shrink and the exception cannot outlive
+  the debt it excused.
+- **The measured surface is wider than the enforcing surface.** `nemo-relay`
+  carries 299 `unsafe` occurrences, dominated by the dynamic native plugin
+  loader, and `nemo-relay-plugin` carries another 315. The plugin crates enforce
+  none of these invariants, but they run in the same process, so a memory-safety
+  bug there can subvert a correct state machine. `security/tcb.toml` therefore
+  measures two tiers: 85,027 source lines in the crates that enforce an
+  invariant, and 114,091 lines / 617 `unsafe` occurrences in everything sharing
+  the kernel's process. The second number, not the first, is the current
+  attack surface.
 - **There is more than one production construction path.** K-011 governs
   `Kernel::new_production`, and
   `DurableRuntime::bootstrap` is the composition root. Both are public, so a

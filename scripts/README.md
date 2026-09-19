@@ -24,8 +24,16 @@ Keep `scripts/` focused on helpers that are still script-native:
 them small. Run `just tcb-report` to print the current surface, or
 `just test-tcb-scripts` to exercise the gate itself. The check fails when a
 forbidden package (a database driver or a foreign-function binding) appears
-anywhere in a trusted crate's resolved tree, or when any budget grows. Raising a
-budget is an explicit edit to that policy file, so growth is visible in review.
+anywhere in a trusted crate's resolved tree, or when any budget grows. Alongside
+the ceilings, each crate's direct and transitive dependency *sets* are pinned by
+digest, so swapping one package for another cannot pass by keeping the count the
+same. Raising a ceiling is an explicit edit to that policy file, so growth is
+visible in review.
+
+The policy defines two tiers: the crates that enforce a kernel invariant, and
+every additional crate linked into the same process, which can subvert one
+without enforcing it. Both are reported, because the second is the real attack
+surface until process isolation exists.
 
 `just tcb-baseline` captures the frozen baseline the refactor is measured
 against - source-tree and lockfile digests, toolchain versions, the workspace
@@ -36,7 +44,10 @@ behind them live in `security/INVARIANTS.md` and `security/BASELINE.md`.
 `just layer-report` enforces `security/layers.toml`, which places every
 workspace crate in a layer and fails when a dependency points upward. Edges that
 point the wrong way today are listed as grandfathered so the check passes on
-arrival and can only get tighter; the report names them on every run.
+arrival and can only get tighter; the report names them on every run. A
+grandfathered entry that no longer describes a real edge also fails, so an
+exception cannot outlive the debt it excused and let a later regression back in
+unnoticed.
 
 ## Opt-In Coding-Agent E2E Tests
 

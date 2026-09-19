@@ -16,6 +16,12 @@ just tcb-baseline      # writes reports/*.json
 just tcb-report        # prints and enforces the trusted-surface budget
 ```
 
+`just tcb-baseline` snapshots the tree it is run against; it does not recreate
+the frozen baseline. The immutable anchor is the revision below, and the reports
+are a reproducible measurement of whatever revision you point the tool at. Run
+it on a checkout of the frozen revision to compare against the original, and on
+the working tree to see the current state.
+
 `reports/` is generated and git-ignored. Keeping it out of the tree is
 deliberate: the source-tree digest is computed over the tree, so a checked-in
 report would change the digest of the tree it describes, and the second run
@@ -65,19 +71,37 @@ where it is reproducible.
 
 ## Trusted surface
 
-Measured with `cargo tree --all-features --locked`, and enforced as a ratchet by
-`security/tcb.toml`.
+Measured with `cargo tree --all-features --locked`, and enforced by
+`security/tcb.toml`. That file records two tiers, because "code that enforces an
+invariant" and "code that can subvert one" are different questions:
+
+| Tier | Crates | Lines | `unsafe` |
+|---|---|---|---|
+| Invariant-enforcing | 5 | 85,027 | 299 |
+| In-process | 12 | 114,091 | 617 |
+
+The five enforcing crates:
 
 | Crate | Files | Lines | `unsafe` | Direct deps | Transitive |
 |---|---|---|---|---|---|
-| `nemo-relay` | 74 | 71,153 | 299 | 39 | 252 |
+| `nemo-relay` | 74 | 71,190 | 299 | 39 | 264 |
+| `nemo-relay-ledger` | 6 | 9,152 | 0 | 9 | 106 |
 | `nemo-relay-types` | 13 | 3,681 | 0 | 7 | 25 |
+| `nemo-relay-executor` | 1 | 572 | 0 | 3 | 24 |
+| `nemo-relay-authority` | 1 | 432 | 0 | 3 | 25 |
 
-Line and `unsafe` counts are upper bounds that include inline test modules, so
-they never undercount. Against the program's targets (`<= 15k-30k` lines,
-`<= 12` direct dependencies, `0` `unsafe`), the kernel is roughly 2-3x over on
-size and dependencies, and the `unsafe` surface is concentrated in the dynamic
-native plugin loader.
+Against the program's targets (`<= 15k-30k` lines, `<= 12` direct dependencies,
+`0` `unsafe`), the kernel is still roughly 2-3x over on size and dependencies.
+The `unsafe` surface is concentrated in the dynamic native plugin loader:
+299 occurrences in `nemo-relay` and another 315 in `nemo-relay-plugin`, which
+enforces none of the invariants but shares the process and therefore the attack
+surface.
+
+Line and `unsafe` counts are upper bounds that include inline test modules, and
+`unsafe` is counted textually without stripping comments, because a regular
+expression cannot distinguish a comment from a `//` inside a string literal.
+The transitive count is a count of resolved identities, so two versions of one
+package count twice instead of collapsing to one name.
 
 ## Test evidence
 
@@ -96,8 +120,19 @@ CI record.
 
 ## Known failures
 
-One, recorded so it is not mistaken for a regression introduced by the
+Two, recorded so neither is mistaken for a regression introduced by the
 refactor:
+
+**`test_regenerated_evidence_breaks_the_attestation` fails.** In
+`scripts/qualification/test_attest_release.py`, the suite reports 9 passed and
+this one failed. `verify()` checks the artifact digest, the current evidence
+bundle, and the signature, but never compares the attestation's recorded
+evidence-manifest digest against the digest of the current evidence manifest.
+Evidence can therefore be regenerated after an attestation is issued without
+invalidating it. This predates the branch, was not introduced here, and remains
+a release blocker — but it was missing from the first version of this file,
+because the qualification script tests were not run when the baseline was
+captured.
 
 **`ty` type check fails on `scripts/check-version-consistency.py`.** The
 `pre-commit` hook `ty (type check)` reports two `invalid-argument-type`
