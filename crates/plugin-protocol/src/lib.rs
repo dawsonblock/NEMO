@@ -397,6 +397,70 @@ pub fn check_frame_len(len: u64) -> Result<(), PluginProtocolError> {
     ))
 }
 
+/// Bytes of big-endian length that precede every frame.
+pub const FRAME_HEADER_BYTES: usize = 4;
+
+/// Encode one message as a length-prefixed frame.
+///
+/// The length is the message only; the header is not counted, so a reader can
+/// take the announced number of bytes without arithmetic that changes when the
+/// header size does.
+pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, PluginProtocolError> {
+    let body = serde_json::to_vec(message).map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::MalformedResponse,
+            format!("could not encode a frame: {error}"),
+        )
+    })?;
+    check_frame_len(body.len() as u64)?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// Decode one message from the front of `bytes`.
+///
+/// Returns the message and how many bytes it occupied, so a reader over a
+/// stream can advance by exactly that much. The announced length is checked
+/// against the limit *before* anything is parsed, and a frame that arrives
+/// short is refused rather than partially decoded: a truncated message is not a
+/// smaller valid message.
+pub fn decode_frame<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, usize), PluginProtocolError> {
+    if bytes.len() < FRAME_HEADER_BYTES {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::MalformedResponse,
+            format!(
+                "a frame needs at least {FRAME_HEADER_BYTES} header bytes, received {}",
+                bytes.len()
+            ),
+        ));
+    }
+    let (header, rest) = bytes.split_at(FRAME_HEADER_BYTES);
+    let declared = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    check_frame_len(u64::from(declared))?;
+    let declared = declared as usize;
+    if rest.len() < declared {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::MalformedResponse,
+            format!(
+                "frame announced {declared} bytes but only {} are available",
+                rest.len()
+            ),
+        ));
+    }
+    let (body, _) = rest.split_at(declared);
+    let message = serde_json::from_slice(body).map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::MalformedResponse,
+            format!("could not decode a frame: {error}"),
+        )
+    })?;
+    Ok((message, FRAME_HEADER_BYTES + declared))
+}
+
 /// Return whether `deadline_unix_ms` has passed at `now_unix_ms`.
 pub const fn deadline_expired(deadline_unix_ms: u64, now_unix_ms: u64) -> bool {
     now_unix_ms >= deadline_unix_ms
@@ -439,6 +503,71 @@ pub fn check_deadline(deadline_unix_ms: u64) -> Result<(), PluginProtocolError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_round_trips_and_reports_exactly_what_it_occupied() {
+        let request = PluginRequest::Health;
+        let frame = encode_frame(&request).expect("encode frame");
+
+        let (decoded, consumed): (PluginRequest, usize) =
+            decode_frame(&frame).expect("decode frame");
+
+        assert_eq!(decoded, request);
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn a_reader_can_advance_past_a_frame_on_a_stream() {
+        let first = encode_frame(&PluginRequest::Health).expect("encode first");
+        let second = encode_frame(&PluginRequest::Health).expect("encode second");
+        let mut stream = first.clone();
+        stream.extend_from_slice(&second);
+
+        let (_, consumed): (PluginRequest, usize) = decode_frame(&stream).expect("decode first");
+
+        // Consuming the whole stream instead of the frame would swallow the
+        // next message, so the reported length is the contract.
+        assert_eq!(consumed, first.len());
+        let (_, again): (PluginRequest, usize) =
+            decode_frame(&stream[consumed..]).expect("decode second");
+        assert_eq!(again, second.len());
+    }
+
+    #[test]
+    fn a_frame_that_arrives_short_is_refused_rather_than_partly_decoded() {
+        let frame = encode_frame(&PluginRequest::Health).expect("encode frame");
+        let truncated = &frame[..frame.len() - 1];
+
+        let failure = decode_frame::<PluginRequest>(truncated)
+            .expect_err("a truncated frame is not a smaller valid message");
+
+        assert_eq!(failure.failure.code, PluginFailureCode::MalformedResponse);
+    }
+
+    #[test]
+    fn an_oversized_announced_length_is_refused_before_anything_is_parsed() {
+        let mut frame = ((MAX_FRAME_BYTES + 1).to_be_bytes()).to_vec();
+        frame.push(b'{');
+
+        let failure = decode_frame::<PluginRequest>(&frame)
+            .expect_err("an oversized frame must be refused before parsing");
+
+        assert_eq!(
+            failure.failure.code,
+            PluginFailureCode::OversizedFrame {
+                observed: u64::from(MAX_FRAME_BYTES) + 1,
+                limit: MAX_FRAME_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn a_header_that_is_not_whole_is_refused() {
+        let failure = decode_frame::<PluginRequest>(&[0, 0, 0])
+            .expect_err("a short header cannot announce a length");
+
+        assert_eq!(failure.failure.code, PluginFailureCode::MalformedResponse);
+    }
 
     #[test]
     fn a_deadline_is_refused_at_the_boundary_and_before_it() {

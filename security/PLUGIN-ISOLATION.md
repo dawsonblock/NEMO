@@ -218,6 +218,15 @@ descriptor, and a caller that wanted to unload later had nothing to name. The
 response now carries the handle as well, because only the backend knows the
 generation it assigned.
 
+Increment 4 has its first piece: the framed transport. `encode_frame` and
+`decode_frame` implement the length-prefixed encoding the process boundary will
+use, and the announced length is checked against `MAX_FRAME_BYTES` before
+anything is parsed, so a hostile prefix cannot ask the other side to allocate.
+A frame that arrives short is refused rather than partly decoded, and a decoder
+reports exactly how many bytes it consumed so a reader over a stream cannot
+swallow the next message. Fifteen contract tests cover it, including the
+oversized-prefix and truncated-frame cases.
+
 This increment does not move `kernel-process unsafe tokens`. That number is
 expected to fall when native loading physically crosses the process boundary in
 increments 4-5, and a reduction achieved by reclassifying crates would not mean

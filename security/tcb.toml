@@ -120,11 +120,11 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 # documentation. That is the price of an upper bound that cannot hide a token,
 # and it means a prose change can move this number.
 [limits.nemo-relay-plugin-protocol]
-max_direct_dependencies = 3
+max_direct_dependencies = 4
 max_transitive_packages = 24
-max_source_lines = 574
+max_source_lines = 703
 max_unsafe_occurrences = 3
-direct_dependency_digest = "162268fbc27e2215997bfa17dcb031b17721a67d59e8159c8f8ace95cd5ce9f8"
+direct_dependency_digest = "07a6410504fe622aba26b024a0180a3ef0ab0a54c2a99247f344f7a14660faa0"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
 
 [limits.nemo-relay-authority]
