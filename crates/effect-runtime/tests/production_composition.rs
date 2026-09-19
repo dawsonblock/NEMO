@@ -383,23 +383,34 @@ impl Drop for CompositionFixture {
 
 #[test]
 #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
-fn a_production_kernel_composes_only_with_the_durable_store() {
+fn production_composition_rejects_a_test_transport_store() {
     let Some(fixture) = CompositionFixture::create() else {
         eprintln!("skipping: NEMO_RELAY_TEST_POSTGRES_URL or role creation unavailable");
         return;
     };
-    let store = fixture.runtime_store();
-    let sealed = registry(&[ExecutionClass::Mutation])
-        .seal()
-        .expect("seal registry");
-    let kernel = Kernel::new_production(
+
+    // The fixture's own transport is the explicitly local test transport: it is
+    // correct for creating the schema and the runtime role, and it can never
+    // attest production readiness. Every store carries the sealed
+    // `ProductionEffectStore` bound regardless of how it was opened, so without
+    // this check a production kernel could be composed around a connection that
+    // was never verified.
+    let result = Kernel::new_production(
         runtime("production"),
-        sealed,
+        registry(&[ExecutionClass::Mutation])
+            .seal()
+            .expect("seal registry"),
         nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
-        store,
-    )
-    .expect("production composition must succeed with a ready durable store");
-    assert_eq!(kernel.registry_digest().len(), 64);
+        fixture.runtime_store(),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(KernelError::EffectStoreNotProductionReady(ref detail))
+                if detail.contains("test-only plaintext transport")
+        ),
+        "the test transport must not attest production readiness"
+    );
 }
 
 #[test]
@@ -439,8 +450,11 @@ fn production_composition_is_fail_closed() {
         Err(KernelError::ProductionRequiresConsequentialCapability)
     ));
 
-    // A schema-owning credential cannot compose a production kernel: readiness
-    // requires a data-only runtime role.
+    // A schema-owning credential cannot compose a production kernel, but this
+    // fixture cannot reach that check: its transport is the test-only one, so
+    // the transport gate fires first. The privilege check itself is covered by
+    // `verify_runtime_privileges` in the ledger suite, which uses the test
+    // transport directly.
     let result = Kernel::new_production(
         runtime("production"),
         registry(&[ExecutionClass::Mutation]).seal().expect("seal"),
@@ -448,8 +462,12 @@ fn production_composition_is_fail_closed() {
         fixture.owner_store(),
     );
     assert!(
-        matches!(result, Err(KernelError::EffectStoreNotProductionReady(_))),
-        "an owning credential must not compose a production kernel"
+        matches!(
+            result,
+            Err(KernelError::EffectStoreNotProductionReady(ref detail))
+                if detail.contains("test-only plaintext transport")
+        ),
+        "the transport gate must fire before any credential check"
     );
 }
 

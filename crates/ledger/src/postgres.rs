@@ -592,6 +592,8 @@ pub enum PostgresEffectStoreError {
         /// Privileges that must not be granted to a runtime role.
         privileges: String,
     },
+    /// A production kernel was offered a store opened over the test-only transport.
+    ProductionTestTransport,
     /// A qualification test injected a durable-operation failure at a boundary.
     ///
     /// Only produced when the testkit feature is enabled and the process was
@@ -646,6 +648,10 @@ impl std::fmt::Display for PostgresEffectStoreError {
                 "runtime role {role} can modify the effect-store schema and must be \
                  restricted to data privileges: {privileges}"
             ),
+            Self::ProductionTestTransport => write!(
+                formatter,
+                "the test-only plaintext transport cannot attest production readiness"
+            ),
             Self::InjectedFailure(point) => {
                 write!(formatter, "injected durable-operation failure at {point}")
             }
@@ -679,6 +685,7 @@ impl std::error::Error for PostgresEffectStoreError {
             | Self::SchemaFingerprintMismatch(_)
             | Self::SchemaObjectMismatch { .. }
             | Self::DatabasePrivilegeViolation { .. }
+            | Self::ProductionTestTransport
             | Self::InjectedFailure(_)
             | Self::CorruptData(_)
             | Self::IntegerOutOfRange(_) => None,
@@ -729,6 +736,15 @@ pub struct PostgresEffectStore {
     /// every checked-out session is instead bounded by what is left of it, so no
     /// database wait can outlive the action it serves.
     deadline: Option<Instant>,
+    /// Whether this handle was opened over the explicitly test-only transport.
+    ///
+    /// Plaintext loopback is correct for a qualification run and permanently
+    /// wrong for a production kernel, so the handle remembers how it was built
+    /// and refuses to attest production readiness afterwards. Without this,
+    /// every store carried the `ProductionEffectStore` bound no matter which
+    /// transport it was opened with, and a production kernel could be composed
+    /// around a connection that was never verified.
+    plaintext_test_transport: bool,
 }
 
 impl PostgresEffectStore {
@@ -738,6 +754,9 @@ impl PostgresEffectStore {
     /// history, physical schema, credential privileges, and recorded database
     /// settings must all hold before a kernel can be composed around it.
     pub fn verify_production_readiness(&self) -> Result<(), PostgresEffectStoreError> {
+        if self.plaintext_test_transport {
+            return Err(PostgresEffectStoreError::ProductionTestTransport);
+        }
         self.verify_database_readiness().map(|_| ())
     }
 
@@ -778,6 +797,7 @@ impl PostgresEffectStore {
             lease_configuration,
             maximum_pool_size,
             budgets,
+            true,
         )
     }
 
@@ -816,6 +836,7 @@ impl PostgresEffectStore {
             lease_configuration,
             maximum_pool_size,
             budgets,
+            false,
         )
     }
 
@@ -914,6 +935,7 @@ impl PostgresEffectStore {
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
         budgets: PostgresOperationBudgets,
+        plaintext_test_transport: bool,
     ) -> Result<Self, PostgresEffectStoreError> {
         validate_store_configuration(schema, maximum_pool_size, &budgets)?;
         let manager = PostgresConnectionManager::new(configuration, NoTls);
@@ -924,6 +946,7 @@ impl PostgresEffectStore {
             lease_configuration,
             budgets,
             deadline: None,
+            plaintext_test_transport,
         })
     }
 
@@ -946,6 +969,7 @@ impl PostgresEffectStore {
             lease_configuration,
             budgets,
             deadline: None,
+            plaintext_test_transport: false,
         })
     }
 
