@@ -3,19 +3,46 @@
 #
 # Trusted computing base policy for the NEMO kernel.
 #
-# A trusted crate is one whose failure could directly violate NEMO's core
-# security or correctness guarantees: canonical action identity, runtime
-# identity, capability and grant verification, execution routing, idempotency,
-# effect state transitions, receipts, and lease fencing.
+# Two tiers, because they answer different questions.
 #
-# Providers, transports, bindings, the CLI, the durable store, DLP, sandboxing,
-# qualification tooling, tests, and docs are deliberately outside this set. The
-# kernel must not know what PostgreSQL, Gmail, GitHub, or a language binding is.
+#   [trusted]     Code that *enforces* a kernel invariant: canonical identity,
+#                 capability and grant verification, execution routing,
+#                 idempotency, effect state transitions, receipts, and lease
+#                 fencing. A function earns a place here by enforcing one of
+#                 the properties in security/INVARIANTS.md.
+#
+#   [in_process]  Additional code linked into the same process as the kernel.
+#                 It enforces none of those invariants, but a memory-safety or
+#                 logic bug in it can subvert them anyway, so it belongs to the
+#                 effective attack surface and is measured on its own tier.
+#
+# Providers, transports, bindings, the CLI, DLP and isolation implementations,
+# qualification tooling, tests, and docs stay outside both tiers. The kernel
+# must not know what PostgreSQL, Gmail, GitHub, or a language binding is.
 
 version = 1
 
 [trusted]
-crates = ["nemo-relay", "nemo-relay-types"]
+crates = [
+    "nemo-relay",
+    "nemo-relay-types",
+    "nemo-relay-authority",
+    "nemo-relay-executor",
+    "nemo-relay-ledger",
+]
+
+# Crates that share the kernel's process but do not enforce an invariant.
+# Worker binaries run in their own processes and are deliberately excluded.
+[in_process]
+crates = [
+    "nemo-effect-runtime",
+    "nemo-relay-adaptive",
+    "nemo-relay-dlp",
+    "nemo-relay-isolation",
+    "nemo-relay-pii-redaction",
+    "nemo-relay-plugin",
+    "nemo-relay-worker-proto",
+]
 
 # Packages that must never appear in a trusted crate's resolved tree.
 #
@@ -48,23 +75,118 @@ nemo-relay-types = [
     "napi",
     "pyo3",
 ]
+nemo-relay-authority = ["sqlx", "tokio-postgres", "postgres", "napi", "pyo3"]
+nemo-relay-executor = ["sqlx", "tokio-postgres", "postgres", "napi", "pyo3"]
+nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 
-# Ratchet budgets. These record the current surface, so the gate fails on
-# growth and passes on shrinkage. Raising a number requires a security review
-# and an edit to this file, which is the point: TCB growth becomes visible in
-# review instead of arriving as a side effect.
+# Budgets.
 #
-# Source lines and `unsafe` occurrences are upper bounds that include inline
-# test modules, so they never undercount the kernel. The dominant `unsafe`
-# concentration is the dynamic native plugin loader, which is not TCB work.
+# The `max_*` numbers are ceilings: exceeding one fails the gate, so growth has
+# to be an explicit, reviewable edit to this file. They are deliberately not
+# two-sided, because every code change in a trusted crate moves the line count
+# and a gate that demands a file edit for every commit gets switched off.
+#
+# The `*_dependency_digest` fields are the ratchet that does not depend on the
+# counts. They pin the resolved dependency *sets*, so removing a harmless
+# package and adding a dangerous one cannot pass by keeping the count equal,
+# and shrinking a set also fails until the digest is refreshed here.
+#
+# Source lines and `unsafe` tokens count every file under the crate's `src`,
+# including inline test modules, and count `unsafe` textually without trying to
+# strip comments. Both are upper bounds and never undercount.
+
 [limits.nemo-relay]
 max_direct_dependencies = 39
-max_transitive_packages = 252
-max_source_lines = 71153
+max_transitive_packages = 264
+max_source_lines = 71190
 max_unsafe_occurrences = 299
+direct_dependency_digest = "67e12bc2c2eada037886632599a6ba0776437ccad20946f7391765e82fade065"
+transitive_dependency_digest = "9c50d4c299f763c50094e75aec0ddd53ce06e4c7c8ead62f30e111b4cc7c1678"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
 max_transitive_packages = 25
 max_source_lines = 3681
 max_unsafe_occurrences = 0
+direct_dependency_digest = "29b46ac95ea3299fa226b19057c808fa984d9cf9d80b6700d83e3212e71e1150"
+transitive_dependency_digest = "4091359e0342f78b247f613d90d2cd00b115de970924e85a7964a08e79347ae5"
+
+[limits.nemo-relay-authority]
+max_direct_dependencies = 3
+max_transitive_packages = 25
+max_source_lines = 432
+max_unsafe_occurrences = 0
+direct_dependency_digest = "f2ca37b9e39b1cfbc63bad5592b355f3b1b2f863d73de53134852ef3a0638444"
+transitive_dependency_digest = "bb61c69b328c93a0a6296704471f8a0231bd4869f1d0dbb0253bd7358031366a"
+
+[limits.nemo-relay-executor]
+max_direct_dependencies = 3
+max_transitive_packages = 24
+max_source_lines = 572
+max_unsafe_occurrences = 0
+direct_dependency_digest = "01cf712eaa393dd8c669c3fbaeb2902df9eb36583b7ae3fc519c3cff0ddada35"
+transitive_dependency_digest = "58a6a3bf090457569441d5a6ba8d17ed2593d6d9f99fb8bf7c56c69306ab0973"
+
+[limits.nemo-relay-ledger]
+max_direct_dependencies = 9
+max_transitive_packages = 106
+max_source_lines = 9152
+max_unsafe_occurrences = 0
+direct_dependency_digest = "92373a6c3c8a6312e1d3b64d981c2fe94cefeddbc6602b9f70fbe49b1bc4c811"
+transitive_dependency_digest = "157d7b132e3b799b50bbb6d84a2c39b4fe9efc85b9af1a48a1ce9ba92defb256"
+
+[limits.nemo-relay-plugin]
+max_direct_dependencies = 6
+max_transitive_packages = 39
+max_source_lines = 5055
+max_unsafe_occurrences = 315
+direct_dependency_digest = "6811b76e1df957ea814c8b9dae9ae9275ca5267b4488d2a926f891503e1a60fc"
+transitive_dependency_digest = "8383f9b4cf799ca37bab6f9e9755c0898b95a2e9cb6f262e3de2757d611b1030"
+
+[limits.nemo-relay-worker-proto]
+max_direct_dependencies = 5
+max_transitive_packages = 97
+max_source_lines = 63
+max_unsafe_occurrences = 0
+direct_dependency_digest = "5f7713816b1163f9df12be1a0bd1263f0d4be1c099c8062cd66894490c457527"
+transitive_dependency_digest = "fc7a3fbef166168eb8f67a6e46999a5990534e37dff425fc48b0eed554e17978"
+
+[limits.nemo-relay-adaptive]
+max_direct_dependencies = 16
+max_transitive_packages = 223
+max_source_lines = 18355
+max_unsafe_occurrences = 3
+direct_dependency_digest = "35dc3acb41d746d352d1ee8ee80e58d55ca8875af4f628a23be2db0ee15c6ce1"
+transitive_dependency_digest = "e8def58eb7843450d10b88609c5aa980511223ce106f5eb1bcd59dcb74c68e0b"
+
+[limits.nemo-relay-pii-redaction]
+max_direct_dependencies = 7
+max_transitive_packages = 214
+max_source_lines = 4869
+max_unsafe_occurrences = 0
+direct_dependency_digest = "b3585dc2c10e7c6afbafcc3ad2a161263afc69291b9e0440fb888b488f697e9e"
+transitive_dependency_digest = "8c659c02204278e6321b42f762cb57f51e34bb546931b0aaf101e768fb35bec8"
+
+[limits.nemo-relay-dlp]
+max_direct_dependencies = 2
+max_transitive_packages = 11
+max_source_lines = 65
+max_unsafe_occurrences = 0
+direct_dependency_digest = "898bac892d25c49838080d7e439c23d722e5e4d5fc0c4cfd6f63f63bcf7c6d34"
+transitive_dependency_digest = "77761fa9f0e0a2c4600dfb2ba2b67ad2290342abea974d7c6fbbdabaef7d611a"
+
+[limits.nemo-relay-isolation]
+max_direct_dependencies = 1
+max_transitive_packages = 7
+max_source_lines = 68
+max_unsafe_occurrences = 0
+direct_dependency_digest = "8b917c4b6163bc82ef4aff025c6f5f4d54205232c4595f39b7b43008256a6cb7"
+transitive_dependency_digest = "655f113e247392496c052a121de3485f9417d60e3139501d04e61ac659dcbf02"
+
+[limits.nemo-effect-runtime]
+max_direct_dependencies = 3
+max_transitive_packages = 243
+max_source_lines = 589
+max_unsafe_occurrences = 0
+direct_dependency_digest = "08d1bc4f247c4be48c173c4eb6dc4b89d148956e12f6abafab93bc080638a1a9"
+transitive_dependency_digest = "47e81cd70592777b4709e36bab7d2d6cb4e5ec8da2ea4570be0dae875f5f25e5"

@@ -21,15 +21,25 @@ package cannot hide behind a feature flag. ``cargo metadata`` alone is not
 enough: it resolves optional dependencies whether or not a build activates
 them, which reports coupling that no build actually links.
 
-Source metrics cover every file under a trusted crate's ``src`` directory,
-including inline test modules, and strip line comments before counting
-``unsafe``. Treating both numbers as upper bounds is deliberate: a budget that
-silently undercounts the kernel is worse than one that is slightly pessimistic.
+Two resolution properties are pinned rather than only counted. The transitive
+metric counts *resolved identities* (name and version), so two versions of one
+package are two entries instead of collapsing to one name. Each crate's direct
+and transitive dependency *sets* are also hashed and compared against the
+recorded digest, so replacing a dependency with a different one cannot pass by
+keeping the count the same. The size budgets stay ceilings, and the policy file
+says so.
+
+Source metrics cover every file under a crate's ``src`` directory, including
+inline test modules, and count every textual ``unsafe`` token without trying to
+strip comments. A regular expression cannot tell a comment from a `//` inside a
+string literal, so stripping can only ever hide a token; overcounting is the
+correct direction for an upper bound.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import re
@@ -41,7 +51,6 @@ from dataclasses import dataclass
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = REPO_ROOT / "security" / "tcb.toml"
 
-LINE_COMMENT = re.compile(r"//.*$")
 UNSAFE = re.compile(r"\bunsafe\b")
 
 # Budget keys mapped to the measurement they cap.
@@ -50,6 +59,12 @@ LIMIT_FIELDS = {
     "max_transitive_packages": "transitive_packages",
     "max_source_lines": "source_lines",
     "max_unsafe_occurrences": "unsafe_occurrences",
+}
+
+# Recorded digests, mapped to the measurement they pin.
+DIGEST_FIELDS = {
+    "direct_dependency_digest": "direct_dependency_digest",
+    "transitive_dependency_digest": "transitive_dependency_digest",
 }
 
 
@@ -63,6 +78,8 @@ class Metrics:
     unsafe_occurrences: int
     direct_dependencies: int
     transitive_packages: int
+    direct_dependency_digest: str
+    transitive_dependency_digest: str
 
 
 def load_policy(path: pathlib.Path) -> dict:
@@ -94,8 +111,13 @@ def package_index(metadata: dict) -> tuple[dict, dict]:
     return by_id, by_name
 
 
-def dependency_tree(repo_root: pathlib.Path, crate: str) -> list[str]:
-    """Return every package in the crate's widest build, excluding the crate."""
+def dependency_identities(repo_root: pathlib.Path, crate: str) -> list[str]:
+    """Return resolved ``name@version`` identities for the crate's widest build.
+
+    Counting names instead would collapse two resolved versions of one package
+    into a single entry, so a graph could gain a duplicate version without the
+    metric moving.
+    """
     completed = subprocess.run(
         [
             "cargo",
@@ -112,18 +134,33 @@ def dependency_tree(repo_root: pathlib.Path, crate: str) -> list[str]:
         capture_output=True,
         text=True,
     )
-    names = {line.split()[0] for line in completed.stdout.splitlines() if line.strip()}
-    names.discard(crate)
-    return sorted(names)
+    identities = set()
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if not fields or fields[0] == crate:
+            continue
+        version = fields[1] if len(fields) > 1 else ""
+        identities.add(f"{fields[0]}@{version}" if version else fields[0])
+    return sorted(identities)
 
 
-def direct_dependency_names(metadata: dict, tree: list[str], crate: str) -> list[str]:
+def identity_names(identities: list[str]) -> set[str]:
+    """Return the package names behind a list of ``name@version`` identities."""
+    return {identity.split("@", 1)[0] for identity in identities}
+
+
+def dependency_digest(names: set[str]) -> str:
+    """Return a stable digest over a dependency set."""
+    return hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest()
+
+
+def direct_dependency_names(metadata: dict, identities: list[str], crate: str) -> list[str]:
     """Return the crate's declared direct dependencies that a build links."""
     _, by_name = package_index(metadata)
     declared = {
         dependency["name"] for dependency in by_name[crate].get("dependencies", []) if dependency.get("kind") is None
     }
-    return sorted(declared.intersection(tree))
+    return sorted(declared.intersection(identity_names(identities)))
 
 
 def source_metrics(crate_dir: pathlib.Path) -> tuple[int, int, int]:
@@ -134,38 +171,58 @@ def source_metrics(crate_dir: pathlib.Path) -> tuple[int, int, int]:
     for path in files:
         text = path.read_text(encoding="utf-8", errors="replace")
         lines += text.count("\n")
-        code = "\n".join(LINE_COMMENT.sub("", line) for line in text.splitlines())
-        unsafe_occurrences += len(UNSAFE.findall(code))
+        unsafe_occurrences += len(UNSAFE.findall(text))
     return len(files), lines, unsafe_occurrences
 
 
-def measure(metadata: dict, tree: list[str], crate: str) -> Metrics:
-    """Measure one trusted crate against the resolved metadata."""
+def measure(metadata: dict, identities: list[str], crate: str) -> Metrics:
+    """Measure one crate against the resolved metadata."""
     _, by_name = package_index(metadata)
     crate_dir = pathlib.Path(by_name[crate]["manifest_path"]).parent / "src"
     source_files, source_lines, unsafe_occurrences = source_metrics(crate_dir)
+    direct = direct_dependency_names(metadata, identities, crate)
     return Metrics(
         crate=crate,
         source_files=source_files,
         source_lines=source_lines,
         unsafe_occurrences=unsafe_occurrences,
-        direct_dependencies=len(direct_dependency_names(metadata, tree, crate)),
-        transitive_packages=len(tree),
+        direct_dependencies=len(direct),
+        transitive_packages=len(identities),
+        direct_dependency_digest=dependency_digest(set(direct)),
+        transitive_dependency_digest=dependency_digest(identity_names(identities)),
     )
 
 
-def find_violations(metadata: dict, trees: dict[str, list[str]], policy: dict) -> tuple[list[Metrics], list[str]]:
+def enforcement_crates(policy: dict) -> list[str]:
+    """Return the crates whose failure could violate a kernel invariant."""
+    trusted = policy.get("trusted", {}).get("crates", [])
+    return sorted(trusted)
+
+
+def in_process_crates(policy: dict) -> list[str]:
+    """Return every crate linked into the same process as the kernel.
+
+    A memory-safety bug in an in-process component can subvert an invariant
+    that the component does not itself enforce, so the effective surface is
+    wider than the set of crates that name an invariant.
+    """
+    members = set(enforcement_crates(policy))
+    members.update(policy.get("in_process", {}).get("crates", []))
+    return sorted(members)
+
+
+def find_violations(metadata: dict, identities: dict[str, list[str]], policy: dict) -> tuple[list[Metrics], list[str]]:
     """Return the per-crate report and every policy violation."""
     reports: list[Metrics] = []
     problems: list[str] = []
 
     for crate, forbidden in sorted(policy.get("forbidden", {}).items()):
-        hits = sorted(set(trees[crate]).intersection(forbidden))
+        hits = sorted(identity_names(identities[crate]).intersection(forbidden))
         if hits:
             problems.append(f"{crate} reaches forbidden package(s): {', '.join(hits)}")
 
     for crate, limits in sorted(policy.get("limits", {}).items()):
-        metrics = measure(metadata, trees[crate], crate)
+        metrics = measure(metadata, identities[crate], crate)
         reports.append(metrics)
         for field, attribute in LIMIT_FIELDS.items():
             if field not in limits:
@@ -177,6 +234,15 @@ def find_violations(metadata: dict, trees: dict[str, list[str]], policy: dict) -
                     f"{crate}: {attribute} is {actual}, budget is {budget}; "
                     "raising the budget is a security review recorded in "
                     "security/tcb.toml"
+                )
+        for field, attribute in DIGEST_FIELDS.items():
+            if field not in limits:
+                continue
+            if getattr(metrics, attribute) != limits[field]:
+                problems.append(
+                    f"{crate}: {attribute} changed; the resolved dependency set "
+                    "is not the recorded one. Review the change and update the "
+                    "digest in security/tcb.toml"
                 )
 
     return reports, problems
@@ -192,6 +258,24 @@ def render(reports: list[Metrics]) -> str:
             f"{metrics.source_lines:>9}{metrics.unsafe_occurrences:>8}"
             f"{metrics.direct_dependencies:>8}{metrics.transitive_packages:>12}"
         )
+    return "\n".join(rows)
+
+
+def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dict) -> str:
+    """Render the two-tier surface: invariant enforcers, then everything in-process."""
+    rows = [
+        "surface",
+        "",
+        f"  {'tier':<26}{'crates':>7}{'lines':>10}{'unsafe':>9}",
+    ]
+    for label, crates in (
+        ("invariant-enforcing", enforcement_crates(policy)),
+        ("in-process", in_process_crates(policy)),
+    ):
+        measured = [measure(metadata, identities[crate], crate) for crate in crates]
+        total_lines = sum(item.source_lines for item in measured)
+        total_unsafe = sum(item.unsafe_occurrences for item in measured)
+        rows.append(f"  {label:<26}{len(crates):>7}{total_lines:>10}{total_unsafe:>9}")
     return "\n".join(rows)
 
 
@@ -223,17 +307,24 @@ def main(argv: list[str] | None = None) -> int:
         metadata = cargo_metadata(arguments.repo_root)
 
     policy = load_policy(arguments.policy)
-    crates = sorted(set(policy.get("limits", {})) | set(policy.get("forbidden", {})))
-    trees = {crate: dependency_tree(arguments.repo_root, crate) for crate in crates}
-    reports, problems = find_violations(metadata, trees, policy)
+    crates = sorted(
+        set(policy.get("limits", {}))
+        | set(policy.get("forbidden", {}))
+        | set(enforcement_crates(policy))
+        | set(in_process_crates(policy))
+    )
+    identities = {crate: dependency_identities(arguments.repo_root, crate) for crate in crates}
+    reports, problems = find_violations(metadata, identities, policy)
 
     print(render(reports))
+    print()
+    print(render_surface(metadata, identities, policy))
     if problems:
         print(file=sys.stderr)
         for problem in problems:
             print(f"error: {problem}", file=sys.stderr)
         return 1
-    print("\nTCB budget satisfied.")
+    print("\nTCB budgets satisfied.")
     return 0
 
 

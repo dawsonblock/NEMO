@@ -36,12 +36,16 @@ def metadata(tmp_path: pathlib.Path, dependencies: tuple[str, ...] = ()) -> dict
     }
 
 
-def test_source_metrics_counts_files_lines_and_unsafe(tmp_path: pathlib.Path) -> None:
+def test_source_metrics_counts_every_unsafe_token(tmp_path: pathlib.Path) -> None:
+    # Counting is deliberately textual. A regular expression cannot tell a
+    # comment from a `//` inside a string literal, so stripping comments can
+    # only ever hide a real token. Overcounting is the correct direction for an
+    # upper bound, and the first line is the case that used to swallow one.
     source = tmp_path / "crate" / "src"
     source.mkdir(parents=True)
     (source / "lib.rs").write_text(
-        "// unsafe is only a word in this comment\n"
-        "pub fn safe() {}\n"
+        'let url = "https://example.com";\n'
+        "// unsafe appears in this comment\n"
         "pub fn risky() { unsafe { core::ptr::null::<u8>(); } }\n",
         encoding="utf-8",
     )
@@ -50,7 +54,44 @@ def test_source_metrics_counts_files_lines_and_unsafe(tmp_path: pathlib.Path) ->
 
     assert files == 1
     assert lines == 3
-    assert unsafe_occurrences == 1
+    assert unsafe_occurrences == 2
+
+
+def test_transitive_identity_keeps_two_versions_apart() -> None:
+    identities = ["foo@1.0.0", "foo@2.0.0", "bar@1.0.0"]
+
+    # Two resolved versions of one package are two entries, not one.
+    assert len(identities) == 3
+    assert report.identity_names(identities) == {"foo", "bar"}
+
+
+def test_dependency_digest_ignores_order_but_not_membership() -> None:
+    assert report.dependency_digest({"a", "b"}) == report.dependency_digest({"b", "a"})
+    assert report.dependency_digest({"a", "b"}) != report.dependency_digest({"a", "c"})
+
+
+def test_a_swapped_direct_dependency_fails_even_though_the_count_matches(
+    tmp_path: pathlib.Path,
+) -> None:
+    # The recorded digest is what makes a swap visible. A count-only budget
+    # would pass here, which is exactly the hole this closes.
+    policy = {
+        "forbidden": {},
+        "limits": {
+            "nemo-relay": {
+                "max_direct_dependencies": 1,
+                "direct_dependency_digest": report.dependency_digest({"serde"}),
+            }
+        },
+    }
+
+    _, problems = report.find_violations(
+        metadata(tmp_path, dependencies=("reqwest",)),
+        {"nemo-relay": ["reqwest@0.12.0"]},
+        policy,
+    )
+
+    assert any("direct_dependency_digest changed" in item for item in problems)
 
 
 def test_direct_dependencies_count_only_what_a_build_links(
@@ -114,7 +155,7 @@ def test_a_crate_within_budget_passes(tmp_path: pathlib.Path) -> None:
     assert problems == []
 
 
-def test_repository_policy_gives_every_trusted_crate_a_budget() -> None:
+def test_repository_policy_measures_every_crate_it_trusts() -> None:
     policy = report.load_policy(report.DEFAULT_POLICY)
 
     assert policy["version"] == 1
@@ -123,3 +164,8 @@ def test_repository_policy_gives_every_trusted_crate_a_budget() -> None:
     for crate in trusted:
         assert crate in policy["limits"], f"{crate} is trusted but unmeasured"
         assert crate in policy["forbidden"], f"{crate} has no forbidden list"
+        limits = policy["limits"][crate]
+        assert "direct_dependency_digest" in limits, f"{crate} does not pin its direct dependency set"
+        assert "transitive_dependency_digest" in limits, f"{crate} does not pin its transitive dependency set"
+    for crate in policy["in_process"]["crates"]:
+        assert crate in policy["limits"], f"{crate} shares the kernel's process but is unmeasured"

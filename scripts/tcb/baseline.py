@@ -109,15 +109,17 @@ def capture(root: pathlib.Path) -> dict[str, dict]:
     dependency = {
         "crate_graph": crate_graph(metadata),
         "trusted_direct_dependencies": {
-            crate: report.direct_dependency_names(metadata, report.dependency_tree(root, crate), crate)
+            crate: report.direct_dependency_names(metadata, report.dependency_identities(root, crate), crate)
             for crate in policy["trusted"]["crates"]
         },
     }
 
-    trees = {crate: report.dependency_tree(root, crate) for crate in policy["trusted"]["crates"]}
+    identities = {crate: report.dependency_identities(root, crate) for crate in policy["trusted"]["crates"]}
     trusted = {
         "policy_version": policy["version"],
-        "crates": {crate: vars(report.measure(metadata, trees[crate], crate)) for crate in policy["trusted"]["crates"]},
+        "crates": {
+            crate: vars(report.measure(metadata, identities[crate], crate)) for crate in policy["trusted"]["crates"]
+        },
     }
 
     return {

@@ -12,9 +12,14 @@ enforced in code the kernel does not own.
 
 Rewriting the graph takes several milestones, so this gate is a ratchet rather
 than a wall. ``[grandfathered]`` in ``security/layers.toml`` lists the edges
-that point upward today, and the check fails only when a new one appears. The
-list is printed on every run, and entries that no longer describe a real edge
-are reported as stale, so the debt stays visible while it shrinks.
+that point upward today, and the check fails when a new one appears. The list
+is printed on every run.
+
+A grandfathered entry that no longer describes a real edge is also a failure,
+not a note. Otherwise the exception outlives the debt it excused: an edge
+removed on one milestone leaves a permanent hole that a later regression can
+re-enter without the gate noticing. Failing on the stale entry forces the
+policy to tighten while the improvement is still in the same change.
 
 An unclassified crate is a failure, not a warning. A crate that nobody placed
 is a crate whose dependencies nobody is checking.
@@ -107,6 +112,23 @@ def render(graph: dict[str, list[str]], upward: list[tuple[str, str]], policy: d
     return "\n".join(rows)
 
 
+def problems_for(graph: dict[str, list[str]], policy: dict) -> list[str]:
+    """Return every policy violation for a crate graph."""
+    upward = upward_edges(graph, policy)
+    problems = [
+        f"{source} -> {target} is a new upward edge; either move the dependency "
+        "down or record it in security/layers.toml with a milestone that removes it"
+        for source, target in unexpected_edges(upward, policy)
+    ]
+    problems.extend(
+        f"{source} -> {target} is grandfathered but the edge no longer exists; "
+        "remove it from security/layers.toml so the exception cannot be reused"
+        for source, target in stale_entries(upward, policy)
+    )
+    problems.extend(f"{crate} has no layer in security/layers.toml" for crate in unclassified_crates(graph, policy))
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the layer gate."""
     parser = argparse.ArgumentParser(description="Enforce the dependency-layer rules for the NEMO workspace.")
@@ -124,21 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     policy = report.load_policy(arguments.policy)
 
     upward = upward_edges(graph, policy)
-    problems = [
-        f"{source} -> {target} is a new upward edge; either move the dependency "
-        "down or record it in security/layers.toml with a milestone that removes it"
-        for source, target in unexpected_edges(upward, policy)
-    ]
-    problems.extend(f"{crate} has no layer in security/layers.toml" for crate in unclassified_crates(graph, policy))
+    problems = problems_for(graph, policy)
 
     print(render(graph, upward, policy))
     sys.stdout.flush()
 
-    for source, target in stale_entries(upward, policy):
-        print(
-            f"note: {source} -> {target} is grandfathered but no longer exists; remove it from security/layers.toml",
-            file=sys.stderr,
-        )
     if problems:
         print(file=sys.stderr)
         for problem in problems:

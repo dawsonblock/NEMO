@@ -71,6 +71,29 @@ def test_a_grandfathered_edge_that_disappeared_is_reported_stale() -> None:
     assert layers.stale_entries([], policy()) == [("kernel", "adapters")]
 
 
+def test_a_stale_grandfather_entry_fails_the_gate() -> None:
+    # If this only warned, the exception would outlive the debt it excused and a
+    # later regression could re-enter the hole unnoticed.
+    problems = layers.problems_for({"kernel": ["contracts"]}, policy())
+
+    assert any("grandfathered but the edge no longer exists" in item for item in problems)
+
+
+def test_a_new_upward_edge_fails_through_the_gate_entry_point() -> None:
+    problems = layers.problems_for({"kernel": ["adapters", "runtime"]}, policy())
+
+    assert any("new upward edge" in item for item in problems)
+
+
+def test_a_policy_with_no_debt_passes() -> None:
+    clean = {
+        "layers": {"contracts": ["contracts"], "kernel": ["kernel"]},
+        "grandfathered": {},
+    }
+
+    assert layers.problems_for({"kernel": ["contracts"]}, clean) == []
+
+
 def test_unclassified_crates_are_reported() -> None:
     graph = {"kernel": ["contracts", "mystery"]}
 
