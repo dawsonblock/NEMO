@@ -122,6 +122,20 @@ Runtime and migration credentials are separate. Production startup calls
 `effect_schema_state`. A runtime credential that can rewrite the ledger it
 trusts can hide drift from every later check.
 
+The role check covers the powers that need no grant as well as the ones that
+do. A runtime role is rejected for `SUPERUSER`, `BYPASSRLS`, and `CREATEROLE`,
+and for owning the effect schema or any effect-store relation, because
+ownership conveys powers that an ordinary `GRANT` list never shows.
+
+Readiness also compares the server's settings against a policy instead of only
+reporting them. `DatabaseReadinessPolicy` requires a server at or above the
+qualified major version, a `synchronous_commit` that keeps a committed write
+durable, and a transaction isolation level the runtime accepts, so a database
+running `synchronous_commit = off` no longer passes. Wait timeouts and the
+session time zone are reported but deliberately not enforced: the adapter sets
+statement and lock timeouts on every checked-out session from the action
+budget, so the server defaults are not the binding constraint.
+
 PostgreSQL waits are bounded by the action, not only by a fixed maximum. The
 configured budgets remain upper bounds, and
 `PostgresOperationBudgets::for_remaining` derives

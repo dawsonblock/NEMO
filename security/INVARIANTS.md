@@ -190,6 +190,16 @@ than by the type. A distinct `ProductionPostgresEffectStore`, produced only by
 the verified-transport constructors, would make the bad combination
 unrepresentable instead of rejected, and is the type-level target.
 
+What "attests readiness" covers was also widened, because the checks behind it
+proved less than the bound implied. The role check now covers the powers that
+need no grant (`SUPERUSER`, `BYPASSRLS`, `CREATEROLE`) and ownership of the
+effect schema or its relations, alongside the existing grant checks, including
+`DELETE` on `effect_schema_state`. The server settings are compared against a
+`DatabaseReadinessPolicy` rather than only reported, so a database running
+`synchronous_commit = off` is rejected instead of observed. Each of those was
+verified against the PostgreSQL release the repository pins for qualification,
+by escalating one property at a time and asserting the specific rejection.
+
 **Verified by** `a_production_kernel_composes_only_with_the_durable_store`,
 `production_composition_is_fail_closed`, and `the_production_store_trait_is_sealed`
 (`crates/effect-runtime/tests/production_composition.rs`).
