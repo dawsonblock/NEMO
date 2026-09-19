@@ -1765,6 +1765,22 @@ qualification-digest:
 test-qualification-scripts:
     uv run --locked python -m pytest scripts/qualification -q
 
+# Report the trusted computing base budget and fail on forbidden dependencies or growth.
+tcb-report:
+    python3 scripts/tcb/report.py
+
+# Enforce the dependency-layer rules and fail on a new upward edge.
+layer-report:
+    python3 scripts/tcb/layers.py
+
+# Capture the minimal-trusted-kernel baseline into reports/ (generated, git-ignored).
+tcb-baseline:
+    python3 scripts/tcb/baseline.py
+
+# Run the trusted computing base gate's own tests.
+test-tcb-scripts:
+    uv run --locked python -m pytest scripts/tcb -q
+
 # Verify source, lockfile, Git, and archive digests against qualification evidence.
 provenance-check:
     python3 scripts/qualification/provenance_check.py

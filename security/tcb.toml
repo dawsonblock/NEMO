@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Trusted computing base policy for the NEMO kernel.
+#
+# A trusted crate is one whose failure could directly violate NEMO's core
+# security or correctness guarantees: canonical action identity, runtime
+# identity, capability and grant verification, execution routing, idempotency,
+# effect state transitions, receipts, and lease fencing.
+#
+# Providers, transports, bindings, the CLI, the durable store, DLP, sandboxing,
+# qualification tooling, tests, and docs are deliberately outside this set. The
+# kernel must not know what PostgreSQL, Gmail, GitHub, or a language binding is.
+
+version = 1
+
+[trusted]
+crates = ["nemo-relay", "nemo-relay-types"]
+
+# Packages that must never appear in a trusted crate's resolved tree.
+#
+# The kernel depends on interfaces, not implementations, so a database driver
+# or a foreign-function binding appearing here means an implementation leaked
+# across the boundary. Measured with `cargo tree --all-features`, these hold
+# today: core reaches `nemo-relay-ledger` for its effect-store contract, but the
+# ledger crate keeps the PostgreSQL driver behind a feature core never enables.
+#
+# Transport and HTTP packages (`reqwest`, `tonic`, `axum`, `hyper`,
+# `object_store`, `libloading`) are still reachable and are held flat by the
+# budgets below rather than listed here, because a gate that is red on arrival
+# enforces nothing.
+[forbidden]
+nemo-relay = [
+    "sqlx",
+    "tokio-postgres",
+    "postgres",
+    "deadpool-postgres",
+    "diesel",
+    "napi",
+    "pyo3",
+]
+nemo-relay-types = [
+    "sqlx",
+    "tokio-postgres",
+    "postgres",
+    "deadpool-postgres",
+    "diesel",
+    "napi",
+    "pyo3",
+]
+
+# Ratchet budgets. These record the current surface, so the gate fails on
+# growth and passes on shrinkage. Raising a number requires a security review
+# and an edit to this file, which is the point: TCB growth becomes visible in
+# review instead of arriving as a side effect.
+#
+# Source lines and `unsafe` occurrences are upper bounds that include inline
+# test modules, so they never undercount the kernel. The dominant `unsafe`
+# concentration is the dynamic native plugin loader, which is not TCB work.
+[limits.nemo-relay]
+max_direct_dependencies = 39
+max_transitive_packages = 252
+max_source_lines = 71153
+max_unsafe_occurrences = 299
+
+[limits.nemo-relay-types]
+max_direct_dependencies = 7
+max_transitive_packages = 25
+max_source_lines = 3681
+max_unsafe_occurrences = 0

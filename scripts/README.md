@@ -18,6 +18,26 @@ Keep `scripts/` focused on helpers that are still script-native:
 - `test-install.ps1`: Run live GitHub release and local interface checks for the PowerShell CLI installer
 - `test-install-mocks.sh`: Run installer scenarios that require simulated platforms or failures
 
+## Trusted Computing Base
+
+`security/tcb.toml` declares which crates are trusted and the budgets that keep
+them small. Run `just tcb-report` to print the current surface, or
+`just test-tcb-scripts` to exercise the gate itself. The check fails when a
+forbidden package (a database driver or a foreign-function binding) appears
+anywhere in a trusted crate's resolved tree, or when any budget grows. Raising a
+budget is an explicit edit to that policy file, so growth is visible in review.
+
+`just tcb-baseline` captures the frozen baseline the refactor is measured
+against - source-tree and lockfile digests, toolchain versions, the workspace
+crate graph, and the trusted-surface measurements - into the generated,
+git-ignored `reports/` directory. The recorded invariants and the known gaps
+behind them live in `security/INVARIANTS.md` and `security/BASELINE.md`.
+
+`just layer-report` enforces `security/layers.toml`, which places every
+workspace crate in a layer and fails when a dependency points upward. Edges that
+point the wrong way today are listed as grandfathered so the check passes on
+arrival and can only get tighter; the report names them on every run.
+
 ## Opt-In Coding-Agent E2E Tests
 
 These checks exercise installed coding-agent clients and are intentionally outside the default Rust and CI test suites. Run the recipe that matches an available local client:
