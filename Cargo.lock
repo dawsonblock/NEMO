@@ -2035,6 +2035,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-plugin-protocol"
+version = "0.9.1-rc.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nemo-relay-python"
 version = "0.9.1-rc.4"
 dependencies = [

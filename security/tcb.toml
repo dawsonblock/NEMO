@@ -111,6 +111,22 @@ max_unsafe_occurrences = 0
 direct_dependency_digest = "11e4bcc51abb330176957e169b265053384410421ab598cf026210efe3e2cfb9"
 transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d92cc3dfc4d7fd800"
 
+# The plugin-execution contract. It is measured from the moment it exists so its
+# growth is visible, but it is in neither tier yet: nothing depends on it until
+# the kernel takes the interface, at which point it joins the in-process tier.
+#
+# Its `unsafe` budget is 3 while the crate contains no `unsafe` at all. Counting
+# is textual, so the three occurrences are the word in this crate's own
+# documentation. That is the price of an upper bound that cannot hide a token,
+# and it means a prose change can move this number.
+[limits.nemo-relay-plugin-protocol]
+max_direct_dependencies = 2
+max_transitive_packages = 13
+max_source_lines = 383
+max_unsafe_occurrences = 3
+direct_dependency_digest = "bd4b7af49da2622c3f36b9bc8d284ffeb126deacce8fcd8113f73a335c542747"
+transitive_dependency_digest = "108e1b5b6140bdb66473662b39389eeec866f70fbe24b3cf1219afe41683175e"
+
 [limits.nemo-relay-authority]
 max_direct_dependencies = 3
 max_transitive_packages = 25
