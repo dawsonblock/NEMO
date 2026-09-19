@@ -13,7 +13,7 @@
 
 #![cfg(all(feature = "unstable-postgres", feature = "unstable-hardening-testkit"))]
 
-use nemo_relay_ledger::postgres::PostgresEffectStore;
+use nemo_relay_ledger::postgres::{DatabaseReadinessPolicy, PostgresEffectStore};
 use nemo_relay_ledger::unstable::LeaseConfiguration;
 use postgres::NoTls;
 use std::sync::{Arc, Barrier};
@@ -87,6 +87,52 @@ impl TestSchema {
             .expect("count contract relations")
             .get(0)
     }
+}
+
+/// Create the data-only runtime role production requires for `schema`.
+///
+/// The shape is USAGE on the schema, data privileges on the effect tables, and
+/// nothing on either ledger table. Returns `None` when this session cannot
+/// create roles, which is the case for a non-superuser test connection.
+fn create_data_only_role(schema: &TestSchema) -> Option<String> {
+    let role = format!("nemo_runtime_{}", schema.name);
+    let created = schema.client().batch_execute(&format!(
+        "create role \"{role}\" login password 'runtime-only';
+         grant usage on schema \"{schema}\" to \"{role}\";
+         grant select, insert, update, delete on all tables in schema \"{schema}\" to \"{role}\";
+         revoke insert, update, delete, truncate on \"{schema}\".effect_schema_migrations from \"{role}\";
+         revoke insert, update, delete, truncate on \"{schema}\".effect_schema_state from \"{role}\";
+         revoke create on schema \"{schema}\" from \"{role}\"",
+        schema = schema.name,
+    ));
+    if created.is_err() {
+        eprintln!("skipping restricted-role case: cannot create roles on this server");
+        return None;
+    }
+    Some(role)
+}
+
+/// Connect a store as the named runtime role.
+fn runtime_store(schema: &TestSchema, role: &str) -> PostgresEffectStore {
+    let url = format!(
+        "postgresql://{role}:runtime-only@{}",
+        schema
+            .connection
+            .rsplit('@')
+            .next()
+            .expect("host in test URL")
+    );
+    PostgresEffectStore::connect_insecure_local_for_tests(
+        &url,
+        &schema.name,
+        LeaseConfiguration {
+            default_duration_ms: 60_000,
+            maximum_duration_ms: 60_000,
+            renewal_enabled: true,
+        },
+        2,
+    )
+    .expect("connect runtime role")
 }
 
 impl Drop for TestSchema {
@@ -320,6 +366,170 @@ fn a_missing_historical_row_cannot_be_replayed_over_existing_objects() {
     assert!(
         failure.is_err(),
         "a migration must not silently adopt objects it did not create: {failure:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_data_only_runtime_role_satisfies_privilege_and_policy_readiness() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    let runtime = runtime_store(&schema, &role);
+    runtime
+        .verify_runtime_privileges()
+        .expect("a data-only role must satisfy privilege readiness");
+    runtime
+        .verify_database_policy(&DatabaseReadinessPolicy::default())
+        .expect("the server default settings must satisfy the durability policy");
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_runtime_credential_that_can_delete_schema_state_is_rejected() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    // The data-only shape revokes this. Granting it back is the smallest
+    // possible escalation: a runtime role that can delete the ledger row
+    // recording the schema description can hide drift from every later check.
+    schema
+        .client()
+        .batch_execute(&format!(
+            "grant delete on \"{}\".effect_schema_state to \"{role}\"",
+            schema.name
+        ))
+        .expect("grant delete on the schema state table");
+
+    let failure = runtime_store(&schema, &role)
+        .verify_runtime_privileges()
+        .expect_err("delete on the schema-state ledger must be rejected");
+    assert!(
+        failure
+            .to_string()
+            .contains("DELETE from effect_schema_state"),
+        "expected the schema-state delete privilege to be named: {failure}"
+    );
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_runtime_credential_with_a_dangerous_role_attribute_is_rejected() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    // CREATEROLE needs no grant on the effect schema to be dangerous: it lets
+    // the runtime role mint a role that can do more than it can.
+    schema
+        .client()
+        .batch_execute(&format!("alter role \"{role}\" createrole"))
+        .expect("grant createrole to the runtime role");
+
+    let failure = runtime_store(&schema, &role)
+        .verify_runtime_privileges()
+        .expect_err("a role attribute that permits escalation must be rejected");
+    assert!(
+        failure.to_string().contains("CREATEROLE role attribute"),
+        "expected the role attribute to be named: {failure}"
+    );
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_runtime_credential_that_owns_the_schema_is_rejected() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    // Ownership needs no ordinary GRANT, which is why the grant checks alone
+    // cannot prove the credential is data-only.
+    schema
+        .client()
+        .batch_execute(&format!(
+            "alter schema \"{}\" owner to \"{role}\"",
+            schema.name
+        ))
+        .expect("transfer schema ownership to the runtime role");
+
+    let failure = runtime_store(&schema, &role)
+        .verify_runtime_privileges()
+        .expect_err("schema ownership must be rejected");
+    assert!(
+        failure
+            .to_string()
+            .contains("ownership of the effect-store schema"),
+        "expected schema ownership to be named: {failure}"
+    );
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_runtime_credential_that_owns_an_effect_store_relation_is_rejected() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    // Taking ownership requires CREATE on the schema, so this role is rejected
+    // for more than one reason. The assertion names the ownership finding
+    // specifically, which is the column this case exists to exercise.
+    schema
+        .client()
+        .batch_execute(&format!(
+            "grant create on schema \"{}\" to \"{role}\";
+             alter table \"{}\".effect_receipts owner to \"{role}\"",
+            schema.name, schema.name
+        ))
+        .expect("transfer relation ownership to the runtime role");
+
+    let failure = runtime_store(&schema, &role)
+        .verify_runtime_privileges()
+        .expect_err("relation ownership must be rejected");
+    assert!(
+        failure
+            .to_string()
+            .contains("ownership of an effect-store relation"),
+        "expected relation ownership to be named: {failure}"
+    );
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_non_durable_synchronous_commit_setting_is_rejected() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    // `off` lets a committed write be lost in a crash, so the settings the
+    // store reports must be compared against a policy rather than only read.
+    schema
+        .client()
+        .batch_execute(&format!(
+            "alter role \"{role}\" set synchronous_commit = off"
+        ))
+        .expect("make the runtime role non-durable");
+
+    let runtime = runtime_store(&schema, &role);
+    let failure = runtime
+        .verify_database_policy(&DatabaseReadinessPolicy::default())
+        .expect_err("a non-durable synchronous_commit must be rejected");
+    assert!(
+        failure.to_string().contains("synchronous_commit"),
+        "expected the durability setting to be named: {failure}"
     );
 }
 

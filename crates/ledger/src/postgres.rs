@@ -555,6 +555,52 @@ pub struct PostgresDatabaseSettings {
     pub timezone: String,
 }
 
+/// Lowest PostgreSQL release this adapter is qualified against.
+///
+/// The repository pins PostgreSQL 17 for qualification. Refusing an older
+/// server is the honest reading of "production ready": a release that was never
+/// qualified has not been shown to hold the same guarantees.
+pub const MINIMUM_QUALIFIED_SERVER_MAJOR: i32 = 17;
+
+/// Durability and isolation requirements a production database must meet.
+///
+/// [`PostgresEffectStore::database_settings`] reports what the server is
+/// configured to do; this type is what the runtime requires it to do. Without
+/// the two being compared, an observation was being reported as readiness, and
+/// a database running `synchronous_commit = off` passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseReadinessPolicy {
+    /// Lowest acceptable `server_version_num / 10000`.
+    pub minimum_server_major: i32,
+    /// `synchronous_commit` settings that keep a committed effect durable.
+    ///
+    /// PostgreSQL accepts a comma-separated list for this setting, so each
+    /// element is checked rather than the string as a whole.
+    pub acceptable_synchronous_commit: Vec<String>,
+    /// Transaction isolation levels the runtime accepts.
+    pub acceptable_transaction_isolation: Vec<String>,
+}
+
+impl Default for DatabaseReadinessPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_server_major: MINIMUM_QUALIFIED_SERVER_MAJOR,
+            // `off` and `local` both let a committed write be lost in a crash,
+            // which is the one outcome a durable effect cannot tolerate.
+            acceptable_synchronous_commit: vec![
+                "on".to_owned(),
+                "remote_write".to_owned(),
+                "remote_apply".to_owned(),
+            ],
+            acceptable_transaction_isolation: vec![
+                "read committed".to_owned(),
+                "repeatable read".to_owned(),
+                "serializable".to_owned(),
+            ],
+        }
+    }
+}
+
 /// Failures the PostgreSQL durable-effect adapter can report.
 #[derive(Debug)]
 pub enum PostgresEffectStoreError {
@@ -594,6 +640,15 @@ pub enum PostgresEffectStoreError {
     },
     /// A production kernel was offered a store opened over the test-only transport.
     ProductionTestTransport,
+    /// The server is configured in a way that cannot hold durable effects.
+    DatabasePolicyViolation {
+        /// Which setting failed.
+        setting: &'static str,
+        /// What the server reported.
+        observed: String,
+        /// What the runtime requires.
+        requirement: String,
+    },
     /// A qualification test injected a durable-operation failure at a boundary.
     ///
     /// Only produced when the testkit feature is enabled and the process was
@@ -652,6 +707,15 @@ impl std::fmt::Display for PostgresEffectStoreError {
                 formatter,
                 "the test-only plaintext transport cannot attest production readiness"
             ),
+            Self::DatabasePolicyViolation {
+                setting,
+                observed,
+                requirement,
+            } => write!(
+                formatter,
+                "PostgreSQL {setting} is {observed}, which does not meet the production \
+                 durability requirement: {requirement}"
+            ),
             Self::InjectedFailure(point) => {
                 write!(formatter, "injected durable-operation failure at {point}")
             }
@@ -686,6 +750,7 @@ impl std::error::Error for PostgresEffectStoreError {
             | Self::SchemaObjectMismatch { .. }
             | Self::DatabasePrivilegeViolation { .. }
             | Self::ProductionTestTransport
+            | Self::DatabasePolicyViolation { .. }
             | Self::InjectedFailure(_)
             | Self::CorruptData(_)
             | Self::IntegerOutOfRange(_) => None,
@@ -1247,7 +1312,59 @@ impl PostgresEffectStore {
         self.verify_migration_history()?;
         self.verify_physical_schema()?;
         self.verify_runtime_privileges()?;
+        self.verify_database_policy(&DatabaseReadinessPolicy::default())?;
         self.database_settings()
+    }
+
+    /// Verify the server settings that durable operation depends on.
+    ///
+    /// `statement_timeout`, `idle_in_transaction_session_timeout`, and the
+    /// session time zone are deliberately not enforced. The adapter sets
+    /// statement and lock timeouts on every checked-out session from the action
+    /// budget, so the server defaults are not the binding constraint; enforcing
+    /// them here would reject a deployment for a setting that never applies.
+    pub fn verify_database_policy(
+        &self,
+        policy: &DatabaseReadinessPolicy,
+    ) -> Result<(), PostgresEffectStoreError> {
+        let settings = self.database_settings()?;
+        if settings.server_major < policy.minimum_server_major {
+            return Err(PostgresEffectStoreError::DatabasePolicyViolation {
+                setting: "server_version",
+                observed: settings.server_version.clone(),
+                requirement: format!("major version >= {}", policy.minimum_server_major),
+            });
+        }
+
+        for element in settings.synchronous_commit.split(',') {
+            let element = element.trim().to_ascii_lowercase();
+            if !policy
+                .acceptable_synchronous_commit
+                .iter()
+                .any(|accepted| accepted == &element)
+            {
+                return Err(PostgresEffectStoreError::DatabasePolicyViolation {
+                    setting: "synchronous_commit",
+                    observed: settings.synchronous_commit.clone(),
+                    requirement: policy.acceptable_synchronous_commit.join(", "),
+                });
+            }
+        }
+
+        let isolation = settings.transaction_isolation.trim().to_ascii_lowercase();
+        if !policy
+            .acceptable_transaction_isolation
+            .iter()
+            .any(|accepted| accepted == &isolation)
+        {
+            return Err(PostgresEffectStoreError::DatabasePolicyViolation {
+                setting: "default_transaction_isolation",
+                observed: settings.transaction_isolation.clone(),
+                requirement: policy.acceptable_transaction_isolation.join(", "),
+            });
+        }
+
+        Ok(())
     }
 
     /// Verify that the connected role cannot modify the schema or its ledger.
@@ -1268,7 +1385,15 @@ impl PostgresEffectStore {
              has_table_privilege(current_user, $2, 'TRUNCATE'), \
              has_table_privilege(current_user, $3, 'INSERT'), \
              has_table_privilege(current_user, $3, 'UPDATE'), \
-             has_table_privilege(current_user, $3, 'TRUNCATE')",
+             has_table_privilege(current_user, $3, 'DELETE'), \
+             has_table_privilege(current_user, $3, 'TRUNCATE'), \
+             coalesce((select rolsuper from pg_roles where rolname = current_user), false), \
+             coalesce((select rolbypassrls from pg_roles where rolname = current_user), false), \
+             coalesce((select rolcreaterole from pg_roles where rolname = current_user), false), \
+             coalesce((select pg_get_userbyid(nspowner) = current_user from pg_namespace \
+                       where nspname = $1), false), \
+             exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+                     where n.nspname = $1 and pg_get_userbyid(c.relowner) = current_user)",
             &[
                 &self.schema,
                 &self.table("effect_schema_migrations"),
@@ -1284,7 +1409,13 @@ impl PostgresEffectStore {
             ("TRUNCATE of effect_schema_migrations", row.get(6)),
             ("INSERT into effect_schema_state", row.get(7)),
             ("UPDATE of effect_schema_state", row.get(8)),
-            ("TRUNCATE of effect_schema_state", row.get(9)),
+            ("DELETE from effect_schema_state", row.get(9)),
+            ("TRUNCATE of effect_schema_state", row.get(10)),
+            ("SUPERUSER role attribute", row.get(11)),
+            ("BYPASSRLS role attribute", row.get(12)),
+            ("CREATEROLE role attribute", row.get(13)),
+            ("ownership of the effect-store schema", row.get(14)),
+            ("ownership of an effect-store relation", row.get(15)),
         ];
         let granted: Vec<&str> = violations
             .iter()
