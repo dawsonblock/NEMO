@@ -12,10 +12,15 @@ on:
       - 'crates/core/**'
       - 'crates/executor/**'
       - 'crates/ledger/**'
+      - 'crates/effect-qualification/**'
+      - 'crates/effect-runtime/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
       - 'scripts/qualification/run.sh'
+      - 'scripts/qualification/**'
+      - 'qualification/README.md'
+      - 'docs/e3-baseline.md'
       - 'docs/reference/hardening.mdx'
       - '.github/actions/load-ci-tool-versions/**'
       - '.github/workflows/effect-contract-conformance.yml'
@@ -30,10 +35,15 @@ on:
       - 'crates/core/**'
       - 'crates/executor/**'
       - 'crates/ledger/**'
+      - 'crates/effect-qualification/**'
+      - 'crates/effect-runtime/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'justfile'
       - 'scripts/qualification/run.sh'
+      - 'scripts/qualification/**'
+      - 'qualification/README.md'
+      - 'docs/e3-baseline.md'
       - 'docs/reference/hardening.mdx'
       - '.github/actions/load-ci-tool-versions/**'
       - '.github/workflows/effect-contract-conformance.yml'
@@ -98,12 +108,30 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: false
+
+      # Provenance is the first gate: it decides whether any other result in this
+      # run describes the source that is actually checked out.
+      - name: Run mandatory provenance tests
+        run: uv run --locked python -m pytest scripts/qualification -q
+
       - name: Lint contract crates
         run: |
           cargo clippy --locked -p nemo-relay-authority --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-relay-executor --all-targets --features unstable-hardening -- -D warnings
           cargo clippy --locked -p nemo-relay-ledger --all-targets --features unstable-hardening-testkit,unstable-postgres -- -D warnings
           cargo clippy --locked -p nemo-relay --all-targets --features unstable-hardening -- -D warnings
+          cargo clippy --locked -p nemo-effect-qualification --all-targets -- -D warnings
+          cargo clippy --locked -p nemo-effect-runtime --all-targets -- -D warnings
 
       - name: Run hardening contract conformance
         run: just test-effect-contracts
@@ -120,3 +148,28 @@ jobs:
         env:
           NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: just test-postgres-crash-recovery
+
+      - name: Run PostgreSQL migration integrity
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-migration-integrity
+
+      - name: Run database failure boundary tests
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-db-failure-boundaries
+
+      - name: Run runtime composition tests
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-runtime-composition
+
+      - name: Run physical schema verification
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-schema-verification
+
+      - name: Run kernel and provider process restart
+        env:
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: just test-postgres-kernel-restart

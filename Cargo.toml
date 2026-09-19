@@ -13,6 +13,8 @@ members = [
     "crates/authority",
     "crates/ledger",
     "crates/executor",
+    "crates/effect-qualification",
+    "crates/effect-runtime",
     "crates/isolation",
   "crates/dlp",
     "crates/cli",

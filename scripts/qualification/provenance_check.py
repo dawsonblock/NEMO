@@ -1,95 +1,54 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 
-"""Verify that qualification evidence still describes the current source tree."""
+"""Verify that qualification evidence still describes the current source tree.
+
+The candidate set always comes from the filesystem, never from the manifest
+under test. Comparing ``manifest_entries`` against a manifest-derived candidate
+set only ever proves ``manifest <= tree``; a manifest can never report a file it
+does not list, so brand-new source files would verify clean. Enumerating the
+tree independently turns the check into ``tree == manifest``.
+
+Every mismatch category is a hard failure: unexpected entries, missing entries,
+type mismatches, mode mismatches, content mismatches, and symlink target
+mismatches.
+"""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
-import json
 import os
 import pathlib
 import subprocess
 import sys
-import argparse
-from typing import Any
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import source_tree  # noqa: E402  (local module)
+
+ROOT = SCRIPT_DIR.parents[1]
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
-EXCLUDED_ROOTS = {
-    ".git",
-    "target",
-    "node_modules",
-    "coverage",
-    "qualification",
-    ".venv",
-    ".uv-cache",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    "build",
-    "dist",
-}
-GENERATED_PREFIX = ("release", "artifacts")
+def report_failure(messages: list[str]) -> int:
+    """Print a structured failure report and return a non-zero exit code."""
+
+    print(f"PROVENANCE FAIL\n{len(messages)} discrepancy(s)")
+    for message in messages:
+        print(f"- {message}")
+    return 1
 
 
-def excluded(relative: pathlib.Path) -> bool:
-    if not relative.parts:
-        return False
-    if relative.parts[0] in EXCLUDED_ROOTS or relative.parts[:2] == GENERATED_PREFIX:
-        return True
-    if "__pycache__" in relative.parts or relative.name == ".coverage":
-        return True
-    return relative.suffix in {".pyc", ".pyo"}
+def git_output(root: pathlib.Path, *args: str) -> str:
+    """Run a read-only Git command, returning an empty string on failure."""
 
-
-def source_files(manifest_paths: set[str] | None = None) -> list[pathlib.Path]:
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            cwd=ROOT,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        paths = {
-            pathlib.Path(raw.decode())
-            for raw in result.stdout.split(b"\0")
-            if raw
-        }
-    except (OSError, subprocess.CalledProcessError):
-        paths = {pathlib.Path(name) for name in (manifest_paths or set())}
-    return sorted(
-        (
-            relative
-            for relative in paths
-            if not excluded(relative)
-            and (ROOT / relative).is_file()
-            and not (ROOT / relative).is_symlink()
-        ),
-        key=lambda path: path.as_posix(),
-    )
-
-
-def file_hashes(files: list[pathlib.Path]) -> dict[str, str]:
-    return {
-        relative.as_posix(): hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
-        for relative in files
-    }
-
-
-def tree_digest(hashes: dict[str, str]) -> str:
-    canonical = "".join(f"{name}\t{digest}\n" for name, digest in hashes.items()).encode()
-    return hashlib.sha256(canonical).hexdigest()
-
-
-def git_output(*args: str) -> str:
     try:
         return subprocess.run(
             ["git", *args],
-            cwd=ROOT,
+            cwd=root,
             check=True,
             text=True,
             stdout=subprocess.PIPE,
@@ -99,29 +58,120 @@ def git_output(*args: str) -> str:
         return ""
 
 
-def report_failure(messages: list[str]) -> int:
-    print(f"PROVENANCE FAIL\n{len(messages)} discrepancy(s)")
-    for message in messages:
-        print(f"- {message}")
-    return 1
+def verify_archive(root: pathlib.Path, recorded: str | None, label: str, findings: list[str]) -> None:
+    """Re-hash a recorded archive digest when the operator supplied the path."""
 
-
-def verify_archive(recorded: Any, label: str, discrepancies: list[str]) -> None:
     if not recorded or recorded in {"NOT_PROVIDED", "NOT_AVAILABLE"}:
         return
-    archive_value = os.environ.get(
-        "NEMO_RELAY_RELEASE_ARCHIVE" if label == "release" else "NEMO_RELAY_SOURCE_ARCHIVE"
-    )
+    variable = "NEMO_RELAY_RELEASE_ARCHIVE" if label == "release" else "NEMO_RELAY_SOURCE_ARCHIVE"
+    archive_value = os.environ.get(variable)
     if not archive_value:
-        discrepancies.append(f"{label} archive hash is recorded but archive path is not provided")
+        findings.append(f"{label} archive hash is recorded but archive path is not provided")
         return
     archive = pathlib.Path(archive_value).expanduser()
     if not archive.is_file():
-        discrepancies.append(f"{label} archive is missing: {archive}")
+        findings.append(f"{label} archive is missing: {archive}")
         return
     actual = hashlib.sha256(archive.read_bytes()).hexdigest()
     if actual != recorded:
-        discrepancies.append(f"{label} archive digest differs: expected {recorded}, got {actual}")
+        findings.append(f"{label} archive digest differs: expected {recorded}, got {actual}")
+
+
+def verify_lockfiles(root: pathlib.Path, manifest: dict, findings: list[str]) -> None:
+    """Confirm every recorded lockfile digest still matches."""
+
+    root = root.resolve()
+    for lockfile, recorded in (manifest.get("lockfiles") or {}).items():
+        try:
+            validated = source_tree.validate_path(lockfile)
+        except source_tree.SourceTreeError as error:
+            findings.append(f"lockfile path is not a safe manifest path: {error}")
+            continue
+        path = (root / validated).resolve()
+        if not path.is_relative_to(root):
+            findings.append(f"lockfile path escapes the source tree: {lockfile}")
+            continue
+        actual = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}" if path.is_file() else None
+        if actual != recorded:
+            findings.append(f"lockfile digest differs: {lockfile}")
+
+
+def verify_git(root: pathlib.Path, manifest: dict, actual_tree: str, findings: list[str]) -> None:
+    """Confirm Git provenance still agrees with the recorded manifest."""
+
+    recorded_git = manifest.get("git") or {}
+    current_commit = git_output(root, "rev-parse", "HEAD")
+    if current_commit and recorded_git.get("commit") and recorded_git["commit"] != current_commit:
+        changed_since = git_output(root, "diff", "--name-only", f"{recorded_git['commit']}..HEAD").splitlines()
+        non_generated = [
+            path
+            for path in changed_since
+            if not path.startswith("qualification/") and not path.startswith("release/artifacts/")
+        ]
+        if non_generated:
+            findings.append("Git commit differs with non-generated source changes")
+    recorded_tree_digest = recorded_git.get("source_tree_sha256")
+    if recorded_tree_digest and recorded_tree_digest != actual_tree:
+        findings.append("recorded Git source tree digest differs from the actual source tree")
+    elif recorded_git.get("tree") and recorded_git["tree"] != git_output(root, "rev-parse", "HEAD^{tree}"):
+        findings.append("Git tree differs from qualification manifest")
+    if current_commit:
+        dirty = [
+            line
+            for line in git_output(root, "status", "--short").splitlines()
+            if "qualification/" not in line and "release/artifacts/" not in line
+        ]
+        if dirty:
+            findings.append(f"working tree is dirty: {', '.join(dirty[:5])}")
+
+
+def verify_policy(manifest: dict, enumeration: "source_tree.Enumeration", findings: list[str]) -> None:
+    """Confirm the recorded exclusion policy still describes how we enumerated."""
+
+    recorded = manifest.get("policy")
+    if recorded is None:
+        findings.append("source manifest does not record its exclusion policy")
+        return
+    current = enumeration.policy()
+    if recorded != current:
+        differing = sorted(key for key in set(recorded) | set(current) if recorded.get(key) != current.get(key))
+        findings.append(f"source exclusion policy differs from the manifest: {', '.join(differing)}")
+
+
+def verify(root: pathlib.Path, manifest_path: pathlib.Path) -> tuple[list[str], int]:
+    """Return every discrepancy between a manifest and the tree it claims.
+
+    An empty findings list means the evidence describes this exact tree.
+    The second element is the verified entry count from the enumeration.
+    """
+
+    root = pathlib.Path(root).resolve()
+    manifest_path = pathlib.Path(manifest_path)
+    if not manifest_path.is_absolute():
+        manifest_path = root / manifest_path
+    try:
+        manifest = source_tree.load_manifest(manifest_path)
+    except source_tree.SourceTreeError as error:
+        return [str(error)], 0
+    try:
+        enumeration = source_tree.enumerate_tree(root)
+    except source_tree.SourceTreeError as error:
+        return [str(error)], 0
+
+    expected = manifest["entries"]
+    actual = enumeration.entries
+    mismatches = source_tree.compare(expected, actual)
+    findings: list[str] = source_tree.describe(mismatches)
+
+    actual_digest = enumeration.digest
+    if actual_digest != manifest.get("root_digest"):
+        findings.append(f"source tree digest differs: expected {manifest.get('root_digest')}, got {actual_digest}")
+    verify_policy(manifest, enumeration, findings)
+    verify_lockfiles(root, manifest, findings)
+    verify_git(root, manifest, actual_digest, findings)
+    verify_archive(root, manifest.get("source_archive_sha256"), "source", findings)
+    verify_archive(root, manifest.get("release_archive_sha256"), "release", findings)
+    return findings, len(enumeration.entries)
 
 
 def main() -> int:
@@ -139,77 +189,16 @@ def main() -> int:
         help="source manifest path; defaults to qualification/source-manifest.json",
     )
     args = parser.parse_args()
-    global ROOT
-    if args.root is not None:
-        ROOT = args.root.resolve()
+
+    root = args.root.resolve() if args.root is not None else ROOT
     manifest_path = args.manifest or pathlib.Path(
-        os.environ.get("NEMO_RELAY_SOURCE_MANIFEST", ROOT / "qualification" / "source-manifest.json")
+        os.environ.get("NEMO_RELAY_SOURCE_MANIFEST", root / "qualification" / "source-manifest.json")
     )
-    if not manifest_path.is_absolute():
-        manifest_path = ROOT / manifest_path
-    if not manifest_path.is_file():
-        return report_failure([f"missing qualification manifest: {manifest_path}"])
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except json.JSONDecodeError as error:
-        return report_failure([f"invalid qualification manifest: {error}"])
 
-    expected = manifest.get("files", {})
-    actual = file_hashes(source_files(set(expected)))
-    discrepancies: list[str] = []
-    missing = sorted(set(expected) - set(actual))
-    added = sorted(set(actual) - set(expected))
-    changed = sorted(name for name in set(expected) & set(actual) if expected[name] != actual[name])
-    if missing:
-        discrepancies.append(f"{len(missing)} manifest source file(s) missing: {', '.join(missing[:5])}")
-    if added:
-        discrepancies.append(f"{len(added)} source file(s) absent from manifest: {', '.join(added[:5])}")
-    if changed:
-        discrepancies.append(f"{len(changed)} source file(s) differ: {', '.join(changed[:5])}")
-    actual_tree = tree_digest(actual)
-    if actual_tree != manifest.get("root_digest"):
-        discrepancies.append(
-            f"source tree digest differs: expected {manifest.get('root_digest')}, got {actual_tree}"
-        )
-
-    for lockfile, recorded in (manifest.get("lockfiles") or {}).items():
-        path = ROOT / lockfile
-        actual_lock = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}" if path.is_file() else None
-        if actual_lock != recorded:
-            discrepancies.append(f"lockfile digest differs: {lockfile}")
-
-    recorded_git = manifest.get("git") or {}
-    current_commit = git_output("rev-parse", "HEAD")
-    if current_commit and recorded_git.get("commit") and recorded_git["commit"] != current_commit:
-        try:
-            changed_since = git_output("diff", "--name-only", f"{recorded_git['commit']}..HEAD").splitlines()
-        except subprocess.CalledProcessError:
-            changed_since = []
-        non_generated = [
-            path for path in changed_since if not path.startswith("qualification/") and not path.startswith("release/artifacts/")
-        ]
-        if non_generated:
-            discrepancies.append("Git commit differs with non-generated source changes")
-    if recorded_git.get("source_tree_sha256"):
-        if recorded_git["source_tree_sha256"] != actual_tree:
-            discrepancies.append("Git source tree digest differs from qualification manifest")
-    elif recorded_git.get("tree") and recorded_git["tree"] != git_output("rev-parse", "HEAD^{tree}"):
-        discrepancies.append("Git tree differs from qualification manifest")
-    dirty = []
-    if current_commit:
-        dirty = [
-            line
-            for line in git_output("status", "--short").splitlines()
-            if "qualification/" not in line and "release/artifacts/" not in line
-        ]
-    if dirty:
-        discrepancies.append(f"working tree is dirty: {', '.join(dirty[:5])}")
-
-    verify_archive(manifest.get("source_archive_sha256"), "source", discrepancies)
-    verify_archive(manifest.get("release_archive_sha256"), "release", discrepancies)
-    if discrepancies:
-        return report_failure(discrepancies)
-    print("PROVENANCE PASS")
+    findings, entries = verify(root, manifest_path)
+    if findings:
+        return report_failure(findings)
+    print(f"PROVENANCE PASS\n{entries} source entries match the qualification manifest")
     return 0
 
 

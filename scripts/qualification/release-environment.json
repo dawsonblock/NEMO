@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "description": "Pinned release qualification environment. Mirrors .github/ci-tool-versions.env and .devcontainer/Dockerfile so a local run cannot inherit a release tier.",
+  "release_platform": "linux",
+  "release_machine": "x86_64",
+  "postgres_major": 17,
+  "sources": [
+    ".github/ci-tool-versions.env",
+    ".devcontainer/Dockerfile",
+    ".github/workflows/effect-contract-conformance.yml"
+  ],
+  "tools": {
+    "rustc": "1.96.1",
+    "cargo": "1.96.1",
+    "node": "24.16.0",
+    "npm": "11.11.0",
+    "python": "3.11",
+    "uv": "0.9.28",
+    "go": "1.26.1",
+    "just": "1.47.1",
+    "cargo-nextest": "0.9.133",
+    "cargo-deny": "0.19.1",
+    "cargo-audit": "0.22.2",
+    "cargo-about": "0.9.1"
+  }
+}

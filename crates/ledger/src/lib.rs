@@ -18,6 +18,10 @@ pub mod conformance;
 #[cfg(feature = "unstable-postgres")]
 pub mod postgres;
 
+/// Physical schema verification for the durable effect store.
+#[cfg(feature = "unstable-postgres")]
+pub mod schema;
+
 /// Opt-in experimental contracts.
 #[cfg(feature = "unstable-hardening")]
 pub mod unstable {
@@ -26,6 +30,31 @@ pub mod unstable {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Seal for [`ProductionEffectStore`].
+    ///
+    /// The module is private, so the supertrait is not nameable outside this
+    /// crate. That makes the production store bound impossible to satisfy with
+    /// a locally defined store type: a harness cannot implement its way into a
+    /// production kernel.
+    #[allow(private_interfaces, private_bounds)]
+    pub(crate) mod production_seal {
+        pub trait Sealed {}
+    }
+
+    /// A durable effect store that may back a production kernel.
+    ///
+    /// Only the durable PostgreSQL adapter implements this trait. A kernel
+    /// composed for production requires this bound, so an in-memory or
+    /// test-double store cannot satisfy production composition even if it
+    /// implements every open store contract.
+    pub trait ProductionEffectStore: production_seal::Sealed {
+        /// Error returned when the store cannot attest production readiness.
+        type Error: std::fmt::Display;
+
+        /// Attest that this store is physically ready to hold durable effects.
+        fn verify_production_readiness(&self) -> Result<(), Self::Error>;
+    }
 
     /// Consequential-effect lifecycle state shared with the Effect Fabric ABI.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

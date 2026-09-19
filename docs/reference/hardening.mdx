@@ -48,11 +48,42 @@ coalescing. Cache writes expose `flush_cache_writes()` and
 Qualification is provenance-bound. The harness writes `source-manifest.json`,
 `source-tree.sha256`, `environment-lock.json`, and lockfile digests before it
 runs checks, then verifies that same source manifest after the checks finish.
-A source change invalidates the certificate rather than inheriting a previous
-`PASS`. Missing prerequisites are recorded as `NOT_RUN` with a reason; they do
-not become a test failure or an implicit pass. A report with any `NOT_RUN` or
-`INCONCLUSIVE` check remains `DEV`/`INCONCLUSIVE` and is not a release
-certificate. A valid full qualification now also requires live PostgreSQL
+The verifier enumerates the filesystem directly and compares exact entry sets,
+so an entry that the manifest does not list cannot verify: new files, deleted
+files, symlinks replaced by regular files, changed symlink targets, and changed
+mode bits are all hard failures. Symlink targets must stay inside the tree.
+Ignore rules are read from the tree's own `.gitignore` files rather than
+delegated to `git ls-files`, so a Git checkout and an extracted archive with the
+same contents enumerate identically. A source change invalidates the
+certificate rather than inheriting a previous `PASS`; a manifest written under
+the previous flat schema is rejected instead of upgraded. Missing prerequisites
+are recorded as `NOT_RUN` with a reason; they do not become a test failure or an
+implicit pass. A report with any `NOT_RUN` or `INCONCLUSIVE` check remains
+`DEV`/`INCONCLUSIVE` and is not a release certificate.
+
+Promotion is the highest tier whose evidence is actually present:
+`DEV_PASS` (tests passed in a recorded environment), `QUALIFIED_LOCAL` (that
+environment is reproduced exactly on the verifying host), `QUALIFIED_CI` (clean
+checkout on the pinned Linux release environment with a fresh database and the
+full mandatory matrix), `QUALIFIED_FAILURE` (plus fault injection and recovery),
+`PRODUCTION_CANDIDATE` (plus real authority, providers, recovery supervisor,
+isolation, DLP, and HA database evidence, signed), and `PRODUCTION_RELEASE`
+(bound to one exact final artifact). The pinned release environment lives in
+`scripts/qualification/release-environment.json`. A macOS workstation can reach
+`QUALIFIED_LOCAL`; it cannot emit `QUALIFIED_CI` or a production tier, and
+`qualification.json` records the reason each withheld tier was withheld.
+
+Every artifact a run produces is hashed into `evidence-manifest.json`, together
+with a DSSE envelope carrying an in-toto statement. Set
+`NEMO_RELAY_EVIDENCE_SIGN` to request a keyless cosign signature from the ambient
+CI identity and never store a signing key in the repository; an unsigned bundle
+is recorded as `UNSIGNED` and withholds the production tiers. Verify a bundle
+with `just evidence-verify`, the source manifest with `just provenance-check`,
+and the mandatory provenance tests with `just test-qualification-scripts`.
+See [the E3 baseline](../e3-baseline.md) for the current qualification status,
+which is `UNQUALIFIED`.
+
+A valid full qualification also requires live PostgreSQL
 conformance, concurrency, fresh-store restart, and process-kill recovery
 checks. The crash gate kills a child process after the action lock, receipt
 insertion, action update, immediately before commit, and immediately after
@@ -60,6 +91,46 @@ commit. Recovery from a fresh process must observe either the complete
 pre-transaction state or the complete committed state. When a PostgreSQL test
 URL is supplied, the qualification environment record captures the server
 version used for those gates.
+
+Schema verification inspects the physical database rather than the migration
+ledger alone, and it is split so a failure names the fact that failed:
+`verify_migration_history()`, `verify_physical_schema()`,
+`verify_runtime_privileges()`, and the aggregate
+`verify_database_readiness()`. The physical check builds a canonical
+description (`nemo.effect-store.pg.v1`) of the effect-store relations from the
+PostgreSQL catalogs - columns, types, nullability, defaults and generated
+expressions, constraints, indexes and their predicates, and triggers - and
+compares it against the description recorded when the migrations ran. A dropped
+index, a retyped column, a removed `NOT NULL`, a changed generated expression, a
+dropped table, an added trigger, a changed index predicate, or a rewritten
+foreign key fails verification even when `effect_schema_migrations` is
+untouched, and the failure names the object kind that drifted. Object *data*,
+OIDs, and creation order are excluded, so recording the expected description
+inside the schema creates no self-reference.
+
+Migrations own their objects. `0001_effect_store.sql` creates tables and indexes
+without `IF NOT EXISTS`, so a conflicting pre-existing object fails the
+migration instead of being adopted, and a migration refuses to claim a schema
+that already contains relations it does not own. The physical fingerprint is
+computed and recorded inside the migration transaction before the migration
+version is recorded, so a process killed between the DDL and the ledger write
+rolls back both.
+
+Runtime and migration credentials are separate. Production startup calls
+`verify_runtime_privileges`, which fails readiness when the connected role can
+`CREATE` in the effect schema or write to `effect_schema_migrations` or
+`effect_schema_state`. A runtime credential that can rewrite the ledger it
+trusts can hide drift from every later check.
+
+PostgreSQL waits are bounded by the action, not only by a fixed maximum. The
+configured budgets remain upper bounds, and
+`PostgresOperationBudgets::for_remaining` derives
+`lock_timeout = min(configured_lock, remaining / 3)` and
+`statement_timeout = min(configured_statement, remaining)` from the trusted
+remaining action budget. `PostgresEffectStore::with_deadline` returns a handle
+sharing the same pool but carrying a trusted deadline, so every call made
+through it is bounded by what is left of that deadline without changing the
+shared store traits.
 
 The authority, ledger, and executor crates provide experimental kernel
 contracts and adapter boundaries. Production authority enforcement, durable
@@ -231,13 +302,39 @@ NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-effect-store-restart
 NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
   just test-postgres-crash-recovery
+NEMO_RELAY_TEST_POSTGRES_URL='host=/tmp dbname=postgres user=postgres' \
+  just test-postgres-kernel-restart
 ```
 
 The adapter remains experimental and disabled by default. The process-crash
 gate establishes atomic terminal-state recovery at the named PostgreSQL
 transaction boundaries. It does not establish the wider machine-reboot, OOM,
-network-loss, long-running provider, recovery-discovery, load, or real-provider
-crash matrix.
+network-loss, long-running provider, load, or real-provider crash matrix.
+The separate `nemo-effect-qualification-fixture` constructs the real kernel and
+PostgreSQL store with a qualification-only authority and persistent provider
+simulator. Its process-restart test kills execution after provider commit but
+before terminal receipt persistence, then uses a bounded store-owned candidate
+scan and fenced kernel recovery to reconcile without another provider effect.
+The fixture requires an explicit qualification acknowledgement and permits only
+local test PostgreSQL connections. It is not a production composition root,
+Correct-Once adapter, autonomous recovery service, or general deployment gate.
+
+### Durable runtime composition
+
+`nemo-effect-runtime` is the production composition boundary for deployments
+that supply real Correct-Once and Effect Fabric adapters. It constructs the
+kernel only after validating the stable runtime identity, connecting through a
+local Unix socket or verified TLS/mTLS, and verifying the versioned
+`effect_schema_migrations` ledger. Normal workers never call `migrate()`;
+that method is reserved for a dedicated migration role. Production mode rejects
+plaintext loopback PostgreSQL and identities whose environment is not
+`production`.
+
+The adapter sets bounded pool-acquire, lock, statement, and idle-transaction
+budgets on checked-out PostgreSQL sessions. A timeout after provider dispatch
+still means `UNKNOWN`/reconciliation rather than permission to redispatch.
+This composition crate is not itself a Correct-Once implementation, provider
+registry, recovery scheduler, or production daemon.
 
 Recovery is evidence-aware. It checks persisted conflicts and terminal
 evidence before calling a provider reconciler, then distinguishes a live

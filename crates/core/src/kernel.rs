@@ -40,6 +40,23 @@ pub enum KernelError {
     /// A capability identifier was registered more than once.
     #[error("capability is already registered: {0}")]
     CapabilityAlreadyRegistered(String),
+    /// A production kernel was requested outside the production environment.
+    #[error("production composition requires a production runtime environment")]
+    ProductionEnvironmentMismatch,
+    /// A production kernel was requested without any consequential capability.
+    #[error(
+        "production composition requires at least one admitted MUTATION or CRITICAL capability"
+    )]
+    ProductionRequiresConsequentialCapability,
+    /// The durable effect store did not attest production readiness.
+    #[error("durable effect store is not production-ready: {0}")]
+    EffectStoreNotProductionReady(String),
+    /// Registry sealing failed because a registration is not internally consistent.
+    #[error("capability registration digest failed: {0}")]
+    RegistrationDigestFailed(String),
+    /// The trusted runtime host supplied an ambiguous durable identity.
+    #[error("runtime identity is invalid: {0}")]
+    RuntimeIdentityInvalid(String),
     /// Arguments did not satisfy the immutable capability schema.
     #[error("capability arguments failed schema validation: {0}")]
     SchemaValidationFailed(String),
@@ -397,6 +414,95 @@ impl CapabilityRegistry {
         Ok(())
     }
 
+    /// Validate the registrations and seal the registry for runtime use.
+    ///
+    /// Sealing consumes the builder, so there is no value left to mutate: the
+    /// running kernel can only be handed an immutable registry. The seal also
+    /// computes one digest over every security-relevant registration field, so
+    /// a whole-registry identity exists to bind alongside per-capability
+    /// registration digests.
+    pub fn seal(self) -> Result<SealedCapabilityRegistry, KernelError> {
+        let digest = self.compute_digest()?;
+        Ok(SealedCapabilityRegistry {
+            capabilities: self.capabilities,
+            digest,
+        })
+    }
+
+    /// Return the canonical whole-registry digest of the current registrations.
+    fn compute_digest(&self) -> Result<String, KernelError> {
+        let mut entries: Vec<Json> = self
+            .capabilities
+            .values()
+            .map(|registered| {
+                let definition = &registered.definition;
+                serde_json::json!({
+                    "capability_id": definition.capability_id,
+                    "capability_generation": definition.capability_generation,
+                    "registration_digest": definition.registration_digest,
+                    "execution_class": format!("{:?}", definition.execution_class),
+                    "operation": definition.operation,
+                    "route_digest": definition.route_digest,
+                    "admission_id": definition.admission_id,
+                    "policy_version": definition.policy_version,
+                    "policy_epoch": definition.policy_epoch,
+                    "admitted": definition.admitted,
+                })
+            })
+            .collect();
+        entries.sort_by(|left, right| {
+            left["capability_id"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["capability_id"].as_str().unwrap_or_default())
+        });
+        let canonical = serde_json_canonicalizer::to_vec(&entries)
+            .map_err(|error| KernelError::RegistrationDigestFailed(error.to_string()))?;
+        Ok(sha256_hex(&canonical))
+    }
+}
+
+/// An immutable capability registry handed to a running kernel.
+///
+/// This type exposes no mutation: `CapabilityRegistry::seal` consumed the
+/// builder, so a running kernel cannot have its classification semantics,
+/// routes, or generations changed after boot.
+pub struct SealedCapabilityRegistry {
+    capabilities: HashMap<String, RegisteredCapability>,
+    digest: String,
+}
+
+impl SealedCapabilityRegistry {
+    /// Return the digest over every security-relevant registration field.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Return how many capabilities the sealed registry holds.
+    pub fn len(&self) -> usize {
+        self.capabilities.len()
+    }
+
+    /// Return whether the sealed registry holds no capabilities.
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+
+    /// Return whether an admitted capability of a given class is registered.
+    ///
+    /// Production composition requires this to be true for at least one
+    /// consequential class, so a kernel cannot be composed for production with
+    /// only `PURE` or `READ` capabilities registered.
+    fn has_admitted_consequential_capability(&self) -> bool {
+        self.capabilities.values().any(|registered| {
+            registered.definition.admitted
+                && matches!(
+                    registered.definition.execution_class,
+                    ExecutionClass::Mutation | ExecutionClass::Critical
+                )
+        })
+    }
+
     fn resolve(&self, capability_id: &str) -> Result<&RegisteredCapability, KernelError> {
         self.capabilities
             .get(capability_id)
@@ -679,17 +785,22 @@ where
 /// remain external adapters.
 pub struct Kernel<A, F, E, ES> {
     runtime: RuntimeIdentity,
-    registry: CapabilityRegistry,
+    registry: SealedCapabilityRegistry,
     router: BackendRouter<A, F, E>,
     effect_store: ES,
 }
 
 impl<A, F, E, ES> Kernel<A, F, E, ES> {
-    /// Construct a kernel from a trusted runtime identity, immutable registry,
-    /// and external adapter router.
-    pub fn new(
+    /// Construct a kernel from an already-sealed registry without readiness.
+    ///
+    /// This is the development and test construction path. It performs no
+    /// production readiness checks, so it is deliberately named to make its
+    /// trust level obvious at every call site, and production code is checked
+    /// for it by an architectural test.
+    #[doc(hidden)]
+    pub fn new_unchecked_for_tests(
         runtime: RuntimeIdentity,
-        registry: CapabilityRegistry,
+        registry: SealedCapabilityRegistry,
         router: BackendRouter<A, F, E>,
         effect_store: ES,
     ) -> Self {
@@ -701,7 +812,89 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
         }
     }
 
+    /// Construct a development kernel after validating the runtime identity.
+    ///
+    /// The registry is sealed here so a development kernel has exactly the same
+    /// post-boot immutability as a production one. Use [`Self::new_production`]
+    /// for anything that will hold consequential authority: this constructor
+    /// accepts any store, including an in-memory one.
+    pub fn new_development(
+        runtime: RuntimeIdentity,
+        registry: CapabilityRegistry,
+        router: BackendRouter<A, F, E>,
+        effect_store: ES,
+    ) -> Result<Self, KernelError> {
+        let sealed = registry.seal()?;
+        Self::new_production_identity_check(&runtime)?;
+        Ok(Self::new_unchecked_for_tests(
+            runtime,
+            sealed,
+            router,
+            effect_store,
+        ))
+    }
+
+    fn new_production_identity_check(runtime: &RuntimeIdentity) -> Result<(), KernelError> {
+        runtime
+            .validate()
+            .map_err(|error| KernelError::RuntimeIdentityInvalid(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Return the sealed registry digest this kernel is running with.
+    pub fn registry_digest(&self) -> &str {
+        self.registry.digest()
+    }
+
+    /// Construct the production kernel.
+    ///
+    /// Three things must hold, and none of them can be satisfied by a harness
+    /// that assembles its own components:
+    ///
+    /// * the runtime identity must validate *and* declare the production
+    ///   environment;
+    /// * the registry must already be sealed and must contain at least one
+    ///   admitted `MUTATION` or `CRITICAL` capability, so a kernel cannot be
+    ///   composed for production with only `PURE`/`READ` routes;
+    /// * the effect store must implement
+    ///   [`nemo_relay_ledger::unstable::ProductionEffectStore`], a sealed trait
+    ///   that only the durable PostgreSQL adapter implements, and it must
+    ///   attest production readiness.
+    ///
+    /// The store bound is the load-bearing one: the seal makes it impossible for
+    /// another crate to implement the trait for its own type, so the durable
+    /// effect store cannot be substituted.
+    pub fn new_production(
+        runtime: RuntimeIdentity,
+        registry: SealedCapabilityRegistry,
+        router: BackendRouter<A, F, E>,
+        effect_store: ES,
+    ) -> Result<Self, KernelError>
+    where
+        ES: nemo_relay_ledger::unstable::ProductionEffectStore,
+    {
+        Self::new_production_identity_check(&runtime)?;
+        if runtime.environment != "production" {
+            return Err(KernelError::ProductionEnvironmentMismatch);
+        }
+        if !registry.has_admitted_consequential_capability() {
+            return Err(KernelError::ProductionRequiresConsequentialCapability);
+        }
+        effect_store
+            .verify_production_readiness()
+            .map_err(|error| KernelError::EffectStoreNotProductionReady(error.to_string()))?;
+        Ok(Self::new_unchecked_for_tests(
+            runtime,
+            registry,
+            router,
+            effect_store,
+        ))
+    }
+
     fn bind(&self, invocation: &InvocationRequest) -> Result<BoundExecutionRequest, KernelError> {
+        self.runtime
+            .validate()
+            .map_err(|error| KernelError::RuntimeIdentityInvalid(error.to_string()))?;
         let registered = self.registry.resolve(&invocation.capability_id)?;
         if !registered.definition.admitted {
             return Err(KernelError::CapabilityNotAdmitted(
@@ -3450,12 +3643,13 @@ mod tests {
             receipts: receipts.clone(),
             ..TestEffectStore::default()
         };
-        let kernel = Kernel::new(
+        let kernel = Kernel::new_development(
             runtime(),
             registry(class),
             BackendRouter::new(authority.clone(), function.clone(), effect.clone()),
             effects,
-        );
+        )
+        .expect("development kernel");
         (kernel, authority, function, effect, actions, receipts)
     }
 
@@ -3472,6 +3666,53 @@ mod tests {
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert_eq!(actions.prepare_calls.load(Ordering::SeqCst), 0);
         assert!(receipts.receipts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_runtime_identity_is_rejected_before_any_execution() {
+        let (mut runtime, read_registry, router, effects) = {
+            let authority = TestAuthority {
+                decision: Decision::Allow,
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            (
+                runtime(),
+                registry(ExecutionClass::Read),
+                BackendRouter::new(authority, TestBackend::default(), TestBackend::default()),
+                TestEffectStore::default(),
+            )
+        };
+        runtime.tenant_id = Some(" ".into());
+        assert!(
+            matches!(
+                Kernel::new_development(runtime.clone(), read_registry, router, effects),
+                Err(KernelError::RuntimeIdentityInvalid(_))
+            ),
+            "an ambiguous identity must be rejected at composition time"
+        );
+
+        // Composition is not the only guard: binding re-validates, so even a
+        // kernel assembled through the raw test constructor cannot execute a
+        // consequential action under an ambiguous identity.
+        let kernel = Kernel::new_unchecked_for_tests(
+            runtime,
+            registry(ExecutionClass::Read)
+                .seal()
+                .expect("seal registry"),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::Allow,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                TestBackend::default(),
+            ),
+            TestEffectStore::default(),
+        );
+        assert!(matches!(
+            kernel.begin(&invocation()),
+            Err(KernelError::RuntimeIdentityInvalid(_))
+        ));
     }
 
     #[test]
@@ -3506,12 +3747,13 @@ mod tests {
             ManualStoreClock::new(1_000),
             LeaseConfiguration::default(),
         );
-        let kernel = Kernel::new(
+        let kernel = Kernel::new_development(
             runtime(),
             registry(ExecutionClass::Mutation),
             BackendRouter::new(authority, TestBackend::default(), effect.clone()),
             effects.clone(),
-        );
+        )
+        .expect("development kernel");
         assert!(matches!(
             kernel.begin(&invocation_with_request_id("reference-store-kernel")),
             Ok(InvocationOutcome::Completed(_))
@@ -3556,7 +3798,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         };
         let second_effect = TestBackend::default();
-        let restarted = Kernel::new(
+        let restarted = Kernel::new_development(
             runtime(),
             registry(ExecutionClass::Mutation),
             BackendRouter::new(authority, TestBackend::default(), second_effect.clone()),
@@ -3565,7 +3807,8 @@ mod tests {
                 receipts,
                 ..TestEffectStore::default()
             },
-        );
+        )
+        .expect("development kernel");
         let existing = match restarted.begin(&request) {
             Ok(InvocationOutcome::ExistingAction(existing)) => existing,
             _ => panic!("expected the original completed action"),
@@ -3745,7 +3988,7 @@ mod tests {
             _ => panic!("critical action should await approval"),
         };
         let resumed_effect = TestBackend::default();
-        let resumed = Kernel::new(
+        let resumed = Kernel::new_development(
             runtime(),
             registry(ExecutionClass::Critical),
             BackendRouter::new(
@@ -3761,7 +4004,8 @@ mod tests {
                 receipts,
                 ..TestEffectStore::default()
             },
-        );
+        )
+        .expect("development kernel");
         assert!(matches!(
             resumed.resume_approval(
                 &action_id,
@@ -3926,7 +4170,7 @@ mod tests {
             _ => panic!("grant failure should cancel the action"),
         };
         let resumed_effect = TestBackend::default();
-        let resumed = Kernel::new(
+        let resumed = Kernel::new_development(
             runtime(),
             registry(ExecutionClass::Mutation),
             BackendRouter::new(
@@ -3942,7 +4186,8 @@ mod tests {
                 receipts,
                 ..TestEffectStore::default()
             },
-        );
+        )
+        .expect("development kernel");
         let existing = match resumed.begin(&request) {
             Ok(InvocationOutcome::ExistingAction(existing)) => existing,
             _ => panic!("cancelled actions must not be re-authorized"),
@@ -4739,7 +4984,7 @@ mod tests {
         let second_effect = TestBackend::default();
         let mut second_runtime = runtime();
         second_runtime.tenant_id = Some("other-tenant".into());
-        let second = Kernel::new(
+        let second = Kernel::new_development(
             second_runtime,
             registry(ExecutionClass::Mutation),
             BackendRouter::new(
@@ -4755,7 +5000,8 @@ mod tests {
                 receipts,
                 ..TestEffectStore::default()
             },
-        );
+        )
+        .expect("development kernel");
         assert!(matches!(
             second.begin(&request),
             Ok(InvocationOutcome::Completed(_))

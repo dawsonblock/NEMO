@@ -16,17 +16,26 @@ record_status() {
     local name="$1"
     local status="$2"
     local reason="${3:-}"
-    printf '%s\t%s\t%s\n' "${name}" "${status}" "${reason}" >> "${status_file}"
+    local duration_ms="${4:-0}"
+    printf '%s\t%s\t%s\t%s\n' "${name}" "${status}" "${reason}" "${duration_ms}" >> "${status_file}"
+}
+
+# Portable millisecond clock. BSD `date` has no %N, and gate evidence records a
+# duration so qualification can show where a run actually spent its time.
+now_ms() {
+    python3 -c 'import time; print(int(time.time() * 1000))'
 }
 
 run_check() {
     local name="$1"
     shift
     local log="${output_dir}/${name}.txt"
+    local started
+    started="$(now_ms)"
     if "$@" >"${log}" 2>&1; then
-        record_status "${name}" "PASS" "command completed successfully"
+        record_status "${name}" "PASS" "command completed successfully" "$(( $(now_ms) - started ))"
     else
-        record_status "${name}" "FAIL" "command exited non-zero"
+        record_status "${name}" "FAIL" "command exited non-zero" "$(( $(now_ms) - started ))"
     fi
 }
 
@@ -34,7 +43,7 @@ not_run() {
     local name="$1"
     local reason="$2"
     printf '%s\n' "${reason}" >"${output_dir}/${name}.txt"
-    record_status "${name}" "NOT_RUN" "${reason}"
+    record_status "${name}" "NOT_RUN" "${reason}" "0"
 }
 
 run_if_available() {
@@ -68,11 +77,11 @@ run_cargo_subcommand() {
 run_go_tests() {
     local log="${output_dir}/go-tests.txt"
     if just test-go >"${log}" 2>&1; then
-        record_status go-tests PASS "command completed successfully"
+        record_status go-tests PASS "command completed successfully" 0
     elif rg -q "cannot update the lock file|missing Rust artifacts|signal 15|aws-lc-sys|toolchain" "${log}"; then
-        record_status go-tests INCONCLUSIVE "Go qualification pipeline did not complete because of a build-environment or fixture prerequisite"
+        record_status go-tests INCONCLUSIVE "Go qualification pipeline did not complete because of a build-environment or fixture prerequisite" 0
     else
-        record_status go-tests FAIL "Go test command exited non-zero"
+        record_status go-tests FAIL "Go test command exited non-zero" 0
     fi
 }
 
@@ -111,8 +120,11 @@ report = json.loads(path.read_text())
 report["schema_version"] = max(int(report.get("schema_version", 1)), 3)
 report["overall"] = "FAIL"
 report["promotion"] = "DEV"
+report["qualification_level"] = "DEV"
 report["qualification_status"] = "INVALIDATED"
 report["invalidation_reason"] = "SOURCE_TREE_CHANGED_AFTER_QUALIFICATION"
+report["tier_evaluation_source"] = "invalidated_before_tier_evaluation"
+report["blocking_reasons"] = ["source changed after qualification; rerun the full matrix"]
 checks = report.setdefault("checks", {})
 details = report.setdefault("check_details", {})
 checks["source-stability"] = "FAIL"
@@ -145,212 +157,11 @@ fi
 
 # Capture a canonical source-tree manifest before running any checks. This is
 # independent of Git commit metadata, so an extracted archive can still bind
-# evidence to the exact files that were tested.
-python3 - "${repo_root}" "${output_dir}" "${mode}" <<'PY'
-import hashlib
-import json
-import os
-import pathlib
-import platform
-import shutil
-import subprocess
-import sys
-
-root = pathlib.Path(sys.argv[1]).resolve()
-out = pathlib.Path(sys.argv[2]).resolve()
-mode = sys.argv[3]
-out.mkdir(parents=True, exist_ok=True)
-
-
-def first_line(command):
-    if shutil.which(command[0]) is None:
-        return None
-    result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
-    if result.returncode != 0:
-        return None
-    output = (result.stdout or result.stderr).strip().splitlines()
-    return output[0] if output else None
-
-
-def postgres_server_version():
-    connection = os.environ.get("NEMO_RELAY_TEST_POSTGRES_URL")
-    if not connection or shutil.which("psql") is None:
-        return None
-    result = subprocess.run(
-        ["psql", connection, "--tuples-only", "--no-align", "--command", "SHOW server_version"],
-        cwd=root,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    if result.returncode != 0:
-        return None
-    output = result.stdout.strip().splitlines()
-    return output[0] if output else None
-
-
-def git_output(arguments):
-    if shutil.which("git") is None:
-        return None
-    result = subprocess.run(["git", *arguments], cwd=root, text=True, capture_output=True, check=False)
-    return result.stdout if result.returncode == 0 else None
-
-
-def excluded(relative):
-    if not relative.parts:
-        return False
-    if relative.parts[0] in {
-        ".git",
-        "target",
-        "node_modules",
-        "coverage",
-        "qualification",
-        ".venv",
-        ".uv-cache",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".tox",
-        "build",
-        "dist",
-    }:
-        return True
-    if "__pycache__" in relative.parts or relative.name == ".coverage":
-        return True
-    if relative.suffix in {".pyc", ".pyo"}:
-        return True
-    # Deterministic release packages and their sidecar evidence are generated
-    # outputs, not source inputs. Keep them out of the tree hash to avoid a
-    # self-referential archive/provenance cycle.
-    return relative.parts[:2] == ("release", "artifacts")
-
-
-tracked = git_output(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
-if tracked is not None:
-    candidates = [pathlib.Path(item) for item in tracked.split("\0") if item]
-else:
-    candidates = [path.relative_to(root) for path in root.rglob("*") if path.is_file()]
-
-file_hashes = {}
-for relative in sorted(set(candidates), key=lambda path: path.as_posix()):
-    if excluded(relative):
-        continue
-    path = root / relative
-    if not path.is_file() or path.is_symlink():
-        continue
-    file_hashes[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-
-canonical = "".join(f"{name}\t{digest}\n" for name, digest in file_hashes.items()).encode()
-source_tree_sha256 = hashlib.sha256(canonical).hexdigest()
-(out / "source-tree.sha256").write_text(source_tree_sha256 + "\n")
-
-archive_value = os.environ.get("NEMO_RELAY_SOURCE_ARCHIVE")
-source_archive_sha256 = None
-if archive_value:
-    archive = pathlib.Path(archive_value).expanduser()
-    if archive.is_file():
-        source_archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
-        (out / "source-archive.sha256").write_text(source_archive_sha256 + "\n")
-    else:
-        (out / "source-archive.sha256").write_text("NOT_AVAILABLE\n")
-else:
-    (out / "source-archive.sha256").write_text("NOT_PROVIDED\n")
-
-release_archive_value = os.environ.get("NEMO_RELAY_RELEASE_ARCHIVE")
-release_archive_sha256 = None
-if release_archive_value:
-    release_archive = pathlib.Path(release_archive_value).expanduser()
-    if release_archive.is_file():
-        release_archive_sha256 = hashlib.sha256(release_archive.read_bytes()).hexdigest()
-        (out / "release-archive.sha256").write_text(release_archive_sha256 + "\n")
-    else:
-        (out / "release-archive.sha256").write_text("NOT_AVAILABLE\n")
-else:
-    (out / "release-archive.sha256").write_text("NOT_PROVIDED\n")
-
-environment_path = out / "environment.json"
-environment_sha_path = out / "environment-sha256.txt"
-environment_lock_path = out / "environment-lock.json"
-if mode == "provenance" and environment_path.is_file() and environment_sha_path.is_file() and environment_lock_path.is_file():
-    # Archive binding must not replace the environment that actually ran the
-    # full test matrix. In particular, a release host need not have the live
-    # PostgreSQL test URL that was used for the qualification gate.
-    environment = json.loads(environment_path.read_text())
-    environment_sha256 = environment_sha_path.read_text().strip()
-else:
-    environment = {
-        "schema_version": 3,
-        "platform": platform.platform(),
-        "machine": platform.machine(),
-        "tools": {
-            "rustc": first_line(["rustc", "--version"]),
-            "cargo": first_line(["cargo", "--version"]),
-            "node": first_line(["node", "--version"]),
-            "npm": first_line(["npm", "--version"]),
-            "python": first_line(["python3", "--version"]),
-            "uv": first_line(["uv", "--version"]),
-            "go": first_line(["go", "version"]),
-            "protoc": first_line(["protoc", "--version"]),
-            "just": first_line(["just", "--version"]),
-            "cargo-nextest": first_line(["cargo", "nextest", "--version"]),
-            "cargo-deny": first_line(["cargo", "deny", "--version"]),
-            "cargo-audit": first_line(["cargo", "audit", "--version"]),
-            "cargo-about": first_line(["cargo-about", "--version"]),
-        },
-        "postgres_server_version": postgres_server_version(),
-    }
-    environment_bytes = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
-    environment_sha256 = hashlib.sha256(environment_bytes).hexdigest()
-    environment_path.write_text(json.dumps(environment, indent=2) + "\n")
-    environment_sha_path.write_text(environment_sha256 + "\n")
-    environment_lock_path.write_text(json.dumps({
-        "schema_version": 1,
-        "environment_sha256": environment_sha256,
-        "environment": environment,
-    }, indent=2) + "\n")
-
-locks = {}
-for name in ["Cargo.lock", "package-lock.json", "uv.lock"]:
-    path = root / name
-    locks[name] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-(out / "dependency-lock-digests.json").write_text(json.dumps(locks, indent=2) + "\n")
-
-manifest = {
-    "schema_version": 1,
-    "algorithm": "sha256",
-    "root_digest": source_tree_sha256,
-    "files": file_hashes,
-    "excluded_roots": [
-        ".git", "target", "node_modules", "coverage", "qualification", ".venv",
-        ".uv-cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "build", "dist",
-    ],
-    "source_archive_sha256": source_archive_sha256,
-    "release_archive_sha256": release_archive_sha256,
-    "lockfiles": locks,
-    "git": {
-        "commit": (git_output(["rev-parse", "HEAD"]) or "").strip() or None,
-        "tree": (git_output(["rev-parse", "HEAD^{tree}"]) or "").strip() or None,
-        "source_tree_sha256": source_tree_sha256,
-        "status": [
-            line
-            for line in (git_output(["status", "--short"]) or "").splitlines()
-            if "qualification/" not in line and "release/artifacts/" not in line
-        ],
-    },
-}
-(out / "source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-
-provenance = {
-    "source_tree_sha256": source_tree_sha256,
-    "source_archive_sha256": source_archive_sha256,
-    "release_archive_sha256": release_archive_sha256,
-    "environment_sha256": environment_sha256,
-    "lockfiles": locks,
-    "git": manifest["git"],
-}
-(out / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
-PY
+# evidence to the exact files that were tested. The capture shares its
+# enumeration with provenance_check.py, so the producer and the verifier
+# cannot disagree about which entries are source content.
+python3 "${script_dir}/capture_provenance.py" \
+    --root "${repo_root}" --out "${output_dir}" --mode "${mode}"
 
 git_commit="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
 git_tree="$(git -C "${repo_root}" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
@@ -369,9 +180,9 @@ git_dirty="$(git -C "${repo_root}" status --short 2>/dev/null | grep -v 'qualifi
 } >"${output_dir}/git-revision.txt"
 
 if [[ -n "${git_dirty}" ]]; then
-    record_status source-cleanliness FAIL "source tree was dirty before qualification began"
+    record_status source-cleanliness FAIL "source tree was dirty before qualification began" 0
 else
-    record_status source-cleanliness PASS "source tree was clean before qualification began"
+    record_status source-cleanliness PASS "source tree was clean before qualification began" 0
 fi
 
 if [[ "${mode}" == "provenance" ]]; then
@@ -380,7 +191,8 @@ if [[ "${mode}" == "provenance" ]]; then
 elif [[ "${mode}" == "manifest" ]]; then
     # Manifest-only mode is useful when the host cannot run the full matrix.
     for check in rust-format clippy rust-tests rust-doc-tests effect-contracts postgres-transport-security cargo-deny cargo-audit \
-        postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery \
+        migration-integrity physical-schema-verification db-failure-boundaries runtime-composition \
+        postgres-effect-store postgres-concurrency postgres-restart postgres-crash-recovery postgres-kernel-restart \
         python-tests node-tests go-tests sbom; do
         not_run "${check}" "qualification checks intentionally skipped in manifest-only mode"
     done
@@ -406,15 +218,34 @@ else
     run_if_available postgres-transport-security just just test-postgres-transport-security
 
     if [[ -n "${NEMO_RELAY_TEST_POSTGRES_URL:-}" ]]; then
+        # E3-011 and E3-012 are separate gates: an intact migration ledger and a
+        # physically verified schema are different facts, and either can fail
+        # while the other passes.
+        export NEMO_RELAY_SCHEMA_EVIDENCE_DIR="${output_dir}"
+        run_check migration-integrity just test-postgres-migration-integrity
+        run_check physical-schema-verification just test-postgres-schema-verification
+        # The boundary invariant is mandatory for E3.1: a database failure must
+        # not be allowed to decide, by itself, whether an external effect
+        # happened.
+        run_check db-failure-boundaries just test-postgres-db-failure-boundaries
+        # E3.2 evidence. Recorded as it lands, but not yet part of the frozen
+        # E3.1 matrix: gate E3-016 stays open until the whole slice completes.
+        run_check runtime-composition just test-runtime-composition
         run_check postgres-effect-store just test-postgres-effect-store
         run_check postgres-concurrency just test-postgres-effect-store-concurrency
         run_check postgres-restart just test-postgres-effect-store-restart
         run_check postgres-crash-recovery just test-postgres-crash-recovery
+        run_check postgres-kernel-restart just test-postgres-kernel-restart
     else
+        not_run migration-integrity "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run physical-schema-verification "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run db-failure-boundaries "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run runtime-composition "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-effect-store "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-concurrency "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-restart "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
         not_run postgres-crash-recovery "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
+        not_run postgres-kernel-restart "NEMO_RELAY_TEST_POSTGRES_URL is required for live PostgreSQL qualification"
     fi
 
     run_cargo_subcommand cargo-deny deny check
@@ -468,9 +299,9 @@ else
         if cargo about generate --config about.toml --format json --locked -o "${about_json}" \
             >"${output_dir}/sbom.txt" 2>&1 \
             && python3 "${script_dir}/generate_spdx_sbom.py" "${about_json}" "${output_dir}/sbom.spdx.json" "${release_version}"; then
-            record_status sbom PASS "cargo-about inventory converted to SPDX 2.3"
+            record_status sbom PASS "cargo-about inventory converted to SPDX 2.3" 0
         else
-            record_status sbom FAIL "cargo-about exited non-zero"
+            record_status sbom FAIL "cargo-about exited non-zero" 0
         fi
         rm -f "${about_json}"
     else
@@ -483,12 +314,13 @@ fi
 # profile so a source edit during qualification cannot inherit a PASS.
 if NEMO_RELAY_SOURCE_MANIFEST="${output_dir}/source-manifest.json" \
     python3 "${script_dir}/provenance_check.py" >"${output_dir}/source-stability.txt" 2>&1; then
-    record_status source-stability PASS "source tree remained identical throughout qualification"
+    record_status source-stability PASS "source tree remained identical throughout qualification" 0
 else
-    record_status source-stability FAIL "source tree changed during qualification"
+    record_status source-stability FAIL "source tree changed during qualification" 0
 fi
 
-python3 - "${status_file}" "${output_dir}/qualification.json" "${output_dir}/provenance.json" "${mode}" "${release_version}" <<'PY'
+python3 - "${status_file}" "${output_dir}/qualification.json" "${output_dir}/provenance.json" \
+    "${mode}" "${release_version}" "${script_dir}" "${output_dir}" "${repo_root}" <<'PY'
 import json
 import pathlib
 import sys
@@ -496,6 +328,13 @@ import sys
 statuses = {}
 details = {}
 previous = {}
+script_dir = pathlib.Path(sys.argv[6])
+output_dir = pathlib.Path(sys.argv[7])
+repo_root = pathlib.Path(sys.argv[8])
+sys.path.insert(0, str(script_dir))
+import capture_provenance
+import qualification_levels
+
 if sys.argv[4] == "provenance" and pathlib.Path(sys.argv[2]).is_file():
     try:
         previous = json.loads(pathlib.Path(sys.argv[2]).read_text())
@@ -505,16 +344,19 @@ if sys.argv[4] == "provenance" and pathlib.Path(sys.argv[2]).is_file():
     details.update(previous.get("check_details", {}))
 
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
-    fields = line.split("\t", 2)
+    fields = line.split("\t", 3)
     name, status = fields[:2]
-    reason = fields[2] if len(fields) == 3 else ""
+    reason = fields[2] if len(fields) >= 3 else ""
+    duration_ms = int(fields[3]) if len(fields) == 4 and fields[3].isdigit() else 0
     statuses[name] = status
-    details[name] = {"status": status, "reason": reason}
+    details[name] = {"status": status, "reason": reason, "duration_ms": duration_ms}
 
 required = [
     "source-cleanliness", "source-stability", "rust-format", "clippy", "rust-tests", "rust-doc-tests",
-    "effect-contracts", "postgres-transport-security", "postgres-effect-store", "postgres-concurrency", "postgres-restart",
-    "postgres-crash-recovery",
+    "effect-contracts", "postgres-transport-security", "migration-integrity", "physical-schema-verification",
+    "db-failure-boundaries",
+    "postgres-effect-store", "postgres-concurrency", "postgres-restart",
+    "postgres-crash-recovery", "postgres-kernel-restart",
     "cargo-deny", "cargo-audit", "python-tests", "node-tests", "go-tests", "sbom",
 ]
 for name in required:
@@ -526,33 +368,126 @@ for name in required:
 values = [statuses.get(name, "NOT_RUN") for name in required]
 overall = "FAIL" if "FAIL" in values else "INCONCLUSIVE" if any(value in {"NOT_RUN", "INCONCLUSIVE"} for value in values) else "PASS"
 provenance = json.loads(pathlib.Path(sys.argv[3]).read_text())
-profile = sys.argv[4]
-if profile == "provenance":
-    profile = previous.get("profile", profile)
+mode_argument = sys.argv[4]
+profile = previous.get("profile", mode_argument) if mode_argument == "provenance" else mode_argument
+
+source_manifest_path = output_dir / "source-manifest.json"
+source_manifest = (
+    json.loads(source_manifest_path.read_text()) if source_manifest_path.is_file() else {}
+)
+
 report = {
-    "schema_version": 3,
-    "qualification_level": "E2_LOCAL",
+    "schema_version": 4,
     "release_version": sys.argv[5],
     "profile": profile,
     "overall": overall,
-    "promotion": "QUALIFIED_LOCAL" if overall == "PASS" else "DEV",
     "qualification_status": "VALID" if overall == "PASS" else "INVALID",
     "checks": statuses,
     "check_details": details,
     "provenance": provenance,
+    "_source_manifest": source_manifest,
     "notes": [
-        "Qualification is cryptographically bound to source-manifest.json and environment-lock.json.",
-        "The source manifest is verified both before and after checks; source changes invalidate qualification.",
+        "Qualification is cryptographically bound to source-manifest.json, environment-lock.json, and evidence-manifest.json.",
+        "The source manifest enumerates the filesystem directly and is verified both before and after checks; source changes invalidate qualification.",
         "Live PostgreSQL conformance, concurrency, restart, and process-crash checks are required for a PASS qualification.",
+        "Promotion is the highest tier whose evidence is actually present; blocked tiers are recorded with reasons.",
+        "Only the pinned Linux release environment can reach QUALIFIED_CI or above.",
         "Telemetry remains non-authoritative; durable ledger enforcement is not enabled.",
         "Kernel contracts and adapters are present; authority enforcement, durable effects, isolation enforcement, and outbound DLP remain disabled until external providers are configured.",
         "NOT_RUN means a prerequisite or profile requirement prevented execution; it is not a passing result.",
     ],
 }
+
+if mode_argument == "provenance" and previous.get("promotion"):
+    # A provenance refresh re-binds archive metadata to a tree that was already
+    # qualified on a different host. It must not re-derive a tier from this
+    # host's environment.
+    report["promotion"] = previous["promotion"]
+    report["qualification_level"] = previous.get("qualification_level", previous["promotion"])
+    report["tier_evaluation"] = previous.get("tier_evaluation", {})
+    report["tier_evaluation_source"] = "inherited_from_full_run"
+    report["blocking_reasons"] = previous.get("blocking_reasons", [])
+else:
+    lock_path = output_dir / "environment-lock.json"
+    recorded_environment = (
+        json.loads(lock_path.read_text()).get("environment") if lock_path.is_file() else None
+    )
+    current_environment, _ = capture_provenance.capture_environment(repo_root)
+    # The evidence bundle is written after this report, so the signature state is
+    # decided here from what the run can actually produce and then re-checked
+    # against the bundle once it exists.
+    sign_requested = bool(__import__("os").environ.get("NEMO_RELAY_EVIDENCE_SIGN"))
+    evidence_signature = (
+        "SIGNED" if sign_requested and __import__("shutil").which("cosign") else "UNSIGNED"
+    )
+    evaluation = qualification_levels.evaluate(
+        report,
+        recorded_environment=recorded_environment,
+        current_environment=current_environment,
+        evidence_signature=evidence_signature,
+        attestation_signature="MISSING",
+    )
+    report["qualification_level"] = evaluation["promotion"]
+    report["promotion"] = evaluation["promotion"]
+    report["blocking_reasons"] = evaluation["blocking_reasons"]
+    report["tier_evaluation"] = {
+        "tiers": evaluation["tiers"],
+        "environment": evaluation["environment"],
+        "gates": evaluation["gates"],
+        "signatures": evaluation["signatures"],
+        "signature_required_tiers": evaluation["signature_required_tiers"],
+    }
+    report["tier_evaluation_source"] = "computed_from_this_run"
+
+report.pop("_source_manifest", None)
 pathlib.Path(sys.argv[2]).write_text(json.dumps(report, indent=2) + "\n")
 PY
 
 cat "${output_dir}/qualification.json"
+
+# Bind every artifact this run produced into one evidence bundle. The bundle is
+# written after the report so it covers the final qualification result and the
+# complete set of gate logs, and it is verified immediately so a broken bundle
+# cannot leave the run looking successful. The final distributed artifact is
+# bound separately by attest_release.py, outside the artifact it describes.
+# Set NEMO_RELAY_EVIDENCE_SIGN to request a cosign signature from the ambient CI
+# identity.
+evidence_args=(--root "${repo_root}" --qualification-dir "${output_dir}")
+if [[ -n "${NEMO_RELAY_EVIDENCE_SIGN:-}" ]]; then
+    evidence_args+=(--sign)
+fi
+if ! python3 "${script_dir}/build_evidence_manifest.py" "${evidence_args[@]}"; then
+    printf 'Evidence bundle generation failed.\n' >&2
+    exit 1
+fi
+if ! python3 "${script_dir}/build_evidence_manifest.py" "${evidence_args[@]}" --verify; then
+    printf 'Evidence bundle verification failed.\n' >&2
+    exit 1
+fi
+
+# A run must not claim a signature it did not produce. The report decided the
+# signature state before the bundle existed; this reconciles the two, so a
+# requested-but-failed signature downgrades the record instead of leaving an
+# unsigned bundle carrying a signed tier.
+if [[ "${mode}" != "manifest" ]] && ! python3 - "${output_dir}/qualification.json" "${output_dir}/evidence-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+bundle = json.loads(pathlib.Path(sys.argv[2]).read_text())
+claimed = report.get("tier_evaluation", {}).get("signatures", {}).get("evidence")
+actual = bundle.get("signing", {}).get("status")
+if claimed and claimed != actual:
+    raise SystemExit(
+        f"qualification report claims evidence signature {claimed!r} but the "
+        f"evidence bundle records {actual!r}"
+    )
+PY
+then
+    printf 'Evidence signature state does not match the qualification report.\n' >&2
+    exit 1
+fi
 
 # The report is the contract for callers: an incomplete or failed gate must
 # fail the recipe as well as remain visible in the JSON evidence.  Without
