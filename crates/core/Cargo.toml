@@ -57,6 +57,7 @@ unstable-hardening = [
 [dependencies]
 nemo-relay-types.workspace = true
 nemo-relay-plugin.workspace = true
+nemo-relay-plugin-protocol.workspace = true
 nemo-relay-worker-proto = { workspace = true, optional = true }
 nemo-relay-authority = { workspace = true, optional = true, features = ["unstable-hardening"] }
 nemo-relay-ledger = { workspace = true, optional = true, features = ["unstable-hardening"] }

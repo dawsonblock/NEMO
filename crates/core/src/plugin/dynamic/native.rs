@@ -113,6 +113,18 @@ impl NativePluginActivation {
         self.plugins.is_empty()
     }
 
+    /// Return the plugin kinds this activation registered.
+    ///
+    /// A backend outside this crate holds the activation as the lifetime guard
+    /// for what it loaded, and has to describe those kinds without reaching into
+    /// the instances themselves.
+    pub fn plugin_kinds(&self) -> Vec<String> {
+        self.plugin_registrations
+            .iter()
+            .map(|(plugin_kind, _)| plugin_kind.clone())
+            .collect()
+    }
+
     /// Consumes the activation and deregisters loaded plugin kinds.
     pub fn clear(self) {}
 

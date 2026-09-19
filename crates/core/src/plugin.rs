@@ -52,6 +52,8 @@ pub use nemo_relay_types::plugin::{ConfigDiagnostic, DiagnosticLevel};
 
 pub mod dynamic;
 pub use dynamic::*;
+/// The kernel-owned seam for plugin execution.
+pub mod execution;
 
 type PluginMap = HashMap<String, RegisteredPlugin>;
 

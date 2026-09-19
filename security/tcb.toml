@@ -96,12 +96,12 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 # strip comments. Both are upper bounds and never undercount.
 
 [limits.nemo-relay]
-max_direct_dependencies = 39
-max_transitive_packages = 264
-max_source_lines = 71241
+max_direct_dependencies = 40
+max_transitive_packages = 265
+max_source_lines = 71580
 max_unsafe_occurrences = 299
-direct_dependency_digest = "337262e231b6c5e7b0b994eb7f908a065c71eb704aeeabcd8aa1d30ce4b0c074"
-transitive_dependency_digest = "1f07d1eb5bb9bb7c4bef8388e67f6b0df3a7a892b31eb1ce4b388a164f6d76a3"
+direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
+transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
@@ -169,19 +169,19 @@ transitive_dependency_digest = "f182378dd10c8c07d8544097889fd5fe3b308e626c30bf19
 
 [limits.nemo-relay-adaptive]
 max_direct_dependencies = 16
-max_transitive_packages = 223
+max_transitive_packages = 224
 max_source_lines = 18355
 max_unsafe_occurrences = 3
 direct_dependency_digest = "331568db3de0a45bb18a65209ac977b74010caa4f161552c292e5f42b79e2663"
-transitive_dependency_digest = "7e20f8d43536cbd956c28c621822ce6ecb33c20e2e84a3988b7dbe49e71aff87"
+transitive_dependency_digest = "85c902c98093122874f49ac21da4643225f11a1e8ef257143bb55c34a7b2e78d"
 
 [limits.nemo-relay-pii-redaction]
 max_direct_dependencies = 7
-max_transitive_packages = 214
+max_transitive_packages = 215
 max_source_lines = 4869
 max_unsafe_occurrences = 0
 direct_dependency_digest = "53d627f83c8ce0f7e8da4fa458a586b8353029500ba62c880d6bf34638c1811d"
-transitive_dependency_digest = "164b70b43bd34cc8ab70fc14b19ca28e2b5a99eded5a4183739c995532a66734"
+transitive_dependency_digest = "025a0d74e4635ff33c29f9c97ce40364833fd8ba61262605b9d50b02efa40dbb"
 
 [limits.nemo-relay-dlp]
 max_direct_dependencies = 2
@@ -201,8 +201,20 @@ transitive_dependency_digest = "e0bbdf96638cc171acc2b9f7b95b4a34fb959a94d7084910
 
 [limits.nemo-effect-runtime]
 max_direct_dependencies = 3
-max_transitive_packages = 243
+max_transitive_packages = 244
 max_source_lines = 589
 max_unsafe_occurrences = 0
 direct_dependency_digest = "59b383378c3be1f4d7e84e04ad1fc400c2233b2df975f3816d2d5948f5f73f98"
-transitive_dependency_digest = "f173d6a551bfb6ad9157f77ad07081ebe5aa4cce1c8ab378e6ecf844ab4ec85a"
+transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c737afe4f65fafb6004"
+
+# The in-process plugin backend. Measured from the start so its growth is
+# visible, but it sits in neither tier: it is the compatibility bridge that the
+# process backend replaces, and its own `unsafe` count is 1 only because
+# counting is textual and this crate's documentation says the word once.
+[limits.nemo-relay-plugin-host]
+max_direct_dependencies = 3
+max_transitive_packages = 209
+max_source_lines = 364
+max_unsafe_occurrences = 1
+direct_dependency_digest = "8fe645305d31725241bae067e82e46f4fd07a63fcd169619289606a9c83b786f"
+transitive_dependency_digest = "8961e02e30018785a63b78b27e42d84253fb8d8911a6f26609a21c249cb23160"

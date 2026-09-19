@@ -164,13 +164,34 @@ during execution is reported as `DeadlineExceeded`; and a host terminated
 *because* the deadline passed is still `DeadlineExceeded`, not `HostCrashed`,
 which is reserved for a host that ended on its own.
 
-The core-owned trait and the injected backend are deliberately not written yet.
-The finding above is the reason: a trait whose operations are
-load/invoke/inspect/health would omit the callback flows that most native
-plugins use, and its shape is what decides whether the remaining increments are
-migrations or a redesign. The next step is to model host-to-plugin callback
-delivery in the contract — correlated, bounded, and carrying the same dispatch
-vocabulary — and then design the trait against both directions at once.
+The seam itself now exists:
+
+- `nemo_relay::plugin::execution` owns `PluginExecutionBackend` and
+  `PluginManager`. The trait is asynchronous, is expressed entirely in the
+  protocol vocabulary, and names no transport.
+- `PluginManager` owns the deadline rule: every operation checks the context's
+  deadline *before* the backend is reached, so "an operation that is already out
+  of time is never started" holds for every backend rather than being something
+  each implementation has to remember. It is constructed from the backend rather
+  than reaching for a process-wide one.
+- `crates/plugin-host` holds `InProcessPluginBackend`, which implements the seam
+  by calling the existing loader and holding each activation as the lifetime
+  guard for what it loaded. The kernel does not depend on this crate.
+- `crates/plugin-host/src/conformance.rs` is the shared suite: the in-process
+  backend passes it today, and the process backend runs the identical suite so
+  "implements the contract" is demonstrated rather than asserted.
+- `crates/plugin-host/tests/architecture.rs` fails when new native-loading code
+  or a new caller of `load_native_plugins` appears outside the grandfather list.
+  It found the CLI caller on its first run, which is why that exception is
+  written down by crate and path instead of being left implicit.
+
+Two things are deliberately outstanding. The trait covers load, unload, inspect,
+and health, but not `invoke`: a loaded plugin registers components into the
+runtime's own machinery rather than exposing an endpoint, so there is nothing
+honest for an in-process backend to invoke yet, and a method whose only
+implementation refuses would be the temporary abstraction this milestone is
+supposed to avoid. `invoke` arrives with the process host that has to serve it.
+And the CLI still calls the loader directly — that is increment 3.
 
 This increment does not move `kernel-process unsafe tokens`. That number is
 expected to fall when native loading physically crosses the process boundary in

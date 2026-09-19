@@ -7,6 +7,7 @@ members = [
     "crates/types",
     "crates/plugin",
     "crates/plugin-protocol",
+    "crates/plugin-host",
     "crates/worker-proto",
     "crates/worker",
     "crates/adaptive",
@@ -37,6 +38,7 @@ repository = "https://github.com/NVIDIA/NeMo-Relay"
 nemo-relay = { version = "0.9.1-rc.4", path = "crates/core", default-features = false }
 nemo-relay-types = { version = "0.9.1-rc.4", path = "crates/types" }
 nemo-relay-plugin = { version = "0.9.1-rc.4", path = "crates/plugin" }
+nemo-relay-plugin-protocol = { version = "0.9.1-rc.4", path = "crates/plugin-protocol" }
 nemo-relay-worker-proto = { version = "0.9.1-rc.4", path = "crates/worker-proto" }
 nemo-relay-worker = { version = "0.9.1-rc.4", path = "crates/worker" }
 nemo-relay-adaptive = { version = "0.9.1-rc.4", path = "crates/adaptive" }

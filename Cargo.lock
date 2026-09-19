@@ -1804,6 +1804,7 @@ dependencies = [
  "nemo-relay-executor",
  "nemo-relay-ledger",
  "nemo-relay-plugin",
+ "nemo-relay-plugin-protocol",
  "nemo-relay-types",
  "nemo-relay-worker-proto",
  "object_store",
@@ -2033,6 +2034,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "nemo-relay-plugin-host"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay",
+ "nemo-relay-plugin",
+ "nemo-relay-plugin-protocol",
+ "tokio",
 ]
 
 [[package]]
