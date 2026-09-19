@@ -83,15 +83,15 @@ old figure — which is why the two are stated as snapshot and source.
 
 | Tier | Crates | Lines | `unsafe` |
 |---|---|---|---|
-| Invariant-enforcing | 5 | 85,182 | 299 |
-| In-process | 12 | 114,246 | 617 |
+| Invariant-enforcing | 5 | 85,329 | 299 |
+| In-process | 12 | 114,393 | 617 |
 
 The five enforcing crates:
 
 | Crate | Files | Lines | `unsafe` | Direct deps | Transitive |
 |---|---|---|---|---|---|
-| `nemo-relay` | 74 | 71,190 | 299 | 39 | 264 |
-| `nemo-relay-ledger` | 6 | 9,307 | 0 | 9 | 106 |
+| `nemo-relay` | 74 | 71,241 | 299 | 39 | 264 |
+| `nemo-relay-ledger` | 6 | 9,403 | 0 | 9 | 106 |
 | `nemo-relay-types` | 13 | 3,681 | 0 | 7 | 25 |
 | `nemo-relay-executor` | 1 | 572 | 0 | 3 | 24 |
 | `nemo-relay-authority` | 1 | 432 | 0 | 3 | 25 |

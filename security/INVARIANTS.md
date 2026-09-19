@@ -264,6 +264,14 @@ kernel then routes through `unknown_after_dispatching`
 `failed_unknown_persistence_returns_state_recovery_with_real_action_id`
 (`crates/core/src/kernel.rs`).
 
+The same destination covers a trusted deadline that expires before the outcome
+can be persisted. A committed provider effect whose receipt cannot be written
+inside the action budget is not a failed effect, and the kernel now refuses to
+persist it under a zero budget: it records `UNKNOWN` and lets reconciliation
+find the receipt. Finalization is bounded by what is left of the deadline
+rather than by the store's static maximum, so this is the intended outcome
+rather than a timeout that happens to be reported as one.
+
 ## What is not yet enforced
 
 These are gaps between the invariant set and the current tree. They are recorded

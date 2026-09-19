@@ -146,6 +146,15 @@ sharing the same pool but carrying a trusted deadline, so every call made
 through it is bounded by what is left of that deadline without changing the
 shared store traits.
 
+The kernel reaches that path for terminal receipt finalization, which is the
+last place a database wait can outlive the action it serves. `EffectStore` has
+a budget-aware finalization form whose default implementation delegates to the
+plain one, so a store that cannot block stays valid, and the PostgreSQL adapter
+overrides it to derive its waits from what is left. When the trusted deadline
+has already passed, the kernel does not call the store at all: it records the
+action as `UNKNOWN` for reconciliation rather than handing over a zero budget
+that would fail inside the transaction it was meant to bound.
+
 The authority, ledger, and executor crates provide experimental kernel
 contracts and adapter boundaries. Production authority enforcement, durable
 action/receipt storage, isolation enforcement, and outbound DLP remain
