@@ -25,8 +25,8 @@ use nemo_relay_plugin_proto::convert::{
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
-    LifecycleOutcome, PROTOCOL_VERSION, PluginHostReadCapability, PluginProtocolError,
-    PluginSessionIdentity, Uuid, check_protocol_version,
+    LifecycleOutcome, PROTOCOL_VERSION, PluginProtocolError, PluginSessionIdentity, Uuid,
+    check_protocol_version,
 };
 use tonic::{Request, Response, Status};
 
@@ -332,11 +332,6 @@ impl PluginHostService {
         let envelope = operation_envelope_from_wire(session_id, context)?;
         Ok(envelope.context)
     }
-}
-
-/// The read capabilities a host accepted, for a kernel that wants to check them.
-pub fn accepted_capabilities(identity: &PluginSessionIdentity) -> Vec<PluginHostReadCapability> {
-    identity.accepted_read_capabilities.clone()
 }
 
 #[cfg(test)]

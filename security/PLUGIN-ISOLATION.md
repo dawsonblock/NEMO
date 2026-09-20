@@ -467,6 +467,14 @@ holds the supervisor that starts it and the backend that reaches it.
   same conformance suite the in-process backend runs, so "implements the
   contract" is demonstrated rather than asserted. The same file kills a host
   mid-test and asserts the kernel survives it.
+- **The architecture gate reads the workspace.** It enumerates members from the
+  workspace manifest rather than a list someone has to remember to extend, so a
+  new crate that loads a library is caught the moment it exists, and it checks
+  the dependency side too: only one crate may declare the dynamic loader, and the
+  kernel may not depend on the implementation of its own seam. Widening it found
+  a false positive worth naming — the SDK declares the ABI's entry-point type,
+  which is a signature rather than a load — and the token list no longer treats
+  it as one.
 
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process
