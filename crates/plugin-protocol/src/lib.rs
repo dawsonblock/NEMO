@@ -70,8 +70,71 @@ pub struct PluginDescriptor {
     pub manifest_digest: Option<String>,
     /// Plugin kinds the host registered on the plugin's behalf.
     pub registration_kinds: Vec<String>,
+    /// What each registration installs, so a proxy can be built from it.
+    pub registrations: Vec<PluginRegistrationDescriptor>,
     /// Capabilities the plugin offers.
     pub capabilities: Vec<PluginCapability>,
+}
+
+/// What class of runtime component a registration installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRegistrationClass {
+    /// Wraps or rewrites a call.
+    Middleware,
+    /// Allows, refuses or sanitizes a call.
+    Guardrail,
+    /// Observes events without changing them.
+    Subscriber,
+    /// Provides a tool.
+    Tool,
+    /// Intercepts an LLM call.
+    LlmIntercept,
+    /// Encodes or decodes a payload.
+    PayloadCodec,
+}
+
+/// How a registration sits relative to others in its class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistrationOrdering {
+    /// Lower runs first, matching how the runtime orders its own registrations.
+    pub priority: i32,
+    /// Whether this registration can stop the chain it is part of.
+    pub may_break_chain: bool,
+}
+
+/// Whether a registration answers once or streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginExecutionShape {
+    /// One request, one response.
+    Unary,
+    /// One request, a sequence of responses.
+    Streaming,
+}
+
+/// Everything the kernel needs to re-create one registration as a proxy.
+///
+/// A loaded plugin is not a single thing the kernel invokes: it registers
+/// components that the runtime then calls, and each has a class, an order and a
+/// shape of its own. A process host cannot hand back local objects, so it hands
+/// back this description and the runtime builds a proxy from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistrationDescriptor {
+    /// Identity of this registration within the plugin.
+    pub registration_id: String,
+    /// Component kind the runtime resolves.
+    pub component_kind: String,
+    /// What class of component this is.
+    pub class: PluginRegistrationClass,
+    /// Where it sits relative to others in its class.
+    pub ordering: PluginRegistrationOrdering,
+    /// Whether its callback answers once or streams.
+    pub shape: PluginExecutionShape,
+    /// Configuration keys the component reads.
+    pub config_keys: Vec<String>,
+    /// Digest the plugin declares, when it declares one.
+    pub declared_digest: Option<String>,
 }
 
 /// One capability a plugin offers.

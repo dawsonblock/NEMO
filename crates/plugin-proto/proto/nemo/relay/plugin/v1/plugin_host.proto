@@ -66,6 +66,26 @@ enum PluginCapabilityKind {
   SUBSCRIBER = 3;
 }
 
+// What class of runtime component a registration installs.
+// Protobuf enum values are siblings of their type rather than children of it,
+// so these are prefixed to stay unique within the package.
+enum PluginRegistrationClass {
+  PLUGIN_REGISTRATION_CLASS_UNSPECIFIED = 0;
+  REGISTRATION_MIDDLEWARE = 1;
+  REGISTRATION_GUARDRAIL = 2;
+  REGISTRATION_SUBSCRIBER = 3;
+  REGISTRATION_TOOL = 4;
+  REGISTRATION_LLM_INTERCEPT = 5;
+  REGISTRATION_PAYLOAD_CODEC = 6;
+}
+
+// Whether a registration answers once or streams.
+enum PluginExecutionShape {
+  PLUGIN_EXECUTION_SHAPE_UNSPECIFIED = 0;
+  SHAPE_UNARY = 1;
+  SHAPE_STREAMING = 2;
+}
+
 // Identity, binding and budget for one operation.
 message PluginExecutionContext {
   // Correlation identity for the operation. Callbacks carry it too, so a call
@@ -104,6 +124,36 @@ message PluginDescriptor {
   optional string manifest_digest = 4;
   repeated string registration_kinds = 5;
   repeated PluginCapability capabilities = 6;
+  repeated PluginRegistrationDescriptor registrations = 7;
+}
+
+// How one registration sits relative to others in its class.
+message PluginRegistrationOrdering {
+  // Lower runs first, as the runtime orders its own registrations.
+  int32 priority = 1;
+  // Whether this registration can stop the chain it is part of.
+  bool may_break_chain = 2;
+}
+
+// Everything the kernel needs to re-create one registration as a proxy.
+//
+// A loaded plugin is not a single thing the kernel invokes: it registers
+// components that the runtime then calls, and each has a class, an order, a
+// shape and configuration of its own. A process host cannot hand back local
+// objects, so it hands back this description instead. A list of kind names
+// cannot carry it — the runtime would not know how to order two registrations,
+// whether one breaks a chain, whether its callback streams, or which
+// configuration it reads.
+message PluginRegistrationDescriptor {
+  string registration_id = 1;
+  string component_kind = 2;
+  PluginRegistrationClass class = 3;
+  PluginRegistrationOrdering ordering = 4;
+  PluginExecutionShape shape = 5;
+  // Configuration keys the component reads, so a validator can require them.
+  repeated string config_keys = 6;
+  // Present only when the plugin supplies one; absence is the truth.
+  optional string declared_digest = 7;
 }
 
 message PluginFailure {
@@ -116,30 +166,56 @@ message PluginFailure {
   optional uint32 received_version = 6;
 }
 
-// First message the kernel sends. Binds the session to a runtime identity, so a
-// host started under one NEMO runtime cannot be retained by another.
+// First message the kernel sends.
+//
+// It binds the session to a runtime identity, so a host started under one NEMO
+// runtime cannot be retained by another, and it authenticates the peer: the
+// supervisor generates a session credential and passes it to the host out of
+// band, so another local process cannot present itself as the kernel merely by
+// knowing the socket path.
+//
+// `client_nonce` is the kernel's; `host_instance_id` is the host's and is
+// returned rather than asserted here, because the host is the only party that
+// knows which process it is.
 message HandshakeRequest {
   uint32 protocol_version = 1;
   string runtime_binding_digest = 2;
-  string host_instance_id = 3;
-  string session_nonce = 4;
+  string client_nonce = 3;
+  string session_credential = 4;
   uint32 maximum_frame_bytes = 5;
   repeated string supported_features = 6;
 }
 
+// The session the host establishes.
+//
+// `session_id` is the single authority for everything that follows: every later
+// request names it, and the host checks it against the session it holds. Before
+// this the schema carried a `session_id` on each request that nothing ever
+// issued, so "which session?" had no answer.
 message HandshakeResponse {
   uint32 protocol_version = 1;
-  string host_instance_id = 2;
-  string session_nonce = 3;
-  uint32 maximum_frame_bytes = 4;
-  repeated string supported_features = 5;
+  string session_id = 2;
+  string host_instance_id = 3;
+  string host_nonce = 4;
+  uint32 maximum_frame_bytes = 5;
+  repeated string supported_features = 6;
 }
 
+// Load a plugin.
+//
+// `artifact` is a reference, so on its own it would let the host load a file
+// the kernel did not approve: something could be verified, the path left in
+// place, and the file replaced before the host opens it. The digests are the
+// kernel's statement of what it approved, and the host verifies both
+// immediately before loading — a manifest whose contents decide what is loaded,
+// and the library itself.
 message LoadRequest {
   string session_id = 1;
   PluginExecutionContext context = 2;
   string plugin_id = 3;
   string artifact = 4;
+  string manifest_digest = 5;
+  string library_digest = 6;
 }
 
 message LoadResponse {

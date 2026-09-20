@@ -96,8 +96,8 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             v1::HandshakeRequest {
                 protocol_version: 1,
                 runtime_binding_digest: "runtime-binding-digest".into(),
-                host_instance_id: "host-1".into(),
-                session_nonce: "nonce-1".into(),
+                client_nonce: "client-nonce".into(),
+                session_credential: "session-credential".into(),
                 maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
                 supported_features: vec!["streaming".into(), "cancel".into()],
             }
@@ -110,6 +110,8 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                 context: Some(context("operation-1")),
                 plugin_id: "example".into(),
                 artifact: "relay-plugin.toml".into(),
+                manifest_digest: "manifest-digest".into(),
+                library_digest: "library-digest".into(),
             }
             .encode_to_vec(),
         ),
@@ -127,6 +129,18 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                     manifest_digest: Some("manifest-digest".into()),
                     registration_kinds: vec!["example_kind".into()],
                     capabilities: Vec::new(),
+                    registrations: vec![v1::PluginRegistrationDescriptor {
+                        registration_id: "registration-1".into(),
+                        component_kind: "example_kind".into(),
+                        class: v1::PluginRegistrationClass::RegistrationMiddleware as i32,
+                        ordering: Some(v1::PluginRegistrationOrdering {
+                            priority: 10,
+                            may_break_chain: false,
+                        }),
+                        shape: v1::PluginExecutionShape::ShapeUnary as i32,
+                        config_keys: vec!["model".into()],
+                        declared_digest: None,
+                    }],
                 }),
             }
             .encode_to_vec(),

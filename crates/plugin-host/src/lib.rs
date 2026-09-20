@@ -200,6 +200,12 @@ impl PluginExecutionBackend for InProcessPluginBackend {
                 negotiated_abi_version: None,
                 manifest_digest: None,
                 registration_kinds,
+                // The in-process loader registers components into this
+                // process's own runtime, so there is no proxy to build and
+                // nothing to describe across a boundary. Reporting an empty set
+                // is the truth; inventing descriptors here would be the same
+                // mistake as the synthesised capabilities this replaced.
+                registrations: Vec::new(),
                 capabilities: Vec::new(),
             };
             let handle = PluginHandle {

@@ -224,42 +224,42 @@ stream, and the limit travels in the handshake instead of in a header. The
 schema is authoritative: an architecture test permits `.proto` files and
 `include_proto!` in the two wire crates and rejects them everywhere else.
 
-## Remaining before the process backend
+## Boundary closure
 
-The schema is ahead of what the native ABI actually does, and writing the
-supervisor before closing that gap would force ad hoc exceptions. These are the
-known gaps, in the order they need closing:
+The schema was ahead of what the native ABI does, and writing the supervisor
+before closing that gap would have forced ad hoc exceptions. Closed:
 
-1. **Registration descriptors.** `registration_kinds: Vec<String>` cannot
-   reconstruct what core keeps locally. A process host has to hand back enough
-   to build a proxy: registration identity, plugin kind, callback type,
-   priority, break-chain behaviour, guardrail or middleware or subscriber type,
-   configuration requirements, and streaming versus unary.
-2. **Complete callback mapping.** ABI v4 exposes far more than the three typed
-   calls in `RelayRuntime`: tool and LLM sanitizers, conditional execution,
-   request and execution intercepts, streaming intercepts, async middleware,
-   scopes and marks, codecs. Each needs a defined RPC representation, and the
-   pull-based downstream LLM stream needs a streaming shape because a unary
-   call cannot carry open, pull, cancel and release.
-3. **Wire↔domain conversion with fail-closed checks.** The two representations
-   have already drifted: the wire carries `remaining_budget_millis` and session
-   identity that the domain type does not. Conversion must reject `UNSPECIFIED`
-   and unknown enum values, missing nested messages, version mismatches, empty
-   identifiers and inconsistent failure detail, so a less-trusted host cannot
-   construct something core reads as valid.
-4. **Session establishment.** The handshake does not yet return a `session_id`,
-   and it is unspecified who owns `host_instance_id`. Every later request names
-   a session that nothing currently issues.
-5. **Artifact identity.** `LoadRequest.artifact` is a path, so a host that is
-   less trusted than the kernel can load a file the kernel did not approve.
-   Loading needs a manifest and library digest verified immediately before
-   `dlopen`, or an open handle where the platform allows one.
-6. **Local peer authentication.** A runtime-binding digest and a nonce are not
-   an IPC authentication mechanism. The transport needs restrictive permissions
-   and an unguessable per-session credential, not merely a socket path.
-7. **Vector coverage.** Five recorded messages out of roughly thirty. The test
-   compares the recorded set against a hand-written list, so a new message can
-   be added without a vector; a schema-inventory check closes that.
+- **Registration descriptors.** `PluginDescriptor.registrations` carries what a
+  proxy needs: registration identity, component kind, class, ordering with
+  priority and chain-breaking, execution shape, configuration keys and an
+  optional declared digest. A list of kind names could not say how to order two
+  registrations, whether one breaks a chain, or whether its callback streams.
+- **Wire↔domain conversion.** `plugin_proto::convert` refuses `UNSPECIFIED` and
+  unknown enums, missing nested messages, inconsistent failure detail, empty
+  identities and generation-zero handles, so the host's looseness cannot become
+  domain state the kernel trusts.
+- **Session establishment.** `HandshakeResponse` returns the `session_id` every
+  later request names; the host owns `host_instance_id` because only it knows
+  which process it is, and the kernel supplies the client nonce.
+- **Artifact identity.** `LoadRequest` carries a manifest and library digest,
+  which is the kernel's statement of what it approved; the host verifies both
+  immediately before loading.
+- **Local peer authentication.** The handshake carries a session credential the
+  supervisor passes to the host out of band, so knowing the socket path is not
+  enough to present as the kernel.
+- **Vector coverage.** A check parses the `rpc` signatures and requires every
+  message they name to be vectored or explicitly pending, asserting first that
+  it found at least twenty so it cannot pass by parsing nothing.
+
+One gap remains, and it is the large one:
+
+**Complete callback mapping.** ABI v4 exposes far more than the typed calls in
+`RelayRuntime`: tool and LLM sanitizers, conditional execution, request and
+execution intercepts, streaming intercepts, async middleware, scopes and marks,
+codecs. Each needs a defined RPC representation, and the pull-based downstream
+LLM stream needs a streaming shape, because a unary call cannot carry open,
+pull, cancel and release. Until that mapping exists the process host would have
+to invent it, which is the outcome this closure work exists to prevent.
 
 This increment does not move `kernel-process unsafe tokens`, which is 621. The
 number falls when native loading physically crosses the process boundary, and a

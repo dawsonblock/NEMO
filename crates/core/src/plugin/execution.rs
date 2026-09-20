@@ -304,6 +304,7 @@ mod tests {
                         negotiated_abi_version: Some(1),
                         manifest_digest: None,
                         registration_kinds: Vec::new(),
+                        registrations: Vec::new(),
                         capabilities: Vec::<PluginCapability>::new(),
                     },
                 })

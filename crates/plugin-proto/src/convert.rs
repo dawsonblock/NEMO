@@ -16,8 +16,9 @@
 
 use nemo_relay_plugin_protocol::{
     DispatchState, OutcomeCertainty, PluginCapability, PluginCapabilityKind, PluginDescriptor,
-    PluginExecutionContext, PluginFailure, PluginFailureCode, PluginHandle, PluginLoadResponse,
-    PluginProtocolError, PluginSuccess,
+    PluginExecutionContext, PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle,
+    PluginLoadResponse, PluginProtocolError, PluginRegistrationClass, PluginRegistrationDescriptor,
+    PluginRegistrationOrdering, PluginSuccess,
 };
 
 use crate::v1;
@@ -202,7 +203,74 @@ pub fn descriptor_from_wire(
         },
         manifest_digest: wire.manifest_digest.clone(),
         registration_kinds: wire.registration_kinds.clone(),
+        registrations: wire
+            .registrations
+            .iter()
+            .map(registration_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
         capabilities,
+    })
+}
+
+/// Validate one registration description.
+///
+/// A registration the runtime cannot order or classify is worse than a missing
+/// one, because the proxy would be built and then behave unlike the plugin it
+/// stands for. Every field that decides behaviour is therefore required rather
+/// than defaulted.
+fn registration_from_wire(
+    wire: &v1::PluginRegistrationDescriptor,
+) -> Result<PluginRegistrationDescriptor, PluginProtocolError> {
+    if wire.registration_id.trim().is_empty() {
+        return Err(malformed("a registration with no identity"));
+    }
+    if wire.component_kind.trim().is_empty() {
+        return Err(malformed("a registration with no component kind"));
+    }
+    let class = v1::PluginRegistrationClass::try_from(wire.class)
+        .map_err(|_| malformed(format!("an unknown registration class {}", wire.class)))?;
+    let class = match class {
+        v1::PluginRegistrationClass::Unspecified => {
+            return Err(malformed("a registration with no class"));
+        }
+        v1::PluginRegistrationClass::RegistrationMiddleware => PluginRegistrationClass::Middleware,
+        v1::PluginRegistrationClass::RegistrationGuardrail => PluginRegistrationClass::Guardrail,
+        v1::PluginRegistrationClass::RegistrationSubscriber => PluginRegistrationClass::Subscriber,
+        v1::PluginRegistrationClass::RegistrationTool => PluginRegistrationClass::Tool,
+        v1::PluginRegistrationClass::RegistrationLlmIntercept => {
+            PluginRegistrationClass::LlmIntercept
+        }
+        v1::PluginRegistrationClass::RegistrationPayloadCodec => {
+            PluginRegistrationClass::PayloadCodec
+        }
+    };
+    let shape = v1::PluginExecutionShape::try_from(wire.shape)
+        .map_err(|_| malformed(format!("an unknown execution shape {}", wire.shape)))?;
+    let shape = match shape {
+        v1::PluginExecutionShape::Unspecified => {
+            return Err(malformed(
+                "a registration that does not say whether it answers once or streams",
+            ));
+        }
+        v1::PluginExecutionShape::ShapeUnary => PluginExecutionShape::Unary,
+        v1::PluginExecutionShape::ShapeStreaming => PluginExecutionShape::Streaming,
+    };
+    let ordering = wire
+        .ordering
+        .as_ref()
+        .ok_or_else(|| malformed("a registration with no ordering"))?;
+
+    Ok(PluginRegistrationDescriptor {
+        registration_id: wire.registration_id.clone(),
+        component_kind: wire.component_kind.clone(),
+        class,
+        ordering: PluginRegistrationOrdering {
+            priority: ordering.priority,
+            may_break_chain: ordering.may_break_chain,
+        },
+        shape,
+        config_keys: wire.config_keys.clone(),
+        declared_digest: wire.declared_digest.clone(),
     })
 }
 
