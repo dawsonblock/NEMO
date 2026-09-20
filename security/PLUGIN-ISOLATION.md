@@ -218,16 +218,49 @@ descriptor, and a caller that wanted to unload later had nothing to name. The
 response now carries the handle as well, because only the backend knows the
 generation it assigned.
 
-Increment 4 has its first piece: the framed transport. `encode_frame` and
-`decode_frame` implement the length-prefixed encoding the process boundary will
-use, and the announced length is checked against `MAX_FRAME_BYTES` before
-anything is parsed, so a hostile prefix cannot ask the other side to allocate.
-A frame that arrives short is refused rather than partly decoded, and a decoder
-reports exactly how many bytes it consumed so a reader over a stream cannot
-swallow the next message. Fifteen contract tests cover it, including the
-oversized-prefix and truncated-frame cases.
+The wire model now lives in `crates/plugin-proto` as a gRPC schema, and the
+earlier hand-rolled length-prefixed JSON framing is gone — gRPC frames the
+stream, and the limit travels in the handshake instead of in a header. The
+schema is authoritative: an architecture test permits `.proto` files and
+`include_proto!` in the two wire crates and rejects them everywhere else.
 
-This increment does not move `kernel-process unsafe tokens`. That number is
-expected to fall when native loading physically crosses the process boundary in
-increments 4-5, and a reduction achieved by reclassifying crates would not mean
-anything.
+## Remaining before the process backend
+
+The schema is ahead of what the native ABI actually does, and writing the
+supervisor before closing that gap would force ad hoc exceptions. These are the
+known gaps, in the order they need closing:
+
+1. **Registration descriptors.** `registration_kinds: Vec<String>` cannot
+   reconstruct what core keeps locally. A process host has to hand back enough
+   to build a proxy: registration identity, plugin kind, callback type,
+   priority, break-chain behaviour, guardrail or middleware or subscriber type,
+   configuration requirements, and streaming versus unary.
+2. **Complete callback mapping.** ABI v4 exposes far more than the three typed
+   calls in `RelayRuntime`: tool and LLM sanitizers, conditional execution,
+   request and execution intercepts, streaming intercepts, async middleware,
+   scopes and marks, codecs. Each needs a defined RPC representation, and the
+   pull-based downstream LLM stream needs a streaming shape because a unary
+   call cannot carry open, pull, cancel and release.
+3. **Wire↔domain conversion with fail-closed checks.** The two representations
+   have already drifted: the wire carries `remaining_budget_millis` and session
+   identity that the domain type does not. Conversion must reject `UNSPECIFIED`
+   and unknown enum values, missing nested messages, version mismatches, empty
+   identifiers and inconsistent failure detail, so a less-trusted host cannot
+   construct something core reads as valid.
+4. **Session establishment.** The handshake does not yet return a `session_id`,
+   and it is unspecified who owns `host_instance_id`. Every later request names
+   a session that nothing currently issues.
+5. **Artifact identity.** `LoadRequest.artifact` is a path, so a host that is
+   less trusted than the kernel can load a file the kernel did not approve.
+   Loading needs a manifest and library digest verified immediately before
+   `dlopen`, or an open handle where the platform allows one.
+6. **Local peer authentication.** A runtime-binding digest and a nonce are not
+   an IPC authentication mechanism. The transport needs restrictive permissions
+   and an unguessable per-session credential, not merely a socket path.
+7. **Vector coverage.** Five recorded messages out of roughly thirty. The test
+   compares the recorded set against a hand-written list, so a new message can
+   be added without a vector; a schema-inventory check closes that.
+
+This increment does not move `kernel-process unsafe tokens`, which is 621. The
+number falls when native loading physically crosses the process boundary, and a
+reduction achieved by reclassifying crates would not mean anything.

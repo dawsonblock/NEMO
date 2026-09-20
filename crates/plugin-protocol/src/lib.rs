@@ -441,15 +441,18 @@ mod tests {
 
     #[test]
     fn a_protocol_version_mismatch_fails_closed_in_both_directions() {
-        for received in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
-            let failure = check_protocol_version(received)
+        for peer_version in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
+            let failure = check_protocol_version(peer_version)
                 .expect_err("a mismatch must not be negotiated around");
             let PluginFailureCode::VersionMismatch { expected, received } = failure.failure.code
             else {
                 panic!("unexpected failure code: {:?}", failure.failure.code);
             };
             assert_eq!(expected, PROTOCOL_VERSION);
-            assert_eq!(received, received);
+            // Against the peer's version, not against itself. The earlier form
+            // destructured into a name that shadowed the loop variable, so the
+            // assertion was true whatever the code returned.
+            assert_eq!(received, peer_version);
         }
     }
 

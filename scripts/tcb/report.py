@@ -288,7 +288,10 @@ def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dic
     for label, crates in (
         ("invariant-enforcing", enforcement_crates(policy)),
         ("in-process", in_process_crates(policy)),
-        ("plugin host", plugin_host_crates(policy)),
+        # A target classification rather than a current one: until the loader
+        # physically crosses a process boundary its crate is also part of the
+        # in-process tier above.
+        ("plugin host (target)", plugin_host_crates(policy)),
     ):
         measured = [measure(metadata, identities[crate], crate) for crate in crates]
         total_lines = sum(item.source_lines for item in measured)

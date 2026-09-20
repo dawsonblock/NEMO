@@ -36,6 +36,18 @@ const LOADER_TOKENS: &[&str] = &[
     "NemoRelayNativePluginEntry",
 ];
 
+/// Core API that loads native plugins inside whichever process calls it.
+///
+/// Checking for direct calls to the loader alone missed the real path: Node,
+/// Python, and FFI do not call `load_native_plugins`, they call this, and core
+/// loads on their behalf. Naming the current callers makes the remaining
+/// migration visible instead of invisible, and stops a *new* consumer from
+/// adopting the same route while it is being replaced.
+const INDIRECT_LOAD_CALLERS: &[&str] = &["ffi", "node", "python"];
+
+/// The token that identifies a call through that API.
+const INDIRECT_LOAD_TOKEN: &str = "PluginHostActivation::";
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -98,6 +110,15 @@ fn no_new_native_loading_appears_outside_the_grandfathered_paths() {
                 && code_lines(&source).any(|line| line.contains("load_native_plugins("))
             {
                 offenders.push(format!("{crate_name}:{relative} calls the native loader"));
+            }
+
+            if !INDIRECT_LOAD_CALLERS.contains(crate_name)
+                && code_lines(&source).any(|line| line.contains(INDIRECT_LOAD_TOKEN))
+            {
+                offenders.push(format!(
+                    "{crate_name}:{relative} loads native plugins through the core \
+                     activation API instead of the backend seam"
+                ));
             }
         }
     }

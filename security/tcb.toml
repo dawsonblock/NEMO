@@ -45,15 +45,18 @@ crates = [
     # It stays out of the invariant-enforcing tier: it carries vocabulary, not
     # enforcement.
     "nemo-relay-plugin-protocol",
+    # The compatibility backend runs inside whichever process links it, which
+    # today is the kernel's. It is counted here because that is physically true
+    # now, and separately in [plugin_host] because that is where it belongs once
+    # the loader crosses a process boundary. Counting it only in the target tier
+    # would let an architecture diagram stand in for an accounting fact.
+    "nemo-relay-plugin-host",
     "nemo-relay-worker-proto",
 ]
 
-# The process that will host native plugins once the boundary exists.
-#
-# Its `unsafe` count is classified rather than hidden: corruption inside that
-# process must not be able to corrupt the kernel, which is the whole point of
-# moving the loader there. Until the move happens this is the compatibility
-# backend, measured so the reduction is visible when it occurs.
+# The process that will host native plugins once the boundary exists. This is a
+# target classification, not a current one: `nemo-relay-plugin-host` is also
+# listed in [in_process] because that is where its code actually runs today.
 [plugin_host]
 crates = ["nemo-relay-plugin-host"]
 
@@ -135,7 +138,7 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 [limits.nemo-relay-plugin-protocol]
 max_direct_dependencies = 3
 max_transitive_packages = 24
-max_source_lines = 478
+max_source_lines = 481
 max_unsafe_occurrences = 3
 direct_dependency_digest = "162268fbc27e2215997bfa17dcb031b17721a67d59e8159c8f8ace95cd5ce9f8"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"

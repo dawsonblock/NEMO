@@ -91,13 +91,18 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             .encode_to_vec(),
         ),
         (
-            "HostCallRequest",
-            v1::HostCallRequest {
-                session_id: "session-1".into(),
-                operation_request_id: "operation-1".into(),
-                host_call_id: "call-1".into(),
-                capability: v1::HostCallCapability::DownstreamLlmStream as i32,
-                arguments: "{}".into(),
+            "InvokeOutcome",
+            v1::InvokeOutcome {
+                dispatch_state: v1::DispatchState::DispatchAttempted as i32,
+                outcome_certainty: v1::OutcomeCertainty::Unknown as i32,
+                result: Some(v1::invoke_outcome::Result::Failure(v1::PluginFailure {
+                    code: v1::FailureCode::HostCrashed as i32,
+                    message: "the plugin host exited during dispatch".into(),
+                    observed: None,
+                    limit: None,
+                    expected_version: None,
+                    received_version: None,
+                })),
             }
             .encode_to_vec(),
         ),
@@ -177,8 +182,8 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
             "PluginFailure" => v1::PluginFailure::decode(bytes.as_slice())
                 .expect("decode PluginFailure")
                 .encode_to_vec(),
-            "HostCallRequest" => v1::HostCallRequest::decode(bytes.as_slice())
-                .expect("decode HostCallRequest")
+            "InvokeOutcome" => v1::InvokeOutcome::decode(bytes.as_slice())
+                .expect("decode InvokeOutcome")
                 .encode_to_vec(),
             other => panic!("no decoder for recorded vector {other}"),
         };
