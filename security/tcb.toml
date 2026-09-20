@@ -41,6 +41,10 @@ crates = [
     "nemo-relay-isolation",
     "nemo-relay-pii-redaction",
     "nemo-relay-plugin",
+    # Core depends on the plugin contract, so it is in the kernel's process.
+    # It stays out of the invariant-enforcing tier: it carries vocabulary, not
+    # enforcement.
+    "nemo-relay-plugin-protocol",
     "nemo-relay-worker-proto",
 ]
 
@@ -107,7 +111,7 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 [limits.nemo-relay]
 max_direct_dependencies = 40
 max_transitive_packages = 265
-max_source_lines = 71587
+max_source_lines = 71768
 max_unsafe_occurrences = 299
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
@@ -131,7 +135,7 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 [limits.nemo-relay-plugin-protocol]
 max_direct_dependencies = 4
 max_transitive_packages = 24
-max_source_lines = 703
+max_source_lines = 756
 max_unsafe_occurrences = 3
 direct_dependency_digest = "07a6410504fe622aba26b024a0180a3ef0ab0a54c2a99247f344f7a14660faa0"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -223,7 +227,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 3
 max_transitive_packages = 209
-max_source_lines = 428
+max_source_lines = 548
 max_unsafe_occurrences = 1
 direct_dependency_digest = "8fe645305d31725241bae067e82e46f4fd07a63fcd169619289606a9c83b786f"
 transitive_dependency_digest = "8961e02e30018785a63b78b27e42d84253fb8d8911a6f26609a21c249cb23160"

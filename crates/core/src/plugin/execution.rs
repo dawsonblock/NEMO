@@ -25,15 +25,16 @@
 //! composition decision, make tests order-dependent, and detach the backend from
 //! the runtime identity it is supposed to serve.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nemo_relay_plugin_protocol::{
-    DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext,
-    PluginExecutionOutcome, PluginFailureCode, PluginHostHealth, PluginInspectRequest,
-    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginResponse,
-    PluginUnloadRequest, check_deadline,
+    DispatchState, MAX_FRAME_BYTES, OutcomeCertainty, PROTOCOL_VERSION, PluginDescriptor,
+    PluginExecutionContext, PluginExecutionOutcome, PluginFailureCode, PluginHostHealth,
+    PluginInspectRequest, PluginLoadRequest, PluginLoadResponse, PluginProtocolError,
+    PluginSuccess, PluginUnloadRequest, check_deadline,
 };
 
 /// A plugin operation in progress.
@@ -89,17 +90,87 @@ pub trait PluginExecutionBackend: Send + Sync {
 /// backend rather than being a rule each implementation has to remember.
 pub struct PluginManager {
     backend: Arc<dyn PluginExecutionBackend>,
+    /// Request identities currently in flight.
+    ///
+    /// Only concurrent identities are tracked, so this stays bounded by the
+    /// number of outstanding operations. Two live operations sharing one
+    /// identity would make their responses ambiguous, and a caller could not
+    /// tell which result answered which request.
+    in_flight: Mutex<HashSet<String>>,
 }
 
 impl PluginManager {
     /// Compose a manager around a backend.
     pub fn new(backend: Arc<dyn PluginExecutionBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            in_flight: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Return the backend this manager dispatches to.
     pub fn backend(&self) -> &Arc<dyn PluginExecutionBackend> {
         &self.backend
+    }
+
+    fn in_flight(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Check every invariant that holds for all backends, then claim the
+    /// request identity.
+    ///
+    /// A backend is not asked to remember these. If it were, each new backend
+    /// would have to re-derive the same rules, and the ones it forgot would be
+    /// the ones nobody tested.
+    fn begin(&self, context: &PluginExecutionContext) -> Result<InFlight<'_>, PluginProtocolError> {
+        if context.protocol_version != PROTOCOL_VERSION {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    received: context.protocol_version,
+                },
+                "the operation declares a protocol version this kernel does not speak",
+            ));
+        }
+        if context.runtime_binding_digest.trim().is_empty() {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "the operation carries no runtime binding",
+            ));
+        }
+        if context.operation_request_id.trim().is_empty() {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "the operation carries no request identity",
+            ));
+        }
+        if context.max_response_bytes == 0 || context.max_response_bytes > MAX_FRAME_BYTES {
+            // Rejected rather than clamped: silently shrinking a caller's limit
+            // would make it believe a response was truncated for another reason.
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::OversizedFrame {
+                    observed: u64::from(context.max_response_bytes),
+                    limit: MAX_FRAME_BYTES,
+                },
+                "the operation's response budget is outside the protocol's frame limit",
+            ));
+        }
+        check_deadline(context.deadline_unix_ms)?;
+        let mut in_flight = self.in_flight();
+        if !in_flight.insert(context.operation_request_id.clone()) {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "an operation with this request identity is already in flight",
+            ));
+        }
+        drop(in_flight);
+        Ok(InFlight {
+            manager: self,
+            request_id: context.operation_request_id.clone(),
+        })
     }
 
     /// Load one plugin.
@@ -108,7 +179,7 @@ impl PluginManager {
         request: PluginLoadRequest,
         context: PluginExecutionContext,
     ) -> Result<PluginLoadResponse, PluginProtocolError> {
-        check_deadline(context.deadline_unix_ms)?;
+        let _in_flight = self.begin(&context)?;
         self.backend.load(request, context).await
     }
 
@@ -118,7 +189,7 @@ impl PluginManager {
         request: PluginUnloadRequest,
         context: PluginExecutionContext,
     ) -> Result<(), PluginProtocolError> {
-        check_deadline(context.deadline_unix_ms)?;
+        let _in_flight = self.begin(&context)?;
         self.backend.unload(request, context).await
     }
 
@@ -128,7 +199,7 @@ impl PluginManager {
         request: PluginInspectRequest,
         context: PluginExecutionContext,
     ) -> Result<Vec<PluginDescriptor>, PluginProtocolError> {
-        check_deadline(context.deadline_unix_ms)?;
+        let _in_flight = self.begin(&context)?;
         self.backend.inspect(request, context).await
     }
 
@@ -137,8 +208,24 @@ impl PluginManager {
         &self,
         context: PluginExecutionContext,
     ) -> Result<PluginHostHealth, PluginProtocolError> {
-        check_deadline(context.deadline_unix_ms)?;
+        let _in_flight = self.begin(&context)?;
         self.backend.health(context).await
+    }
+}
+
+/// An in-flight request identity, released when the operation ends.
+///
+/// A guard rather than an explicit removal so an early return, an error, or a
+/// panic cannot leave the identity claimed and make every later operation with
+/// the same identifier look like a duplicate.
+struct InFlight<'a> {
+    manager: &'a PluginManager,
+    request_id: String,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.manager.in_flight().remove(&self.request_id);
     }
 }
 
@@ -157,7 +244,7 @@ pub fn unsupported(operation: &str) -> PluginProtocolError {
 /// external system, and this is the shape that carries the answer rather than
 /// leaving it to be assumed.
 pub fn outcome_from(
-    result: Result<PluginResponse, PluginProtocolError>,
+    result: Result<PluginSuccess, PluginProtocolError>,
     dispatch: DispatchState,
     certainty: OutcomeCertainty,
 ) -> PluginExecutionOutcome {
@@ -203,8 +290,11 @@ mod tests {
                         generation: 1,
                     },
                     descriptor: PluginDescriptor {
-                        name: request.plugin_id,
-                        abi_version: 1,
+                        plugin_id: request.plugin_id,
+                        plugin_version: None,
+                        negotiated_abi_version: Some(1),
+                        manifest_digest: None,
+                        registration_kinds: Vec::new(),
                         capabilities: Vec::<PluginCapability>::new(),
                     },
                 })
@@ -246,12 +336,82 @@ mod tests {
 
     fn context(deadline_unix_ms: u64) -> PluginExecutionContext {
         PluginExecutionContext {
-            request_id: "operation-1".into(),
+            operation_request_id: "operation-1".into(),
             protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
             runtime_binding_digest: "binding".into(),
             deadline_unix_ms,
             max_response_bytes: 1024,
         }
+    }
+
+    #[tokio::test]
+    async fn the_manager_rejects_contexts_every_backend_would_have_to_check() {
+        // These rules live here so a new backend cannot forget them. Each case
+        // asserts the specific failure rather than that something failed.
+        let backend = RecordingBackend::new();
+        let manager = PluginManager::new(backend.clone());
+        let load = |_context: PluginExecutionContext| PluginLoadRequest {
+            plugin_id: "example".into(),
+            artifact: "relay-plugin.toml".into(),
+        };
+
+        let mut wrong_version = context(live_deadline());
+        wrong_version.protocol_version = nemo_relay_plugin_protocol::PROTOCOL_VERSION + 1;
+        let failure = manager
+            .load(load(wrong_version.clone()), wrong_version)
+            .await
+            .expect_err("a version the kernel does not speak must be refused");
+        assert!(matches!(
+            failure.failure.code,
+            PluginFailureCode::VersionMismatch { .. }
+        ));
+
+        let mut no_binding = context(live_deadline());
+        no_binding.runtime_binding_digest = "  ".into();
+        let failure = manager
+            .load(load(no_binding.clone()), no_binding)
+            .await
+            .expect_err("a blank runtime binding is not a binding");
+        assert_eq!(failure.failure.code, PluginFailureCode::Rejected);
+
+        let mut oversized = context(live_deadline());
+        oversized.max_response_bytes = nemo_relay_plugin_protocol::MAX_FRAME_BYTES + 1;
+        let failure = manager
+            .load(load(oversized.clone()), oversized)
+            .await
+            .expect_err("a response budget above the frame limit is not honour-able");
+        assert!(matches!(
+            failure.failure.code,
+            PluginFailureCode::OversizedFrame { .. }
+        ));
+
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "none of these may reach the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_request_identity_can_be_reused() {
+        // Unique among *concurrent* operations, not forever: a caller that
+        // retries with the same identity after a completed operation is not
+        // making an ambiguous request.
+        let backend = RecordingBackend::new();
+        let manager = PluginManager::new(backend.clone());
+        let load = PluginLoadRequest {
+            plugin_id: "example".into(),
+            artifact: "relay-plugin.toml".into(),
+        };
+
+        for _ in 0..2 {
+            manager
+                .load(load.clone(), context(live_deadline()))
+                .await
+                .expect("a live context loads");
+        }
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
     }
 
     fn expired_deadline() -> u64 {

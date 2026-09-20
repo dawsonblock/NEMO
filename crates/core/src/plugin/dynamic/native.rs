@@ -125,6 +125,27 @@ impl NativePluginActivation {
             .collect()
     }
 
+    /// Describe each loaded plugin as the loader actually knows it.
+    ///
+    /// Returns the registered kind and the compatibility version the plugin's
+    /// manifest declares. Nothing here is inferred: a caller that needs the
+    /// ABI version negotiated with the library has to say so, because this
+    /// activation does not retain it and reporting the host's maximum instead
+    /// would invent a guarantee the plugin never made.
+    pub fn loaded_plugins(&self) -> Vec<(String, Option<String>)> {
+        self.plugins
+            .iter()
+            .map(|instance| {
+                let declared = if instance.relay_compat.trim().is_empty() {
+                    None
+                } else {
+                    Some(instance.relay_compat.clone())
+                };
+                (instance.plugin_kind.clone(), declared)
+            })
+            .collect()
+    }
+
     /// Consumes the activation and deregisters loaded plugin kinds.
     pub fn clear(self) {}
 

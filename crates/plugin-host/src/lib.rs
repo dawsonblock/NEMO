@@ -25,18 +25,30 @@ use nemo_relay::plugin::dynamic::{
     NativePluginActivation, NativePluginLoadSpec, load_native_plugins,
 };
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFuture, PluginManager};
-use nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION;
 use nemo_relay_plugin_protocol::{
     PROTOCOL_VERSION, PluginDescriptor, PluginExecutionContext, PluginFailure, PluginFailureCode,
     PluginHandle, PluginHostHealth, PluginInspectRequest, PluginLoadRequest, PluginLoadResponse,
     PluginProtocolError, PluginUnloadRequest,
 };
 
-/// A plugin loaded through the in-process loader.
+/// What the backend holds for one plugin identifier.
 ///
-/// The activation is held rather than dropped because it is the lifetime guard
-/// for the loaded library: dropping it deregisters the plugin kinds and unloads
-/// the code, so it has to live exactly as long as the handle does.
+/// The `Loading` arm is a reservation, not a status report. Loading happens
+/// without the lock held, so without a reservation a second request could pass
+/// the "is it loaded?" check while the first is still working, and two requests
+/// would map onto one result — the first caller's success reported to the
+/// second, or two libraries loaded under one identifier.
+enum Entry {
+    /// A load is in progress; the identifier is claimed.
+    Loading,
+    /// The plugin is loaded.
+    ///
+    /// Boxed because a loaded plugin carries far more than the reservation
+    /// marker, and the map holds many of them.
+    Loaded(Box<LoadedPlugin>),
+}
+
+/// A plugin loaded through the in-process loader.
 struct LoadedPlugin {
     handle: PluginHandle,
     descriptor: PluginDescriptor,
@@ -55,7 +67,7 @@ struct LoadedPlugin {
 /// kernel uses today, so behaviour is unchanged; what changes is that the kernel
 /// no longer has to know which implementation it is talking to.
 pub struct InProcessPluginBackend {
-    loaded: Mutex<HashMap<String, LoadedPlugin>>,
+    loaded: Mutex<HashMap<String, Entry>>,
     generations: AtomicU64,
 }
 
@@ -74,7 +86,7 @@ impl InProcessPluginBackend {
         }
     }
 
-    fn loaded(&self) -> std::sync::MutexGuard<'_, HashMap<String, LoadedPlugin>> {
+    fn loaded(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         self.loaded.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -82,9 +94,12 @@ impl InProcessPluginBackend {
         let mut descriptors: Vec<PluginDescriptor> = self
             .loaded()
             .values()
-            .map(|loaded| loaded.descriptor.clone())
+            .filter_map(|entry| match entry {
+                Entry::Loaded(loaded) => Some(loaded.descriptor.clone()),
+                Entry::Loading => None,
+            })
             .collect();
-        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
         descriptors
     }
 
@@ -92,7 +107,10 @@ impl InProcessPluginBackend {
         let mut handles: Vec<PluginHandle> = self
             .loaded()
             .values()
-            .map(|loaded| loaded.handle.clone())
+            .filter_map(|entry| match entry {
+                Entry::Loaded(loaded) => Some(loaded.handle.clone()),
+                Entry::Loading => None,
+            })
             .collect();
         handles.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
         handles
@@ -115,43 +133,87 @@ impl PluginExecutionBackend for InProcessPluginBackend {
         _context: PluginExecutionContext,
     ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
         Box::pin(async move {
-            if self.loaded().contains_key(&request.plugin_id) {
-                return Err(refused(format!(
-                    "plugin {} is already loaded",
-                    request.plugin_id
-                )));
+            // Claim the identifier before doing any work. Releasing the lock
+            // while the loader runs would otherwise let a concurrent request
+            // see "not loaded" and start a second load of the same plugin.
+            {
+                let mut loaded = self.loaded();
+                match loaded.get(&request.plugin_id) {
+                    Some(Entry::Loading) => {
+                        return Err(PluginProtocolError::new(
+                            PluginFailureCode::AlreadyLoading,
+                            format!("plugin {} is being loaded", request.plugin_id),
+                        ));
+                    }
+                    Some(Entry::Loaded(_)) => {
+                        return Err(PluginProtocolError::new(
+                            PluginFailureCode::AlreadyLoaded,
+                            format!("plugin {} is already loaded", request.plugin_id),
+                        ));
+                    }
+                    None => {
+                        loaded.insert(request.plugin_id.clone(), Entry::Loading);
+                    }
+                }
             }
-            let activation = load_native_plugins([NativePluginLoadSpec {
+
+            let activation = match load_native_plugins([NativePluginLoadSpec {
                 plugin_id: request.plugin_id.clone(),
                 manifest_ref: request.artifact,
-            }])
-            .map_err(|error| refused(error.to_string()))?;
+            }]) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    // Release the reservation so a later attempt is possible.
+                    self.loaded().remove(&request.plugin_id);
+                    return Err(refused(error.to_string()));
+                }
+            };
 
-            let generation = self.generations.fetch_add(1, Ordering::SeqCst);
+            // Checked rather than wrapping: a generation that silently reused a
+            // number would let a stale handle address a newer instance, which
+            // is the one thing the generation exists to prevent.
+            let generation = self
+                .generations
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| {
+                    PluginProtocolError::new(
+                        PluginFailureCode::GenerationExhausted,
+                        "the plugin generation counter cannot advance",
+                    )
+                })?;
+
+            // Only what the loader actually knows is reported. The earlier
+            // version synthesised a Tool capability for every registered kind
+            // and claimed the host's maximum ABI as the plugin's negotiated one,
+            // which turned an unknown into a security-relevant assertion.
+            let mut registration_kinds = Vec::new();
+            let mut plugin_version = None;
+            for (plugin_kind, declared) in activation.loaded_plugins() {
+                registration_kinds.push(plugin_kind);
+                plugin_version = plugin_version.or(declared);
+            }
             let descriptor = PluginDescriptor {
-                name: request.plugin_id.clone(),
-                abi_version: u16::try_from(NEMO_RELAY_NATIVE_ABI_VERSION).unwrap_or(u16::MAX),
-                capabilities: activation
-                    .plugin_kinds()
-                    .into_iter()
-                    .map(|plugin_kind| nemo_relay_plugin_protocol::PluginCapability {
-                        id: plugin_kind,
-                        kind: nemo_relay_plugin_protocol::PluginCapabilityKind::Tool,
-                        declared_digest: String::new(),
-                    })
-                    .collect(),
+                plugin_id: request.plugin_id.clone(),
+                plugin_version,
+                negotiated_abi_version: None,
+                manifest_digest: None,
+                registration_kinds,
+                capabilities: Vec::new(),
             };
             let handle = PluginHandle {
                 plugin_id: request.plugin_id.clone(),
                 generation,
             };
-            self.loaded().insert(
+            let mut loaded = self.loaded();
+            loaded.insert(
                 request.plugin_id.clone(),
-                LoadedPlugin {
+                Entry::Loaded(Box::new(LoadedPlugin {
                     handle: handle.clone(),
                     descriptor: descriptor.clone(),
                     _activation: activation,
-                },
+                })),
             );
             Ok(PluginLoadResponse { handle, descriptor })
         })
@@ -164,22 +226,36 @@ impl PluginExecutionBackend for InProcessPluginBackend {
     ) -> PluginExecutionFuture<'a, ()> {
         Box::pin(async move {
             let mut loaded = self.loaded();
-            let matches = loaded
-                .get(&request.handle.plugin_id)
-                .is_some_and(|entry| entry.handle.generation == request.handle.generation);
-            if !matches {
-                // A handle whose generation does not match addresses nothing:
-                // either the plugin was never loaded or it was unloaded and
-                // reloaded since, and neither may unload the current instance.
-                return Err(PluginProtocolError {
-                    failure: PluginFailure {
-                        code: PluginFailureCode::UnknownPlugin,
-                        message: format!(
-                            "no loaded plugin {} at generation {}",
-                            request.handle.plugin_id, request.handle.generation
-                        ),
-                    },
-                });
+            match loaded.get(&request.handle.plugin_id) {
+                Some(Entry::Loading) => {
+                    return Err(PluginProtocolError::new(
+                        PluginFailureCode::AlreadyLoading,
+                        format!("plugin {} is being loaded", request.handle.plugin_id),
+                    ));
+                }
+                Some(Entry::Loaded(entry)) => {
+                    if entry.handle.generation != request.handle.generation {
+                        // The plugin exists, but this handle is from before a
+                        // reload. It must not be able to unload the instance
+                        // that replaced it, and the caller needs to know that is
+                        // what happened rather than that nothing was there.
+                        return Err(PluginProtocolError::new(
+                            PluginFailureCode::StaleHandle,
+                            format!(
+                                "plugin {} is loaded at generation {}, not {}",
+                                request.handle.plugin_id,
+                                entry.handle.generation,
+                                request.handle.generation
+                            ),
+                        ));
+                    }
+                }
+                None => {
+                    return Err(PluginProtocolError::new(
+                        PluginFailureCode::UnknownPlugin,
+                        format!("plugin {} is not loaded", request.handle.plugin_id),
+                    ));
+                }
             }
             // Dropping the entry drops the activation, which deregisters the
             // plugin kinds and unloads the library.
@@ -196,20 +272,26 @@ impl PluginExecutionBackend for InProcessPluginBackend {
         Box::pin(async move {
             match request.handle {
                 None => Ok(self.descriptors()),
-                Some(handle) => self
-                    .loaded()
-                    .get(&handle.plugin_id)
-                    .filter(|entry| entry.handle.generation == handle.generation)
-                    .map(|entry| vec![entry.descriptor.clone()])
-                    .ok_or_else(|| PluginProtocolError {
-                        failure: PluginFailure {
-                            code: PluginFailureCode::UnknownPlugin,
-                            message: format!(
-                                "no loaded plugin {} at generation {}",
-                                handle.plugin_id, handle.generation
-                            ),
-                        },
-                    }),
+                Some(handle) => match self.loaded().get(&handle.plugin_id) {
+                    Some(Entry::Loaded(entry)) if entry.handle.generation == handle.generation => {
+                        Ok(vec![entry.descriptor.clone()])
+                    }
+                    Some(Entry::Loaded(entry)) => Err(PluginProtocolError::new(
+                        PluginFailureCode::StaleHandle,
+                        format!(
+                            "plugin {} is loaded at generation {}, not {}",
+                            handle.plugin_id, entry.handle.generation, handle.generation
+                        ),
+                    )),
+                    Some(Entry::Loading) => Err(PluginProtocolError::new(
+                        PluginFailureCode::AlreadyLoading,
+                        format!("plugin {} is being loaded", handle.plugin_id),
+                    )),
+                    None => Err(PluginProtocolError::new(
+                        PluginFailureCode::UnknownPlugin,
+                        format!("plugin {} is not loaded", handle.plugin_id),
+                    )),
+                },
             }
         })
     }
@@ -285,7 +367,7 @@ impl LoadedPlugins {
 
 fn context_with_live_deadline() -> PluginExecutionContext {
     PluginExecutionContext {
-        request_id: "in-process-load".into(),
+        operation_request_id: "in-process-load".into(),
         protocol_version: PROTOCOL_VERSION,
         runtime_binding_digest: "in-process".into(),
         deadline_unix_ms: u64::MAX,
@@ -305,5 +387,43 @@ mod tests {
             .block_on(conformance::check(&InProcessPluginBackend::new()));
 
         assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
+    fn a_failed_load_releases_its_reservation() {
+        // The identifier is claimed before the loader runs, so a failure has to
+        // give the claim back. A reservation that outlived its load would wedge
+        // the plugin permanently: every later attempt would report
+        // `AlreadyLoading` for something that is not loading and never will be.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a current-thread runtime");
+        let backend = InProcessPluginBackend::new();
+        let context = PluginExecutionContext {
+            operation_request_id: "load".into(),
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            deadline_unix_ms: u64::MAX,
+            max_response_bytes: 1024,
+        };
+
+        for attempt in 0..2 {
+            let failure = runtime
+                .block_on(backend.load(
+                    PluginLoadRequest {
+                        plugin_id: "absent-plugin".into(),
+                        artifact: "/nonexistent/relay-plugin.toml".into(),
+                    },
+                    context.clone(),
+                ))
+                .expect_err("a manifest that does not exist cannot load");
+            assert_eq!(
+                failure.failure.code,
+                PluginFailureCode::Rejected,
+                "attempt {attempt} must fail on the manifest, not on a stale reservation"
+            );
+        }
+
+        assert!(backend.handles().is_empty());
     }
 }

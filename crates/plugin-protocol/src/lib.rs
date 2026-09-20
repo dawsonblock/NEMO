@@ -51,13 +51,25 @@ pub struct PluginHandle {
 }
 
 /// What a plugin declares about itself once loaded.
+///
+/// Every field that the host may genuinely not know is optional rather than
+/// defaulted. An empty string is a claim; `None` is the truth, and the
+/// difference matters because these values feed capability identity. The
+/// negotiated ABI version in particular is what the loaded library declared,
+/// never the host's maximum supported version — reporting the maximum would
+/// invent a guarantee the plugin never made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginDescriptor {
-    /// Plugin name as the host reported it.
-    pub name: String,
-    /// Plugin ABI version, which is the plugin's own value rather than this
-    /// crate's protocol version.
-    pub abi_version: u16,
+    /// Deployment-chosen identifier the plugin was loaded under.
+    pub plugin_id: String,
+    /// Version the plugin reports for itself, when it reports one.
+    pub plugin_version: Option<String>,
+    /// ABI version negotiated with the loaded library, when it declared one.
+    pub negotiated_abi_version: Option<u16>,
+    /// Digest of the manifest the plugin was loaded from, when one was read.
+    pub manifest_digest: Option<String>,
+    /// Plugin kinds the host registered on the plugin's behalf.
+    pub registration_kinds: Vec<String>,
     /// Capabilities the plugin offers.
     pub capabilities: Vec<PluginCapability>,
 }
@@ -69,13 +81,13 @@ pub struct PluginCapability {
     pub id: String,
     /// What kind of runtime work this capability performs.
     pub kind: PluginCapabilityKind,
-    /// Digest of the capability's declared shape, supplied by the plugin.
+    /// Digest of the capability's declared shape, when the plugin supplies one.
     ///
     /// A digest that the plugin supplies proves only that the plugin has not
     /// changed its claim since it was loaded. Deriving it from a canonical
     /// descriptor on the kernel side is a later concern, and this field is
     /// deliberately named so that is not mistaken for something it is not.
-    pub declared_digest: String,
+    pub declared_digest: Option<String>,
 }
 
 /// Kind of runtime work a capability performs.
@@ -167,7 +179,9 @@ pub struct PluginExecutionContext {
     ///
     /// Host calls made by the plugin while it runs carry the same identifier, so
     /// a call belongs to exactly one operation even when several are in flight.
-    pub request_id: String,
+    /// It is named for the operation rather than for the request because each
+    /// callback needs its own identity within it.
+    pub operation_request_id: String,
     /// Protocol version the caller speaks.
     pub protocol_version: u16,
     /// Digest of the runtime identity this operation is bound to.
@@ -192,7 +206,7 @@ pub struct PluginExecutionOutcome {
     /// Certainty about the outcome.
     pub certainty: OutcomeCertainty,
     /// The response, or the structured failure that replaced it.
-    pub result: Result<PluginResponse, PluginFailure>,
+    pub result: Result<PluginSuccess, PluginFailure>,
 }
 
 /// Something a plugin asks the host to do while it is running.
@@ -222,7 +236,13 @@ pub enum HostCallCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCall {
     /// Operation this call belongs to.
-    pub request_id: String,
+    pub operation_request_id: String,
+    /// Identity of this call within the operation.
+    ///
+    /// Separate from the operation identity because one operation may make
+    /// several calls, and a response that named only the operation could not
+    /// say which call it answered.
+    pub host_call_id: String,
     /// What the plugin is asking for.
     pub capability: HostCallCapability,
     /// Canonical JSON arguments.
@@ -233,7 +253,9 @@ pub struct HostCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCallResponse {
     /// The call this answers.
-    pub request_id: String,
+    pub operation_request_id: String,
+    /// The call this answers, within the operation.
+    pub host_call_id: String,
     /// Canonical JSON result, or a structured failure.
     pub result: Result<String, PluginFailure>,
 }
@@ -269,10 +291,15 @@ pub struct PluginLoadResponse {
     pub descriptor: PluginDescriptor,
 }
 
-/// One response across the boundary.
+/// A successful response across the boundary.
+///
+/// There is deliberately no `Failed` variant. A failure travels as
+/// [`PluginFailure`] in the error channel, so a result can never say both
+/// "succeeded, and the answer is a failure" and "failed", which are the same
+/// event described two ways and would eventually disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
-pub enum PluginResponse {
+pub enum PluginSuccess {
     /// Version negotiation reply.
     Handshake(PluginHandshake),
     /// A plugin is loaded.
@@ -285,8 +312,6 @@ pub enum PluginResponse {
     Inspected(Vec<PluginDescriptor>),
     /// Host liveness.
     Health(PluginHostHealth),
-    /// The request failed.
-    Failed(PluginFailure),
 }
 
 /// Structured failure returned across the boundary, or raised before it.
@@ -322,6 +347,20 @@ pub enum PluginFailureCode {
     },
     /// No loaded instance matches the handle.
     UnknownPlugin,
+    /// The handle names a generation that is no longer the loaded one.
+    ///
+    /// Distinct from `UnknownPlugin`: the plugin exists, but a handle from
+    /// before a reload must not be able to address the instance that replaced
+    /// it, and a caller needs to be able to tell those apart.
+    StaleHandle,
+    /// Another request is already loading this plugin.
+    AlreadyLoading,
+    /// The plugin is already loaded.
+    AlreadyLoaded,
+    /// The operation was cancelled before it produced a result.
+    Cancelled,
+    /// The monotonic generation counter cannot advance.
+    GenerationExhausted,
     /// The plugin answered, and the answer was refused.
     Rejected,
     /// A frame exceeded [`MAX_FRAME_BYTES`].
@@ -613,13 +652,17 @@ mod tests {
     #[test]
     fn a_host_call_is_correlated_with_the_operation_that_made_it() {
         let call = HostCall {
-            request_id: "operation-7".into(),
+            operation_request_id: "operation-7".into(),
+            host_call_id: "call-1".into(),
             capability: HostCallCapability::DownstreamLlmStream,
             arguments: "{}".into(),
         };
         let encoded = serde_json::to_string(&call).expect("encode host call");
 
-        assert!(encoded.contains(r#""request_id":"operation-7""#));
+        // Both identities are on the wire: the operation says which invocation
+        // the call belongs to, the call identity says which call it is.
+        assert!(encoded.contains(r#""operation_request_id":"operation-7""#));
+        assert!(encoded.contains(r#""host_call_id":"call-1""#));
         assert!(encoded.contains(r#""capability":"downstream_llm_stream""#));
     }
 
@@ -689,15 +732,25 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_carries_its_structured_cause_across_the_boundary() {
-        let response = PluginResponse::Failed(PluginFailure {
+    fn a_failure_travels_in_the_error_channel_and_nowhere_else() {
+        // One representation only: a result that says both "succeeded" and
+        // "the answer is a failure" is the same event described twice, and the
+        // two descriptions eventually disagree.
+        let failure = PluginFailure {
             code: PluginFailureCode::DeadlineExceeded,
             message: "plugin did not answer within the action budget".into(),
-        });
+        };
+        let outcome = PluginExecutionOutcome {
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+            result: Err(failure.clone()),
+        };
 
-        let encoded = serde_json::to_string(&response).expect("encode response");
-        let decoded: PluginResponse = serde_json::from_str(&encoded).expect("decode response");
+        let encoded = serde_json::to_string(&outcome).expect("encode outcome");
+        let decoded: PluginExecutionOutcome =
+            serde_json::from_str(&encoded).expect("decode outcome");
 
-        assert_eq!(decoded, response);
+        assert_eq!(decoded, outcome);
+        assert!(matches!(decoded.result, Err(ref carried) if carried == &failure));
     }
 }

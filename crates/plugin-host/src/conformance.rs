@@ -28,7 +28,7 @@ use nemo_relay_plugin_protocol::{
 
 fn context(request_id: &str) -> PluginExecutionContext {
     PluginExecutionContext {
-        request_id: request_id.to_owned(),
+        operation_request_id: request_id.to_owned(),
         protocol_version: PROTOCOL_VERSION,
         runtime_binding_digest: "conformance-binding".into(),
         deadline_unix_ms: u64::MAX,
