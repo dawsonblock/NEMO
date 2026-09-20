@@ -538,7 +538,21 @@ message PluginSessionMessage {
     CompletionCancelled completion_cancelled = 13;
     ContinuationChunk continuation_chunk = 14;
     ContinuationChunkDisposition continuation_disposition = 15;
+    OutputCredit output_credit = 16;
   }
+}
+
+// Capacity for the plugin's output stream, granted by the kernel.
+//
+// In process, a full bounded queue makes the push return `Backpressured` and
+// the plugin retries. Transport flow control says only that bytes are not being
+// consumed quickly, which is not the same statement, so the grant is explicit:
+// the host reports "the producer may continue" exactly while it holds credit,
+// and the kernel grants more as it consumes. Credits are additional items, so
+// granting two twice allows four.
+message OutputCredit {
+  string operation_request_id = 1;
+  uint64 items = 2;
 }
 
 // Opens an independent downstream LLM stream for one operation.

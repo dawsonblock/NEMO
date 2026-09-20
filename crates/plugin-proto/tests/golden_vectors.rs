@@ -309,6 +309,19 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             .encode_to_vec(),
         ),
         (
+            "PluginSessionMessage",
+            v1::PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: Some(v1::plugin_session_message::Message::OutputCredit(
+                    v1::OutputCredit {
+                        operation_request_id: "operation-1".into(),
+                        items: 8,
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
             "ContinuationRequest",
             v1::ContinuationRequest {
                 session_id: "session-1".into(),

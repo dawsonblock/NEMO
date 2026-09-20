@@ -692,6 +692,23 @@ pub enum PluginSessionPayload {
     ContinuationChunk(PluginContinuationChunk),
     /// The plugin's answer about one chunk.
     ContinuationDisposition(PluginContinuationDisposition),
+    /// Capacity the kernel grants the plugin's output stream.
+    OutputCredit(PluginOutputCredit),
+}
+
+/// Capacity for one operation's output stream.
+///
+/// The ABI's "the producer may continue" is a statement about the consumer's
+/// capacity, and transport flow control is a different statement. Making the
+/// grant explicit is what lets a host report backpressure for the same reason
+/// in process and across a boundary, instead of inferring it from a socket
+/// buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOutputCredit {
+    /// The operation whose stream the credit applies to.
+    pub operation_request_id: String,
+    /// Additional items the producer may send.
+    pub items: u64,
 }
 
 /// A request to open a downstream stream.

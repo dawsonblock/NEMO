@@ -22,9 +22,9 @@ use std::collections::BTreeSet;
 use nemo_relay_plugin_protocol::{
     PluginCompletionCancelled, PluginCompletionOutcome, PluginCompletionSettlement,
     PluginContinuationChunk, PluginContinuationDisposition, PluginContinuationRequest,
-    PluginFailure, PluginFailureCode, PluginProtocolError, PluginStreamControl, PluginStreamEnd,
-    PluginStreamFailed, PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest,
-    PluginStreamOpened, PluginStreamPullRequest,
+    PluginFailure, PluginFailureCode, PluginOutputCredit, PluginProtocolError, PluginStreamChunk,
+    PluginStreamControl, PluginStreamEnd, PluginStreamFailed, PluginStreamItem,
+    PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened, PluginStreamPullRequest,
 };
 
 /// A protocol violation the session remembers enough to refuse.
@@ -102,6 +102,8 @@ pub struct PluginSessionState {
     /// correlation for exactly one call at a time; reusing one while it is still
     /// outstanding is how an answer gets applied to the wrong call.
     outstanding_calls: BTreeSet<String>,
+    /// Output items the kernel has granted the plugin per operation.
+    output_credit: BTreeMap<String, u64>,
 }
 
 impl PluginSessionState {
@@ -127,6 +129,7 @@ impl PluginSessionState {
             && self.pending_opens.is_empty()
             && self.completions.is_empty()
             && self.continuations.is_empty()
+            && self.output_credit.is_empty()
     }
 
     /// Record that the kernel expects a completion.
@@ -284,6 +287,58 @@ impl PluginSessionState {
         }
         continuation.awaiting_disposition = Some(chunk.sequence);
         continuation.next_sequence += 1;
+        Ok(())
+    }
+
+    /// Grant the plugin capacity to send more of an operation's output.
+    ///
+    /// The grant is the whole of the backpressure contract: the host reports
+    /// "the producer may continue" while it holds credit, so the kernel is the
+    /// one that decides when the consumer has room, exactly as the in-process
+    /// bounded queue did.
+    pub fn grant_output_credit(
+        &mut self,
+        credit: &PluginOutputCredit,
+    ) -> Result<(), PluginProtocolError> {
+        let available = self
+            .output_credit
+            .entry(credit.operation_request_id.clone())
+            .or_insert(0);
+        *available = available.checked_add(credit.items).ok_or_else(|| {
+            rejected(format!(
+                "credit for operation {} cannot grow any further",
+                credit.operation_request_id
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Validate a frame of the plugin's output stream against the credit.
+    ///
+    /// A producer that sends without credit is producing past what the consumer
+    /// granted, which is the case the in-process queue refused; an unaccounted
+    /// frame is one the kernel would have to buffer without having said it
+    /// could.
+    pub fn receive_output_chunk(
+        &mut self,
+        chunk: &PluginStreamChunk,
+    ) -> Result<(), PluginProtocolError> {
+        let available = self
+            .output_credit
+            .get_mut(&chunk.operation_request_id)
+            .ok_or_else(|| {
+                rejected(format!(
+                    "operation {} has no output credit",
+                    chunk.operation_request_id
+                ))
+            })?;
+        if *available == 0 {
+            return Err(rejected(format!(
+                "operation {} has spent its output credit",
+                chunk.operation_request_id
+            )));
+        }
+        *available -= 1;
         Ok(())
     }
 
@@ -499,6 +554,7 @@ impl PluginSessionState {
             .retain(|_, continuation| continuation.operation_request_id != operation_request_id);
         self.completions
             .retain(|_, completion| completion.operation_request_id != operation_request_id);
+        self.output_credit.remove(operation_request_id);
     }
 
     /// Record that the kernel answered a pull.
@@ -862,6 +918,62 @@ mod tests {
                 chunk_json: r#"{"delta":"b"}"#.into(),
             })
             .expect("the second chunk");
+    }
+
+    #[test]
+    fn a_producer_cannot_send_past_the_capacity_it_was_granted() {
+        use nemo_relay_plugin_protocol::{DispatchState, OutcomeCertainty, PluginStreamChunkKind};
+
+        let mut session = PluginSessionState::new("session-1");
+        let frame = |delta: &str| PluginStreamChunk {
+            operation_request_id: "operation-1".into(),
+            chunk: PluginStreamChunkKind::Data(delta.into()),
+            dispatch: DispatchState::NotDispatched,
+            certainty: OutcomeCertainty::ConfirmedSuccess,
+        };
+
+        // Nothing granted is nothing the producer may send: without this the
+        // host would have to buffer frames it never said it could take.
+        assert!(session.receive_output_chunk(&frame("first")).is_err());
+
+        session
+            .grant_output_credit(&PluginOutputCredit {
+                operation_request_id: "operation-1".into(),
+                items: 2,
+            })
+            .expect("a grant");
+        session
+            .receive_output_chunk(&frame("first"))
+            .expect("the first item");
+        session
+            .receive_output_chunk(&frame("second"))
+            .expect("the second item");
+        assert!(session.receive_output_chunk(&frame("third")).is_err());
+
+        // Grants are additive, and they cannot be made to overflow.
+        session
+            .grant_output_credit(&PluginOutputCredit {
+                operation_request_id: "operation-1".into(),
+                items: 1,
+            })
+            .expect("another grant");
+        session
+            .receive_output_chunk(&frame("third"))
+            .expect("the granted third item");
+        session
+            .grant_output_credit(&PluginOutputCredit {
+                operation_request_id: "operation-1".into(),
+                items: 1,
+            })
+            .expect("a grant that is held");
+        assert!(
+            session
+                .grant_output_credit(&PluginOutputCredit {
+                    operation_request_id: "operation-1".into(),
+                    items: u64::MAX,
+                })
+                .is_err()
+        );
     }
 
     #[test]

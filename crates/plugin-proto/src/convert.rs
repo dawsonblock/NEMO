@@ -23,13 +23,13 @@ use nemo_relay_plugin_protocol::{
     PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginHandshakeRequest,
     PluginHostCallOutcome, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
     PluginInvokeRequest, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
-    PluginMarkEmit, PluginOperationEnvelope, PluginProtocolError, PluginRegistrationDescriptor,
-    PluginRegistrationOperation, PluginRegistrationOrdering, PluginResolveCodecRequest,
-    PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest, PluginSessionIdentity,
-    PluginSessionMessage, PluginSessionPayload, PluginStreamChunk, PluginStreamChunkKind,
-    PluginStreamControl, PluginStreamEnd, PluginStreamFailed, PluginStreamItem,
-    PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened, PluginStreamPullRequest,
-    PluginSuccess, PluginUnloadRequest, registration_shape,
+    PluginMarkEmit, PluginOperationEnvelope, PluginOutputCredit, PluginProtocolError,
+    PluginRegistrationDescriptor, PluginRegistrationOperation, PluginRegistrationOrdering,
+    PluginResolveCodecRequest, PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest,
+    PluginSessionIdentity, PluginSessionMessage, PluginSessionPayload, PluginStreamChunk,
+    PluginStreamChunkKind, PluginStreamControl, PluginStreamEnd, PluginStreamFailed,
+    PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened,
+    PluginStreamPullRequest, PluginSuccess, PluginUnloadRequest, registration_shape,
 };
 
 use crate::v1;
@@ -1343,6 +1343,26 @@ pub fn continuation_chunk_from_wire(
     })
 }
 
+/// Read a grant of output capacity.
+///
+/// A grant of nothing is not a grant: it would leave the host reporting
+/// backpressure forever with no way to tell that from a consumer that simply
+/// stopped.
+pub fn output_credit_from_wire(
+    wire: &v1::OutputCredit,
+) -> Result<PluginOutputCredit, PluginProtocolError> {
+    if wire.items == 0 {
+        return Err(malformed("a credit that grants no capacity"));
+    }
+    Ok(PluginOutputCredit {
+        operation_request_id: required_text(
+            &wire.operation_request_id,
+            "a credit that belongs to no operation",
+        )?,
+        items: wire.items,
+    })
+}
+
 /// Read a plugin's answer about one chunk.
 pub fn continuation_disposition_from_wire(
     wire: &v1::ContinuationChunkDisposition,
@@ -1569,6 +1589,9 @@ pub fn session_message_from_wire(
                 disposition,
             )?)
         }
+        Some(v1::plugin_session_message::Message::OutputCredit(credit)) => {
+            PluginSessionPayload::OutputCredit(output_credit_from_wire(credit)?)
+        }
         None => return Err(malformed("a session message that carries nothing")),
     };
     Ok(PluginSessionMessage {
@@ -1687,6 +1710,10 @@ pub fn session_message_to_wire(message: &PluginSessionMessage) -> v1::PluginSess
                 }),
             })
         }
+        PluginSessionPayload::OutputCredit(credit) => Wire::OutputCredit(v1::OutputCredit {
+            operation_request_id: credit.operation_request_id.clone(),
+            items: credit.items,
+        }),
     };
     v1::PluginSessionMessage {
         session_id: message.session_id.clone(),
@@ -2975,6 +3002,44 @@ mod tests {
         for operation in [v1::CodecOperation::Unspecified as i32, 9_999] {
             assert!(resolve_codec_request_from_wire(&codec(operation)).is_err());
         }
+    }
+
+    #[test]
+    fn a_grant_of_output_capacity_is_refused_when_it_grants_nothing() {
+        // A grant of zero would leave the host reporting backpressure forever,
+        // with no way to tell that from a consumer that stopped consuming.
+        assert!(
+            output_credit_from_wire(&v1::OutputCredit {
+                operation_request_id: "operation-1".into(),
+                items: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            output_credit_from_wire(&v1::OutputCredit {
+                operation_request_id: "  ".into(),
+                items: 1,
+            })
+            .is_err()
+        );
+
+        let credit = output_credit_from_wire(&v1::OutputCredit {
+            operation_request_id: "operation-1".into(),
+            items: 8,
+        })
+        .expect("a grant");
+        assert_eq!(credit.items, 8);
+
+        // And it travels as a session message like every other grant.
+        let message = PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: PluginSessionPayload::OutputCredit(credit),
+        };
+        assert_eq!(
+            session_message_from_wire(&session_message_to_wire(&message))
+                .expect("a session message this side built"),
+            message
+        );
     }
 
     #[test]

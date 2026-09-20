@@ -352,7 +352,7 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   | `emit_mark`, `emit_mark_v2` | `EmitMark` typed request carrying the whole v2 payload — parent scope, metadata, schema, severity and timestamp included — with the scope named by its canonical UUID and a negative timestamp refused |
   | `llm_request_codec_encode`, `llm_request_codec_decode`, `llm_response_codec_decode`, `async_completion_llm_*_codec_*` | `ResolveCodec` typed request with a closed `CodecOperation` naming one of the three |
   | `async_next_invoke_stream` | session `ContinuationChunk` (kernel → plugin, one-based `sequence`) and `ContinuationChunkDisposition` (plugin → kernel: `Continue`, `Stop`, or a failure). The kernel does not produce chunk N+1 until the disposition for N permits it, which is what the callback's return value means in process |
-  | `async_stream_is_backpressured` and the `Backpressured` status | **not yet mapped**: the invariant is stated below, and it is the host's to demonstrate rather than to assume |
+  | `async_stream_is_backpressured` and the `Backpressured` status | session `OutputCredit`: the kernel grants items, the host reports "the producer may continue" exactly while it holds credit, and a frame sent past the grant is refused |
   | `get_runtime_diagnostics`, `plugin_runtime_list_registrations` | **decided, not yet served**: each is a read capability (`RuntimeDiagnostics`, `RegistrationInventory`) that the kernel grants in the handshake. Requesting one is not being granted it, an unknown capability is refused rather than dropped, and the default grant is empty |
   | `scope_stack_set_thread`, `scope_stack_capture_thread`, `scope_stack_restore_thread`, `with_scope_stack` | host-local: they bind a runtime-issued stack to a thread inside the host process |
   | `string_new`, `string_data`, `string_len`, `string_free`, `last_error_clear`, `last_error_set` | host-local: allocation and the plugin's error channel inside the host process |
@@ -363,11 +363,10 @@ before closing that gap would have forced ad hoc exceptions. Closed:
 
   - **Backpressure means the same thing on both sides.** In process, a full
     bounded queue makes the push return `Backpressured` and the plugin retries.
-    Remotely, "the producer may continue" holds exactly when the transport has
-    granted equivalent capacity, and transport flow control alone says only that
-    bytes are not being consumed quickly. The host must demonstrate the
-    equivalence, and if it cannot, the answer is explicit credit messages rather
-    than an assumption.
+    Remotely, that sentence is only equivalent if the capacity is explicit, so
+    it is: `OutputCredit` grants items, the state machine refuses a frame sent
+    past the grant, and the kernel grants more as it consumes. Transport flow
+    control stops being asked to mean something it does not say.
   - **A settlement is answered.** A plugin that settles a completion learns
     whether the settlement was taken, so a completion that was already
     cancelled cannot leave the callback's owner waiting forever.
@@ -405,12 +404,9 @@ before closing that gap would have forced ad hoc exceptions. Closed:
 
 Still open, in the order they need closing:
 
-1. **The output queue's backpressure equivalence**, which is a host obligation:
-   the host must show that the transport grants the producer equivalent
-   capacity, or the protocol gains explicit credit messages. Diagnostics and
-   registration reads still have to be *served* under the capabilities the
-   handshake now negotiates; deciding what they may return is the kernel's
-   authorization step, not a conversion step.
+1. **Serving the read capabilities.** Diagnostics and registration reads are
+   negotiated in the handshake but nothing serves them yet; deciding what they
+   may return is the kernel's authorization step, not a conversion step.
 2. **The supervisor, and the host-side half of the session.** The state machine
    is one side of one session; nothing drives it yet, because nothing speaks the
    channel yet. The supervisor is what turns it into a running session: spawn,

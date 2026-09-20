@@ -468,6 +468,21 @@ const MANIFEST: &[Entry] = &[
         &["every_session_message_survives_the_wire"],
         "",
     ),
+    entry_with_reasons(
+        "OutputCredit",
+        "both",
+        true,
+        &[
+            "session_message_from_wire",
+            "session_message_to_wire",
+            "output_credit_from_wire",
+        ],
+        "",
+        &[],
+        "carried inside the session envelope, whose vectors record it",
+        &["a_grant_of_output_capacity_is_refused_when_it_grants_nothing"],
+        "",
+    ),
 ];
 
 fn manifest_path(relative: &str) -> PathBuf {
