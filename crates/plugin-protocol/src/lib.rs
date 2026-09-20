@@ -25,6 +25,16 @@ use serde::{Deserialize, Serialize};
 
 pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
 
+/// The exact attachment point a registration installs itself at.
+///
+/// This is the runtime's own vocabulary rather than a second enum of the same
+/// sixteen values. Two lists describing one set of attachment points would drift,
+/// and the drift would appear as a proxy installed at the wrong point — the
+/// failure this field exists to make impossible. Re-exporting also means the
+/// loader can report what it registered without this crate having to describe
+/// the runtime to it.
+pub use nemo_relay_types::api::registry::RuntimeRegistrationKind as PluginRegistrationOperation;
+
 /// Version of the wire contract.
 ///
 /// Bumped whenever any type below changes shape, because the two sides of the
@@ -77,31 +87,19 @@ pub struct PluginDescriptor {
     pub capabilities: Vec<PluginCapability>,
 }
 
-/// What class of runtime component a registration installs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginRegistrationClass {
-    /// Wraps or rewrites a call.
-    Middleware,
-    /// Allows, refuses or sanitizes a call.
-    Guardrail,
-    /// Observes events without changing them.
-    Subscriber,
-    /// Provides a tool.
-    Tool,
-    /// Intercepts an LLM call.
-    LlmIntercept,
-    /// Encodes or decodes a payload.
-    PayloadCodec,
-}
-
 /// How a registration sits relative to others in its class.
+///
+/// Both fields are optional because the native ABI declares them for some
+/// registrations and not others: a subscriber carries no priority, and only the
+/// intercept and middleware hooks say whether a callback may break its chain. A
+/// default here would be a claim nobody made, and this descriptor exists so the
+/// side building a proxy knows what the plugin actually declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginRegistrationOrdering {
-    /// Lower runs first, matching how the runtime orders its own registrations.
-    pub priority: i32,
-    /// Whether this registration can stop the chain it is part of.
-    pub may_break_chain: bool,
+    /// Lower runs first, when the registration declares an order.
+    pub priority: Option<i32>,
+    /// Whether it may stop the chain it is part of, when that is declared.
+    pub may_break_chain: Option<bool>,
 }
 
 /// Whether a registration answers once or streams.
@@ -114,24 +112,69 @@ pub enum PluginExecutionShape {
     Streaming,
 }
 
+/// The shape a registration at this attachment point has.
+///
+/// Derived rather than asserted, because the shape is a property of the
+/// attachment point: exactly one attachment point streams today, and a host
+/// reporting a streaming callback anywhere else would be describing something
+/// the runtime does not have.
+pub fn registration_shape(operation: PluginRegistrationOperation) -> PluginExecutionShape {
+    use PluginRegistrationOperation as Operation;
+    match operation {
+        Operation::Subscriber
+        | Operation::EventMetadataInjector
+        | Operation::MarkSanitizeGuardrail
+        | Operation::ScopeSanitizeStartGuardrail
+        | Operation::ScopeSanitizeEndGuardrail
+        | Operation::ToolSanitizeRequestGuardrail
+        | Operation::ToolSanitizeResponseGuardrail
+        | Operation::ToolConditionalExecutionGuardrail
+        | Operation::ToolRequestIntercept
+        | Operation::ToolExecutionIntercept
+        | Operation::LlmSanitizeRequestGuardrail
+        | Operation::LlmSanitizeResponseGuardrail
+        | Operation::LlmConditionalExecutionGuardrail
+        | Operation::LlmRequestIntercept
+        | Operation::LlmExecutionIntercept => PluginExecutionShape::Unary,
+        Operation::LlmStreamExecutionIntercept => PluginExecutionShape::Streaming,
+    }
+}
+
 /// Everything the kernel needs to re-create one registration as a proxy.
 ///
 /// A loaded plugin is not a single thing the kernel invokes: it registers
-/// components that the runtime then calls, and each has a class, an order and a
-/// shape of its own. A process host cannot hand back local objects, so it hands
-/// back this description and the runtime builds a proxy from it.
+/// components that the runtime then calls, and each installs itself at an exact
+/// attachment point with an order and a shape of its own. A process host cannot
+/// hand back local objects, so it hands back this description and the runtime
+/// builds a proxy from it. "It registered a guardrail" is not enough to build
+/// anything: without the attachment point the kernel knows that something
+/// exists but not where to install it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginRegistrationDescriptor {
-    /// Identity of this registration within the plugin.
+    /// Identity of this registration in the runtime's namespace.
+    ///
+    /// The qualified name rather than the name the plugin authored: the runtime
+    /// qualifies plugin-local names with the component namespace so two
+    /// components of one plugin cannot collide, and the qualified name is what
+    /// gates match and ordering applies to.
     pub registration_id: String,
-    /// Component kind the runtime resolves.
+    /// Component kind that made this registration.
     pub component_kind: String,
-    /// What class of component this is.
-    pub class: PluginRegistrationClass,
-    /// Where it sits relative to others in its class.
+    /// The exact attachment point this registration installs itself at.
+    pub operation: PluginRegistrationOperation,
+    /// Where it sits relative to others, as far as it declares.
     pub ordering: PluginRegistrationOrdering,
     /// Whether its callback answers once or streams.
     pub shape: PluginExecutionShape,
+    /// The registration this one gates, when it is a gate.
+    ///
+    /// A conditional middleware guardrail is not a component at an attachment
+    /// point: it decides whether another registration runs. The name is the one
+    /// the plugin supplied, which the runtime matches against the qualified
+    /// registration name, so a gate whose target does not exist matches nothing
+    /// rather than installing nothing. Describing a gate without its target
+    /// would leave a proxy that gates nothing.
+    pub gated_registration: Option<String>,
     /// Configuration keys the component reads.
     pub config_keys: Vec<String>,
     /// Digest the plugin declares, when it declares one.

@@ -234,6 +234,9 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   priority and chain-breaking, execution shape, configuration keys and an
   optional declared digest. A list of kind names could not say how to order two
   registrations, whether one breaks a chain, or whether its callback streams.
+  The coarse class is gone: it is replaced by the attachment point below, and a
+  registration the runtime cannot place is worse than a missing one, because a
+  proxy would be built and then behave unlike the plugin it stands for.
 - **Wire↔domain conversion.** `plugin_proto::convert` refuses `UNSPECIFIED` and
   unknown enums, missing nested messages, inconsistent failure detail, empty
   identities and generation-zero handles, so the host's looseness cannot become
@@ -274,19 +277,54 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   counterpart, so the kernel had nothing to validate before naming a session,
   and the frame limit the host offers is now checked against this side's own
   rather than adopted.
+- **The attachment point of every native registration.** The native ABI has
+  fourteen registration hooks, and each installs its callback somewhere
+  different; "it registered a guardrail" cannot install a proxy at the right
+  place. `PluginRegistrationOperation` names the exact attachment point, the
+  loader records it inside the host function that performs the registration —
+  the only place it is known — and `InProcessPluginBackend` reports what the
+  loader recorded instead of a hard-coded empty list. The ordering fields became
+  optional in the same change, because the ABI declares a priority for some
+  hooks and a chain answer for fewer still, and a default would be a claim
+  nobody made. A gate records one entry per kind it gates and carries the
+  registration it decides; a gate the plugin removes through its runtime
+  handle is dropped from the record, so the description cannot name a
+  registration that no longer runs.
+
+  The ABI v4 callback inventory, each hook mapped to exactly one attachment
+  point:
+
+  | Native host callback | Attachment point |
+  |---|---|
+  | `plugin_context_register_subscriber` | `Subscriber` |
+  | `plugin_context_register_async_middleware` (kind 0–14) | the kind's own point: tool and LLM request/response sanitizers, tool and LLM conditional execution, tool and LLM request and execution intercepts, mark and scope sanitizers, event metadata injector |
+  | `plugin_context_register_async_stream_middleware` | `LlmStreamExecutionIntercept` |
+  | `plugin_context_register_tool_sanitize_request_guardrail` | `ToolSanitizeRequestGuardrail` |
+  | `plugin_context_register_tool_sanitize_response_guardrail` | `ToolSanitizeResponseGuardrail` |
+  | `plugin_context_register_tool_conditional_execution_guardrail` | `ToolConditionalExecutionGuardrail` |
+  | `plugin_context_register_tool_request_intercept` | `ToolRequestIntercept` |
+  | `plugin_context_register_tool_execution_intercept` | `ToolExecutionIntercept` |
+  | `plugin_context_register_llm_sanitize_request_guardrail` | `LlmSanitizeRequestGuardrail` |
+  | `plugin_context_register_llm_sanitize_response_guardrail` | `LlmSanitizeResponseGuardrail` |
+  | `plugin_context_register_llm_conditional_execution_guardrail` | `LlmConditionalExecutionGuardrail` |
+  | `plugin_context_register_llm_request_intercept` | `LlmRequestIntercept` |
+  | `plugin_context_register_llm_execution_intercept` | `LlmExecutionIntercept` |
+  | `plugin_context_register_llm_stream_execution_intercept` | `LlmStreamExecutionIntercept` |
+  | `plugin_context_register_conditional_middleware_guardrail` (+ `_callback`, and the runtime-handle pair) | one entry per gated kind, with the gated registration named |
+
+  A native fixture registers on every one of those surfaces, and the test
+  asserts the recorded set is exactly the sixteen attachment points and nothing
+  else.
 
 Still open, in the order they need closing:
 
-1. **Registration operation identity.** The six broad classes cannot reconstruct
-   a proxy: tool and LLM sanitizers, conditional execution, request and
-   execution intercepts and streaming intercepts all collapse into one class
-   while needing different installation points.
-2. **Complete callback mapping for ABI v4**, especially async continuation and
-   the pull-based downstream LLM stream, which cannot be a unary call because
-   the plugin controls when to pull and backpressure is explicit.
-3. **Conversions for every message the host uses**, and vectors for all of them
+1. **Async continuation and the pull-based downstream LLM stream**, which cannot
+   be a unary call because the plugin controls when to pull and backpressure is
+   explicit. The registration side of the ABI is now mapped; the callbacks a
+   registered component makes while it runs are not.
+2. **Conversions for every message the host uses**, and vectors for all of them
    rather than fourteen declared pending.
-4. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
+3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 
 Until those are closed the process host would still be architecture by

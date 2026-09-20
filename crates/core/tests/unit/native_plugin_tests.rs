@@ -505,6 +505,7 @@ fn native_test_adapter(
             relay_compat: "^0.8".into(),
             allows_multiple_components: false,
             plugin: Mutex::new(plugin),
+            registrations: Mutex::new(Vec::new()),
             _library: libloading::os::unix::Library::this().into(),
         }),
     }
@@ -4757,6 +4758,7 @@ fn native_registration_entrypoints_reject_invalid_host_contexts_and_names() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let mut invalid_host = NativeHostPluginContext {
@@ -5193,6 +5195,7 @@ fn assert_async_request_registration_rejects_legacy_relay_contract() {
         relay_compat: "^0.5".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let mut registration = PluginRegistrationContext::new();
@@ -5242,6 +5245,7 @@ async fn native_async_wrappers_validate_callback_result_shapes() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let result = native_string("true");
@@ -6107,6 +6111,7 @@ async fn native_callback_wrappers_release_error_outputs_and_preserve_reasons() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let request = LlmRequest {

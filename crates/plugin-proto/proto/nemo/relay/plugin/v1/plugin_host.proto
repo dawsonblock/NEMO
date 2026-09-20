@@ -66,17 +66,32 @@ enum PluginCapabilityKind {
   SUBSCRIBER = 3;
 }
 
-// What class of runtime component a registration installs.
-// Protobuf enum values are siblings of their type rather than children of it,
-// so these are prefixed to stay unique within the package.
-enum PluginRegistrationClass {
-  PLUGIN_REGISTRATION_CLASS_UNSPECIFIED = 0;
-  REGISTRATION_MIDDLEWARE = 1;
-  REGISTRATION_GUARDRAIL = 2;
-  REGISTRATION_SUBSCRIBER = 3;
-  REGISTRATION_TOOL = 4;
-  REGISTRATION_LLM_INTERCEPT = 5;
-  REGISTRATION_PAYLOAD_CODEC = 6;
+// The exact attachment point a registration installs itself at.
+//
+// The values mirror the runtime's own registration vocabulary, one per surface
+// the runtime calls into. A coarse class such as "middleware" or "guardrail" is
+// not enough to install a proxy: a tool request sanitizer, a tool execution
+// intercept and an LLM stream intercept all answer to those names and attach in
+// different places. Protobuf enum values are siblings of their type rather than
+// children of it, so these are prefixed to stay unique within the package.
+enum PluginRegistrationOperation {
+  PLUGIN_REGISTRATION_OPERATION_UNSPECIFIED = 0;
+  REGISTRATION_OPERATION_SUBSCRIBER = 1;
+  REGISTRATION_OPERATION_EVENT_METADATA_INJECTOR = 2;
+  REGISTRATION_OPERATION_MARK_SANITIZE_GUARDRAIL = 3;
+  REGISTRATION_OPERATION_SCOPE_SANITIZE_START_GUARDRAIL = 4;
+  REGISTRATION_OPERATION_SCOPE_SANITIZE_END_GUARDRAIL = 5;
+  REGISTRATION_OPERATION_TOOL_SANITIZE_REQUEST_GUARDRAIL = 6;
+  REGISTRATION_OPERATION_TOOL_SANITIZE_RESPONSE_GUARDRAIL = 7;
+  REGISTRATION_OPERATION_TOOL_CONDITIONAL_EXECUTION_GUARDRAIL = 8;
+  REGISTRATION_OPERATION_TOOL_REQUEST_INTERCEPT = 9;
+  REGISTRATION_OPERATION_TOOL_EXECUTION_INTERCEPT = 10;
+  REGISTRATION_OPERATION_LLM_SANITIZE_REQUEST_GUARDRAIL = 11;
+  REGISTRATION_OPERATION_LLM_SANITIZE_RESPONSE_GUARDRAIL = 12;
+  REGISTRATION_OPERATION_LLM_CONDITIONAL_EXECUTION_GUARDRAIL = 13;
+  REGISTRATION_OPERATION_LLM_REQUEST_INTERCEPT = 14;
+  REGISTRATION_OPERATION_LLM_EXECUTION_INTERCEPT = 15;
+  REGISTRATION_OPERATION_LLM_STREAM_EXECUTION_INTERCEPT = 16;
 }
 
 // Whether a registration answers once or streams.
@@ -128,32 +143,44 @@ message PluginDescriptor {
 }
 
 // How one registration sits relative to others in its class.
+//
+// Both fields are optional because the native ABI declares them for some
+// registrations and not others; a default would be a claim nobody made.
 message PluginRegistrationOrdering {
   // Lower runs first, as the runtime orders its own registrations.
-  int32 priority = 1;
+  optional int32 priority = 1;
   // Whether this registration can stop the chain it is part of.
-  bool may_break_chain = 2;
+  optional bool may_break_chain = 2;
 }
 
 // Everything the kernel needs to re-create one registration as a proxy.
 //
 // A loaded plugin is not a single thing the kernel invokes: it registers
-// components that the runtime then calls, and each has a class, an order, a
-// shape and configuration of its own. A process host cannot hand back local
-// objects, so it hands back this description instead. A list of kind names
-// cannot carry it — the runtime would not know how to order two registrations,
-// whether one breaks a chain, whether its callback streams, or which
-// configuration it reads.
+// components that the runtime then calls, and each installs itself at an exact
+// attachment point with an order, a shape and configuration of its own. A
+// process host cannot hand back local objects, so it hands back this
+// description instead. A list of kind names cannot carry it — the runtime would
+// not know where to install the proxy, how to order two registrations, whether
+// one breaks a chain, whether its callback streams, or which configuration it
+// reads.
 message PluginRegistrationDescriptor {
+  reserved 3;
+  reserved "class";
   string registration_id = 1;
   string component_kind = 2;
-  PluginRegistrationClass class = 3;
   PluginRegistrationOrdering ordering = 4;
   PluginExecutionShape shape = 5;
   // Configuration keys the component reads, so a validator can require them.
   repeated string config_keys = 6;
   // Present only when the plugin supplies one; absence is the truth.
   optional string declared_digest = 7;
+  // The exact attachment point this registration installs itself at.
+  PluginRegistrationOperation operation = 8;
+  // Present only when this registration is a gate: the name of the registration
+  // whose execution it decides, as the plugin declared it. The runtime matches
+  // it against the qualified registration name, so a gate whose target does not
+  // exist matches nothing rather than installing nothing.
+  optional string gated_registration = 9;
 }
 
 message PluginFailure {

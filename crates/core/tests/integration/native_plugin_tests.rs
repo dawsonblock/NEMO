@@ -13,6 +13,7 @@ use nemo_relay::api::llm::{
     LlmCallEndParams, LlmCallExecuteParams, LlmCallParams, LlmRequest, LlmStreamCallExecuteParams,
     llm_call, llm_call_end, llm_call_execute, llm_stream_call_execute,
 };
+use nemo_relay::api::registry::RuntimeRegistrationKind;
 use nemo_relay::api::runtime::{
     LlmJsonStream, TASK_SCOPE_STACK, ThreadScopeStackBinding, capture_thread_scope_stack,
     create_scope_stack, restore_thread_scope_stack, set_thread_scope_stack,
@@ -1349,6 +1350,130 @@ entrypoint = "fixture.worker:create_plugin"
         "worker manifest should fail native loading",
     );
     assert!(error.contains("only supports rust_dynamic"), "{error}");
+}
+
+#[tokio::test]
+async fn native_loader_records_where_every_registration_attaches() {
+    // The ABI v4 callback inventory, as a test. Each native registration hook
+    // runs a different piece of the runtime, so "the plugin registered a
+    // guardrail" is not enough to install a proxy: the attachment point decides
+    // which chain the callback belongs to. The fixture registers on every
+    // surface the host exposes, which is what makes this the complete list
+    // rather than a sample of it.
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture);
+    let activation = load_native_plugins([NativePluginLoadSpec {
+        plugin_id: "fixture_native".into(),
+        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
+    }])
+    .expect("fixture should load");
+    let mut cleanup = NativePluginTestCleanup::new();
+
+    // Native registration is config-driven, so a freshly loaded plugin has
+    // registered nothing yet. Reporting an empty list here is the truth, and it
+    // is also why a descriptor frozen at load time cannot be used.
+    let loaded = activation.loaded_plugins();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].plugin_kind, "fixture_native");
+    assert!(loaded[0].declared_compat.is_some());
+    assert!(
+        loaded[0].registrations.is_empty(),
+        "the register callback has not run yet, so nothing has been recorded: {:?}",
+        loaded[0].registrations
+    );
+
+    let mut config = PluginConfig::default();
+    config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(config)
+        .await
+        .expect("fixture should register its components");
+    cleanup.mark_plugin_configuration_active();
+
+    let loaded = activation.loaded_plugins();
+    let registrations = &loaded[0].registrations;
+    let operations: std::collections::BTreeSet<_> = registrations
+        .iter()
+        .map(|registration| registration.operation)
+        .collect();
+    let expected = std::collections::BTreeSet::from([
+        RuntimeRegistrationKind::Subscriber,
+        RuntimeRegistrationKind::EventMetadataInjector,
+        RuntimeRegistrationKind::MarkSanitizeGuardrail,
+        RuntimeRegistrationKind::ScopeSanitizeStartGuardrail,
+        RuntimeRegistrationKind::ScopeSanitizeEndGuardrail,
+        RuntimeRegistrationKind::ToolSanitizeRequestGuardrail,
+        RuntimeRegistrationKind::ToolSanitizeResponseGuardrail,
+        RuntimeRegistrationKind::ToolConditionalExecutionGuardrail,
+        RuntimeRegistrationKind::ToolRequestIntercept,
+        RuntimeRegistrationKind::ToolExecutionIntercept,
+        RuntimeRegistrationKind::LlmSanitizeRequestGuardrail,
+        RuntimeRegistrationKind::LlmSanitizeResponseGuardrail,
+        RuntimeRegistrationKind::LlmConditionalExecutionGuardrail,
+        RuntimeRegistrationKind::LlmRequestIntercept,
+        RuntimeRegistrationKind::LlmExecutionIntercept,
+        RuntimeRegistrationKind::LlmStreamExecutionIntercept,
+    ]);
+    assert_eq!(
+        operations, expected,
+        "every attachment point the fixture registers at has to be recorded, and nothing else"
+    );
+
+    let find = |operation: RuntimeRegistrationKind| {
+        registrations
+            .iter()
+            .find(|registration| registration.operation == operation)
+            .unwrap_or_else(|| panic!("no registration recorded for {}", operation.as_str()))
+    };
+
+    // A priority-bearing hook records the priority and the chain answer the
+    // plugin declared.
+    let intercept = find(RuntimeRegistrationKind::ToolRequestIntercept);
+    assert_eq!(intercept.local_name, "fixture_rewrite_args");
+    assert_eq!(intercept.priority, Some(0));
+    assert_eq!(intercept.may_break_chain, Some(false));
+    assert!(
+        intercept.qualified_name.contains("fixture_rewrite_args"),
+        "the record names the registration the runtime gates by: {}",
+        intercept.qualified_name
+    );
+
+    // A subscriber hook carries neither, and the record says so rather than
+    // claiming zero.
+    let subscriber = find(RuntimeRegistrationKind::Subscriber);
+    assert_eq!(subscriber.priority, None);
+    assert_eq!(subscriber.may_break_chain, None);
+
+    // The streaming attachment point is recorded as itself, not as its
+    // non-streaming neighbour.
+    let stream = find(RuntimeRegistrationKind::LlmStreamExecutionIntercept);
+    assert_eq!(stream.local_name, "fixture_llm_stream_execution");
+    assert_eq!(stream.priority, Some(0));
+
+    // A gate names the registration it decides, once per kind it gates.
+    let gate = registrations
+        .iter()
+        .find(|registration| registration.gated_registration.is_some())
+        .expect("the fixture registers a gate");
+    assert_eq!(
+        gate.gated_registration.as_deref(),
+        Some("missing-initial-target")
+    );
+    assert_eq!(gate.operation, RuntimeRegistrationKind::Subscriber);
+
+    // A gate the plugin registered through its runtime handle and then removed
+    // is not still reported: the fixture does exactly that, and a description
+    // claiming it would name a registration that no longer runs.
+    assert!(
+        !registrations
+            .iter()
+            .any(|registration| registration.local_name == "fixture_dynamic_gate"),
+        "a gate the plugin removed is not part of what it registered"
+    );
 }
 
 #[test]

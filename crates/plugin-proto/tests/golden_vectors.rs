@@ -94,14 +94,16 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
         registrations: vec![v1::PluginRegistrationDescriptor {
             registration_id: "registration-1".into(),
             component_kind: "example_kind".into(),
-            class: v1::PluginRegistrationClass::RegistrationMiddleware as i32,
+            operation: v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept
+                as i32,
             ordering: Some(v1::PluginRegistrationOrdering {
-                priority: 10,
-                may_break_chain: false,
+                priority: Some(10),
+                may_break_chain: Some(false),
             }),
             shape: v1::PluginExecutionShape::ShapeUnary as i32,
             config_keys: vec!["model".into()],
             declared_digest: None,
+            gated_registration: Some("example_kind:gated".into()),
         }],
     };
     let handle = || v1::PluginHandle {

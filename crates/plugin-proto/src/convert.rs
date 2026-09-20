@@ -19,8 +19,8 @@ use nemo_relay_plugin_protocol::{
     PluginCapability, PluginCapabilityKind, PluginDescriptor, PluginExecutionContext,
     PluginExecutionOutcome, PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle,
     PluginHostHealth, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
-    PluginProtocolError, PluginRegistrationClass, PluginRegistrationDescriptor,
-    PluginRegistrationOrdering, PluginSessionIdentity, PluginSuccess,
+    PluginProtocolError, PluginRegistrationDescriptor, PluginRegistrationOperation,
+    PluginRegistrationOrdering, PluginSessionIdentity, PluginSuccess, registration_shape,
 };
 
 use crate::v1;
@@ -478,10 +478,129 @@ pub fn descriptor_from_wire(
 
 /// Validate one registration description.
 ///
-/// A registration the runtime cannot order or classify is worse than a missing
-/// one, because the proxy would be built and then behave unlike the plugin it
-/// stands for. Every field that decides behaviour is therefore required rather
-/// than defaulted.
+/// The attachment point a wire registration names.
+///
+/// The match is exhaustive on purpose. A registration surface the runtime gains
+/// and this vocabulary has not been told about fails to compile here rather than
+/// reaching a peer as a value it would have to guess at.
+pub fn registration_operation_to_wire(operation: PluginRegistrationOperation) -> i32 {
+    use PluginRegistrationOperation as Operation;
+    let wire = match operation {
+        Operation::Subscriber => v1::PluginRegistrationOperation::RegistrationOperationSubscriber,
+        Operation::EventMetadataInjector => {
+            v1::PluginRegistrationOperation::RegistrationOperationEventMetadataInjector
+        }
+        Operation::MarkSanitizeGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationMarkSanitizeGuardrail
+        }
+        Operation::ScopeSanitizeStartGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationScopeSanitizeStartGuardrail
+        }
+        Operation::ScopeSanitizeEndGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationScopeSanitizeEndGuardrail
+        }
+        Operation::ToolSanitizeRequestGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationToolSanitizeRequestGuardrail
+        }
+        Operation::ToolSanitizeResponseGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationToolSanitizeResponseGuardrail
+        }
+        Operation::ToolConditionalExecutionGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationToolConditionalExecutionGuardrail
+        }
+        Operation::ToolRequestIntercept => {
+            v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept
+        }
+        Operation::ToolExecutionIntercept => {
+            v1::PluginRegistrationOperation::RegistrationOperationToolExecutionIntercept
+        }
+        Operation::LlmSanitizeRequestGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationLlmSanitizeRequestGuardrail
+        }
+        Operation::LlmSanitizeResponseGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationLlmSanitizeResponseGuardrail
+        }
+        Operation::LlmConditionalExecutionGuardrail => {
+            v1::PluginRegistrationOperation::RegistrationOperationLlmConditionalExecutionGuardrail
+        }
+        Operation::LlmRequestIntercept => {
+            v1::PluginRegistrationOperation::RegistrationOperationLlmRequestIntercept
+        }
+        Operation::LlmExecutionIntercept => {
+            v1::PluginRegistrationOperation::RegistrationOperationLlmExecutionIntercept
+        }
+        Operation::LlmStreamExecutionIntercept => {
+            v1::PluginRegistrationOperation::RegistrationOperationLlmStreamExecutionIntercept
+        }
+    };
+    wire as i32
+}
+
+/// Read the attachment point a wire registration names.
+pub fn registration_operation_from_wire(
+    value: i32,
+) -> Result<PluginRegistrationOperation, PluginProtocolError> {
+    use PluginRegistrationOperation as Operation;
+    let wire = v1::PluginRegistrationOperation::try_from(value)
+        .map_err(|_| malformed(format!("an unknown registration operation {value}")))?;
+    Ok(match wire {
+        v1::PluginRegistrationOperation::Unspecified => {
+            return Err(malformed("a registration with no attachment point"));
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationSubscriber => Operation::Subscriber,
+        v1::PluginRegistrationOperation::RegistrationOperationEventMetadataInjector => {
+            Operation::EventMetadataInjector
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationMarkSanitizeGuardrail => {
+            Operation::MarkSanitizeGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationScopeSanitizeStartGuardrail => {
+            Operation::ScopeSanitizeStartGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationScopeSanitizeEndGuardrail => {
+            Operation::ScopeSanitizeEndGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationToolSanitizeRequestGuardrail => {
+            Operation::ToolSanitizeRequestGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationToolSanitizeResponseGuardrail => {
+            Operation::ToolSanitizeResponseGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationToolConditionalExecutionGuardrail => {
+            Operation::ToolConditionalExecutionGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept => {
+            Operation::ToolRequestIntercept
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationToolExecutionIntercept => {
+            Operation::ToolExecutionIntercept
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationLlmSanitizeRequestGuardrail => {
+            Operation::LlmSanitizeRequestGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationLlmSanitizeResponseGuardrail => {
+            Operation::LlmSanitizeResponseGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationLlmConditionalExecutionGuardrail => {
+            Operation::LlmConditionalExecutionGuardrail
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationLlmRequestIntercept => {
+            Operation::LlmRequestIntercept
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationLlmExecutionIntercept => {
+            Operation::LlmExecutionIntercept
+        }
+        v1::PluginRegistrationOperation::RegistrationOperationLlmStreamExecutionIntercept => {
+            Operation::LlmStreamExecutionIntercept
+        }
+    })
+}
+
+/// A registration the runtime cannot place is worse than a missing one, because
+/// the proxy would be built and then behave unlike the plugin it stands for.
+/// Every field that decides where it goes is therefore required rather than
+/// defaulted, and the shape has to agree with the attachment point rather than
+/// being taken on faith.
 fn registration_from_wire(
     wire: &v1::PluginRegistrationDescriptor,
 ) -> Result<PluginRegistrationDescriptor, PluginProtocolError> {
@@ -491,23 +610,7 @@ fn registration_from_wire(
     if wire.component_kind.trim().is_empty() {
         return Err(malformed("a registration with no component kind"));
     }
-    let class = v1::PluginRegistrationClass::try_from(wire.class)
-        .map_err(|_| malformed(format!("an unknown registration class {}", wire.class)))?;
-    let class = match class {
-        v1::PluginRegistrationClass::Unspecified => {
-            return Err(malformed("a registration with no class"));
-        }
-        v1::PluginRegistrationClass::RegistrationMiddleware => PluginRegistrationClass::Middleware,
-        v1::PluginRegistrationClass::RegistrationGuardrail => PluginRegistrationClass::Guardrail,
-        v1::PluginRegistrationClass::RegistrationSubscriber => PluginRegistrationClass::Subscriber,
-        v1::PluginRegistrationClass::RegistrationTool => PluginRegistrationClass::Tool,
-        v1::PluginRegistrationClass::RegistrationLlmIntercept => {
-            PluginRegistrationClass::LlmIntercept
-        }
-        v1::PluginRegistrationClass::RegistrationPayloadCodec => {
-            PluginRegistrationClass::PayloadCodec
-        }
-    };
+    let operation = registration_operation_from_wire(wire.operation)?;
     let shape = v1::PluginExecutionShape::try_from(wire.shape)
         .map_err(|_| malformed(format!("an unknown execution shape {}", wire.shape)))?;
     let shape = match shape {
@@ -519,20 +622,41 @@ fn registration_from_wire(
         v1::PluginExecutionShape::ShapeUnary => PluginExecutionShape::Unary,
         v1::PluginExecutionShape::ShapeStreaming => PluginExecutionShape::Streaming,
     };
-    let ordering = wire
-        .ordering
-        .as_ref()
-        .ok_or_else(|| malformed("a registration with no ordering"))?;
+    if shape != registration_shape(operation) {
+        return Err(malformed(format!(
+            "a registration at {} declaring a {} shape",
+            operation.as_str(),
+            match shape {
+                PluginExecutionShape::Unary => "unary",
+                PluginExecutionShape::Streaming => "streaming",
+            }
+        )));
+    }
+    let ordering = match wire.ordering.as_ref() {
+        Some(ordering) => PluginRegistrationOrdering {
+            priority: ordering.priority,
+            may_break_chain: ordering.may_break_chain,
+        },
+        None => PluginRegistrationOrdering {
+            priority: None,
+            may_break_chain: None,
+        },
+    };
+    if let Some(gated) = wire.gated_registration.as_ref()
+        && gated.trim().is_empty()
+    {
+        // An empty target names no registration, which is a gate that decides
+        // nothing rather than a gate whose target is unknown.
+        return Err(malformed("a gate naming an empty registration"));
+    }
 
     Ok(PluginRegistrationDescriptor {
         registration_id: wire.registration_id.clone(),
         component_kind: wire.component_kind.clone(),
-        class,
-        ordering: PluginRegistrationOrdering {
-            priority: ordering.priority,
-            may_break_chain: ordering.may_break_chain,
-        },
+        operation,
+        ordering,
         shape,
+        gated_registration: wire.gated_registration.clone(),
         config_keys: wire.config_keys.clone(),
         declared_digest: wire.declared_digest.clone(),
     })
@@ -1278,5 +1402,216 @@ mod tests {
         for code in errors {
             assert_eq!(code, PluginFailureCode::MalformedResponse);
         }
+    }
+
+    fn wire_registration(
+        operation: v1::PluginRegistrationOperation,
+        shape: v1::PluginExecutionShape,
+    ) -> v1::PluginRegistrationDescriptor {
+        v1::PluginRegistrationDescriptor {
+            registration_id: "registration-1".into(),
+            component_kind: "example_kind".into(),
+            operation: operation as i32,
+            shape: shape as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_attachment_point_survives_the_wire() {
+        // The numbers are listed rather than derived so that renumbering a value
+        // — which every peer would misread — fails here and not in the field.
+        let operations = [
+            (PluginRegistrationOperation::Subscriber, 1),
+            (PluginRegistrationOperation::EventMetadataInjector, 2),
+            (PluginRegistrationOperation::MarkSanitizeGuardrail, 3),
+            (PluginRegistrationOperation::ScopeSanitizeStartGuardrail, 4),
+            (PluginRegistrationOperation::ScopeSanitizeEndGuardrail, 5),
+            (PluginRegistrationOperation::ToolSanitizeRequestGuardrail, 6),
+            (
+                PluginRegistrationOperation::ToolSanitizeResponseGuardrail,
+                7,
+            ),
+            (
+                PluginRegistrationOperation::ToolConditionalExecutionGuardrail,
+                8,
+            ),
+            (PluginRegistrationOperation::ToolRequestIntercept, 9),
+            (PluginRegistrationOperation::ToolExecutionIntercept, 10),
+            (PluginRegistrationOperation::LlmSanitizeRequestGuardrail, 11),
+            (
+                PluginRegistrationOperation::LlmSanitizeResponseGuardrail,
+                12,
+            ),
+            (
+                PluginRegistrationOperation::LlmConditionalExecutionGuardrail,
+                13,
+            ),
+            (PluginRegistrationOperation::LlmRequestIntercept, 14),
+            (PluginRegistrationOperation::LlmExecutionIntercept, 15),
+            (PluginRegistrationOperation::LlmStreamExecutionIntercept, 16),
+        ];
+
+        for (operation, number) in operations {
+            assert_eq!(
+                registration_operation_to_wire(operation),
+                number,
+                "{} encodes to a different number than it did",
+                operation.as_str()
+            );
+            assert_eq!(
+                registration_operation_from_wire(number).expect("a known operation"),
+                operation
+            );
+
+            let shape = match registration_shape(operation) {
+                PluginExecutionShape::Unary => v1::PluginExecutionShape::ShapeUnary,
+                PluginExecutionShape::Streaming => v1::PluginExecutionShape::ShapeStreaming,
+            };
+            let wire = match operation {
+                PluginRegistrationOperation::Subscriber => {
+                    v1::PluginRegistrationOperation::RegistrationOperationSubscriber
+                }
+                PluginRegistrationOperation::EventMetadataInjector => {
+                    v1::PluginRegistrationOperation::RegistrationOperationEventMetadataInjector
+                }
+                PluginRegistrationOperation::MarkSanitizeGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationMarkSanitizeGuardrail
+                }
+                PluginRegistrationOperation::ScopeSanitizeStartGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationScopeSanitizeStartGuardrail
+                }
+                PluginRegistrationOperation::ScopeSanitizeEndGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationScopeSanitizeEndGuardrail
+                }
+                PluginRegistrationOperation::ToolSanitizeRequestGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationToolSanitizeRequestGuardrail
+                }
+                PluginRegistrationOperation::ToolSanitizeResponseGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationToolSanitizeResponseGuardrail
+                }
+                PluginRegistrationOperation::ToolConditionalExecutionGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationToolConditionalExecutionGuardrail
+                }
+                PluginRegistrationOperation::ToolRequestIntercept => {
+                    v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept
+                }
+                PluginRegistrationOperation::ToolExecutionIntercept => {
+                    v1::PluginRegistrationOperation::RegistrationOperationToolExecutionIntercept
+                }
+                PluginRegistrationOperation::LlmSanitizeRequestGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationLlmSanitizeRequestGuardrail
+                }
+                PluginRegistrationOperation::LlmSanitizeResponseGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationLlmSanitizeResponseGuardrail
+                }
+                PluginRegistrationOperation::LlmConditionalExecutionGuardrail => {
+                    v1::PluginRegistrationOperation::RegistrationOperationLlmConditionalExecutionGuardrail
+                }
+                PluginRegistrationOperation::LlmRequestIntercept => {
+                    v1::PluginRegistrationOperation::RegistrationOperationLlmRequestIntercept
+                }
+                PluginRegistrationOperation::LlmExecutionIntercept => {
+                    v1::PluginRegistrationOperation::RegistrationOperationLlmExecutionIntercept
+                }
+                PluginRegistrationOperation::LlmStreamExecutionIntercept => {
+                    v1::PluginRegistrationOperation::RegistrationOperationLlmStreamExecutionIntercept
+                }
+            };
+            let descriptor =
+                registration_from_wire(&wire_registration(wire, shape)).expect("a registration");
+
+            assert_eq!(descriptor.operation, operation);
+            assert_eq!(descriptor.shape, registration_shape(operation));
+        }
+    }
+
+    #[test]
+    fn a_registration_that_does_not_say_where_it_attaches_is_refused() {
+        // Without the attachment point a kernel knows a registration exists but
+        // not where to install it, which is the state this field was added to
+        // end.
+        for operation in [v1::PluginRegistrationOperation::Unspecified as i32, 9_999] {
+            let error = registration_from_wire(&v1::PluginRegistrationDescriptor {
+                operation,
+                ..wire_registration(
+                    v1::PluginRegistrationOperation::RegistrationOperationSubscriber,
+                    v1::PluginExecutionShape::ShapeUnary,
+                )
+            })
+            .expect_err("a registration without an attachment point is not usable");
+
+            assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+        }
+    }
+
+    #[test]
+    fn a_registration_whose_shape_contradicts_its_attachment_point_is_refused() {
+        // Both fields are on the wire, so they can disagree. One of them is a
+        // property of the runtime and the other is a claim, and a proxy built
+        // from the claim would answer differently than the plugin it replaces.
+        let error = registration_from_wire(&wire_registration(
+            v1::PluginRegistrationOperation::RegistrationOperationLlmStreamExecutionIntercept,
+            v1::PluginExecutionShape::ShapeUnary,
+        ))
+        .expect_err("the streaming attachment point does not answer once");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+
+        let error = registration_from_wire(&wire_registration(
+            v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept,
+            v1::PluginExecutionShape::ShapeStreaming,
+        ))
+        .expect_err("a tool request intercept does not stream");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+    }
+
+    #[test]
+    fn an_ordering_the_plugin_did_not_declare_stays_absent() {
+        // Subscribers carry no priority in the ABI. Reporting zero would be a
+        // claim the plugin never made, and the runtime would order by it.
+        let descriptor = registration_from_wire(&wire_registration(
+            v1::PluginRegistrationOperation::RegistrationOperationSubscriber,
+            v1::PluginExecutionShape::ShapeUnary,
+        ))
+        .expect("a subscriber");
+        assert_eq!(
+            descriptor.ordering,
+            PluginRegistrationOrdering {
+                priority: None,
+                may_break_chain: None
+            }
+        );
+
+        let mut wire = wire_registration(
+            v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept,
+            v1::PluginExecutionShape::ShapeUnary,
+        );
+        wire.ordering = Some(v1::PluginRegistrationOrdering {
+            priority: Some(10),
+            may_break_chain: None,
+        });
+        let descriptor = registration_from_wire(&wire).expect("a tool request intercept");
+        assert_eq!(
+            descriptor.ordering,
+            PluginRegistrationOrdering {
+                priority: Some(10),
+                may_break_chain: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_gate_naming_an_empty_target_is_refused() {
+        // An empty target is a gate that decides nothing rather than a gate
+        // whose target is unknown, and the two call for different handling.
+        let mut wire = wire_registration(
+            v1::PluginRegistrationOperation::RegistrationOperationSubscriber,
+            v1::PluginExecutionShape::ShapeUnary,
+        );
+        wire.gated_registration = Some("  ".into());
+
+        let error = registration_from_wire(&wire).expect_err("a gate needs a target");
+
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
     }
 }
