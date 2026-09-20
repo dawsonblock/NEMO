@@ -29,6 +29,7 @@ adapters = [
     "nemo-relay-ledger",
     "nemo-relay-plugin",
     "nemo-relay-plugin-host",
+    "nemo-relay-plugin-proto",
     "nemo-relay-worker",
     "nemo-relay-worker-proto",
 ]

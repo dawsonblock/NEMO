@@ -1135,7 +1135,6 @@ version = "0.9.1-rc.4"
 dependencies = [
  "nemo-relay-types",
  "serde",
- "serde_json",
  "thiserror",
 ]
 

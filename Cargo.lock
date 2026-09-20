@@ -2048,6 +2048,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-plugin-proto"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay-plugin-protocol",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "serde_json",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "nemo-relay-plugin-protocol"
 version = "0.9.1-rc.4"
 dependencies = [

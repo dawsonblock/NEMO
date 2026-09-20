@@ -133,11 +133,11 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 # documentation. That is the price of an upper bound that cannot hide a token,
 # and it means a prose change can move this number.
 [limits.nemo-relay-plugin-protocol]
-max_direct_dependencies = 4
+max_direct_dependencies = 3
 max_transitive_packages = 24
-max_source_lines = 756
+max_source_lines = 478
 max_unsafe_occurrences = 3
-direct_dependency_digest = "07a6410504fe622aba26b024a0180a3ef0ab0a54c2a99247f344f7a14660faa0"
+direct_dependency_digest = "162268fbc27e2215997bfa17dcb031b17721a67d59e8159c8f8ace95cd5ce9f8"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
 
 [limits.nemo-relay-authority]
@@ -231,3 +231,14 @@ max_source_lines = 548
 max_unsafe_occurrences = 1
 direct_dependency_digest = "8fe645305d31725241bae067e82e46f4fd07a63fcd169619289606a9c83b786f"
 transitive_dependency_digest = "8961e02e30018785a63b78b27e42d84253fb8d8911a6f26609a21c249cb23160"
+
+# The wire schema. Measured because it is shipped and because its transitive set
+# is dominated by the protobuf and gRPC toolchain, which is exactly the kind of
+# weight the contract crate should not have inherited.
+[limits.nemo-relay-plugin-proto]
+max_direct_dependencies = 4
+max_transitive_packages = 108
+max_source_lines = 64
+max_unsafe_occurrences = 0
+direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
+transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"

@@ -1,0 +1,307 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package nemo.relay.plugin.v1;
+
+// The wire protocol between the kernel and the process that hosts native
+// plugins. This file is the single authority for what crosses that boundary:
+// no other crate declares plugin wire messages, and the semantic Rust types in
+// `nemo-relay-plugin-protocol` are the in-domain vocabulary that maps onto it.
+//
+// Every operation carries the session it belongs to and its execution context.
+// The context is on the wire rather than being an out-of-band Rust argument
+// because the host has to enforce the budget, and a value the host cannot see
+// is a value it cannot enforce.
+//
+// There is no request envelope with a `oneof request`: the RPC method already
+// says which operation is being performed, and a second discriminator inside
+// the message could disagree with it.
+
+// Why an operation failed. The variants are the cases the kernel reasons about;
+// a plugin that hangs, crashes or answers unreadably is not the same as one that
+// refused, and the caller may not treat them alike.
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0;
+  VERSION_MISMATCH = 1;
+  ABI_MISMATCH = 2;
+  UNKNOWN_PLUGIN = 3;
+  STALE_HANDLE = 4;
+  ALREADY_LOADING = 5;
+  ALREADY_LOADED = 6;
+  REJECTED = 7;
+  OVERSIZED_FRAME = 8;
+  DEADLINE_EXCEEDED = 9;
+  HOST_CRASHED = 10;
+  MALFORMED_RESPONSE = 11;
+  UNAVAILABLE = 12;
+  CANCELLED = 13;
+  GENERATION_EXHAUSTED = 14;
+}
+
+// Whether the plugin may have reached an external system. Kept separate from
+// the outcome: an effect that was dispatched and definitely failed is a
+// different case from one never dispatched, and both differ from one nobody can
+// account for.
+enum DispatchState {
+  DISPATCH_STATE_UNSPECIFIED = 0;
+  NOT_DISPATCHED = 1;
+  DISPATCH_ATTEMPTED = 2;
+  DISPATCH_CONFIRMED = 3;
+}
+
+// Whether the runtime can prove what happened.
+enum OutcomeCertainty {
+  OUTCOME_CERTAINTY_UNSPECIFIED = 0;
+  CONFIRMED_FAILURE = 1;
+  CONFIRMED_SUCCESS = 2;
+  UNKNOWN = 3;
+}
+
+enum PluginCapabilityKind {
+  PLUGIN_CAPABILITY_KIND_UNSPECIFIED = 0;
+  TOOL = 1;
+  LLM = 2;
+  SUBSCRIBER = 3;
+}
+
+// Something a plugin asks the runtime to do while it runs.
+enum HostCallCapability {
+  HOST_CALL_CAPABILITY_UNSPECIFIED = 0;
+  SCOPE_STACK = 1;
+  DOWNSTREAM_LLM_STREAM = 2;
+  PAYLOAD_CODEC = 3;
+}
+
+// Identity, binding and budget for one operation.
+message PluginExecutionContext {
+  // Correlation identity for the operation. Callbacks carry it too, so a call
+  // belongs to exactly one operation even when several are in flight.
+  string operation_request_id = 1;
+  uint32 protocol_version = 2;
+  string runtime_binding_digest = 3;
+  // Absolute deadline, for audit and logging.
+  uint64 deadline_unix_ms = 4;
+  // What is actually left, for enforcement.
+  uint64 remaining_budget_millis = 5;
+  uint32 max_response_bytes = 6;
+}
+
+// Stable identity of one loaded plugin instance.
+message PluginHandle {
+  string plugin_id = 1;
+  uint64 generation = 2;
+}
+
+message PluginCapability {
+  string id = 1;
+  PluginCapabilityKind kind = 2;
+  // Present only when the plugin supplies one. An empty string would be a
+  // claim; absence is the truth.
+  optional string declared_digest = 3;
+}
+
+// What a plugin declares about itself once loaded. Optional fields are the ones
+// the host may genuinely not know; reporting the host's maximum ABI as the
+// plugin's negotiated one would invent a guarantee the plugin never made.
+message PluginDescriptor {
+  string plugin_id = 1;
+  optional string plugin_version = 2;
+  optional uint32 negotiated_abi_version = 3;
+  optional string manifest_digest = 4;
+  repeated string registration_kinds = 5;
+  repeated PluginCapability capabilities = 6;
+}
+
+message PluginFailure {
+  FailureCode code = 1;
+  // Human-readable detail. Never parsed.
+  string message = 2;
+  optional uint64 observed = 3;
+  optional uint32 limit = 4;
+  optional uint32 expected_version = 5;
+  optional uint32 received_version = 6;
+}
+
+// First message the kernel sends. Binds the session to a runtime identity, so a
+// host started under one NEMO runtime cannot be retained by another.
+message HandshakeRequest {
+  uint32 protocol_version = 1;
+  string runtime_binding_digest = 2;
+  string host_instance_id = 3;
+  string session_nonce = 4;
+  uint32 maximum_frame_bytes = 5;
+  repeated string supported_features = 6;
+}
+
+message HandshakeResponse {
+  uint32 protocol_version = 1;
+  string host_instance_id = 2;
+  string session_nonce = 3;
+  uint32 maximum_frame_bytes = 4;
+  repeated string supported_features = 5;
+}
+
+message LoadRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  string plugin_id = 3;
+  string artifact = 4;
+}
+
+message LoadResponse {
+  PluginHandle handle = 1;
+  PluginDescriptor descriptor = 2;
+}
+
+message UnloadRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  PluginHandle handle = 3;
+}
+
+message UnloadResponse {}
+
+message InspectRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  optional PluginHandle handle = 3;
+}
+
+message InspectResponse {
+  repeated PluginDescriptor descriptors = 1;
+}
+
+message InvokeRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  PluginHandle handle = 3;
+  string capability_id = 4;
+  string arguments = 5;
+}
+
+message InvokeResponse {
+  string output = 1;
+  DispatchState dispatch_state = 2;
+  OutcomeCertainty outcome_certainty = 3;
+}
+
+// One frame of a streaming invocation. The stream ends with `end`, or with a
+// failure that terminates it; a stream that simply stops is a truncation and
+// must be treated as one.
+message StreamChunk {
+  string operation_request_id = 1;
+  oneof chunk {
+    string data = 2;
+    PluginFailure failure = 3;
+    bool end = 4;
+  }
+}
+
+message CancelOperationRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  string operation_request_id = 3;
+}
+
+message CancelOperationResponse {}
+
+message HealthRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+}
+
+message HealthResponse {
+  uint32 protocol_version = 1;
+  bool accepting_work = 2;
+  repeated PluginHandle loaded = 3;
+}
+
+message SessionCloseRequest {
+  string session_id = 1;
+}
+
+message SessionCloseResponse {}
+
+// A call from the plugin into the runtime. Both identities are present: the
+// operation says which invocation it belongs to, and the call identity says
+// which call it is, so several calls in one operation stay distinguishable.
+message HostCallRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  HostCallCapability capability = 4;
+  string arguments = 5;
+}
+
+message HostCallResponse {
+  string operation_request_id = 1;
+  string host_call_id = 2;
+  oneof result {
+    string output = 3;
+    PluginFailure failure = 4;
+  }
+}
+
+message EmitMarkRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  string name = 4;
+  string data_json = 5;
+}
+
+message EmitMarkResponse {}
+
+message ScopeStackRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  string operation = 4;
+  string payload_json = 5;
+}
+
+message ScopeStackResponse {
+  oneof result {
+    string output = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message ResolveCodecRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  string kind = 4;
+  string payload_json = 5;
+}
+
+message ResolveCodecResponse {
+  oneof result {
+    string output = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// Served by the plugin host process.
+service PluginHost {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Load(LoadRequest) returns (LoadResponse);
+  rpc Unload(UnloadRequest) returns (UnloadResponse);
+  rpc Inspect(InspectRequest) returns (InspectResponse);
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+  rpc InvokeStream(InvokeRequest) returns (stream StreamChunk);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc SessionClose(SessionCloseRequest) returns (SessionCloseResponse);
+}
+
+// Served by the kernel for plugins that call back into the runtime while they
+// run. This is the direction the earlier request-only model could not express.
+service RelayRuntime {
+  rpc HostCall(HostCallRequest) returns (HostCallResponse);
+  rpc EmitMark(EmitMarkRequest) returns (EmitMarkResponse);
+  rpc ScopeStack(ScopeStackRequest) returns (ScopeStackResponse);
+  rpc ResolveCodec(ResolveCodecRequest) returns (ResolveCodecResponse);
+}
