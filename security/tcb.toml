@@ -44,6 +44,15 @@ crates = [
     "nemo-relay-worker-proto",
 ]
 
+# The process that will host native plugins once the boundary exists.
+#
+# Its `unsafe` count is classified rather than hidden: corruption inside that
+# process must not be able to corrupt the kernel, which is the whole point of
+# moving the loader there. Until the move happens this is the compatibility
+# backend, measured so the reduction is visible when it occurs.
+[plugin_host]
+crates = ["nemo-relay-plugin-host"]
+
 # Packages that must never appear in a trusted crate's resolved tree.
 #
 # The kernel depends on interfaces, not implementations, so a database driver

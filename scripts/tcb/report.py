@@ -216,6 +216,17 @@ def in_process_crates(policy: dict) -> list[str]:
     return sorted(members)
 
 
+def plugin_host_crates(policy: dict) -> list[str]:
+    """Return the crates that host native plugins.
+
+    A separate tier rather than part of the in-process one: once the loader
+    moves, this code is the attack surface the kernel is protected *from*, and
+    its `unsafe` count should be reported without either hiding it or counting
+    it against the kernel.
+    """
+    return sorted(policy.get("plugin_host", {}).get("crates", []))
+
+
 def find_violations(metadata: dict, identities: dict[str, list[str]], policy: dict) -> tuple[list[Metrics], list[str]]:
     """Return the per-crate report and every policy violation."""
     reports: list[Metrics] = []
@@ -277,6 +288,7 @@ def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dic
     for label, crates in (
         ("invariant-enforcing", enforcement_crates(policy)),
         ("in-process", in_process_crates(policy)),
+        ("plugin host", plugin_host_crates(policy)),
     ):
         measured = [measure(metadata, identities[crate], crate) for crate in crates]
         total_lines = sum(item.source_lines for item in measured)
@@ -325,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         | set(policy.get("forbidden", {}))
         | set(enforcement_crates(policy))
         | set(in_process_crates(policy))
+        | set(plugin_host_crates(policy))
     )
     identities = {crate: dependency_identities(arguments.repo_root, crate) for crate in crates}
     reports, problems = find_violations(metadata, identities, policy)

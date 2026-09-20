@@ -5,6 +5,53 @@ SPDX-License-Identifier: Apache-2.0
 
 # Baseline: NEMO 0.10 minimal trusted kernel
 
+## Hardening baseline — 2026-09-19
+
+This is the *NEMO hardening baseline*: the revision the hardening program starts
+from, recorded so later milestones cannot obscure which guarantees already
+worked. It is a new record, not a replacement — the earlier capture below stays
+in place as evidence.
+
+The four guarantees this revision already has, and which the program must not
+regress:
+
+- plugin-isolation increment 2 foundation — the kernel owns the execution seam
+  and does not construct a backend
+- positive TLS production composition — a verified transport composes a
+  production kernel, and a test-only transport is refused
+- attestation↔evidence binding fixed — an attestation stops verifying once the
+  evidence manifest underneath it is regenerated
+- trusted EffectStore deadline wired — terminal finalization is bounded by the
+  action budget, and an expired budget becomes `UNKNOWN`
+
+| Field | Value |
+|---|---|
+| Branch | `feat/native-plugin-isolation` |
+| Git revision | `c7c492b674ae58fc15bc0e26d7feefc39b46d21e` |
+| Workspace version | `0.9.1-rc.4` |
+| Plugin protocol revision | `1` |
+| Native plugin ABI revision | `4` |
+| `Cargo.lock` | `fcd34ce5b38f49ebd173385279472ae9c7083778b091fbf01882d06bd4b43e9c` |
+
+Toolchains at this revision: `rustc`/`cargo` 1.96.1, `node` v24.16.0.
+
+| Surface | Crates | Lines | `unsafe` |
+|---|---|---|---|
+| Invariant-enforcing (logical TCB) | 5 | 85,737 | 299 |
+| Effective in-process (logical plus additional) | 12 | 114,801 | 617 |
+| Plugin host | 1 | 428 | 1 |
+
+`kernel-process unsafe tokens` is **617**, the number the plugin-isolation
+milestone exists to reduce. The plugin-host figure is reported separately and
+deliberately not counted against the kernel: corruption in that process must not
+be able to corrupt the kernel, which is the point of moving the loader there.
+
+Machine-readable detail is produced by `just tcb-baseline` into the git-ignored
+`reports/`; the companion record for this revision is
+`qualification/baselines/2026-09-19-hardening/`.
+
+The remainder of this file records the earlier 0.10 capture.
+
 Stage 1 of the program is a freeze. This records what the tree measured before
 any code moved, so later milestones can prove they changed only what they
 intended and can detect movement they did not intend.

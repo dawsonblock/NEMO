@@ -72,3 +72,15 @@ def test_every_recorded_lockfile_is_one_the_repository_uses() -> None:
     # every other test, so tie the list to what the tree actually carries.
     assert {"Cargo.lock", "uv.lock", "package-lock.json"} <= recorded
     assert (root / "Cargo.lock").is_file()
+
+
+def test_contract_revisions_are_read_from_the_declarations() -> None:
+    # The baseline records which protocol and plugin ABI it speaks. If a
+    # declaration is renamed or reformatted this fails, rather than the baseline
+    # quietly recording `None` for a number it is supposed to pin.
+    revisions = baseline.declared_revisions(baseline.REPO_ROOT)
+
+    assert set(revisions) == {"plugin_protocol", "native_plugin_abi"}
+    for name, value in revisions.items():
+        assert value is not None, f"{name} was not found in its declaration"
+        assert value > 0, f"{name} recorded {value}"

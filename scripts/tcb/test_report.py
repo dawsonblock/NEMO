@@ -195,3 +195,5 @@ def test_repository_policy_measures_every_crate_it_trusts() -> None:
         assert "transitive_dependency_digest" in limits, f"{crate} does not pin its transitive dependency set"
     for crate in policy["in_process"]["crates"]:
         assert crate in policy["limits"], f"{crate} shares the kernel's process but is unmeasured"
+    for crate in policy["plugin_host"]["crates"]:
+        assert crate in policy["limits"], f"{crate} hosts native plugins but is unmeasured"

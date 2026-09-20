@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -44,7 +45,39 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 LOCKFILES = ("Cargo.lock", "uv.lock", "package-lock.json")
 
 # Toolchains that can change what the recorded measurements mean.
-TOOLS = (("rustc", ["rustc", "--version"]), ("cargo", ["cargo", "--version"]))
+TOOLS = (
+    ("rustc", ["rustc", "--version"]),
+    ("cargo", ["cargo", "--version"]),
+    ("node", ["node", "--version"]),
+)
+
+# Contract revisions that identify what this baseline speaks.
+#
+# Read from the declaration rather than by building the crate to ask it: these
+# numbers identify the baseline, and a build-time query would make recording
+# them depend on compiling the thing being recorded. A test pins the
+# extraction, so a change of declaration style fails loudly instead of
+# silently recording nothing.
+REVISION_DECLARATIONS = {
+    "plugin_protocol": (
+        "crates/plugin-protocol/src/lib.rs",
+        r"pub const PROTOCOL_VERSION: u16 = (\d+);",
+    ),
+    "native_plugin_abi": (
+        "crates/plugin/src/lib.rs",
+        r"pub const NEMO_RELAY_NATIVE_ABI_VERSION: u32 = (\d+);",
+    ),
+}
+
+
+def declared_revisions(root: pathlib.Path) -> dict[str, int | None]:
+    """Return the contract revisions declared in the tree at ``root``."""
+    revisions: dict[str, int | None] = {}
+    for name, (relative, pattern) in REVISION_DECLARATIONS.items():
+        path = pathlib.Path(root) / relative
+        match = re.search(pattern, path.read_text(encoding="utf-8")) if path.is_file() else None
+        revisions[name] = int(match.group(1)) if match else None
+    return revisions
 
 
 def lockfile_digests(root: pathlib.Path) -> dict[str, str | None]:
@@ -103,16 +136,18 @@ def capture(root: pathlib.Path) -> dict[str, dict]:
         "entry_count": len(entries),
         "lockfiles": lockfile_digests(root),
         "toolchain": tool_versions(),
+        "contract_revisions": declared_revisions(root),
         "workspace_members": sorted(by_id[identifier]["name"] for identifier in metadata["workspace_members"]),
     }
 
-    # Freeze both tiers. The policy distinguishes code that enforces an
-    # invariant from code that can subvert one in the same process, so a
-    # baseline that records only the first is not freezing the attack surface
-    # the policy says matters.
+    # Freeze all three surfaces. The policy distinguishes code that enforces an
+    # invariant, code that can subvert one in the same process, and the process
+    # that will host native plugins, so a baseline recording fewer is not
+    # freezing the attack surface the policy says matters.
     logical = report.enforcement_crates(policy)
     in_process = report.in_process_crates(policy)
-    crates = sorted(set(logical) | set(in_process))
+    plugin_host = report.plugin_host_crates(policy)
+    crates = sorted(set(logical) | set(in_process) | set(plugin_host))
     identities = {crate: report.dependency_identities(root, crate) for crate in crates}
     measured = {crate: vars(report.measure(metadata, identities[crate], crate)) for crate in crates}
 
@@ -130,6 +165,7 @@ def capture(root: pathlib.Path) -> dict[str, dict]:
         # is the union of the two, so recording the union under a second name
         # would double count for anyone who added the sections together.
         "additional_in_process": {crate: measured[crate] for crate in in_process if crate not in set(logical)},
+        "plugin_host": {crate: measured[crate] for crate in plugin_host},
     }
 
     return {
