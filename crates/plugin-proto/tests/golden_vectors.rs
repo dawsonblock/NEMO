@@ -34,14 +34,10 @@ fn vectors_path() -> PathBuf {
 /// of the ABI-closure work.
 const PENDING_VECTORS: &[&str] = &[
     "CancelOperationRequest",
-    "CancelOperationResponse",
     "EmitMarkRequest",
     "EmitMarkResponse",
-    "HandshakeResponse",
     "HealthRequest",
-    "HealthResponse",
     "InspectRequest",
-    "InspectResponse",
     "InvokeRequest",
     "ResolveCodecRequest",
     "ResolveCodecResponse",
@@ -51,7 +47,6 @@ const PENDING_VECTORS: &[&str] = &[
     "SessionCloseResponse",
     "StreamChunk",
     "UnloadRequest",
-    "UnloadResponse",
 ];
 
 /// Every message named in an `rpc` signature of the checked-in schema.
@@ -89,6 +84,30 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
         remaining_budget_millis: 29_000,
         max_response_bytes: 1_048_576,
     };
+    let descriptor = || v1::PluginDescriptor {
+        plugin_id: "example".into(),
+        plugin_version: Some(">=0.9,<1.0".into()),
+        negotiated_abi_version: Some(4),
+        manifest_digest: Some("manifest-digest".into()),
+        registration_kinds: vec!["example_kind".into()],
+        capabilities: Vec::new(),
+        registrations: vec![v1::PluginRegistrationDescriptor {
+            registration_id: "registration-1".into(),
+            component_kind: "example_kind".into(),
+            class: v1::PluginRegistrationClass::RegistrationMiddleware as i32,
+            ordering: Some(v1::PluginRegistrationOrdering {
+                priority: 10,
+                may_break_chain: false,
+            }),
+            shape: v1::PluginExecutionShape::ShapeUnary as i32,
+            config_keys: vec!["model".into()],
+            declared_digest: None,
+        }],
+    };
+    let handle = || v1::PluginHandle {
+        plugin_id: "example".into(),
+        generation: 41,
+    };
 
     vec![
         (
@@ -118,30 +137,8 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
         (
             "LoadResponse",
             v1::LoadResponse {
-                handle: Some(v1::PluginHandle {
-                    plugin_id: "example".into(),
-                    generation: 41,
-                }),
-                descriptor: Some(v1::PluginDescriptor {
-                    plugin_id: "example".into(),
-                    plugin_version: Some(">=0.9,<1.0".into()),
-                    negotiated_abi_version: Some(4),
-                    manifest_digest: Some("manifest-digest".into()),
-                    registration_kinds: vec!["example_kind".into()],
-                    capabilities: Vec::new(),
-                    registrations: vec![v1::PluginRegistrationDescriptor {
-                        registration_id: "registration-1".into(),
-                        component_kind: "example_kind".into(),
-                        class: v1::PluginRegistrationClass::RegistrationMiddleware as i32,
-                        ordering: Some(v1::PluginRegistrationOrdering {
-                            priority: 10,
-                            may_break_chain: false,
-                        }),
-                        shape: v1::PluginExecutionShape::ShapeUnary as i32,
-                        config_keys: vec!["model".into()],
-                        declared_digest: None,
-                    }],
-                }),
+                handle: Some(handle()),
+                descriptor: Some(descriptor()),
             }
             .encode_to_vec(),
         ),
@@ -169,6 +166,82 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                     limit: None,
                     expected_version: None,
                     received_version: None,
+                })),
+            }
+            .encode_to_vec(),
+        ),
+        // The lifecycle outcomes. Each carries the same payloads the bare
+        // response messages used to, inside a oneof whose other arm is the
+        // structured failure, so a peer that answers coherently can say that
+        // the operation failed without the caller mistaking it for a channel
+        // error.
+        (
+            "HandshakeOutcome",
+            v1::HandshakeOutcome {
+                result: Some(v1::handshake_outcome::Result::Established(
+                    v1::HandshakeResponse {
+                        protocol_version: 1,
+                        session_id: "session-1".into(),
+                        host_instance_id: "host-1".into(),
+                        host_nonce: "host-nonce".into(),
+                        maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
+                        supported_features: vec!["streaming".into()],
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "LoadOutcome",
+            v1::LoadOutcome {
+                result: Some(v1::load_outcome::Result::Loaded(v1::LoadResponse {
+                    handle: Some(handle()),
+                    descriptor: Some(descriptor()),
+                })),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "UnloadOutcome",
+            v1::UnloadOutcome {
+                result: Some(v1::unload_outcome::Result::Failure(v1::PluginFailure {
+                    code: v1::FailureCode::StaleHandle as i32,
+                    message: "the handle names a generation that is no longer loaded".into(),
+                    observed: None,
+                    limit: None,
+                    expected_version: None,
+                    received_version: None,
+                })),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "InspectOutcome",
+            v1::InspectOutcome {
+                result: Some(v1::inspect_outcome::Result::Inspected(
+                    v1::InspectResponse {
+                        descriptors: vec![descriptor()],
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "CancelOperationOutcome",
+            v1::CancelOperationOutcome {
+                result: Some(v1::cancel_operation_outcome::Result::Cancelled(
+                    v1::CancelOperationResponse {},
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "HealthOutcome",
+            v1::HealthOutcome {
+                result: Some(v1::health_outcome::Result::Health(v1::HealthResponse {
+                    protocol_version: 1,
+                    accepting_work: true,
+                    loaded: vec![handle()],
                 })),
             }
             .encode_to_vec(),
@@ -283,6 +356,24 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
                 .encode_to_vec(),
             "InvokeOutcome" => v1::InvokeOutcome::decode(bytes.as_slice())
                 .expect("decode InvokeOutcome")
+                .encode_to_vec(),
+            "HandshakeOutcome" => v1::HandshakeOutcome::decode(bytes.as_slice())
+                .expect("decode HandshakeOutcome")
+                .encode_to_vec(),
+            "LoadOutcome" => v1::LoadOutcome::decode(bytes.as_slice())
+                .expect("decode LoadOutcome")
+                .encode_to_vec(),
+            "UnloadOutcome" => v1::UnloadOutcome::decode(bytes.as_slice())
+                .expect("decode UnloadOutcome")
+                .encode_to_vec(),
+            "InspectOutcome" => v1::InspectOutcome::decode(bytes.as_slice())
+                .expect("decode InspectOutcome")
+                .encode_to_vec(),
+            "CancelOperationOutcome" => v1::CancelOperationOutcome::decode(bytes.as_slice())
+                .expect("decode CancelOperationOutcome")
+                .encode_to_vec(),
+            "HealthOutcome" => v1::HealthOutcome::decode(bytes.as_slice())
+                .expect("decode HealthOutcome")
                 .encode_to_vec(),
             other => panic!("no decoder for recorded vector {other}"),
         };

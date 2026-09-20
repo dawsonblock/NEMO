@@ -48,8 +48,8 @@ Each one leaves the repository buildable, and none of them is the endpoint.
    `crates/plugin-protocol` (`nemo-relay-plugin-protocol`) defines the
    operations, identities, structured failures, and version handshake, and
    classifies at the `contracts` layer so a kernel interface may depend on it.
-   It ships no loader, no transport, and no `unsafe`, and nothing depends on it
-   yet — in particular `nemo-relay` does not.
+   It ships no loader, no transport, and no `unsafe`, and nothing depended on it
+   yet — in particular `nemo-relay` did not, until increment 2.
 
 2. **Injected interface.** Core depends on a `PluginExecutionBackend`, not on
    the loader. An in-process backend keeps existing consumers building. That is
@@ -263,25 +263,30 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   The converter that turned a bare success into `NotDispatched` with
   `ConfirmedSuccess` is replaced by one that takes the outcome, so a
   convenience path cannot invent certainty.
+- **Structured lifecycle outcomes.** `Load`, `Unload`, `Inspect`, `Health`,
+  `CancelOperation` and `Handshake` answer with a oneof whose arms are the
+  success payload and a `PluginFailure`, so `AlreadyLoaded` or `StaleHandle`
+  travels as a result rather than as a gRPC status. A message carrying neither
+  arm is refused as malformed, because saying nothing is not the same as
+  reporting a failure, and the distinction is what stops a lost response from
+  being read as a definite negative. The handshake's success arm is a new
+  `PluginSessionIdentity`: the session identity was on the wire with no domain
+  counterpart, so the kernel had nothing to validate before naming a session,
+  and the frame limit the host offers is now checked against this side's own
+  rather than adopted.
 
 Still open, in the order they need closing:
 
-1. **Structured lifecycle outcomes.** `InvokeOutcome` carries a failure in the
-   message, but `LoadResponse`, `UnloadResponse`, `InspectResponse`,
-   `HealthResponse` and `HandshakeResponse` do not. A lifecycle failure such as
-   `AlreadyLoaded` or `StaleHandle` would therefore have to travel as a gRPC
-   status, which conflates a peer that answered coherently with a channel that
-   failed.
-2. **Registration operation identity.** The six broad classes cannot reconstruct
+1. **Registration operation identity.** The six broad classes cannot reconstruct
    a proxy: tool and LLM sanitizers, conditional execution, request and
    execution intercepts and streaming intercepts all collapse into one class
    while needing different installation points.
-3. **Complete callback mapping for ABI v4**, especially async continuation and
+2. **Complete callback mapping for ABI v4**, especially async continuation and
    the pull-based downstream LLM stream, which cannot be a unary call because
    the plugin controls when to pull and backpressure is explicit.
-4. **Conversions for every message the host uses**, and vectors for all of them
-   rather than nineteen declared pending.
-5. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
+3. **Conversions for every message the host uses**, and vectors for all of them
+   rather than fourteen declared pending.
+4. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 
 Until those are closed the process host would still be architecture by

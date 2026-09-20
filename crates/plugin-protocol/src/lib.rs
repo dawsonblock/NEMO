@@ -17,8 +17,9 @@
 //! `unsafe`: the implementation stays where it is until the increment that moves
 //! it can be reviewed on its own.
 //!
-//! Nothing in the kernel depends on this crate yet. Adding the dependency is the
-//! next increment, and it belongs to the kernel only as an interface.
+//! The kernel depends on this crate, and on it only as an interface: the plugin
+//! execution module names these types and enforces the deadline rule in front of
+//! every backend, while the loader and the transport stay behind the boundary.
 
 use serde::{Deserialize, Serialize};
 
@@ -170,6 +171,45 @@ pub enum PluginCapabilityKind {
 pub struct PluginHandshake {
     /// Protocol version the sender implements.
     pub protocol_version: u16,
+}
+
+/// The session a handshake established.
+///
+/// Returned rather than asserted, because the host is the only party that knows
+/// which process it is and the kernel is the only party that can check the
+/// frame limit it offers. Nothing here is a claim the kernel simply adopts:
+/// `host_instance_id` and `host_nonce` exist so that a restarted host cannot be
+/// mistaken for the one an open session belongs to, and `maximum_frame_bytes`
+/// is compared against the kernel's own limit before it is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSessionIdentity {
+    /// Protocol version the session was established at.
+    pub protocol_version: u16,
+    /// The session every later operation names.
+    pub session_id: String,
+    /// Which host process this session belongs to.
+    pub host_instance_id: String,
+    /// Per-session nonce the host chose.
+    pub host_nonce: String,
+    /// Largest frame the host will accept.
+    pub maximum_frame_bytes: u32,
+    /// Features both sides agreed on.
+    pub supported_features: Vec<String>,
+}
+
+/// The result of one lifecycle operation.
+///
+/// Distinct from a transport failure, and from a malformed message. The peer
+/// answered coherently and the answer says either that the operation completed
+/// or that it failed for a reason this contract defines. Collapsing those into
+/// a transport error would lose the difference between "the host told me this
+/// plugin is already loaded" and "I could not reach the host".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleOutcome<T> {
+    /// The operation completed.
+    Completed(T),
+    /// The peer answered, and the answer is a structured failure.
+    Failed(PluginFailure),
 }
 
 /// Identity of the artifact a load was approved against.

@@ -362,15 +362,70 @@ message ResolveCodecResponse {
 }
 
 // Served by the plugin host process.
+// Semantic outcomes for the lifecycle operations.
+//
+// Each pairs the success payload with a structured failure, because these
+// operations have meaningful failures of their own — a plugin that is already
+// loaded, a handle from a previous generation, a version the host does not
+// speak. Reporting them as a gRPC status would conflate a peer that answered
+// coherently with a channel that failed, and the two call for different
+// responses: one is a result, the other is a transport problem.
+//
+// The hierarchy this preserves:
+//
+//   transport failure  !=  host failure  !=  semantic plugin failure
+//                      !=  uncertain external effect
+message HandshakeOutcome {
+  oneof result {
+    HandshakeResponse established = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message LoadOutcome {
+  oneof result {
+    LoadResponse loaded = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message UnloadOutcome {
+  oneof result {
+    UnloadResponse unloaded = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message InspectOutcome {
+  oneof result {
+    InspectResponse inspected = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message CancelOperationOutcome {
+  oneof result {
+    CancelOperationResponse cancelled = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message HealthOutcome {
+  oneof result {
+    HealthResponse health = 1;
+    PluginFailure failure = 2;
+  }
+}
+
 service PluginHost {
-  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
-  rpc Load(LoadRequest) returns (LoadResponse);
-  rpc Unload(UnloadRequest) returns (UnloadResponse);
-  rpc Inspect(InspectRequest) returns (InspectResponse);
+  rpc Handshake(HandshakeRequest) returns (HandshakeOutcome);
+  rpc Load(LoadRequest) returns (LoadOutcome);
+  rpc Unload(UnloadRequest) returns (UnloadOutcome);
+  rpc Inspect(InspectRequest) returns (InspectOutcome);
   rpc Invoke(InvokeRequest) returns (InvokeOutcome);
   rpc InvokeStream(InvokeRequest) returns (stream StreamChunk);
-  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
-  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationOutcome);
+  rpc Health(HealthRequest) returns (HealthOutcome);
   rpc SessionClose(SessionCloseRequest) returns (SessionCloseResponse);
 }
 

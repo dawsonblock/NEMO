@@ -15,14 +15,226 @@
 //! silently laundered into domain state that core believes it can rely on.
 
 use nemo_relay_plugin_protocol::{
-    DispatchState, OutcomeCertainty, PluginArtifactIdentity, PluginCapability,
-    PluginCapabilityKind, PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome,
-    PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginInvokeResponse,
-    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginRegistrationClass,
-    PluginRegistrationDescriptor, PluginRegistrationOrdering, PluginSuccess,
+    DispatchState, LifecycleOutcome, MAX_FRAME_BYTES, OutcomeCertainty, PluginArtifactIdentity,
+    PluginCapability, PluginCapabilityKind, PluginDescriptor, PluginExecutionContext,
+    PluginExecutionOutcome, PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle,
+    PluginHostHealth, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
+    PluginProtocolError, PluginRegistrationClass, PluginRegistrationDescriptor,
+    PluginRegistrationOrdering, PluginSessionIdentity, PluginSuccess,
 };
 
 use crate::v1;
+
+// Each lifecycle operation has meaningful failures of its own — a plugin
+// already loaded, a handle from a previous generation, a version the host does
+// not speak — and each of those is a result rather than a channel error. The
+// functions below keep that distinction: a failure arm becomes
+// `LifecycleOutcome::Failed`, and only a message carrying neither arm is an
+// error, because then the peer said nothing rather than reporting something.
+
+/// Read the session a handshake established.
+///
+/// The version is converted, not judged: whether it is one this side speaks is
+/// a policy decision the kernel makes at the boundary, and judging it here as
+/// well would give version policy two homes.
+pub fn handshake_outcome_from_wire(
+    wire: &v1::HandshakeOutcome,
+) -> Result<LifecycleOutcome<PluginSessionIdentity>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::handshake_outcome::Result::Established(established)) => Ok(
+            LifecycleOutcome::Completed(session_identity_from_wire(established)?),
+        ),
+        Some(v1::handshake_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "a handshake outcome that is neither a session nor a failure",
+        )),
+    }
+}
+
+/// Read the result of a load.
+pub fn load_outcome_from_wire(
+    wire: &v1::LoadOutcome,
+) -> Result<LifecycleOutcome<PluginLoadResponse>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::load_outcome::Result::Loaded(loaded)) => Ok(LifecycleOutcome::Completed(
+            load_response_from_wire(loaded)?,
+        )),
+        Some(v1::load_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "a load outcome that is neither a plugin nor a failure",
+        )),
+    }
+}
+
+/// Read the result of an unload.
+///
+/// The success arm carries no payload of its own, which is what the wire's
+/// empty `UnloadResponse` already said.
+pub fn unload_outcome_from_wire(
+    wire: &v1::UnloadOutcome,
+) -> Result<LifecycleOutcome<()>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::unload_outcome::Result::Unloaded(response)) => Ok(LifecycleOutcome::Completed(
+            unload_response_from_wire(response)?,
+        )),
+        Some(v1::unload_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "an unload outcome that is neither an acknowledgement nor a failure",
+        )),
+    }
+}
+
+/// Read the result of an inspection.
+pub fn inspect_outcome_from_wire(
+    wire: &v1::InspectOutcome,
+) -> Result<LifecycleOutcome<Vec<PluginDescriptor>>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::inspect_outcome::Result::Inspected(inspected)) => Ok(LifecycleOutcome::Completed(
+            inspect_response_from_wire(inspected)?,
+        )),
+        Some(v1::inspect_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "an inspection outcome that is neither a description nor a failure",
+        )),
+    }
+}
+
+/// Read the host's reported health.
+pub fn health_outcome_from_wire(
+    wire: &v1::HealthOutcome,
+) -> Result<LifecycleOutcome<PluginHostHealth>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::health_outcome::Result::Health(health)) => Ok(LifecycleOutcome::Completed(
+            health_response_from_wire(health)?,
+        )),
+        Some(v1::health_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "a health outcome that is neither a report nor a failure",
+        )),
+    }
+}
+
+/// Read the result of a cancellation.
+///
+/// An accepted cancellation says the host took the request, not that anything
+/// stopped: what became of the cancelled operation is reported separately, and
+/// it may not have reached the plugin at all.
+pub fn cancel_outcome_from_wire(
+    wire: &v1::CancelOperationOutcome,
+) -> Result<LifecycleOutcome<()>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::cancel_operation_outcome::Result::Cancelled(response)) => Ok(
+            LifecycleOutcome::Completed(cancel_response_from_wire(response)?),
+        ),
+        Some(v1::cancel_operation_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "a cancellation outcome that is neither an acknowledgement nor a failure",
+        )),
+    }
+}
+
+/// Validate the session a handshake established.
+///
+/// The session identity is what every later operation names, so an empty or
+/// absent one would leave "which session?" without an answer. The frame limit
+/// is checked against this side's own maximum because a host reporting a larger
+/// limit than it enforces would be describing a session that does not exist.
+fn session_identity_from_wire(
+    wire: &v1::HandshakeResponse,
+) -> Result<PluginSessionIdentity, PluginProtocolError> {
+    for (value, what) in [
+        (&wire.session_id, "a session with no identity"),
+        (
+            &wire.host_instance_id,
+            "a session that does not say which host it belongs to",
+        ),
+        (&wire.host_nonce, "a session with no nonce"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(malformed(what));
+        }
+    }
+    if wire.maximum_frame_bytes == 0 {
+        return Err(malformed("a session that will not accept a frame at all"));
+    }
+    if wire.maximum_frame_bytes > MAX_FRAME_BYTES {
+        return Err(malformed(format!(
+            "a session offering a frame limit of {} bytes, above the {} this side speaks",
+            wire.maximum_frame_bytes, MAX_FRAME_BYTES
+        )));
+    }
+    let protocol_version = u16::try_from(wire.protocol_version).map_err(|_| {
+        malformed("a session at a protocol version outside the range this code speaks")
+    })?;
+    Ok(PluginSessionIdentity {
+        protocol_version,
+        session_id: wire.session_id.clone(),
+        host_instance_id: wire.host_instance_id.clone(),
+        host_nonce: wire.host_nonce.clone(),
+        maximum_frame_bytes: wire.maximum_frame_bytes,
+        supported_features: wire.supported_features.clone(),
+    })
+}
+
+fn unload_response_from_wire(_wire: &v1::UnloadResponse) -> Result<(), PluginProtocolError> {
+    Ok(())
+}
+
+fn cancel_response_from_wire(
+    _wire: &v1::CancelOperationResponse,
+) -> Result<(), PluginProtocolError> {
+    Ok(())
+}
+
+fn inspect_response_from_wire(
+    wire: &v1::InspectResponse,
+) -> Result<Vec<PluginDescriptor>, PluginProtocolError> {
+    wire.descriptors.iter().map(descriptor_from_wire).collect()
+}
+
+fn health_response_from_wire(
+    wire: &v1::HealthResponse,
+) -> Result<PluginHostHealth, PluginProtocolError> {
+    let mut loaded = Vec::with_capacity(wire.loaded.len());
+    for handle in &wire.loaded {
+        if handle.plugin_id.trim().is_empty() {
+            return Err(malformed(
+                "a health report naming a plugin with no identity",
+            ));
+        }
+        if handle.generation == 0 {
+            // The same rule the load response follows: generation zero is the
+            // protobuf default and no load produces it, so a host reporting one
+            // is describing an instance that never existed.
+            return Err(malformed(
+                "a health report naming a handle at generation zero",
+            ));
+        }
+        loaded.push(PluginHandle {
+            plugin_id: handle.plugin_id.clone(),
+            generation: handle.generation,
+        });
+    }
+    Ok(PluginHostHealth {
+        protocol_version: u16::try_from(wire.protocol_version).map_err(|_| {
+            malformed("a health report with a protocol version outside the range this code speaks")
+        })?,
+        accepting_work: wire.accepting_work,
+        loaded,
+    })
+}
 
 /// Build the wire form of a load request.
 ///
@@ -786,5 +998,285 @@ mod tests {
         };
 
         assert!(load_response_from_wire(&wire).is_err());
+    }
+
+    fn wire_failure(code: v1::FailureCode) -> v1::PluginFailure {
+        v1::PluginFailure {
+            code: code as i32,
+            message: "the host said so".into(),
+            ..Default::default()
+        }
+    }
+
+    fn reported_failure<T: std::fmt::Debug>(outcome: LifecycleOutcome<T>) -> PluginFailure {
+        match outcome {
+            LifecycleOutcome::Failed(failure) => failure,
+            LifecycleOutcome::Completed(value) => {
+                panic!("expected a reported failure, got {value:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_reported_failure_is_a_result_rather_than_a_transport_error() {
+        // Each of these is the host answering coherently. Routing them through
+        // the error channel would make "this plugin is already loaded"
+        // indistinguishable from "I could not reach the host".
+        let load = reported_failure(
+            load_outcome_from_wire(&v1::LoadOutcome {
+                result: Some(v1::load_outcome::Result::Failure(wire_failure(
+                    v1::FailureCode::AlreadyLoaded,
+                ))),
+            })
+            .expect("an answered failure is not a conversion error"),
+        );
+        assert_eq!(load.code, PluginFailureCode::AlreadyLoaded);
+
+        let unload = reported_failure(
+            unload_outcome_from_wire(&v1::UnloadOutcome {
+                result: Some(v1::unload_outcome::Result::Failure(wire_failure(
+                    v1::FailureCode::StaleHandle,
+                ))),
+            })
+            .expect("an answered failure is not a conversion error"),
+        );
+        assert_eq!(unload.code, PluginFailureCode::StaleHandle);
+
+        let inspect = reported_failure(
+            inspect_outcome_from_wire(&v1::InspectOutcome {
+                result: Some(v1::inspect_outcome::Result::Failure(wire_failure(
+                    v1::FailureCode::UnknownPlugin,
+                ))),
+            })
+            .expect("an answered failure is not a conversion error"),
+        );
+        assert_eq!(inspect.code, PluginFailureCode::UnknownPlugin);
+
+        let health = reported_failure(
+            health_outcome_from_wire(&v1::HealthOutcome {
+                result: Some(v1::health_outcome::Result::Failure(wire_failure(
+                    v1::FailureCode::Unavailable,
+                ))),
+            })
+            .expect("an answered failure is not a conversion error"),
+        );
+        assert_eq!(health.code, PluginFailureCode::Unavailable);
+
+        let cancel = reported_failure(
+            cancel_outcome_from_wire(&v1::CancelOperationOutcome {
+                result: Some(v1::cancel_operation_outcome::Result::Failure(wire_failure(
+                    v1::FailureCode::Cancelled,
+                ))),
+            })
+            .expect("an answered failure is not a conversion error"),
+        );
+        assert_eq!(cancel.code, PluginFailureCode::Cancelled);
+
+        // The failure's own detail travels with it: a version mismatch that
+        // arrived would be refused by `failure_from_wire`, and this one is
+        // reported as the domain's two-version form.
+        let handshake = reported_failure(
+            handshake_outcome_from_wire(&v1::HandshakeOutcome {
+                result: Some(v1::handshake_outcome::Result::Failure(v1::PluginFailure {
+                    code: v1::FailureCode::VersionMismatch as i32,
+                    message: "the host speaks another version".into(),
+                    expected_version: Some(2),
+                    received_version: Some(1),
+                    ..Default::default()
+                })),
+            })
+            .expect("an answered failure is not a conversion error"),
+        );
+        assert_eq!(
+            handshake.code,
+            PluginFailureCode::VersionMismatch {
+                expected: 2,
+                received: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_success_carries_the_payload_it_was_given() {
+        let loaded = load_outcome_from_wire(&v1::LoadOutcome {
+            result: Some(v1::load_outcome::Result::Loaded(v1::LoadResponse {
+                handle: Some(v1::PluginHandle {
+                    plugin_id: "example".into(),
+                    generation: 41,
+                }),
+                descriptor: Some(v1::PluginDescriptor {
+                    plugin_id: "example".into(),
+                    ..Default::default()
+                }),
+            })),
+        })
+        .expect("a load outcome");
+        match loaded {
+            LifecycleOutcome::Completed(response) => assert_eq!(response.handle.generation, 41),
+            LifecycleOutcome::Failed(failure) => panic!("expected a load, got {failure:?}"),
+        }
+
+        // The two acknowledgements carry nothing, which is what the wire says.
+        assert!(matches!(
+            unload_outcome_from_wire(&v1::UnloadOutcome {
+                result: Some(v1::unload_outcome::Result::Unloaded(v1::UnloadResponse {})),
+            })
+            .expect("an unload outcome"),
+            LifecycleOutcome::Completed(())
+        ));
+        assert!(matches!(
+            cancel_outcome_from_wire(&v1::CancelOperationOutcome {
+                result: Some(v1::cancel_operation_outcome::Result::Cancelled(
+                    v1::CancelOperationResponse {}
+                )),
+            })
+            .expect("a cancellation outcome"),
+            LifecycleOutcome::Completed(())
+        ));
+
+        let health = health_outcome_from_wire(&v1::HealthOutcome {
+            result: Some(v1::health_outcome::Result::Health(v1::HealthResponse {
+                protocol_version: 1,
+                accepting_work: true,
+                loaded: vec![v1::PluginHandle {
+                    plugin_id: "example".into(),
+                    generation: 41,
+                }],
+            })),
+        })
+        .expect("a health outcome");
+        match health {
+            LifecycleOutcome::Completed(health) => {
+                assert!(health.accepting_work);
+                assert_eq!(health.loaded.len(), 1);
+            }
+            LifecycleOutcome::Failed(failure) => {
+                panic!("expected a health report, got {failure:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_success_arm_is_still_validated() {
+        // The outcome split changes how a failure travels, not whether the
+        // payload is checked: a success arm is the same message it always was.
+        let error = load_outcome_from_wire(&v1::LoadOutcome {
+            result: Some(v1::load_outcome::Result::Loaded(v1::LoadResponse {
+                handle: Some(v1::PluginHandle {
+                    plugin_id: "example".into(),
+                    generation: 0,
+                }),
+                descriptor: Some(v1::PluginDescriptor {
+                    plugin_id: "example".into(),
+                    ..Default::default()
+                }),
+            })),
+        })
+        .expect_err("a handle at generation zero is not a load");
+
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+    }
+
+    #[test]
+    fn a_session_is_validated_rather_than_adopted() {
+        let session = |session_id: &str, maximum_frame_bytes: u32| v1::HandshakeResponse {
+            protocol_version: 1,
+            session_id: session_id.into(),
+            host_instance_id: "host-1".into(),
+            host_nonce: "nonce".into(),
+            maximum_frame_bytes,
+            supported_features: vec!["streaming".into()],
+        };
+
+        let established = handshake_outcome_from_wire(&v1::HandshakeOutcome {
+            result: Some(v1::handshake_outcome::Result::Established(session(
+                "session-1",
+                1024,
+            ))),
+        })
+        .expect("a handshake outcome");
+        match established {
+            LifecycleOutcome::Completed(identity) => {
+                assert_eq!(identity.session_id, "session-1");
+                assert_eq!(identity.maximum_frame_bytes, 1024);
+            }
+            LifecycleOutcome::Failed(failure) => {
+                panic!("expected an established session, got {failure:?}")
+            }
+        }
+
+        // A session with no identity leaves "which session?" unanswered, and a
+        // frame limit above this side's own describes a session that cannot
+        // exist.
+        for wire in [
+            session("  ", 1024),
+            session("session-1", 0),
+            session("session-1", MAX_FRAME_BYTES + 1),
+        ] {
+            let error = handshake_outcome_from_wire(&v1::HandshakeOutcome {
+                result: Some(v1::handshake_outcome::Result::Established(wire)),
+            })
+            .expect_err("this session is not constructible");
+
+            assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+        }
+    }
+
+    #[test]
+    fn a_health_report_is_validated_like_the_load_it_describes() {
+        let report = |handle: v1::PluginHandle| v1::HealthOutcome {
+            result: Some(v1::health_outcome::Result::Health(v1::HealthResponse {
+                protocol_version: 1,
+                accepting_work: true,
+                loaded: vec![handle],
+            })),
+        };
+
+        for handle in [
+            v1::PluginHandle {
+                plugin_id: "  ".into(),
+                generation: 1,
+            },
+            v1::PluginHandle {
+                plugin_id: "example".into(),
+                generation: 0,
+            },
+        ] {
+            let error = health_outcome_from_wire(&report(handle))
+                .expect_err("a handle that addresses nothing is not health");
+
+            assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+        }
+    }
+
+    #[test]
+    fn an_outcome_with_neither_arm_is_malformed() {
+        // Saying nothing is not the same as reporting a failure, and a caller
+        // that treated the two alike would retry an operation nobody answered.
+        let errors = [
+            malformed_code(
+                handshake_outcome_from_wire(&v1::HandshakeOutcome::default()).expect_err("no arm"),
+            ),
+            malformed_code(
+                load_outcome_from_wire(&v1::LoadOutcome::default()).expect_err("no arm"),
+            ),
+            malformed_code(
+                unload_outcome_from_wire(&v1::UnloadOutcome::default()).expect_err("no arm"),
+            ),
+            malformed_code(
+                inspect_outcome_from_wire(&v1::InspectOutcome::default()).expect_err("no arm"),
+            ),
+            malformed_code(
+                health_outcome_from_wire(&v1::HealthOutcome::default()).expect_err("no arm"),
+            ),
+            malformed_code(
+                cancel_outcome_from_wire(&v1::CancelOperationOutcome::default())
+                    .expect_err("no arm"),
+            ),
+        ];
+
+        for code in errors {
+            assert_eq!(code, PluginFailureCode::MalformedResponse);
+        }
     }
 }

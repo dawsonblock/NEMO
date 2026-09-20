@@ -127,9 +127,10 @@ max_unsafe_occurrences = 0
 direct_dependency_digest = "11e4bcc51abb330176957e169b265053384410421ab598cf026210efe3e2cfb9"
 transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d92cc3dfc4d7fd800"
 
-# The plugin-execution contract. It is measured from the moment it exists so its
-# growth is visible, but it is in neither tier yet: nothing depends on it until
-# the kernel takes the interface, at which point it joins the in-process tier.
+# The plugin-execution contract. The kernel depends on it, so it is in the
+# in-process tier above: naming these types is enough to put the crate in the
+# kernel's address space. Measured on its own line so a change to the vocabulary
+# is visible as itself rather than inside the kernel's total.
 #
 # Its `unsafe` budget is 3 while the crate contains no `unsafe` at all. Counting
 # is textual, so the three occurrences are the word in this crate's own
@@ -138,7 +139,7 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 [limits.nemo-relay-plugin-protocol]
 max_direct_dependencies = 3
 max_transitive_packages = 24
-max_source_lines = 570
+max_source_lines = 610
 max_unsafe_occurrences = 3
 direct_dependency_digest = "162268fbc27e2215997bfa17dcb031b17721a67d59e8159c8f8ace95cd5ce9f8"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -241,7 +242,7 @@ transitive_dependency_digest = "8961e02e30018785a63b78b27e42d84253fb8d8911a6f266
 [limits.nemo-relay-plugin-proto]
 max_direct_dependencies = 4
 max_transitive_packages = 108
-max_source_lines = 857
+max_source_lines = 1349
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"
