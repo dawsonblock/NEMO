@@ -187,7 +187,17 @@ pub struct PluginExecutionContext {
     /// Digest of the runtime identity this operation is bound to.
     pub runtime_binding_digest: String,
     /// Wall-clock deadline in milliseconds since the Unix epoch.
+    ///
+    /// Absolute, so it survives logging and audit: a duration means nothing
+    /// once the message has been sitting in a queue.
     pub deadline_unix_ms: u64,
+    /// What is actually left of the budget, for enforcement.
+    ///
+    /// The host enforces this one. It is derived from the trusted action budget
+    /// rather than chosen by the caller, and both forms travel because the
+    /// absolute deadline answers "when" for an auditor while this answers "how
+    /// long" for a timer.
+    pub remaining_budget_millis: u64,
     /// Largest response the caller will accept.
     pub max_response_bytes: u32,
 }

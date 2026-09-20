@@ -41,6 +41,12 @@ pub use v1::plugin_host_server::{PluginHost, PluginHostServer};
 pub use v1::relay_runtime_client::RelayRuntimeClient;
 pub use v1::relay_runtime_server::{RelayRuntime, RelayRuntimeServer};
 
+/// Conversion between the wire schema and the domain vocabulary.
+///
+/// The host is less trusted than the kernel, so everything it sends is decoded
+/// through here and either becomes a valid domain value or is refused.
+pub mod convert;
+
 #[cfg(test)]
 mod tests {
     use super::*;

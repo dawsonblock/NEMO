@@ -371,6 +371,7 @@ fn context_with_live_deadline() -> PluginExecutionContext {
         protocol_version: PROTOCOL_VERSION,
         runtime_binding_digest: "in-process".into(),
         deadline_unix_ms: u64::MAX,
+        remaining_budget_millis: 29_000,
         max_response_bytes: 1024,
     }
 }
@@ -404,6 +405,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             runtime_binding_digest: "binding".into(),
             deadline_unix_ms: u64::MAX,
+            remaining_budget_millis: 29_000,
             max_response_bytes: 1024,
         };
 

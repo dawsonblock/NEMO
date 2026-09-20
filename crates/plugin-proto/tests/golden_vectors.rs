@@ -26,6 +26,59 @@ fn vectors_path() -> PathBuf {
         .join("qualification/abi/plugin-v1/vectors.json")
 }
 
+/// Messages that appear in a service signature but have no vector yet.
+///
+/// The inventory check below fails when a message reaches a service signature
+/// without being either vectored or listed here, so the gap is a decision
+/// somebody made rather than something that happened. Closing this list is part
+/// of the ABI-closure work.
+const PENDING_VECTORS: &[&str] = &[
+    "CancelOperationRequest",
+    "CancelOperationResponse",
+    "EmitMarkRequest",
+    "EmitMarkResponse",
+    "HandshakeResponse",
+    "HealthRequest",
+    "HealthResponse",
+    "InspectRequest",
+    "InspectResponse",
+    "InvokeRequest",
+    "ResolveCodecRequest",
+    "ResolveCodecResponse",
+    "ScopeStackRequest",
+    "ScopeStackResponse",
+    "SessionCloseRequest",
+    "SessionCloseResponse",
+    "StreamChunk",
+    "UnloadRequest",
+    "UnloadResponse",
+];
+
+/// Every message named in an `rpc` signature of the checked-in schema.
+fn messages_reachable_from_services() -> Vec<String> {
+    let proto = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("proto/nemo/relay/plugin/v1/plugin_host.proto");
+    let source = std::fs::read_to_string(&proto).expect("read proto");
+
+    let mut names = Vec::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if !line.starts_with("rpc ") {
+            continue;
+        }
+        // `rpc Name(Req) returns (Resp);`, with `stream` allowed on either side.
+        for part in line.split(['(', ')']) {
+            let candidate = part.trim().trim_start_matches("stream").trim();
+            if candidate.starts_with(|c: char| c.is_ascii_uppercase()) && !candidate.contains(' ') {
+                names.push(candidate.to_owned());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Every message the vectors cover, in a fixed order.
 fn messages() -> Vec<(&'static str, Vec<u8>)> {
     let context = |id: &str| v1::PluginExecutionContext {
@@ -118,6 +171,38 @@ fn decode_hex(text: &str) -> Vec<u8> {
         .step_by(2)
         .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("hex"))
         .collect()
+}
+
+#[test]
+fn every_message_in_a_service_signature_is_vectored_or_explicitly_pending() {
+    let covered: Vec<String> = messages()
+        .into_iter()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let pending: Vec<String> = PENDING_VECTORS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+
+    let reachable = messages_reachable_from_services();
+    assert!(
+        reachable.len() >= 20,
+        "the schema parse found {} service messages, so this check would pass by \
+         finding nothing: {reachable:?}",
+        reachable.len()
+    );
+
+    let mut unaccounted: Vec<String> = reachable
+        .into_iter()
+        .filter(|name| !covered.contains(name) && !pending.contains(name))
+        .collect();
+    unaccounted.sort();
+
+    assert!(
+        unaccounted.is_empty(),
+        "these messages are reachable from a service and are neither vectored nor \
+         listed as pending: {unaccounted:?}"
+    );
 }
 
 #[test]

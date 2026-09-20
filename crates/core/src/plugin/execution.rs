@@ -158,6 +158,15 @@ impl PluginManager {
                 "the operation's response budget is outside the protocol's frame limit",
             ));
         }
+        if context.remaining_budget_millis == 0 {
+            // The deadline check below catches an expiry the kernel can see.
+            // This catches a context that carries no budget at all, which the
+            // host could not enforce even if the deadline were in the future.
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::DeadlineExceeded,
+                "the operation carries no remaining budget for the host to enforce",
+            ));
+        }
         check_deadline(context.deadline_unix_ms)?;
         let mut in_flight = self.in_flight();
         if !in_flight.insert(context.operation_request_id.clone()) {
@@ -337,6 +346,7 @@ mod tests {
     fn context(deadline_unix_ms: u64) -> PluginExecutionContext {
         PluginExecutionContext {
             operation_request_id: "operation-1".into(),
+            remaining_budget_millis: 29_000,
             protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
             runtime_binding_digest: "binding".into(),
             deadline_unix_ms,

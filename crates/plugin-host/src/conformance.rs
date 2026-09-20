@@ -32,6 +32,7 @@ fn context(request_id: &str) -> PluginExecutionContext {
         protocol_version: PROTOCOL_VERSION,
         runtime_binding_digest: "conformance-binding".into(),
         deadline_unix_ms: u64::MAX,
+        remaining_budget_millis: 29_000,
         max_response_bytes: 1024,
     }
 }
