@@ -148,14 +148,13 @@ impl PluginHostActivation {
             .map(|plugin| {
                 // The runtime approves what it is about to load, and the loader
                 // confirms that approval immediately before opening anything.
-                NativePluginLoadSpec::approved(&plugin.plugin_id, &plugin.manifest_ref).map_err(
-                    |error| {
-                        plugin_error_context(
-                            &format!("plugin '{}' could not be approved", plugin.plugin_id),
-                            error,
-                        )
-                    },
-                )
+                //
+                // An artifact that cannot be approved is a load that cannot
+                // happen, so it fails under the same wording the load does: from
+                // a caller's side this is still the native plugin failing to
+                // load, whoever noticed first.
+                NativePluginLoadSpec::approved(&plugin.plugin_id, &plugin.manifest_ref)
+                    .map_err(|error| plugin_error_context("native plugin load failed", error))
             })
             .collect::<crate::plugin::Result<Vec<_>>>()?;
         let native = (!native_specs.is_empty())

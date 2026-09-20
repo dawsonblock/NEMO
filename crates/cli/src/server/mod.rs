@@ -1074,30 +1074,6 @@ impl PluginActivation {
                 snapshot.verify_current()?;
             }
         }
-        let native_specs = dynamic_plugins
-            .iter()
-            .filter(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
-            .map(|plugin| {
-                let manifest_ref = plugin
-                    .activation_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.activation_manifest_ref())
-                    .or_else(|| plugin.manifest_ref.clone())
-                    .ok_or_else(|| {
-                        CliError::Config(format!(
-                            "native dynamic plugin '{}' has no manifest_ref in lifecycle state",
-                            plugin.plugin_id
-                        ))
-                    })?;
-                NativePluginLoadSpec::approved(plugin.plugin_id.clone(), manifest_ref.clone())
-                    .map_err(|error| {
-                        CliError::Config(format!(
-                            "native dynamic plugin '{}' could not be approved: {error}",
-                            plugin.plugin_id
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, CliError>>()?;
         let worker_specs = dynamic_plugins
             .iter()
             .filter(|plugin| plugin.kind == DynamicPluginKind::Worker)
@@ -1134,6 +1110,36 @@ impl PluginActivation {
             .await
             .map_err(|error| CliError::Config(format!("plugin activation failed: {error}")))?;
         let activation: Result<Self, CliError> = async {
+            // Approval happens here rather than before the static configuration
+            // is activated: the established order is that static components
+            // register first, and a dynamic artifact that cannot be approved
+            // must not change that, only fail after it and roll it back.
+            let native_specs = dynamic_plugins
+                .iter()
+                .filter(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
+                .map(|plugin| {
+                    let manifest_ref = plugin
+                        .activation_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.activation_manifest_ref())
+                        .or_else(|| plugin.manifest_ref.clone())
+                        .ok_or_else(|| {
+                            CliError::Config(format!(
+                                "native dynamic plugin '{}' has no manifest_ref in lifecycle state",
+                                plugin.plugin_id
+                            ))
+                        })?;
+                    NativePluginLoadSpec::approved(plugin.plugin_id.clone(), manifest_ref.clone())
+                .map_err(|error| {
+                    CliError::Config(format!(
+                        "native plugin load failed: native dynamic plugin '{}' could not be \
+                         approved: {error}",
+                        plugin.plugin_id
+                    ))
+                })
+                })
+                .collect::<Result<Vec<_>, CliError>>()?;
+
             let native = if native_specs.is_empty() {
                 None
             } else {

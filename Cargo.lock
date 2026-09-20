@@ -2046,6 +2046,7 @@ dependencies = [
  "nemo-relay-plugin",
  "nemo-relay-plugin-proto",
  "nemo-relay-plugin-protocol",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

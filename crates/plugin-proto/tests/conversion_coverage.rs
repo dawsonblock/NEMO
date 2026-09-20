@@ -166,6 +166,20 @@ const MANIFEST: &[Entry] = &[
         &["an_outcome_with_neither_arm_is_malformed"],
     ),
     entry(
+        "ActivateRequest",
+        "both",
+        &["activate_request_from_wire", "activate_request_to_wire"],
+        &["ActivateRequest"],
+        &["an_activation_with_nothing_to_activate_is_refused"],
+    ),
+    entry(
+        "ActivateOutcome",
+        "both",
+        &["activate_outcome_from_wire", "activate_outcome_to_wire"],
+        &["ActivateOutcome"],
+        &["an_activation_with_nothing_to_activate_is_refused"],
+    ),
+    entry(
         "InvokeRequest",
         "wire->domain",
         &["invoke_request_from_wire"],

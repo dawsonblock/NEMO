@@ -427,6 +427,29 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             .encode_to_vec(),
         ),
         (
+            "ActivateRequest",
+            v1::ActivateRequest {
+                session_id: "session-1".into(),
+                context: Some(context("operation-7")),
+                components: vec![v1::ComponentConfiguration {
+                    kind: "example".into(),
+                    config_json: r#"{"model":"example"}"#.into(),
+                }],
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ActivateOutcome",
+            v1::ActivateOutcome {
+                result: Some(v1::activate_outcome::Result::Activated(
+                    v1::ActivateResponse {
+                        descriptors: vec![descriptor()],
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
             "InvokeRequest",
             v1::InvokeRequest {
                 session_id: "session-1".into(),
@@ -674,6 +697,12 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
                 .encode_to_vec(),
             "InspectRequest" => v1::InspectRequest::decode(bytes.as_slice())
                 .expect("decode InspectRequest")
+                .encode_to_vec(),
+            "ActivateRequest" => v1::ActivateRequest::decode(bytes.as_slice())
+                .expect("decode ActivateRequest")
+                .encode_to_vec(),
+            "ActivateOutcome" => v1::ActivateOutcome::decode(bytes.as_slice())
+                .expect("decode ActivateOutcome")
                 .encode_to_vec(),
             "InvokeRequest" => v1::InvokeRequest::decode(bytes.as_slice())
                 .expect("decode InvokeRequest")

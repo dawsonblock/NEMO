@@ -16,20 +16,21 @@
 
 use nemo_relay_plugin_protocol::{
     DataSchema, DispatchState, LifecycleOutcome, LogSeverity, MAX_FRAME_BYTES, OutcomeCertainty,
-    PluginArtifactIdentity, PluginCapability, PluginCapabilityKind, PluginChunkDecision,
-    PluginCodecOperation, PluginCompletionCancelled, PluginCompletionOutcome,
-    PluginCompletionSettlement, PluginContinuationChunk, PluginContinuationDisposition,
-    PluginContinuationRequest, PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome,
-    PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginHandshakeRequest,
-    PluginHostCallOutcome, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
-    PluginInvokeRequest, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
-    PluginMarkEmit, PluginOperationEnvelope, PluginOutputCredit, PluginProtocolError,
-    PluginRegistrationDescriptor, PluginRegistrationOperation, PluginRegistrationOrdering,
-    PluginResolveCodecRequest, PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest,
-    PluginSessionIdentity, PluginSessionMessage, PluginSessionPayload, PluginStreamChunk,
-    PluginStreamChunkKind, PluginStreamControl, PluginStreamEnd, PluginStreamFailed,
-    PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened,
-    PluginStreamPullRequest, PluginSuccess, PluginUnloadRequest, registration_shape,
+    PluginActivateRequest, PluginArtifactIdentity, PluginCapability, PluginCapabilityKind,
+    PluginChunkDecision, PluginCodecOperation, PluginCompletionCancelled, PluginCompletionOutcome,
+    PluginCompletionSettlement, PluginComponentConfiguration, PluginContinuationChunk,
+    PluginContinuationDisposition, PluginContinuationRequest, PluginDescriptor,
+    PluginExecutionContext, PluginExecutionOutcome, PluginExecutionShape, PluginFailure,
+    PluginFailureCode, PluginHandle, PluginHandshakeRequest, PluginHostCallOutcome,
+    PluginHostHealth, PluginHostReadCapability, PluginInspectRequest, PluginInvokeRequest,
+    PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse, PluginMarkEmit,
+    PluginOperationEnvelope, PluginOutputCredit, PluginProtocolError, PluginRegistrationDescriptor,
+    PluginRegistrationOperation, PluginRegistrationOrdering, PluginResolveCodecRequest,
+    PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest, PluginSessionIdentity,
+    PluginSessionMessage, PluginSessionPayload, PluginStreamChunk, PluginStreamChunkKind,
+    PluginStreamControl, PluginStreamEnd, PluginStreamFailed, PluginStreamItem,
+    PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened, PluginStreamPullRequest,
+    PluginSuccess, PluginUnloadRequest, registration_shape,
 };
 
 use crate::v1;
@@ -1149,6 +1150,94 @@ pub fn unload_request_from_wire(
     })
 }
 
+/// Validate an activation request.
+///
+/// A component with no kind names nothing to activate, and one with no
+/// configuration would run a register callback against an empty object while
+/// looking like configuration was supplied; both are refused rather than
+/// guessed at.
+pub fn activate_request_from_wire(
+    wire: &v1::ActivateRequest,
+) -> Result<PluginActivateRequest, PluginProtocolError> {
+    if wire.components.is_empty() {
+        return Err(malformed("an activation with no components"));
+    }
+    let mut components = Vec::with_capacity(wire.components.len());
+    for component in &wire.components {
+        components.push(PluginComponentConfiguration {
+            kind: required_text(&component.kind, "a component with no kind")?,
+            config_json: required_text(
+                &component.config_json,
+                "a component with no configuration",
+            )?,
+        });
+    }
+    Ok(PluginActivateRequest { components })
+}
+
+/// Build the wire form of an activation request.
+pub fn activate_request_to_wire(
+    request: &PluginActivateRequest,
+    session_id: &str,
+    context: &PluginExecutionContext,
+) -> v1::ActivateRequest {
+    v1::ActivateRequest {
+        session_id: session_id.to_owned(),
+        context: Some(context_to_wire(context)),
+        components: request
+            .components
+            .iter()
+            .map(|component| v1::ComponentConfiguration {
+                kind: component.kind.clone(),
+                config_json: component.config_json.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Validate an activation outcome.
+///
+/// The success arm carries the descriptors, because what the host holds after
+/// activation is the answer: a plugin whose registrations are not reported is
+/// one the kernel cannot install a proxy for.
+pub fn activate_outcome_from_wire(
+    wire: &v1::ActivateOutcome,
+) -> Result<LifecycleOutcome<Vec<PluginDescriptor>>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::activate_outcome::Result::Activated(activated)) => {
+            let mut descriptors = Vec::with_capacity(activated.descriptors.len());
+            for descriptor in &activated.descriptors {
+                descriptors.push(descriptor_from_wire(descriptor)?);
+            }
+            Ok(LifecycleOutcome::Completed(descriptors))
+        }
+        Some(v1::activate_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "an activation outcome that is neither an activation nor a failure",
+        )),
+    }
+}
+
+/// Build the wire form of an activation outcome.
+pub fn activate_outcome_to_wire(
+    outcome: LifecycleOutcome<Vec<PluginDescriptor>>,
+) -> v1::ActivateOutcome {
+    v1::ActivateOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(descriptors) => {
+                v1::activate_outcome::Result::Activated(v1::ActivateResponse {
+                    descriptors: descriptors.iter().map(descriptor_to_wire).collect(),
+                })
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::activate_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
 /// Validate an inspection request.
 ///
 /// A missing handle means "everything loaded", which is a question rather than
@@ -2170,6 +2259,57 @@ mod tests {
 
     fn malformed_code(error: PluginProtocolError) -> PluginFailureCode {
         error.failure.code
+    }
+
+    #[test]
+    fn an_activation_with_nothing_to_activate_is_refused() {
+        // An activation that names no component would run nothing and report
+        // success, which the kernel would read as "activated, with no
+        // registrations" — a plugin that registered nothing rather than one that
+        // was never asked to.
+        let error = activate_request_from_wire(&v1::ActivateRequest {
+            session_id: "session-1".into(),
+            context: None,
+            components: Vec::new(),
+        })
+        .expect_err("an activation with no components");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+
+        // A component with no kind, or with no configuration, is the same kind
+        // of nothing.
+        for component in [
+            v1::ComponentConfiguration {
+                kind: "  ".into(),
+                config_json: "{}".into(),
+            },
+            v1::ComponentConfiguration {
+                kind: "example".into(),
+                config_json: String::new(),
+            },
+        ] {
+            assert!(
+                activate_request_from_wire(&v1::ActivateRequest {
+                    session_id: "session-1".into(),
+                    context: None,
+                    components: vec![component],
+                })
+                .is_err()
+            );
+        }
+
+        let request = activate_request_from_wire(&v1::ActivateRequest {
+            session_id: "session-1".into(),
+            context: None,
+            components: vec![v1::ComponentConfiguration {
+                kind: "example".into(),
+                config_json: r#"{"model":"example"}"#.into(),
+            }],
+        })
+        .expect("an activation");
+        assert_eq!(request.components.len(), 1);
+
+        // And an activation that answered nothing is a message nobody answered.
+        assert!(activate_outcome_from_wire(&v1::ActivateOutcome { result: None }).is_err());
     }
 
     #[test]

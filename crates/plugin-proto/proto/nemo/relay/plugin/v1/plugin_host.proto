@@ -299,6 +299,41 @@ message InspectResponse {
   repeated PluginDescriptor descriptors = 1;
 }
 
+// One component the kernel wants activated.
+//
+// Registration is config-driven: the kernel decides which components exist and
+// what configuration each reads, the plugin's register callback runs in
+// response, and only then does the host know what the plugin registered. So
+// activation cannot be folded into load — at load time there is no
+// configuration to run and nothing to report.
+message ComponentConfiguration {
+  string kind = 1;
+  string config_json = 2;
+}
+
+message ActivateRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  repeated ComponentConfiguration components = 3;
+}
+
+// What the host holds once the components are activated.
+//
+// The descriptors are the point: they carry the registrations the plugin made,
+// which is what the kernel needs to install a proxy per registration. A plugin
+// that registered something this session cannot serve is refused here rather
+// than reported as activated.
+message ActivateResponse {
+  repeated PluginDescriptor descriptors = 1;
+}
+
+message ActivateOutcome {
+  oneof result {
+    ActivateResponse activated = 1;
+    PluginFailure failure = 2;
+  }
+}
+
 message InvokeRequest {
   string session_id = 1;
   PluginExecutionContext context = 2;
@@ -766,6 +801,7 @@ service PluginHost {
   rpc Load(LoadRequest) returns (LoadOutcome);
   rpc Unload(UnloadRequest) returns (UnloadOutcome);
   rpc Inspect(InspectRequest) returns (InspectOutcome);
+  rpc Activate(ActivateRequest) returns (ActivateOutcome);
   rpc Invoke(InvokeRequest) returns (InvokeOutcome);
   rpc InvokeStream(InvokeRequest) returns (stream StreamChunk);
   rpc CancelOperation(CancelOperationRequest) returns (CancelOperationOutcome);

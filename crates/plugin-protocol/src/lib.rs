@@ -565,6 +565,26 @@ pub struct PluginInspectRequest {
     pub handle: Option<PluginHandle>,
 }
 
+/// One component the kernel wants activated.
+///
+/// The kind names the component the plugin was loaded as, and the configuration
+/// is what its register callback reads. Both come from the kernel, because the
+/// kernel is the side that decides what a loaded plugin's components are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginComponentConfiguration {
+    /// Component kind, which is the kind the plugin was loaded under.
+    pub kind: String,
+    /// Canonical JSON configuration for it.
+    pub config_json: String,
+}
+
+/// Ask the host to activate components and report what they registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginActivateRequest {
+    /// Components to activate.
+    pub components: Vec<PluginComponentConfiguration>,
+}
+
 /// Liveness and resource state of the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginHostHealth {

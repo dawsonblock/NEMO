@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 
 use nemo_relay::plugin::execution::PluginExecutionBackend;
 use nemo_relay_plugin_proto::convert::{
-    cancel_outcome_to_wire, execution_outcome_to_wire, handshake_outcome_to_wire,
-    handshake_request_from_wire, health_outcome_to_wire, inspect_outcome_to_wire,
-    inspect_request_from_wire, load_outcome_to_wire, load_request_from_wire,
-    operation_envelope_from_wire, session_close_outcome_to_wire, unload_outcome_to_wire,
-    unload_request_from_wire,
+    activate_outcome_to_wire, activate_request_from_wire, cancel_outcome_to_wire,
+    execution_outcome_to_wire, handshake_outcome_to_wire, handshake_request_from_wire,
+    health_outcome_to_wire, inspect_outcome_to_wire, inspect_request_from_wire,
+    load_outcome_to_wire, load_request_from_wire, operation_envelope_from_wire,
+    session_close_outcome_to_wire, unload_outcome_to_wire, unload_request_from_wire,
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
@@ -331,6 +331,75 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         }
         .await;
         Ok(Response::new(inspect_outcome_to_wire(
+            LifecycleOutcome::from_result(outcome.map_err(|error| error.failure)),
+        )))
+    }
+
+    async fn activate(
+        &self,
+        request: Request<v1::ActivateRequest>,
+    ) -> Result<Response<v1::ActivateOutcome>, Status> {
+        let wire = request.into_inner();
+        let outcome = async {
+            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let activation = activate_request_from_wire(&wire)?;
+
+            // Activation runs the plugin's register callbacks in *this*
+            // process: the configuration comes from the kernel, the callbacks
+            // are the plugin's, and what they register is only observable here.
+            let mut config = nemo_relay::plugin::PluginConfig::default();
+            for component in &activation.components {
+                let parsed: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&component.config_json).map_err(|error| {
+                        refused(format!(
+                            "component '{}' configuration is not a JSON object: {error}",
+                            component.kind
+                        ))
+                    })?;
+                config
+                    .components
+                    .push(nemo_relay::plugin::PluginComponentSpec {
+                        kind: component.kind.clone(),
+                        enabled: true,
+                        config: parsed,
+                    });
+            }
+            nemo_relay::plugin::initialize_plugins_exact(config)
+                .await
+                .map_err(|error| {
+                    refused(format!("the components could not be activated: {error}"))
+                })?;
+
+            // What the plugin registered is reported to the kernel, which is
+            // what it needs to install a proxy per registration.
+            let descriptors = self
+                .backend
+                .inspect(
+                    nemo_relay_plugin_protocol::PluginInspectRequest { handle: None },
+                    context,
+                )
+                .await?;
+
+            // A plugin that registered something this session cannot serve is
+            // refused here — after activation, where registrations first exist,
+            // rather than at load, where they do not yet.
+            let mut unsupported = Vec::new();
+            for descriptor in &descriptors {
+                if let Err(error) = self.unsupported_registrations(descriptor) {
+                    unsupported.push(error.failure.message);
+                }
+            }
+            if !unsupported.is_empty() {
+                // Fail closed without leaving anything registered: the callbacks
+                // were installed by this activation call, so clearing the
+                // configuration takes them back down.
+                let _ = nemo_relay::plugin::clear_plugin_configuration();
+                return Err(refused(unsupported.join("; ")));
+            }
+            Ok(descriptors)
+        }
+        .await;
+        Ok(Response::new(activate_outcome_to_wire(
             LifecycleOutcome::from_result(outcome.map_err(|error| error.failure)),
         )))
     }
@@ -874,6 +943,215 @@ mod tests {
         );
         // And the plugin is not left half-loaded for the kernel never to call.
         assert_eq!(unloaded.lock().expect("the log").as_slice(), ["example"]);
+    }
+
+    /// Core's plugin configuration is process-global, so tests that activate a
+    /// real plugin take turns: two activations in one process replace each
+    /// other's registrations, which is not what either test means to observe.
+    static PLUGIN_ACTIVATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Every attachment point the ABI exposes.
+    const EVERY_REGISTRATION_OPERATION: &[PluginRegistrationOperation] = &[
+        PluginRegistrationOperation::Subscriber,
+        PluginRegistrationOperation::EventMetadataInjector,
+        PluginRegistrationOperation::MarkSanitizeGuardrail,
+        PluginRegistrationOperation::ScopeSanitizeStartGuardrail,
+        PluginRegistrationOperation::ScopeSanitizeEndGuardrail,
+        PluginRegistrationOperation::ToolSanitizeRequestGuardrail,
+        PluginRegistrationOperation::ToolSanitizeResponseGuardrail,
+        PluginRegistrationOperation::ToolConditionalExecutionGuardrail,
+        PluginRegistrationOperation::ToolRequestIntercept,
+        PluginRegistrationOperation::ToolExecutionIntercept,
+        PluginRegistrationOperation::LlmSanitizeRequestGuardrail,
+        PluginRegistrationOperation::LlmSanitizeResponseGuardrail,
+        PluginRegistrationOperation::LlmConditionalExecutionGuardrail,
+        PluginRegistrationOperation::LlmRequestIntercept,
+        PluginRegistrationOperation::LlmExecutionIntercept,
+        PluginRegistrationOperation::LlmStreamExecutionIntercept,
+    ];
+
+    /// The load-and-activate path a kernel drives, against the real fixture.
+    ///
+    /// Registration is config-driven, so this is where a plugin's registrations
+    /// first exist: load reports none of them, and activation is the call that
+    /// makes them observable. What the kernel needs before it can install a
+    /// proxy per registration is exactly this list.
+    #[tokio::test]
+    async fn activation_reports_the_registrations_the_plugin_made() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the activation case");
+            return;
+        };
+
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+
+        // A session that can serve every class the ABI exposes, so nothing is
+        // refused and the descriptors are the whole truth about the plugin.
+        let mut request = handshake_request(&config);
+        request.supported_registration_operations = EVERY_REGISTRATION_OPERATION
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+            })
+            .collect();
+        let outcome = service
+            .handshake(Request::new(request))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        let session_id = handshake_outcome_from_wire(&outcome)
+            .expect("a converted handshake")
+            .into_result()
+            .expect("an established session")
+            .session_id;
+
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                .expect("the fixture's identity");
+        service
+            .load(Request::new(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact,
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load")
+            .into_inner();
+
+        let outcome = service
+            .activate(Request::new(v1::ActivateRequest {
+                session_id,
+                context: Some(context()),
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+            }))
+            .await
+            .expect("a served activation")
+            .into_inner();
+        let descriptors = nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&outcome)
+            .expect("a converted activation")
+            .into_result()
+            .expect("an activation this session can serve");
+
+        let reported: std::collections::BTreeSet<_> = descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .map(|registration| registration.operation)
+            .collect();
+        assert_eq!(
+            reported.len(),
+            EVERY_REGISTRATION_OPERATION.len(),
+            "the fixture registers on every surface, and activation reports what it registered: {reported:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
+    /// A session that can serve nothing, so activation of a real plugin must
+    /// fail closed on whatever it registers.
+    #[tokio::test]
+    async fn an_activation_that_registers_what_this_session_cannot_serve_is_refused_whole() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let fixture = nemo_relay_plugin_host_fixture();
+        let Some((manifest_dir, artifact)) = fixture else {
+            // The fixture is built by `just build-test-plugin-fixtures`; a run
+            // without it says so rather than passing for the wrong reason.
+            eprintln!("the native fixture is missing; skipping the activation case");
+            return;
+        };
+
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let session_id = establish(&service, &config).await;
+
+        // A load needs the identity the kernel approved, and the fixture is what
+        // is loaded; activation is where the plugin's registrations appear.
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                .expect("the fixture's identity");
+        service
+            .load(Request::new(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact: artifact.clone(),
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load")
+            .into_inner();
+
+        let outcome = service
+            .activate(Request::new(v1::ActivateRequest {
+                session_id,
+                context: Some(context()),
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+            }))
+            .await
+            .expect("a served activation")
+            .into_inner();
+
+        // The fixture registers on every surface the ABI exposes, and this
+        // session can serve one class, so activation is refused — and the
+        // refusal names what was registered against what could be served.
+        let failure = nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&outcome)
+            .expect("a converted activation")
+            .into_result()
+            .expect_err("a plugin registering classes this session cannot serve");
+        assert!(failure.message.contains("registers"), "{failure:?}");
+
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
+    /// A real native fixture's manifest, when the fixture has been built.
+    fn nemo_relay_plugin_host_fixture() -> Option<(std::path::PathBuf, String)> {
+        let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_PLUGIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                    "../../target/test-plugin-fixtures/debug/libnemo_relay_plugin_fixture.dylib",
+                )
+            });
+        if !library.exists() {
+            return None;
+        }
+        let manifest_dir =
+            std::env::temp_dir().join(format!("nemo-ph-service-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&manifest_dir).expect("a manifest directory");
+        let manifest = manifest_dir.join("relay-plugin.toml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "manifest_version = 1\n\n[plugin]\nid = \"fixture_native\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \"nemo_relay_fixture_native_plugin\"\n",
+                env!("CARGO_PKG_VERSION"),
+                library.display()
+            ),
+        )
+        .expect("write the manifest");
+        Some((manifest_dir, manifest.to_string_lossy().into_owned()))
     }
 
     #[test]
