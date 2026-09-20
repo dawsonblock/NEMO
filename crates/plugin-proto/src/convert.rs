@@ -194,11 +194,11 @@ fn session_identity_from_wire(
         host_nonce: wire.host_nonce.clone(),
         maximum_frame_bytes: wire.maximum_frame_bytes,
         supported_features: wire.supported_features.clone(),
-        // What was granted, not what was asked for. The host compares this
-        // against its own request, so a session that granted something nobody
-        // requested is caught here rather than used.
-        read_capabilities: read_capabilities_from_wire(
-            &wire.granted_read_capabilities,
+        // What the host accepted. The kernel compares this against what it
+        // offered, so a session that accepted something nobody offered is
+        // caught rather than used.
+        accepted_read_capabilities: read_capabilities_from_wire(
+            &wire.accepted_read_capabilities,
             "a session",
         )?,
     })
@@ -254,17 +254,49 @@ fn health_response_from_wire(
 
 /// Build the wire form of a load request.
 ///
-/// The approved digests travel with it. They are the runtime's statement of
-/// what it approved, so the side performing the load confirms an identity
-/// rather than deciding one.
-pub fn load_request_to_wire(request: &PluginLoadRequest) -> v1::LoadRequest {
+/// The session and the context travel with it: the host has to enforce the
+/// budget, and a value it cannot see is a value it cannot enforce. The approved
+/// digests travel too, because they are the runtime's statement of what it
+/// approved — the side performing the load confirms an identity rather than
+/// deciding one.
+pub fn load_request_to_wire(
+    request: &PluginLoadRequest,
+    session_id: &str,
+    context: &PluginExecutionContext,
+) -> v1::LoadRequest {
     v1::LoadRequest {
-        session_id: String::new(),
-        context: None,
+        session_id: session_id.to_owned(),
+        context: Some(context_to_wire(context)),
         plugin_id: request.plugin_id.clone(),
         artifact: request.artifact.clone(),
         manifest_digest: request.identity.manifest_sha256.clone(),
         library_digest: request.identity.library_sha256.clone(),
+    }
+}
+
+/// Build the wire form of an unload request.
+pub fn unload_request_to_wire(
+    request: &PluginUnloadRequest,
+    session_id: &str,
+    context: &PluginExecutionContext,
+) -> v1::UnloadRequest {
+    v1::UnloadRequest {
+        session_id: session_id.to_owned(),
+        context: Some(context_to_wire(context)),
+        handle: Some(handle_to_wire(&request.handle)),
+    }
+}
+
+/// Build the wire form of an inspection request.
+pub fn inspect_request_to_wire(
+    request: &PluginInspectRequest,
+    session_id: &str,
+    context: &PluginExecutionContext,
+) -> v1::InspectRequest {
+    v1::InspectRequest {
+        session_id: session_id.to_owned(),
+        context: Some(context_to_wire(context)),
+        handle: request.handle.as_ref().map(handle_to_wire),
     }
 }
 
@@ -517,8 +549,204 @@ pub fn descriptor_from_wire(
     })
 }
 
-/// Validate one registration description.
-///
+// The outbound half. A host answers with these, so they are total: every domain
+// value has exactly one wire form, and only the *inbound* direction can fail,
+// because only that direction can be handed something that means nothing.
+
+/// Build the wire form of a plugin handle.
+pub fn handle_to_wire(handle: &PluginHandle) -> v1::PluginHandle {
+    v1::PluginHandle {
+        plugin_id: handle.plugin_id.clone(),
+        generation: handle.generation,
+    }
+}
+
+/// Build the wire form of a capability.
+pub fn capability_to_wire(capability: &PluginCapability) -> v1::PluginCapability {
+    v1::PluginCapability {
+        id: capability.id.clone(),
+        kind: capability_kind_to_wire(capability.kind) as i32,
+        declared_digest: capability.declared_digest.clone(),
+    }
+}
+
+/// Build the wire form of one registration description.
+pub fn registration_to_wire(
+    registration: &PluginRegistrationDescriptor,
+) -> v1::PluginRegistrationDescriptor {
+    v1::PluginRegistrationDescriptor {
+        registration_id: registration.registration_id.clone(),
+        component_kind: registration.component_kind.clone(),
+        ordering: Some(v1::PluginRegistrationOrdering {
+            priority: registration.ordering.priority,
+            may_break_chain: registration.ordering.may_break_chain,
+        }),
+        shape: shape_to_wire(registration.shape),
+        config_keys: registration.config_keys.clone(),
+        declared_digest: registration.declared_digest.clone(),
+        operation: registration_operation_to_wire(registration.operation),
+        gated_registration: registration.gated_registration.clone(),
+    }
+}
+
+/// Build the wire form of a plugin description.
+pub fn descriptor_to_wire(descriptor: &PluginDescriptor) -> v1::PluginDescriptor {
+    v1::PluginDescriptor {
+        plugin_id: descriptor.plugin_id.clone(),
+        plugin_version: descriptor.plugin_version.clone(),
+        negotiated_abi_version: descriptor.negotiated_abi_version.map(u32::from),
+        manifest_digest: descriptor.manifest_digest.clone(),
+        registration_kinds: descriptor.registration_kinds.clone(),
+        registrations: descriptor
+            .registrations
+            .iter()
+            .map(registration_to_wire)
+            .collect(),
+        capabilities: descriptor
+            .capabilities
+            .iter()
+            .map(capability_to_wire)
+            .collect(),
+    }
+}
+
+/// Build the wire form of a host health report.
+pub fn health_to_wire(health: &PluginHostHealth) -> v1::HealthResponse {
+    v1::HealthResponse {
+        protocol_version: u32::from(health.protocol_version),
+        accepting_work: health.accepting_work,
+        loaded: health.loaded.iter().map(handle_to_wire).collect(),
+    }
+}
+
+/// Build the wire form of an established session.
+pub fn session_identity_to_wire(identity: &PluginSessionIdentity) -> v1::HandshakeResponse {
+    v1::HandshakeResponse {
+        protocol_version: u32::from(identity.protocol_version),
+        session_id: identity.session_id.clone(),
+        host_instance_id: identity.host_instance_id.clone(),
+        host_nonce: identity.host_nonce.clone(),
+        maximum_frame_bytes: identity.maximum_frame_bytes,
+        supported_features: identity.supported_features.clone(),
+        accepted_read_capabilities: identity
+            .accepted_read_capabilities
+            .iter()
+            .map(|capability| read_capability_to_wire(*capability))
+            .collect(),
+    }
+}
+
+/// Build the wire form of a lifecycle outcome.
+pub fn handshake_outcome_to_wire(
+    outcome: LifecycleOutcome<PluginSessionIdentity>,
+) -> v1::HandshakeOutcome {
+    v1::HandshakeOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(identity) => {
+                v1::handshake_outcome::Result::Established(session_identity_to_wire(&identity))
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::handshake_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Build the wire form of a load outcome.
+pub fn load_outcome_to_wire(outcome: LifecycleOutcome<PluginLoadResponse>) -> v1::LoadOutcome {
+    v1::LoadOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(response) => {
+                v1::load_outcome::Result::Loaded(v1::LoadResponse {
+                    handle: Some(handle_to_wire(&response.handle)),
+                    descriptor: Some(descriptor_to_wire(&response.descriptor)),
+                })
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::load_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Build the wire form of an unload outcome.
+pub fn unload_outcome_to_wire(outcome: LifecycleOutcome<()>) -> v1::UnloadOutcome {
+    v1::UnloadOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(()) => {
+                v1::unload_outcome::Result::Unloaded(v1::UnloadResponse {})
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::unload_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Build the wire form of an inspection outcome.
+pub fn inspect_outcome_to_wire(
+    outcome: LifecycleOutcome<Vec<PluginDescriptor>>,
+) -> v1::InspectOutcome {
+    v1::InspectOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(descriptors) => {
+                v1::inspect_outcome::Result::Inspected(v1::InspectResponse {
+                    descriptors: descriptors.iter().map(descriptor_to_wire).collect(),
+                })
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::inspect_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Build the wire form of a cancellation outcome.
+pub fn cancel_outcome_to_wire(outcome: LifecycleOutcome<()>) -> v1::CancelOperationOutcome {
+    v1::CancelOperationOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(()) => {
+                v1::cancel_operation_outcome::Result::Cancelled(v1::CancelOperationResponse {})
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::cancel_operation_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Build the wire form of a health outcome.
+pub fn health_outcome_to_wire(outcome: LifecycleOutcome<PluginHostHealth>) -> v1::HealthOutcome {
+    v1::HealthOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(health) => {
+                v1::health_outcome::Result::Health(health_to_wire(&health))
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::health_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Build the wire form of a shape.
+fn shape_to_wire(shape: PluginExecutionShape) -> i32 {
+    let wire = match shape {
+        PluginExecutionShape::Unary => v1::PluginExecutionShape::ShapeUnary,
+        PluginExecutionShape::Streaming => v1::PluginExecutionShape::ShapeStreaming,
+    };
+    wire as i32
+}
+
+/// Build the wire form of a capability kind.
+fn capability_kind_to_wire(kind: PluginCapabilityKind) -> v1::PluginCapabilityKind {
+    match kind {
+        PluginCapabilityKind::Tool => v1::PluginCapabilityKind::Tool,
+        PluginCapabilityKind::Llm => v1::PluginCapabilityKind::Llm,
+        PluginCapabilityKind::Subscriber => v1::PluginCapabilityKind::Subscriber,
+    }
+}
+
 /// The attachment point a wire registration names.
 ///
 /// The match is exhaustive on purpose. A registration surface the runtime gains
@@ -1121,8 +1349,8 @@ pub fn handshake_request_from_wire(
         session_credential: wire.session_credential.clone(),
         maximum_frame_bytes: wire.maximum_frame_bytes,
         supported_features: wire.supported_features.clone(),
-        requested_read_capabilities: read_capabilities_from_wire(
-            &wire.requested_read_capabilities,
+        offered_read_capabilities: read_capabilities_from_wire(
+            &wire.offered_read_capabilities,
             "a handshake request",
         )?,
     })
@@ -1890,7 +2118,16 @@ mod tests {
             },
         };
 
-        let back = load_request_from_wire(&load_request_to_wire(&request)).expect("round trip");
+        let context = PluginExecutionContext {
+            operation_request_id: "operation-1".into(),
+            protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            deadline_unix_ms: 1_700_000_000_000,
+            remaining_budget_millis: 29_000,
+            max_response_bytes: 1024,
+        };
+        let back = load_request_from_wire(&load_request_to_wire(&request, "session-1", &context))
+            .expect("round trip");
 
         assert_eq!(back, request);
     }
@@ -2292,7 +2529,7 @@ mod tests {
             host_nonce: "nonce".into(),
             maximum_frame_bytes,
             supported_features: vec!["streaming".into()],
-            granted_read_capabilities: Vec::new(),
+            accepted_read_capabilities: Vec::new(),
         };
 
         let established = handshake_outcome_from_wire(&v1::HandshakeOutcome {
@@ -3123,11 +3360,11 @@ mod tests {
             session_credential: "credential".into(),
             maximum_frame_bytes: 1024,
             supported_features: vec!["streaming".into()],
-            requested_read_capabilities: vec![v1::HostReadCapability::RuntimeDiagnostics as i32],
+            offered_read_capabilities: vec![v1::HostReadCapability::RuntimeDiagnostics as i32],
         })
         .expect("a request");
         assert_eq!(
-            requested.requested_read_capabilities,
+            requested.offered_read_capabilities,
             vec![PluginHostReadCapability::RuntimeDiagnostics]
         );
 
@@ -3141,12 +3378,12 @@ mod tests {
                 session_credential: "credential".into(),
                 maximum_frame_bytes: 1024,
                 supported_features: Vec::new(),
-                requested_read_capabilities: vec![capability],
+                offered_read_capabilities: vec![capability],
             };
             assert!(handshake_request_from_wire(&wire).is_err());
 
             // The same rule for what a kernel says it granted.
-            wire.requested_read_capabilities = Vec::new();
+            wire.offered_read_capabilities = Vec::new();
             assert!(
                 session_identity_from_wire(&v1::HandshakeResponse {
                     protocol_version: 1,
@@ -3155,7 +3392,7 @@ mod tests {
                     host_nonce: "nonce".into(),
                     maximum_frame_bytes: 1024,
                     supported_features: Vec::new(),
-                    granted_read_capabilities: vec![capability],
+                    accepted_read_capabilities: vec![capability],
                 })
                 .is_err()
             );
@@ -3170,7 +3407,7 @@ mod tests {
                 host_nonce: "nonce".into(),
                 maximum_frame_bytes: 1024,
                 supported_features: Vec::new(),
-                granted_read_capabilities: vec![
+                accepted_read_capabilities: vec![
                     v1::HostReadCapability::RegistrationInventory as i32,
                     v1::HostReadCapability::RegistrationInventory as i32,
                 ],

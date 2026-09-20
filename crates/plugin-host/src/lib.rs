@@ -367,8 +367,13 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 }
 
 pub mod conformance;
+/// The host's side of the boundary: the service the host process serves.
+pub mod service;
 /// The kernel's view of one plugin session: the invariants that need memory.
 pub mod session;
+/// The kernel's side of the process boundary: spawning, handshaking, and the
+/// backend that reaches a host process.
+pub mod supervisor;
 
 /// Native plugins loaded through a backend, kept loaded for as long as this is held.
 ///

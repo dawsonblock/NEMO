@@ -16,6 +16,24 @@ workspace = true
 nemo-relay.workspace = true
 nemo-relay-plugin.workspace = true
 nemo-relay-plugin-protocol.workspace = true
+nemo-relay-plugin-proto.workspace = true
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.2", default-features = false, features = [
+    "codegen",
+    "router",
+    "transport",
+] }
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

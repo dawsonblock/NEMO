@@ -241,12 +241,22 @@ pub struct PluginSessionIdentity {
     pub maximum_frame_bytes: u32,
     /// Features both sides agreed on.
     pub supported_features: Vec<String>,
-    /// Kernel-held state this host may read, and nothing else.
+    /// Kernel-held state this host accepted, and nothing else.
     ///
-    /// Empty is the default and means the host reads nothing: granting is a
-    /// decision the kernel makes, and reading these in process is not a reason
-    /// for another process to read them.
-    pub read_capabilities: Vec<PluginHostReadCapability>,
+    /// Empty is the default and means the host reads nothing. The offer is the
+    /// kernel's decision, so this can only ever be a subset of it, and
+    /// [`PluginSessionIdentity::accepted_within`] is how the kernel checks that
+    /// rather than trusting the answer.
+    pub accepted_read_capabilities: Vec<PluginHostReadCapability>,
+}
+
+impl PluginSessionIdentity {
+    /// Whether this session accepted only what it was offered.
+    pub fn accepted_within(&self, offered: &[PluginHostReadCapability]) -> bool {
+        self.accepted_read_capabilities
+            .iter()
+            .all(|capability| offered.contains(capability))
+    }
 }
 
 /// Kernel-held state a plugin host may be allowed to read.
@@ -277,8 +287,8 @@ pub struct PluginHandshakeRequest {
     pub maximum_frame_bytes: u32,
     /// Features the host offers.
     pub supported_features: Vec<String>,
-    /// Kernel-held state the host asks to read.
-    pub requested_read_capabilities: Vec<PluginHostReadCapability>,
+    /// Kernel-held state the host is offered.
+    pub offered_read_capabilities: Vec<PluginHostReadCapability>,
 }
 
 /// A scope named by its canonical identity.
@@ -459,6 +469,30 @@ pub enum LifecycleOutcome<T> {
     Completed(T),
     /// The peer answered, and the answer is a structured failure.
     Failed(PluginFailure),
+}
+
+impl<T> LifecycleOutcome<T> {
+    /// Turn a result into a lifecycle outcome.
+    ///
+    /// The two are the same distinction: a failure the peer reported is an
+    /// outcome, and anything else is not.
+    pub fn from_result(result: Result<T, PluginFailure>) -> Self {
+        match result {
+            Ok(value) => Self::Completed(value),
+            Err(failure) => Self::Failed(failure),
+        }
+    }
+
+    /// Read the outcome as a result.
+    ///
+    /// A reported failure is a result the caller has to handle, not an error the
+    /// conversion raised.
+    pub fn into_result(self) -> Result<T, PluginFailure> {
+        match self {
+            Self::Completed(value) => Ok(value),
+            Self::Failed(failure) => Err(failure),
+        }
+    }
 }
 
 /// Identity of the artifact a load was approved against.

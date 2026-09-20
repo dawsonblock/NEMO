@@ -211,12 +211,14 @@ message HandshakeRequest {
   string session_credential = 4;
   uint32 maximum_frame_bytes = 5;
   repeated string supported_features = 6;
-  // What the host asks to read of kernel-held state.
+  // Kernel-held state the host is offered.
   //
   // Reading the old ABI's diagnostics or registration inventory in process is
-  // not a reason for another process to read them: each is a capability the
-  // kernel grants, and a request is not a grant.
-  repeated HostReadCapability requested_read_capabilities = 7;
+  // not a reason for another process to read them, and the host is the side a
+  // boundary exists to distrust: it is offered what it may read and can only
+  // accept or decline, never ask for more. A call it cannot serve under what it
+  // accepted fails, which is the fail-closed direction.
+  repeated HostReadCapability offered_read_capabilities = 7;
 }
 
 // The session the host establishes.
@@ -232,8 +234,9 @@ message HandshakeResponse {
   string host_nonce = 4;
   uint32 maximum_frame_bytes = 5;
   repeated string supported_features = 6;
-  // What the kernel granted. The host may read exactly these and no more.
-  repeated HostReadCapability granted_read_capabilities = 7;
+  // What the host accepted. It must be a subset of what was offered, and the
+  // kernel checks that rather than trusting the answer.
+  repeated HostReadCapability accepted_read_capabilities = 7;
 }
 
 // Kernel-held state a plugin host may be allowed to read.

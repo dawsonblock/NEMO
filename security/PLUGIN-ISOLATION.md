@@ -407,19 +407,62 @@ Still open, in the order they need closing:
 1. **Serving the read capabilities.** Diagnostics and registration reads are
    negotiated in the handshake but nothing serves them yet; deciding what they
    may return is the kernel's authorization step, not a conversion step.
-2. **The supervisor, and the host-side half of the session.** The state machine
-   is one side of one session; nothing drives it yet, because nothing speaks the
-   channel yet. The supervisor is what turns it into a running session: spawn,
-   handshake, frame send and receive, monotonic deadlines with a kill at expiry,
-   restart, and the `ProcessPluginBackend` that composes it. The host binary
-   needs its own bookkeeping for the same invariants from the other side, and
-   the two are not interchangeable: a host that trusted the kernel to enforce
-   its pacing would be trusting the side the boundary exists to distrust.
+2. **Invocation, and the session channel behind it.** Nothing asks a host to
+   invoke anything yet: a loaded plugin registers into the runtime's own
+   machinery, so the lifecycle operations are the whole of what crosses today.
+   When invocation arrives it needs the duplex session — the state machine is
+   written and waiting for a driver, and the host needs its own bookkeeping for
+   the same invariants from the other side, because a host that trusted the
+   kernel to pace it would be trusting the side the boundary exists to distrust.
+   Restart-on-crash belongs to that work too: today a host that exits is
+   reported as `HostCrashed` and stays exited.
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
+4. **Resource limits beyond process separation and the deadline.** The child
+   gets a filtered environment, its own socket directory and a kill at expiry;
+   memory, file and child limits, platform sandboxing and destination network
+   policy are not applied yet, and capabilities do not declare the profile they
+   need.
 
-Until those are closed the process host would still be architecture by
-exception, which is why the supervisor is not being written yet.
+## The process boundary
+
+The boundary exists. `crates/plugin-host` builds `nemo-plugin-host`, which loads
+native plugins and serves the kernel's lifecycle operations; the same crate
+holds the supervisor that starts it and the backend that reaches it.
+
+- **Spawn and handshake.** The supervisor creates a directory only it can read
+  (`0700`), passes the socket path, a credential generated for that one session,
+  the runtime binding digest and the protocol version through a filtered
+  environment, and waits for the socket rather than sleeping a fixed time. The
+  child serves the socket; stdout and stderr stay logs and never carry the
+  protocol.
+- **What the handshake binds.** Protocol version, runtime binding and frame
+  limit are all checked on both sides. A host started under one runtime is
+  refused by another, and a host that accepted a read capability it was not
+  offered is refused rather than believed: the offer is the kernel's decision,
+  and the host can only accept or decline.
+- **Deadlines.** Every operation is sent under its remaining budget, computed
+  from the context the kernel derived rather than from anything the caller
+  chose; a budget that has already passed means no request is sent at all, and a
+  budget that passes mid-operation kills the process instead of asking a plugin
+  to honour a cancellation token. A kill is reported as `DeadlineExceeded`, not
+  as a crash.
+- **Failure vocabulary.** A transport failure is reported as `HostCrashed` when
+  the child has exited and as `Unavailable` when it is still running. The two
+  call for different responses — one is a process that ended, the other is a
+  message that did not arrive — so they are never collapsed.
+- **One suite for both backends.**
+  `crates/plugin-host/tests/process_backend.rs` spawns a real host and runs the
+  same conformance suite the in-process backend runs, so "implements the
+  contract" is demonstrated rather than asserted. The same file kills a host
+  mid-test and asserts the kernel survives it.
+
+What has *not* moved: the loader still executes inside the kernel's address
+space, because the backend the host process serves is the same in-process
+implementation the kernel used before. That is deliberate — the boundary and its
+contract exist first, so the step that moves the loader changes one
+implementation rather than discovering a protocol — and it is why the metric
+below has not moved.
 
 This increment does not move `kernel-process unsafe tokens`, which is 621. The
 number falls when native loading physically crosses the process boundary, and a

@@ -121,9 +121,7 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                 session_credential: "session-credential".into(),
                 maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
                 supported_features: vec!["streaming".into(), "cancel".into()],
-                requested_read_capabilities: vec![
-                    v1::HostReadCapability::RuntimeDiagnostics as i32,
-                ],
+                offered_read_capabilities: vec![v1::HostReadCapability::RuntimeDiagnostics as i32],
             }
             .encode_to_vec(),
         ),
@@ -191,7 +189,7 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                         host_nonce: "host-nonce".into(),
                         maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
                         supported_features: vec!["streaming".into()],
-                        granted_read_capabilities: vec![
+                        accepted_read_capabilities: vec![
                             v1::HostReadCapability::RuntimeDiagnostics as i32,
                         ],
                     },
