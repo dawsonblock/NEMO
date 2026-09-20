@@ -409,6 +409,8 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 }
 
 pub mod conformance;
+/// The kernel-side proxies for a plugin's registrations.
+pub mod proxy;
 /// The host's side of the boundary: the service the host process serves.
 pub mod service;
 /// The kernel's view of one plugin session: the invariants that need memory.

@@ -290,11 +290,42 @@ impl ProcessPluginBackend {
     /// Derived from what the backend implements rather than supplied by a
     /// caller: a caller that could declare support the backend does not have
     /// would break the guarantee that a load which cannot be served does not
-    /// happen. Empty means none, which is the truth until remote invocation
-    /// exists — and then it grows here, next to the code that makes it true.
+    /// happen. One entry today, next to the proxy that makes it true: a tool
+    /// request intercept is the class the kernel can install a proxy for and the
+    /// host can run.
     pub fn supported_registration_operations()
     -> Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation> {
-        Vec::new()
+        vec![nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept]
+    }
+
+    /// Ask the host to activate components and report what they registered.
+    ///
+    /// The kernel sends the configuration, the plugin's register callbacks run in
+    /// the host, and the descriptors that come back are what the kernel installs
+    /// proxies from. A plugin that registered something this session cannot
+    /// serve is refused by the host, so nothing is activated that the kernel
+    /// would then have to ignore.
+    pub async fn activate(
+        &self,
+        request: nemo_relay_plugin_protocol::PluginActivateRequest,
+        context: PluginExecutionContext,
+    ) -> Result<Vec<PluginDescriptor>, PluginProtocolError> {
+        let budget = Self::budget(&context, now_unix_ms()?)?;
+        let session_id = self.supervisor.session.session_id.clone();
+        let wire = nemo_relay_plugin_proto::convert::activate_request_to_wire(
+            &request,
+            &session_id,
+            &context,
+        );
+        let mut client = self.supervisor.client.clone();
+        let outcome = self
+            .supervisor
+            .request(budget, async move { client.activate(wire).await })
+            .await?
+            .into_inner();
+        nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&outcome)?
+            .into_result()
+            .map_err(error_to_protocol)
     }
 
     /// Take ownership of a running host.
