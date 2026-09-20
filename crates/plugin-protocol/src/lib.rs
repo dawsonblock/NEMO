@@ -1013,6 +1013,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_message_this_crate_declares_survives_its_own_serialization() {
+        // The vocabulary is `Serialize` so bindings and stored state can carry
+        // it. A tagged enum whose arm is not a map, or a field whose type does
+        // not round-trip, would fail here rather than at a boundary where the
+        // failure looks like a peer sending nonsense.
+        let messages = [
+            PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: PluginSessionPayload::StreamItem(PluginStreamItem {
+                    host_call_id: "call-1".into(),
+                    stream_id: "stream-1".into(),
+                    chunk_json: r#"{"delta":"hi"}"#.into(),
+                }),
+            },
+            PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: PluginSessionPayload::CompletionSettle(PluginCompletionSettlement {
+                    completion_id: "completion-1".into(),
+                    operation_request_id: "operation-1".into(),
+                    result: Err(PluginFailure {
+                        code: PluginFailureCode::Cancelled,
+                        message: "the awaiting runtime cancelled it".into(),
+                    }),
+                }),
+            },
+            PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: PluginSessionPayload::ContinuationDisposition(
+                    PluginContinuationDisposition {
+                        host_call_id: "call-1".into(),
+                        sequence: 2,
+                        disposition: Ok(PluginChunkDecision::Stop),
+                    },
+                ),
+            },
+        ];
+
+        for message in messages {
+            let text = serde_json::to_string(&message).expect("serialize a session message");
+            let back: PluginSessionMessage =
+                serde_json::from_str(&text).expect("deserialize a session message");
+            assert_eq!(back, message);
+        }
+
+        // The mark carries types this crate re-exports, so their serialized
+        // form is part of this crate's promise too.
+        let mark = PluginMarkEmit {
+            operation_request_id: "operation-1".into(),
+            host_call_id: "call-1".into(),
+            name: "example.mark".into(),
+            data_json: Some(r#"{"value":1}"#.into()),
+            parent: Some(
+                PluginScopeReference::from_canonical("018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b")
+                    .expect("a canonical scope"),
+            ),
+            metadata_json: None,
+            data_schema: Some(DataSchema {
+                name: "example".into(),
+                version: "1".into(),
+            }),
+            severity: Some(LogSeverity::Warn),
+            timestamp_unix_micros: Some(1_700_000_000_000_000),
+        };
+        let text = serde_json::to_string(&mark).expect("serialize a mark");
+        assert!(
+            text.contains("\"warn\""),
+            "severity writes its canonical name: {text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PluginMarkEmit>(&text).expect("deserialize a mark"),
+            mark
+        );
+    }
+
+    #[test]
+    fn a_scope_identity_has_one_spelling() {
+        let canonical = "018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b";
+        let reference = PluginScopeReference::from_canonical(canonical).expect("a UUID");
+        assert_eq!(reference.scope_id.to_string(), canonical);
+
+        for other in [
+            "018f0b3c5f5a7c3e9a2b1c2d3e4f5a6b",
+            "{018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b}",
+            "urn:uuid:018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b",
+            "not-a-uuid",
+        ] {
+            assert!(
+                PluginScopeReference::from_canonical(other).is_err(),
+                "{other} is the same value written differently"
+            );
+        }
+    }
+
+    #[test]
     fn a_deadline_is_refused_at_the_boundary_and_before_it() {
         // At the deadline there is no time left, so the operation must not
         // start. A comparison that allowed equality would start work that is

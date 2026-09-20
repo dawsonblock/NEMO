@@ -367,6 +367,8 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 }
 
 pub mod conformance;
+/// The kernel's view of one plugin session: the invariants that need memory.
+pub mod session;
 
 /// Native plugins loaded through a backend, kept loaded for as long as this is held.
 ///

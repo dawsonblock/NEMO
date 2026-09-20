@@ -673,7 +673,12 @@ fn no_wire_type_converts_into_a_domain_type_infallibly() {
     let source = convert_source();
     let offenders: Vec<&str> = source
         .lines()
-        .filter(|line| line.contains("impl From<v1::"))
+        .filter(|line| {
+            // Both spellings: `From<v1::X>` and `From<&v1::X>`. A reference
+            // conversion is just as infallible, and just as easy to reach with
+            // `.into()`.
+            line.contains("impl From<v1::") || line.contains("impl From<&v1::")
+        })
         .collect();
     assert!(
         offenders.is_empty(),

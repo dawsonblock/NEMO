@@ -384,6 +384,25 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   when a message reaches either without an entry. The same file refuses an
   `impl From` for a wire type, so a later `.into()` shortcut cannot compile.
 
+- **The session state machine.** Conversions refuse a message that cannot mean
+  what it says; they cannot refuse one that does not fit what came before it.
+  `nemo_relay_plugin_host::session` holds the kernel's view of one session and
+  the invariants that need memory: a completion settles once and never after it
+  was cancelled, a completion identity the kernel never created is refused
+  rather than believed, a pull is answered exactly once and only by the call
+  that made it, one pull is outstanding per stream, a second pull waits, an item
+  after the terminal frame is refused, a cancelled or released stream produces
+  nothing, a chunk is produced only when the disposition for the previous one
+  arrived and the sequence is exactly the next one — so a replay, a regression
+  and an answer to a chunk nobody sent are one rule — and a call identity cannot
+  be outstanding twice. Completions carry the operation that owns them so
+  `forget_operation` can release everything an operation held, which is what
+  keeps a long-lived session from accumulating a record per callback.
+
+  It is deliberately not a transport and not a driver: it takes the domain
+  messages the conversions produced and answers whether they fit, so the
+  supervisor that owns the socket and the callbacks can stay about those.
+
 Still open, in the order they need closing:
 
 1. **The output queue's backpressure equivalence**, which is a host obligation:
@@ -392,13 +411,14 @@ Still open, in the order they need closing:
    registration reads still have to be *served* under the capabilities the
    handshake now negotiates; deciding what they may return is the kernel's
    authorization step, not a conversion step.
-2. **The session state machine.** The conversions refuse a message that cannot
-   mean what it says, but the invariants that need memory — a settlement for a
-   completion that never existed, a settlement after cancellation, a stream item
-   after the terminal frame, a replayed or regressed sequence, a reused
-   `host_call_id` — belong to the session that owns those identities. They are
-   listed here rather than implemented, because the session has no
-   implementation until the supervisor exists.
+2. **The supervisor, and the host-side half of the session.** The state machine
+   is one side of one session; nothing drives it yet, because nothing speaks the
+   channel yet. The supervisor is what turns it into a running session: spawn,
+   handshake, frame send and receive, monotonic deadlines with a kill at expiry,
+   restart, and the `ProcessPluginBackend` that composes it. The host binary
+   needs its own bookkeeping for the same invariants from the other side, and
+   the two are not interchangeable: a host that trusted the kernel to enforce
+   its pacing would be trusting the side the boundary exists to distrust.
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 
