@@ -83,10 +83,12 @@ use tokio_stream::{Stream, StreamExt};
 use uuid::Uuid;
 
 use super::{
-    DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad,
-    DynamicPluginTeardownOutcome, deregister_tracked_registrations_checked,
-    validate_annotated_request_consumer_compatibility, validate_dynamic_plugin_relay_compatibility,
+    DYNAMIC_PLUGIN_MANIFEST_FILENAME, DynamicPluginKind, DynamicPluginManifest,
+    DynamicPluginManifestLoad, DynamicPluginTeardownOutcome,
+    deregister_tracked_registrations_checked, validate_annotated_request_consumer_compatibility,
+    validate_dynamic_plugin_relay_compatibility,
 };
+use nemo_relay_plugin_protocol::PluginArtifactIdentity;
 
 /// Native plugin load request derived from host dynamic-plugin state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +97,38 @@ pub struct NativePluginLoadSpec {
     pub plugin_id: String,
     /// Path to the authored `relay-plugin.toml`.
     pub manifest_ref: String,
+    /// The identity the runtime approved, when it approved one.
+    ///
+    /// `None` means the caller has no approved identity to confirm, and the
+    /// loader falls back to whatever integrity the manifest itself declares.
+    /// Every shipped path passes `Some`: the approval is the reason the digests
+    /// exist, and a load that cannot say what it was told to load cannot confirm
+    /// anything.
+    pub approved_identity: Option<PluginArtifactIdentity>,
+}
+
+impl NativePluginLoadSpec {
+    /// Build a spec whose artifact this side approves.
+    ///
+    /// The approval is computed here, before any load, so the caller cannot
+    /// forget it: an artifact whose identity cannot be computed is one that
+    /// cannot be approved, and that is a failure rather than a load without a
+    /// guarantee.
+    pub fn approved(
+        plugin_id: impl Into<String>,
+        manifest_ref: impl Into<String>,
+    ) -> crate::plugin::Result<Self> {
+        let manifest_ref = manifest_ref.into();
+        let (manifest_sha256, library_sha256) = plugin_artifact_identity(&manifest_ref)?;
+        Ok(Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref,
+            approved_identity: Some(PluginArtifactIdentity {
+                manifest_sha256,
+                library_sha256,
+            }),
+        })
+    }
 }
 
 /// Owns native dynamic libraries registered into the plugin registry.
@@ -447,7 +481,44 @@ fn drop_native_plugin_descriptor(plugin: &mut NemoRelayNativePluginV1) {
 fn load_one_native_plugin(
     spec: &NativePluginLoadSpec,
 ) -> crate::plugin::Result<Arc<NativePluginInstance>> {
-    let (manifest, manifest_ref) = DynamicPluginManifest::load_from_path(&spec.manifest_ref)?;
+    // The manifest is read once and parsed from the bytes that were hashed, so
+    // the identity and the content are the same object rather than two lookups
+    // of one path.
+    let manifest_path = {
+        let path = PathBuf::from(&spec.manifest_ref);
+        if path.is_dir() {
+            path.join(DYNAMIC_PLUGIN_MANIFEST_FILENAME)
+        } else {
+            path
+        }
+    };
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        PluginError::NotFound(format!(
+            "dynamic plugin manifest '{}' could not be read: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest_sha256 = sha256_hex(&manifest_bytes);
+    if let Some(approved) = &spec.approved_identity
+        && approved.manifest_sha256 != manifest_sha256
+    {
+        return Err(PluginError::RegistrationFailed(format!(
+            "dynamic plugin '{}' is not the approved artifact: '{}' hashes to \
+             {manifest_sha256}, while {} was approved",
+            spec.plugin_id,
+            manifest_path.display(),
+            approved.manifest_sha256
+        )));
+    }
+    let manifest_ref = manifest_path.to_string_lossy().into_owned();
+    let manifest = DynamicPluginManifest::parse_toml(
+        std::str::from_utf8(&manifest_bytes).map_err(|error| {
+            PluginError::InvalidConfig(format!(
+                "'{}' is not UTF-8: {error}",
+                manifest_path.display()
+            ))
+        })?,
+    )?;
     if manifest.plugin.id.trim() != spec.plugin_id {
         return Err(PluginError::InvalidConfig(format!(
             "dynamic plugin manifest id '{}' does not match expected id '{}'",
@@ -500,6 +571,31 @@ fn load_one_native_plugin(
     {
         verify_sha256(&library_path, expected_digest)?;
     }
+    // The approved library identity is checked against the bytes of an open
+    // handle, immediately before the loader is given the path: the digest and
+    // the file it describes are then the same instance rather than two lookups.
+    let verified_library_sha256 = match &spec.approved_identity {
+        Some(approved) => {
+            let file = std::fs::File::open(&library_path).map_err(|error| {
+                PluginError::NotFound(format!(
+                    "native plugin library '{}' could not be opened: {error}",
+                    library_path.display()
+                ))
+            })?;
+            let digest = sha256_of_reader(file)?;
+            if digest != approved.library_sha256 {
+                return Err(PluginError::RegistrationFailed(format!(
+                    "dynamic plugin '{}' is not the approved artifact: library '{}' hashes to \
+                     {digest}, while {} was approved",
+                    spec.plugin_id,
+                    library_path.display(),
+                    approved.library_sha256
+                )));
+            }
+            Some(digest)
+        }
+        None => None,
+    };
     let symbol = load
         .symbol
         .as_deref()
@@ -511,6 +607,22 @@ fn load_one_native_plugin(
             library_path.display()
         ))
     })?;
+    // The loader resolved the path a second time, so the library that is now
+    // mapped is confirmed to be the one that was verified. A change in that
+    // window is refused rather than attributed to the plugin: refusing to
+    // activate is the fail-closed answer, and `dlopen` offers nothing stronger
+    // without loading from a copy whose directory this process owns.
+    if let Some(verified) = &verified_library_sha256 {
+        let mapped = sha256_of_path(&library_path)?;
+        if &mapped != verified {
+            drop(library);
+            return Err(PluginError::RegistrationFailed(format!(
+                "native plugin library '{}' changed between verification and loading; it is \
+                 not the artifact this load approved",
+                library_path.display()
+            )));
+        }
+    }
     let mut plugin = NemoRelayNativePluginV1::default();
     unsafe {
         let entry: Symbol<NemoRelayNativePluginEntry> =
@@ -646,6 +758,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Hash the bytes of an already-open file.
+///
+/// Reading a handle rather than a path is what ties the digest to a specific
+/// file instance: a path can be repointed between the hash and the open, and a
+/// handle cannot.
+fn sha256_of_reader(reader: std::fs::File) -> crate::plugin::Result<String> {
+    use std::io::Read;
+
+    let mut reader = std::io::BufReader::new(reader);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            PluginError::Internal(format!("failed to read a plugin artifact: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize()))
+}
+
+/// Hash a file by path.
+fn sha256_of_path(path: &Path) -> crate::plugin::Result<String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        PluginError::Internal(format!("failed to read '{}': {error}", path.display()))
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn resolve_manifest_relative_path(manifest_path: &Path, value: &str) -> PathBuf {

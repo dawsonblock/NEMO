@@ -488,6 +488,18 @@ holds the supervisor that starts it and the backend that reaches it.
   was verified, so the approved identity, the verified identity and the reported
   one are the same value. An end-to-end test loads a real fixture through a real
   child, mutates one digest, and asserts the child refuses it.
+
+  The verification lives in the loader rather than in its caller, because the
+  loader is where the open happens: the manifest is read once and parsed from the
+  bytes that were hashed, and the library is hashed through an open handle before
+  its path is handed to `dlopen`. After the library is mapped, its path is hashed
+  again: a change in that window means the loaded file is not the verified one,
+  and the load is refused rather than attributed to the plugin. That is
+  detection, not prevention — `dlopen` resolves a path, so preventing the swap
+  outright would mean loading from a copy in a directory this process owns, which
+  would change `@loader_path` for plugins that resolve resources relative to
+  themselves. That is a decision about the plugin-loading contract rather than a
+  hardening detail, so it is written down here instead of taken silently.
 - **What the handshake binds.** Protocol version, runtime binding and frame
   limit are all checked on both sides. A host started under one runtime is
   refused by another, and a host that accepted a read capability it was not

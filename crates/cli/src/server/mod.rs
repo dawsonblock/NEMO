@@ -1089,10 +1089,13 @@ impl PluginActivation {
                             plugin.plugin_id
                         ))
                     })?;
-                Ok(NativePluginLoadSpec {
-                    plugin_id: plugin.plugin_id.clone(),
-                    manifest_ref,
-                })
+                NativePluginLoadSpec::approved(plugin.plugin_id.clone(), manifest_ref.clone())
+                    .map_err(|error| {
+                        CliError::Config(format!(
+                            "native dynamic plugin '{}' could not be approved: {error}",
+                            plugin.plugin_id
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>, CliError>>()?;
         let worker_specs = dynamic_plugins

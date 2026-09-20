@@ -145,11 +145,19 @@ impl PluginHostActivation {
         let native_specs = dynamic_plugins
             .iter()
             .filter(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
-            .map(|plugin| NativePluginLoadSpec {
-                plugin_id: plugin.plugin_id.clone(),
-                manifest_ref: plugin.manifest_ref.clone(),
+            .map(|plugin| {
+                // The runtime approves what it is about to load, and the loader
+                // confirms that approval immediately before opening anything.
+                NativePluginLoadSpec::approved(&plugin.plugin_id, &plugin.manifest_ref).map_err(
+                    |error| {
+                        plugin_error_context(
+                            &format!("plugin '{}' could not be approved", plugin.plugin_id),
+                            error,
+                        )
+                    },
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<crate::plugin::Result<Vec<_>>>()?;
         let native = (!native_specs.is_empty())
             .then(|| {
                 load_native_plugins(native_specs)

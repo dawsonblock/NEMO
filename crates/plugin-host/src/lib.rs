@@ -206,42 +206,15 @@ impl PluginExecutionBackend for InProcessPluginBackend {
                 }
             }
 
-            // Verify the identity the kernel approved, immediately before the
-            // loader opens anything. Without this the digests travel across the
-            // boundary and are then ignored, which turns "the runtime approved
-            // this artifact" into "the file behind this reference is whatever it
-            // is now" — the hole the identity exists to close.
-            let verified =
-                match nemo_relay::plugin::dynamic::plugin_artifact_identity(&request.artifact) {
-                    Ok((manifest_sha256, library_sha256)) => {
-                        if manifest_sha256 != request.identity.manifest_sha256
-                            || library_sha256 != request.identity.library_sha256
-                        {
-                            self.loaded().remove(&request.plugin_id);
-                            return Err(PluginProtocolError::new(
-                                PluginFailureCode::Rejected,
-                                format!(
-                                    "artifact '{}' is not the one this load approved: \
-                                 the manifest hashes to {manifest_sha256} and the library to \
-                                 {library_sha256}, while the approved pair was ({}, {})",
-                                    request.artifact,
-                                    request.identity.manifest_sha256,
-                                    request.identity.library_sha256
-                                ),
-                            ));
-                        }
-                        manifest_sha256
-                    }
-                    Err(error) => {
-                        // Release the reservation so a later attempt is possible.
-                        self.loaded().remove(&request.plugin_id);
-                        return Err(refused(error.to_string()));
-                    }
-                };
-
+            // The approval travels with the load rather than being checked
+            // separately: the loader confirms it against the bytes of an open
+            // handle immediately before it opens the library, so the digest and
+            // the file it describes are the same instance.
+            let approved = request.identity.clone();
             let activation = match load_native_plugins([NativePluginLoadSpec {
                 plugin_id: request.plugin_id.clone(),
                 manifest_ref: request.artifact.clone(),
+                approved_identity: Some(approved.clone()),
             }]) {
                 Ok(activation) => activation,
                 Err(error) => {
@@ -282,7 +255,7 @@ impl PluginExecutionBackend for InProcessPluginBackend {
                 negotiated_abi_version: None,
                 // The digest this load verified, so the approved identity, the
                 // verified identity and the reported one are the same value.
-                manifest_digest: Some(verified),
+                manifest_digest: Some(approved.manifest_sha256.clone()),
                 registration_kinds,
                 // Whatever the loader has recorded so far. Empty at load time
                 // is the truth rather than a gap: native registration is
