@@ -715,6 +715,35 @@ pub fn cancel_outcome_to_wire(outcome: LifecycleOutcome<()>) -> v1::CancelOperat
     }
 }
 
+/// Build the wire form of a session close outcome.
+pub fn session_close_outcome_to_wire(outcome: LifecycleOutcome<()>) -> v1::SessionCloseOutcome {
+    v1::SessionCloseOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(()) => {
+                v1::session_close_outcome::Result::Closed(v1::SessionCloseResponse {})
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::session_close_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
+/// Validate a session close outcome.
+pub fn session_close_outcome_from_wire(
+    wire: &v1::SessionCloseOutcome,
+) -> Result<LifecycleOutcome<()>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::session_close_outcome::Result::Closed(_)) => Ok(LifecycleOutcome::Completed(())),
+        Some(v1::session_close_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "a close outcome that is neither a close nor a failure",
+        )),
+    }
+}
+
 /// Build the wire form of a health outcome.
 pub fn health_outcome_to_wire(outcome: LifecycleOutcome<PluginHostHealth>) -> v1::HealthOutcome {
     v1::HealthOutcome {
@@ -3239,6 +3268,26 @@ mod tests {
         for operation in [v1::CodecOperation::Unspecified as i32, 9_999] {
             assert!(resolve_codec_request_from_wire(&codec(operation)).is_err());
         }
+    }
+
+    #[test]
+    fn a_close_outcome_without_an_arm_is_refused() {
+        // Closing is a lifecycle operation like the rest: a refusal is a result
+        // it reports, and a message that says neither is one nobody answered.
+        let error = session_close_outcome_from_wire(&v1::SessionCloseOutcome { result: None })
+            .expect_err("a close that says nothing");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+
+        assert_eq!(
+            session_close_outcome_from_wire(&v1::SessionCloseOutcome {
+                result: Some(v1::session_close_outcome::Result::Closed(
+                    v1::SessionCloseResponse {}
+                )),
+            })
+            .expect("a close")
+            .into_result(),
+            Ok(())
+        );
     }
 
     #[test]

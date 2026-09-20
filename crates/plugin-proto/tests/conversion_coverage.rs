@@ -247,6 +247,16 @@ const MANIFEST: &[Entry] = &[
         "an empty acknowledgement has no field to refuse",
     ),
     entry(
+        "SessionCloseOutcome",
+        "both",
+        &[
+            "session_close_outcome_from_wire",
+            "session_close_outcome_to_wire",
+        ],
+        &["SessionCloseOutcome"],
+        &["a_close_outcome_without_an_arm_is_refused"],
+    ),
+    entry(
         "EmitMarkRequest",
         "wire->domain",
         &["mark_request_from_wire"],

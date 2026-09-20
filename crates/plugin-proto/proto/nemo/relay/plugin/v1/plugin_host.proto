@@ -362,6 +362,19 @@ message SessionCloseRequest {
 
 message SessionCloseResponse {}
 
+// The outcome of closing a session.
+//
+// Every other lifecycle operation answers with its failure arm, and this one did
+// not: a refusal here travelled as a transport status, which is the conflation
+// the rest of this schema exists to prevent. A session that is already gone is a
+// result, not a channel failure.
+message SessionCloseOutcome {
+  oneof result {
+    SessionCloseResponse closed = 1;
+    PluginFailure failure = 2;
+  }
+}
+
 // Every call a plugin makes into the runtime carries the operation it belongs
 // to and its own identity, so several calls in one operation stay
 // distinguishable.
@@ -749,7 +762,7 @@ service PluginHost {
   rpc InvokeStream(InvokeRequest) returns (stream StreamChunk);
   rpc CancelOperation(CancelOperationRequest) returns (CancelOperationOutcome);
   rpc Health(HealthRequest) returns (HealthOutcome);
-  rpc SessionClose(SessionCloseRequest) returns (SessionCloseResponse);
+  rpc SessionClose(SessionCloseRequest) returns (SessionCloseOutcome);
 }
 
 // Served by the kernel for plugins that call back into the runtime while they

@@ -236,17 +236,21 @@ impl Drop for PluginHostSupervisor {
 /// A backend that reaches the plugin host process.
 pub struct ProcessPluginBackend {
     supervisor: PluginHostSupervisor,
+    /// How to start a replacement, so a crashed host can be replaced without the
+    /// caller having to know it ever existed.
+    config: PluginHostSupervisorConfig,
 }
 
 impl ProcessPluginBackend {
     /// Take ownership of a running host.
-    pub fn new(supervisor: PluginHostSupervisor) -> Self {
-        Self { supervisor }
+    pub fn new(supervisor: PluginHostSupervisor, config: PluginHostSupervisorConfig) -> Self {
+        Self { supervisor, config }
     }
 
     /// Spawn a host and serve it.
     pub async fn launch(config: PluginHostSupervisorConfig) -> Result<Self, PluginProtocolError> {
-        Ok(Self::new(PluginHostSupervisor::spawn(config).await?))
+        let supervisor = PluginHostSupervisor::spawn(config.clone()).await?;
+        Ok(Self::new(supervisor, config))
     }
 
     /// The session this backend belongs to.
@@ -262,6 +266,28 @@ impl ProcessPluginBackend {
     /// End the host process.
     pub async fn kill(&self) -> Result<(), PluginProtocolError> {
         self.supervisor.kill().await
+    }
+
+    /// Whether the host has exited, and how.
+    pub async fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.supervisor.exit_status().await
+    }
+
+    /// Replace a host that has exited with a fresh one.
+    ///
+    /// Deliberately *not* a reload. Everything the previous host held — its
+    /// session, its loaded plugins, and the generations behind their handles —
+    /// belonged to that session, and a new host starts with none of it: a handle
+    /// from before the crash addresses nothing, and the kernel has to ask for a
+    /// load again. Restarting with the old set in place would imply a continuity
+    /// the crash took away, and the loaded set is the kernel's record rather than
+    /// the backend's.
+    pub async fn restart(&mut self) -> Result<(), PluginProtocolError> {
+        let supervisor = PluginHostSupervisor::spawn(self.config.clone()).await?;
+        // The old supervisor drops here, which kills it if it is somehow still
+        // running and removes its socket directory either way.
+        self.supervisor = supervisor;
+        Ok(())
     }
 
     /// How long the operation may take, or a refusal if it may not start.

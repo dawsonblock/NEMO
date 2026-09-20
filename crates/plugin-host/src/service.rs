@@ -20,7 +20,8 @@ use nemo_relay_plugin_proto::convert::{
     cancel_outcome_to_wire, execution_outcome_to_wire, handshake_outcome_to_wire,
     handshake_request_from_wire, health_outcome_to_wire, inspect_outcome_to_wire,
     inspect_request_from_wire, load_outcome_to_wire, load_request_from_wire,
-    operation_envelope_from_wire, unload_outcome_to_wire, unload_request_from_wire,
+    operation_envelope_from_wire, session_close_outcome_to_wire, unload_outcome_to_wire,
+    unload_request_from_wire,
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
@@ -291,19 +292,32 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
     async fn session_close(
         &self,
         request: Request<v1::SessionCloseRequest>,
-    ) -> Result<Response<v1::SessionCloseResponse>, Status> {
+    ) -> Result<Response<v1::SessionCloseOutcome>, Status> {
         let wire = request.into_inner();
+        // A refusal travels as an outcome rather than as a transport status: a
+        // session that is already gone is a result, and a channel failure is a
+        // different event that the kernel has to read differently.
         if let Err(error) = self.established(&wire.session_id) {
-            return Err(Status::failed_precondition(error.failure.message));
+            return Ok(Response::new(session_close_outcome_to_wire(
+                LifecycleOutcome::Failed(error.failure),
+            )));
         }
-        // Closing is a state change the host makes, not a message it answers
-        // with a failure: the session is gone afterwards, so every later request
-        // is refused by the same check that refuses one naming no session.
         match self.session.lock() {
+            // Closing is a state change the host makes: the session is gone
+            // afterwards, so every later request is refused by the same check
+            // that refuses one naming no session.
             Ok(mut session) => *session = None,
-            Err(error) => return Err(Status::internal(error.to_string())),
+            Err(error) => {
+                return Ok(Response::new(session_close_outcome_to_wire(
+                    LifecycleOutcome::Failed(
+                        refused(format!("the session lock was poisoned: {error}")).failure,
+                    ),
+                )));
+            }
         }
-        Ok(Response::new(v1::SessionCloseResponse {}))
+        Ok(Response::new(session_close_outcome_to_wire(
+            LifecycleOutcome::Completed(()),
+        )))
     }
 }
 
@@ -519,12 +533,52 @@ mod tests {
 
         // A closing session stops serving, and later requests are refused by the
         // same check that refused the one naming no session.
-        service
+        let outcome = service
             .session_close(Request::new(v1::SessionCloseRequest {
-                session_id: "closed".into(),
+                session_id: "another-session".into(),
             }))
             .await
-            .expect_err("a session this host did not establish");
+            .expect("a served close")
+            .into_inner();
+        assert!(
+            nemo_relay_plugin_proto::convert::session_close_outcome_from_wire(&outcome)
+                .expect("a converted close")
+                .into_result()
+                .is_err(),
+            "a close naming a session this host did not establish is a refusal"
+        );
+
+        // Closing the established session stops serving, and every later request
+        // is refused by the same check rather than by a broken channel.
+        let session_id = establish(&service, &config).await;
+        let outcome = service
+            .session_close(Request::new(v1::SessionCloseRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect("a served close")
+            .into_inner();
+        assert_eq!(
+            nemo_relay_plugin_proto::convert::session_close_outcome_from_wire(&outcome)
+                .expect("a converted close")
+                .into_result(),
+            Ok(())
+        );
+        let outcome = service
+            .inspect(Request::new(v1::InspectRequest {
+                session_id,
+                context: request().context,
+                handle: None,
+            }))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        assert!(
+            nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&outcome)
+                .expect("a converted inspection")
+                .into_result()
+                .is_err()
+        );
     }
 
     #[test]

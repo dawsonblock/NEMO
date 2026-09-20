@@ -102,6 +102,34 @@ async fn killing_the_host_does_not_kill_the_kernel() {
 }
 
 #[tokio::test]
+async fn a_crashed_host_is_replaced_by_one_that_holds_nothing() {
+    let mut backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    let crashed_session = backend.session().session_id.clone();
+    backend.kill().await.expect("the host should be killable");
+    assert!(
+        backend.exit_status().await.is_some(),
+        "the host should be observed as exited"
+    );
+
+    backend.restart().await.expect("a fresh host should start");
+
+    // A new session, and nothing loaded: the previous host's session and the
+    // generations behind its handles belonged to it, so a handle from before the
+    // crash addresses nothing here.
+    assert_ne!(backend.session().session_id, crashed_session);
+    let descriptors = backend
+        .inspect(
+            nemo_relay_plugin_protocol::PluginInspectRequest { handle: None },
+            context(),
+        )
+        .await
+        .expect("a fresh host answers");
+    assert!(descriptors.is_empty());
+}
+
+#[tokio::test]
 async fn an_operation_that_may_not_start_is_refused_before_it_crosses() {
     let backend = ProcessPluginBackend::launch(host_config())
         .await

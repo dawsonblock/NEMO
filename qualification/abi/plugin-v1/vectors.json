@@ -34,6 +34,7 @@
     { "message": "HealthRequest", "protobuf_hex": "0a0973657373696f6e2d3112360a0b6f7065726174696f6e2d3610011a1672756e74696d652d62696e64696e672d6469676573742080d095ffbc3128c8e20130808040" },
     { "message": "SessionCloseRequest", "protobuf_hex": "0a0973657373696f6e2d31" },
     { "message": "SessionCloseResponse", "protobuf_hex": "" },
+    { "message": "SessionCloseOutcome", "protobuf_hex": "0a00" },
     { "message": "EmitMarkResponse", "protobuf_hex": "" },
     { "message": "ScopeStackResponse", "protobuf_hex": "0a337b2273636f70655f6964223a2230313866306233632d356635612d376333652d396132622d316332643365346635613662227d" },
     { "message": "ResolveCodecResponse", "protobuf_hex": "1225080c12216e6f20636f64656320697320617474616368656420746f20746869732063616c6c" }

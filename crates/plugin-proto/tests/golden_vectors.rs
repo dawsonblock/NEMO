@@ -475,6 +475,15 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             "SessionCloseResponse",
             v1::SessionCloseResponse {}.encode_to_vec(),
         ),
+        (
+            "SessionCloseOutcome",
+            v1::SessionCloseOutcome {
+                result: Some(v1::session_close_outcome::Result::Closed(
+                    v1::SessionCloseResponse {},
+                )),
+            }
+            .encode_to_vec(),
+        ),
         ("EmitMarkResponse", v1::EmitMarkResponse {}.encode_to_vec()),
         (
             "ScopeStackResponse",
@@ -682,6 +691,9 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
                 .encode_to_vec(),
             "SessionCloseResponse" => v1::SessionCloseResponse::decode(bytes.as_slice())
                 .expect("decode SessionCloseResponse")
+                .encode_to_vec(),
+            "SessionCloseOutcome" => v1::SessionCloseOutcome::decode(bytes.as_slice())
+                .expect("decode SessionCloseOutcome")
                 .encode_to_vec(),
             "EmitMarkResponse" => v1::EmitMarkResponse::decode(bytes.as_slice())
                 .expect("decode EmitMarkResponse")

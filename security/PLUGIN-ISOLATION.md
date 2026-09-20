@@ -414,8 +414,10 @@ Still open, in the order they need closing:
    written and waiting for a driver, and the host needs its own bookkeeping for
    the same invariants from the other side, because a host that trusted the
    kernel to pace it would be trusting the side the boundary exists to distrust.
-   Restart-on-crash belongs to that work too: today a host that exits is
-   reported as `HostCrashed` and stays exited.
+   Restarting is explicit rather than automatic: a host that exits is reported
+   as `HostCrashed`, the backend can replace it, and the kernel decides whether
+   to keep using the replacement, because only the kernel knows what the
+   previous session was holding.
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 4. **Resource limits beyond process separation and the deadline.** The child
@@ -451,6 +453,15 @@ holds the supervisor that starts it and the backend that reaches it.
   the child has exited and as `Unavailable` when it is still running. The two
   call for different responses — one is a process that ended, the other is a
   message that did not arrive — so they are never collapsed.
+- **Restart, without implying continuity.** A crashed host can be replaced, and
+  the replacement holds nothing: a new session, nothing loaded, and a handle
+  from before the crash addressing nothing. Restarting with the previous plugins
+  in place would imply a continuity the crash took away, and the loaded set is
+  the kernel's record rather than the backend's.
+- **Closing is an outcome too.** `SessionClose` answers with a failure arm like
+  every other lifecycle operation. It was the last one reporting a refusal as a
+  transport status, which is the conflation the rest of the schema exists to
+  prevent.
 - **One suite for both backends.**
   `crates/plugin-host/tests/process_backend.rs` spawns a real host and runs the
   same conformance suite the in-process backend runs, so "implements the
