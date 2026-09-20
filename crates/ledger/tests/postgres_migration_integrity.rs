@@ -113,17 +113,20 @@ fn create_data_only_role(schema: &TestSchema) -> Option<String> {
 }
 
 /// Connect a store as the named runtime role.
-fn runtime_store(schema: &TestSchema, role: &str) -> PostgresEffectStore {
-    let url = format!(
+fn runtime_url(schema: &TestSchema, role: &str) -> String {
+    format!(
         "postgresql://{role}:runtime-only@{}",
         schema
             .connection
             .rsplit('@')
             .next()
             .expect("host in test URL")
-    );
+    )
+}
+
+fn runtime_store(schema: &TestSchema, role: &str) -> PostgresEffectStore {
     PostgresEffectStore::connect_insecure_local_for_tests(
-        &url,
+        &runtime_url(schema, role),
         &schema.name,
         LeaseConfiguration {
             default_duration_ms: 60_000,
@@ -531,6 +534,50 @@ fn a_non_durable_synchronous_commit_setting_is_rejected() {
         failure.to_string().contains("synchronous_commit"),
         "expected the durability setting to be named: {failure}"
     );
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn a_runtime_credential_that_inherits_a_privileged_role_is_rejected() {
+    let schema = TestSchema::create(&connection_string());
+    schema.store().migrate().expect("initial migration");
+    let Some(role) = create_data_only_role(&schema) else {
+        return;
+    };
+
+    // The escalation is indirect: the runtime role keeps the data-only shape
+    // and carries none of the dangerous attributes itself. Only the role above
+    // it does, which is why checking the connected role alone proves less than
+    // it appears to.
+    let privileged = format!("nemo_privileged_{}", schema.name);
+    schema
+        .client()
+        .batch_execute(&format!(
+            "create role \"{privileged}\" createrole;
+             grant \"{privileged}\" to \"{role}\""
+        ))
+        .expect("create a privileged role and grant it to the runtime role");
+
+    let runtime = runtime_store(&schema, &role);
+    let failure = runtime
+        .verify_runtime_privileges()
+        .expect_err("an inherited privileged role must be rejected");
+    let described = failure.to_string();
+    assert!(
+        described.contains("inherited role(s) with dangerous attributes")
+            && described.contains(&privileged),
+        "expected the inherited role to be named: {failure}"
+    );
+
+    // The escalation is real, not theoretical: membership is what makes it
+    // reachable, so `SET ROLE` succeeds and the runtime credential can act as
+    // the privileged role. That is precisely why readiness has to refuse it
+    // rather than rely on the runtime role's own attributes.
+    let mut client =
+        postgres::Client::connect(&runtime_url(&schema, &role), NoTls).expect("connect runtime");
+    client
+        .batch_execute(&format!("set role \"{privileged}\""))
+        .expect("membership makes the privileged role assumable");
 }
 
 #[test]

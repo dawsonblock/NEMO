@@ -1393,7 +1393,33 @@ impl PostgresEffectStore {
              coalesce((select pg_get_userbyid(nspowner) = current_user from pg_namespace \
                        where nspname = $1), false), \
              exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-                     where n.nspname = $1 and pg_get_userbyid(c.relowner) = current_user)",
+                     where n.nspname = $1 and pg_get_userbyid(c.relowner) = current_user), \
+             coalesce((with recursive reachable(roleid) as ( \
+                         select oid from pg_roles where rolname = current_user \
+                         union \
+                         select m.roleid from pg_auth_members m \
+                         join reachable r on m.member = r.roleid \
+                       ) \
+                       select string_agg(rolname, ', ') from pg_roles \
+                       where oid in (select roleid from reachable) \
+                         and rolname <> current_user \
+                         and (rolsuper or rolcreaterole or rolcreatedb or rolbypassrls)), ''), \
+             coalesce((with recursive reachable(roleid) as ( \
+                         select oid from pg_roles where rolname = current_user \
+                         union \
+                         select m.roleid from pg_auth_members m \
+                         join reachable r on m.member = r.roleid \
+                       ) \
+                       select string_agg(rolname, ', ') from pg_roles \
+                       where oid in (select roleid from reachable) \
+                         and rolname <> current_user \
+                         and (exists (select 1 from pg_namespace n \
+                                      where n.nspname = $1 \
+                                        and pg_get_userbyid(n.nspowner) = rolname) \
+                              or exists (select 1 from pg_class c \
+                                         join pg_namespace n2 on n2.oid = c.relnamespace \
+                                         where n2.nspname = $1 \
+                                           and pg_get_userbyid(c.relowner) = rolname))), '')",
             &[
                 &self.schema,
                 &self.table("effect_schema_migrations"),
@@ -1401,7 +1427,7 @@ impl PostgresEffectStore {
             ],
         )?;
         let role: String = row.get(0);
-        let violations = [
+        let violations: [(&str, bool); 14] = [
             ("CREATE on schema", row.get::<_, bool>(1)),
             ("INSERT into effect_schema_migrations", row.get(3)),
             ("UPDATE of effect_schema_migrations", row.get(4)),
@@ -1417,11 +1443,28 @@ impl PostgresEffectStore {
             ("ownership of the effect-store schema", row.get(14)),
             ("ownership of an effect-store relation", row.get(15)),
         ];
-        let granted: Vec<&str> = violations
+        let mut granted: Vec<String> = violations
             .iter()
             .filter(|(_, present)| *present)
-            .map(|(name, _)| *name)
+            .map(|(name, _)| (*name).to_owned())
             .collect();
+
+        // A role that inherits a dangerous role has that role's powers without
+        // carrying any of its attributes, so checking only the connected role
+        // proves much less than it appears to. Both walks are transitive for the
+        // same reason a chain of two memberships is no safer than one.
+        let inherited_dangerous: String = row.get(16);
+        if !inherited_dangerous.trim().is_empty() {
+            granted.push(format!(
+                "inherited role(s) with dangerous attributes: {inherited_dangerous}"
+            ));
+        }
+        let inherited_owners: String = row.get(17);
+        if !inherited_owners.trim().is_empty() {
+            granted.push(format!(
+                "inherited role(s) owning effect-store objects: {inherited_owners}"
+            ));
+        }
         if !granted.is_empty() {
             return Err(PostgresEffectStoreError::DatabasePrivilegeViolation {
                 role,
