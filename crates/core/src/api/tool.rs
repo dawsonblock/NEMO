@@ -965,6 +965,49 @@ pub async fn tool_request_intercepts(name: &str, args: Json) -> Result<Json> {
     NemoRelayContextState::tool_request_intercepts_snapshot_chain(name, args, &entries).await
 }
 
+/// Run exactly one tool request intercept, named by its registration.
+///
+/// The chain entry points run every intercept for a tool name, which is what a
+/// tool call needs and what a host cannot use: a host holding one plugin's
+/// registrations has to run *that* registration when the kernel asks, or the
+/// kernel's chain — which holds one proxy per registration — would run the
+/// plugin's whole set on every call, once per proxy.
+///
+/// The callback is invoked with the same arguments, in the same arena, and with
+/// the same error handling as it would have had from the chain, because it *is*
+/// the chain runner with one entry: identity is the only thing this changes.
+///
+/// # Errors
+/// NotFound when nothing is registered under that name, which is the answer a
+/// caller needs to refuse the invocation rather than silently do nothing.
+pub async fn invoke_tool_request_intercept_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+) -> Result<Json> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.tool_request_intercepts);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_request_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool request intercept is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::tool_request_intercepts_snapshot_chain(name, args, &[entry]).await
+}
+
 /// Run only the tool conditional-execution guardrail chain.
 ///
 /// This evaluates whether a tool call should be allowed to proceed without

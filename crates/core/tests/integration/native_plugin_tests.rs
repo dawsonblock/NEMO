@@ -13,7 +13,9 @@ use nemo_relay::api::llm::{
     LlmCallEndParams, LlmCallExecuteParams, LlmCallParams, LlmRequest, LlmStreamCallExecuteParams,
     llm_call, llm_call_end, llm_call_execute, llm_stream_call_execute,
 };
-use nemo_relay::api::registry::RuntimeRegistrationKind;
+use nemo_relay::api::registry::{
+    RuntimeRegistrationKind, deregister_tool_request_intercept, register_tool_request_intercept,
+};
 use nemo_relay::api::runtime::{
     LlmJsonStream, TASK_SCOPE_STACK, ThreadScopeStackBinding, capture_thread_scope_stack,
     create_scope_stack, restore_thread_scope_stack, set_thread_scope_stack,
@@ -24,7 +26,8 @@ use nemo_relay::api::scope::{
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use nemo_relay::api::tool::{
-    ToolCallExecuteParams, ToolExecutionResult, tool_call_execute, tool_request_intercepts,
+    ToolCallExecuteParams, ToolExecutionResult, invoke_tool_request_intercept_registration,
+    tool_call_execute, tool_request_intercepts,
 };
 use nemo_relay::codec::response::AnnotatedLlmResponse;
 use nemo_relay::plugin::dynamic::{
@@ -1517,6 +1520,95 @@ async fn native_loader_records_where_every_registration_attaches() {
             .iter()
             .any(|registration| registration.local_name == "fixture_dynamic_gate"),
         "a gate the plugin removed is not part of what it registered"
+    );
+}
+
+/// A host holds one plugin's registrations and must be able to run exactly the
+/// one the kernel asks for: its chain entry points run every intercept for a
+/// tool name, so using them would run the plugin's whole set once per proxy.
+#[tokio::test]
+async fn a_named_registration_can_be_invoked_on_its_own() {
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture);
+    let activation = load_native_plugins([NativePluginLoadSpec::approved(
+        "fixture_native",
+        manifest_ref.to_string_lossy().into_owned(),
+    )
+    .expect("the fixture is approved")])
+    .expect("fixture should load");
+    let mut cleanup = NativePluginTestCleanup::new();
+    let mut config = PluginConfig::default();
+    config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(config)
+        .await
+        .expect("fixture should register");
+    cleanup.mark_plugin_configuration_active();
+
+    // The name the runtime qualified the plugin's intercept under, which is the
+    // identity a kernel would ask a host to run.
+    let qualified = activation.loaded_plugins()[0]
+        .registrations
+        .iter()
+        .find(|registration| {
+            registration.operation == RuntimeRegistrationKind::ToolRequestIntercept
+        })
+        .expect("the fixture registers a tool request intercept")
+        .qualified_name
+        .clone();
+
+    // A second intercept on the same tool name, so a chain run would prove
+    // nothing about running one registration.
+    let second = "nemo-relay-test.second_tool_request_intercept";
+    register_tool_request_intercept(
+        second,
+        100,
+        false,
+        Arc::new(|_name, mut args| {
+            Box::pin(async move {
+                args["second_intercept"] = json!(true);
+                Ok(args)
+            })
+        }),
+    )
+    .expect("the second intercept should register");
+
+    let args = json!({"input": true});
+    let alone =
+        invoke_tool_request_intercept_registration(&qualified, "fixture_tool", args.clone())
+            .await
+            .expect("the named registration");
+    assert_eq!(alone["native_plugin"], true, "{alone}");
+    assert_eq!(
+        alone.get("second_intercept"),
+        None,
+        "invoking one registration runs one registration: {alone}"
+    );
+
+    // The chain still runs both, which is what makes the difference meaningful.
+    let chain = tool_request_intercepts("fixture_tool", args)
+        .await
+        .expect("the chain");
+    assert_eq!(chain["native_plugin"], true, "{chain}");
+    assert_eq!(chain["second_intercept"], true, "{chain}");
+
+    // And a name nothing is registered under is refused rather than silently
+    // doing nothing: an invocation that cannot be attributed must not look like
+    // one that succeeded.
+    let missing = invoke_tool_request_intercept_registration(
+        "nemo-relay-test.no_such_registration",
+        "fixture_tool",
+        json!({"input": true}),
+    )
+    .await;
+    assert!(missing.is_err(), "{missing:?}");
+
+    assert!(
+        deregister_tool_request_intercept(second).expect("the second intercept should deregister")
     );
 }
 

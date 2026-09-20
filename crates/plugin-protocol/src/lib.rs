@@ -539,8 +539,13 @@ pub struct PluginUnloadRequest {
 pub struct PluginInvokeRequest {
     /// Instance to invoke.
     pub handle: PluginHandle,
-    /// Capability to invoke.
-    pub capability_id: String,
+    /// The registration to run, named as the host reported it.
+    ///
+    /// The identity is the one the host gave when the components were activated,
+    /// because that is what a kernel installs its proxy under: resolving a
+    /// capability or a component back to a registration could pick a different
+    /// one than the proxy stands for.
+    pub registration_id: String,
     /// Canonical JSON arguments.
     pub arguments: String,
     /// Milliseconds the kernel will wait before it stops waiting.

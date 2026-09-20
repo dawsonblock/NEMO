@@ -455,7 +455,7 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                 session_id: "session-1".into(),
                 context: Some(context("operation-4")),
                 handle: Some(handle()),
-                capability_id: "example.run".into(),
+                registration_id: "example.run".into(),
                 arguments: r#"{"input":true}"#.into(),
             }
             .encode_to_vec(),

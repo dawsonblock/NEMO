@@ -20,8 +20,9 @@ use nemo_relay_plugin_proto::convert::{
     activate_outcome_to_wire, activate_request_from_wire, cancel_outcome_to_wire,
     execution_outcome_to_wire, handshake_outcome_to_wire, handshake_request_from_wire,
     health_outcome_to_wire, inspect_outcome_to_wire, inspect_request_from_wire,
-    load_outcome_to_wire, load_request_from_wire, operation_envelope_from_wire,
-    session_close_outcome_to_wire, unload_outcome_to_wire, unload_request_from_wire,
+    invoke_request_from_wire, load_outcome_to_wire, load_request_from_wire,
+    operation_envelope_from_wire, session_close_outcome_to_wire, unload_outcome_to_wire,
+    unload_request_from_wire,
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
@@ -163,6 +164,34 @@ impl PluginHostService {
             "plugin {} registers {unsupported:?}, and this session can serve {supported:?}",
             descriptor.plugin_id
         )))
+    }
+}
+
+/// A registration ran and its answer is the output.
+///
+/// `NotDispatched` is the truth for the classes a host serves today: they run
+/// before any call, so nothing was reached that could have happened elsewhere.
+fn success(output: String) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
+    use nemo_relay_plugin_protocol::{DispatchState, OutcomeCertainty, PluginExecutionOutcome};
+    PluginExecutionOutcome {
+        dispatch: DispatchState::NotDispatched,
+        certainty: OutcomeCertainty::ConfirmedSuccess,
+        result: Ok(nemo_relay_plugin_protocol::PluginSuccess::Invoked(
+            nemo_relay_plugin_protocol::PluginInvokeResponse { output },
+        )),
+    }
+}
+
+/// A registration refused, or the invocation never reached one.
+fn refusal(message: impl Into<String>) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
+    use nemo_relay_plugin_protocol::{DispatchState, OutcomeCertainty, PluginExecutionOutcome};
+    PluginExecutionOutcome {
+        dispatch: DispatchState::NotDispatched,
+        certainty: OutcomeCertainty::ConfirmedFailure,
+        result: Err(nemo_relay_plugin_protocol::PluginFailure {
+            code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+            message: message.into(),
+        }),
     }
 }
 
@@ -406,21 +435,77 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
 
     async fn invoke(
         &self,
-        _request: Request<v1::InvokeRequest>,
+        request: Request<v1::InvokeRequest>,
     ) -> Result<Response<v1::InvokeOutcome>, Status> {
-        // Nothing asks a host to invoke yet: a loaded plugin registers into the
-        // runtime's own machinery rather than exposing an endpoint, so there is
-        // nothing here to dispatch to. A structured refusal keeps that visible
-        // rather than looking like an empty success.
-        let outcome =
-            execution_outcome_to_wire(&nemo_relay_plugin_protocol::PluginExecutionOutcome {
-                dispatch: nemo_relay_plugin_protocol::DispatchState::NotDispatched,
-                certainty: nemo_relay_plugin_protocol::OutcomeCertainty::ConfirmedFailure,
-                result: Err(nemo_relay_plugin_protocol::PluginFailure {
-                    code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
-                    message: "this host does not serve invocations".to_string(),
-                }),
-            })
+        let wire = request.into_inner();
+        let outcome: Result<
+            nemo_relay_plugin_protocol::PluginExecutionOutcome,
+            PluginProtocolError,
+        > = async {
+            if let Err(error) = self.established(&wire.session_id) {
+                return Ok(refusal(error.failure.message));
+            }
+            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let request = invoke_request_from_wire(&wire, &context)?;
+
+            // Which registration this is comes from the host's own record of
+            // what the plugin registered, not from what the caller says: a
+            // caller that could name an arbitrary operation against a
+            // registration would be choosing the semantics of a call it did not
+            // make.
+            let operation = self.registration_operation(&request, &context).await?;
+            match operation {
+                // The first class that crosses the boundary. Its payload is the
+                // tool name and the arguments to rewrite; the callback runs in
+                // this process, through the runtime this host links.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept => {
+                    let payload: serde_json::Value = serde_json::from_str(&request.arguments)
+                        .map_err(|error| {
+                            refused(format!(
+                                "a tool request intercept payload must be JSON: {error}"
+                            ))
+                        })?;
+                    let tool = payload
+                        .get("tool")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| refused("a tool request intercept payload names no tool"))?
+                        .to_string();
+                    let args = payload.get("args").cloned().ok_or_else(|| {
+                        refused("a tool request intercept payload carries no arguments")
+                    })?;
+                    let rewritten =
+                        nemo_relay::api::tool::invoke_tool_request_intercept_registration(
+                            &request.registration_id,
+                            &tool,
+                            args,
+                        )
+                        .await;
+                    Ok(match rewritten {
+                        Ok(value) => success(serde_json::to_string(&value).map_err(|error| {
+                            refused(format!(
+                                "the rewritten arguments could not be serialized: {error}"
+                            ))
+                        })?),
+                        // A registration that refused did not dispatch anything
+                        // anywhere else: this hook runs before the call.
+                        Err(error) => refusal(error.to_string()),
+                    })
+                }
+                // Every other class is refused by name rather than answered as
+                // an empty success, because a caller cannot tell the two apart
+                // and would read one as the other.
+                other => Ok(refusal(format!(
+                    "this host does not serve {} invocations yet",
+                    other.as_str()
+                ))),
+            }
+        }
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => refusal(error.failure.message),
+        };
+        let outcome = execution_outcome_to_wire(&outcome)
             .map_err(|error| Status::internal(error.failure.message))?;
         Ok(Response::new(outcome))
     }
@@ -511,6 +596,45 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
 }
 
 impl PluginHostService {
+    /// The operation a registration was made at, from the host's own record.
+    ///
+    /// An invocation naming a registration this host does not hold is refused
+    /// rather than mapped to whichever registration happens to be close: the
+    /// kernel installs one proxy per registration, and a proxy that ran another
+    /// one would be a different call than the one it stands for.
+    async fn registration_operation(
+        &self,
+        request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
+        context: &nemo_relay_plugin_protocol::PluginExecutionContext,
+    ) -> Result<nemo_relay_plugin_protocol::PluginRegistrationOperation, PluginProtocolError> {
+        let descriptors = self
+            .backend
+            .inspect(
+                nemo_relay_plugin_protocol::PluginInspectRequest {
+                    handle: Some(request.handle.clone()),
+                },
+                context.clone(),
+            )
+            .await?;
+        let descriptor = descriptors.first().ok_or_else(|| {
+            PluginProtocolError::new(
+                nemo_relay_plugin_protocol::PluginFailureCode::UnknownPlugin,
+                format!("plugin {} is not loaded", request.handle.plugin_id),
+            )
+        })?;
+        descriptor
+            .registrations
+            .iter()
+            .find(|registration| registration.registration_id == request.registration_id)
+            .map(|registration| registration.operation)
+            .ok_or_else(|| {
+                refused(format!(
+                    "plugin {} has no registration named '{}'",
+                    descriptor.plugin_id, request.registration_id
+                ))
+            })
+    }
+
     /// Validate the session and context of one operation.
     fn prepare(
         &self,
@@ -806,6 +930,22 @@ mod tests {
     }
 
     impl PluginExecutionBackend for RegisteringBackend {
+        fn invoke<'a>(
+            &'a self,
+            _request: nemo_relay_plugin_protocol::PluginInvokeRequest,
+            _context: nemo_relay_plugin_protocol::PluginExecutionContext,
+        ) -> nemo_relay::plugin::execution::PluginExecutionFuture<
+            'a,
+            nemo_relay_plugin_protocol::PluginExecutionOutcome,
+        > {
+            Box::pin(async move {
+                Err(nemo_relay_plugin_protocol::PluginProtocolError::new(
+                    nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                    "this test backend serves no invocations",
+                ))
+            })
+        }
+
         fn load<'a>(
             &'a self,
             request: nemo_relay_plugin_protocol::PluginLoadRequest,
@@ -1152,6 +1292,141 @@ mod tests {
         )
         .expect("write the manifest");
         Some((manifest_dir, manifest.to_string_lossy().into_owned()))
+    }
+
+    /// The first class across the boundary, end to end at the service: the
+    /// kernel asks a host to activate a plugin, then asks it to run one of the
+    /// registrations it reported, and gets the rewritten arguments back.
+    #[tokio::test]
+    async fn an_invocation_runs_the_registration_the_kernel_named() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the invocation case");
+            return;
+        };
+
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let mut request = handshake_request(&config);
+        request.supported_registration_operations = EVERY_REGISTRATION_OPERATION
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+            })
+            .collect();
+        let session_id = handshake_outcome_from_wire(
+            &service
+                .handshake(Request::new(request))
+                .await
+                .expect("a served handshake")
+                .into_inner(),
+        )
+        .expect("a converted handshake")
+        .into_result()
+        .expect("an established session")
+        .session_id;
+
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                .expect("the fixture's identity");
+        let load = service
+            .load(Request::new(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact,
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load")
+            .into_inner();
+        let handle = nemo_relay_plugin_proto::convert::load_outcome_from_wire(&load)
+            .expect("a converted load")
+            .into_result()
+            .expect("a load")
+            .handle;
+
+        let activated = service
+            .activate(Request::new(v1::ActivateRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+            }))
+            .await
+            .expect("a served activation")
+            .into_inner();
+        let descriptors = nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&activated)
+            .expect("a converted activation")
+            .into_result()
+            .expect("an activation this session can serve");
+
+        // The registration the kernel would install a proxy under, from what the
+        // host itself reported.
+        let registration = descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .find(|registration| {
+                registration.operation
+                    == nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept
+            })
+            .expect("the fixture registers a tool request intercept")
+            .registration_id
+            .clone();
+
+        let invoked = service
+            .invoke(Request::new(v1::InvokeRequest {
+                session_id,
+                context: Some(context()),
+                handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(&handle)),
+                registration_id: registration.clone(),
+                arguments: serde_json::json!({"tool": "fixture_tool", "args": {"input": true}})
+                    .to_string(),
+            }))
+            .await
+            .expect("a served invocation")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&invoked)
+            .expect("a converted invocation");
+        assert_eq!(
+            outcome.dispatch,
+            nemo_relay_plugin_protocol::DispatchState::NotDispatched
+        );
+        let output = outcome.result.expect("the registration's answer").clone();
+        let nemo_relay_plugin_protocol::PluginSuccess::Invoked(response) = output else {
+            panic!("an invocation answers with output");
+        };
+        let args: serde_json::Value = serde_json::from_str(&response.output).expect("JSON");
+        assert_eq!(args["native_plugin"], true, "{args}");
+
+        // A registration this host does not hold is refused rather than mapped
+        // to whichever one happens to be close.
+        let unknown = service
+            .invoke(Request::new(v1::InvokeRequest {
+                session_id: "session-1".into(),
+                context: Some(context()),
+                handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(&handle)),
+                registration_id: "nemo-relay-plugin.v1.fixture_native:1:no_such_registration"
+                    .into(),
+                arguments: serde_json::json!({"tool": "fixture_tool", "args": {}}).to_string(),
+            }))
+            .await
+            .expect("a served invocation")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&unknown)
+            .expect("a converted invocation");
+        assert!(outcome.result.is_err(), "{outcome:?}");
+
+        let _ = std::fs::remove_dir_all(&manifest_dir);
     }
 
     #[test]

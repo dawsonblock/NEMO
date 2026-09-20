@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use nemo_relay_plugin_protocol::{
     DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext,
     PluginExecutionOutcome, PluginFailureCode, PluginHostHealth, PluginInspectRequest,
-    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginSuccess, PluginUnloadRequest,
-    check_execution_context,
+    PluginInvokeRequest, PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginSuccess,
+    PluginUnloadRequest, check_execution_context,
 };
 
 /// A plugin operation in progress.
@@ -80,6 +80,21 @@ pub trait PluginExecutionBackend: Send + Sync {
         &'a self,
         context: PluginExecutionContext,
     ) -> PluginExecutionFuture<'a, PluginHostHealth>;
+
+    /// Run one registration a loaded plugin made.
+    ///
+    /// This is what a kernel calls when its own chain reaches a proxy: the
+    /// backend is responsible for reaching the registration and for reporting
+    /// what is known about the outcome, including whether the plugin may have
+    /// reached an external system before the answer was lost.
+    ///
+    /// A backend whose plugins register into the caller's own process does not
+    /// proxy anything, and says so rather than pretending to invoke.
+    fn invoke<'a>(
+        &'a self,
+        request: PluginInvokeRequest,
+        context: PluginExecutionContext,
+    ) -> PluginExecutionFuture<'a, PluginExecutionOutcome>;
 }
 
 /// Owner of plugin execution, holding whichever backend was composed.
@@ -259,6 +274,19 @@ mod tests {
     }
 
     impl PluginExecutionBackend for RecordingBackend {
+        fn invoke<'a>(
+            &'a self,
+            _request: PluginInvokeRequest,
+            _context: PluginExecutionContext,
+        ) -> PluginExecutionFuture<'a, PluginExecutionOutcome> {
+            Box::pin(async move {
+                Err(PluginProtocolError::new(
+                    PluginFailureCode::Rejected,
+                    "the recording backend serves no invocations",
+                ))
+            })
+        }
+
         fn load<'a>(
             &'a self,
             request: PluginLoadRequest,

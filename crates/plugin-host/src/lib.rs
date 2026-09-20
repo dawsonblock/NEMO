@@ -175,6 +175,32 @@ fn refused(message: impl Into<String>) -> PluginProtocolError {
     }
 }
 
+impl InProcessPluginBackend {
+    /// Run one registration a loaded plugin made.
+    ///
+    /// The in-process backend exists for plugins that register into *this*
+    /// process: their callbacks are already in the runtime's own registries, so
+    /// there is no proxy to reach and nothing for this to forward to. It refuses
+    /// rather than pretending, because an invocation that quietly did nothing
+    /// would look like a registration that ran.
+    pub async fn invoke_registration(
+        &self,
+        request: nemo_relay_plugin_protocol::PluginInvokeRequest,
+        _context: PluginExecutionContext,
+    ) -> Result<
+        nemo_relay_plugin_protocol::PluginExecutionOutcome,
+        nemo_relay_plugin_protocol::PluginProtocolError,
+    > {
+        Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "plugin {} is hosted in this process; registration {} has no proxy to invoke",
+                request.handle.plugin_id, request.registration_id
+            ),
+        ))
+    }
+}
+
 impl PluginExecutionBackend for InProcessPluginBackend {
     fn load<'a>(
         &'a self,
@@ -358,6 +384,14 @@ impl PluginExecutionBackend for InProcessPluginBackend {
                 },
             }
         })
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        request: nemo_relay_plugin_protocol::PluginInvokeRequest,
+        context: PluginExecutionContext,
+    ) -> PluginExecutionFuture<'a, nemo_relay_plugin_protocol::PluginExecutionOutcome> {
+        Box::pin(async move { self.invoke_registration(request, context).await })
     }
 
     fn health<'a>(

@@ -334,11 +334,23 @@ message ActivateOutcome {
   }
 }
 
+// Invoke one registration a loaded plugin made.
+//
+// The registration is named by the identity the host reported when the
+// components were activated, because that identity is what the kernel installs
+// its proxy under: an invocation that named a capability or a component would
+// have to be resolved back to a registration, and the resolution could pick a
+// different one than the proxy stood for.
+//
+// `arguments` carries the payload the registration's class defines, as a JSON
+// object whose shape the class documents — a tool request intercept, for
+// instance, is given a tool name and the arguments to rewrite. The host refuses
+// a payload that does not fit the class rather than guessing.
 message InvokeRequest {
   string session_id = 1;
   PluginExecutionContext context = 2;
   PluginHandle handle = 3;
-  string capability_id = 4;
+  string registration_id = 4;
   string arguments = 5;
 }
 

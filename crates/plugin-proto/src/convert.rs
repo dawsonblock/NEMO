@@ -1253,6 +1253,25 @@ pub fn inspect_request_from_wire(
     })
 }
 
+/// Build the wire form of an invocation request.
+///
+/// The registration identity travels as the host reported it: a kernel installs
+/// its proxy under that name, and an invocation that had to be resolved back to
+/// a registration could reach a different one than the proxy stood for.
+pub fn invoke_request_to_wire(
+    request: &PluginInvokeRequest,
+    session_id: &str,
+    context: &PluginExecutionContext,
+) -> v1::InvokeRequest {
+    v1::InvokeRequest {
+        session_id: session_id.to_owned(),
+        context: Some(context_to_wire(context)),
+        handle: Some(handle_to_wire(&request.handle)),
+        registration_id: request.registration_id.clone(),
+        arguments: request.arguments.clone(),
+    }
+}
+
 /// Validate an invocation request against the context it belongs to.
 ///
 /// The budget is not on the request: it comes from the context, which is the
@@ -1264,9 +1283,9 @@ pub fn invoke_request_from_wire(
 ) -> Result<PluginInvokeRequest, PluginProtocolError> {
     Ok(PluginInvokeRequest {
         handle: plugin_handle_from_wire(wire.handle.as_ref(), "an invocation")?,
-        capability_id: required_text(
-            &wire.capability_id,
-            "an invocation with no capability to invoke",
+        registration_id: required_text(
+            &wire.registration_id,
+            "an invocation naming no registration",
         )?,
         arguments: required_text(&wire.arguments, "an invocation with no arguments")?,
         budget_millis: context.remaining_budget_millis,
@@ -3783,7 +3802,7 @@ mod tests {
                     plugin_id: "example".into(),
                     generation: 7,
                 }),
-                capability_id: "run".into(),
+                registration_id: "run".into(),
                 arguments: r#"{"input":true}"#.into(),
                 ..Default::default()
             },
@@ -3797,7 +3816,7 @@ mod tests {
         assert!(
             invoke_request_from_wire(
                 &v1::InvokeRequest {
-                    capability_id: "run".into(),
+                    registration_id: "run".into(),
                     arguments: "  ".into(),
                     ..Default::default()
                 },

@@ -429,6 +429,33 @@ impl PluginExecutionBackend for ProcessPluginBackend {
         })
     }
 
+    fn invoke<'a>(
+        &'a self,
+        request: nemo_relay_plugin_protocol::PluginInvokeRequest,
+        context: PluginExecutionContext,
+    ) -> PluginExecutionFuture<'a, nemo_relay_plugin_protocol::PluginExecutionOutcome> {
+        Box::pin(async move {
+            let budget = Self::budget(&context, now_unix_ms()?)?;
+            let session_id = self.supervisor.session.session_id.clone();
+            let wire = nemo_relay_plugin_proto::convert::invoke_request_to_wire(
+                &request,
+                &session_id,
+                &context,
+            );
+            let mut client = self.supervisor.client.clone();
+            let outcome = self
+                .supervisor
+                .request(budget, async move { client.invoke(wire).await })
+                .await?
+                .into_inner();
+            // The outcome travels whole, because the distinction it carries is
+            // the reason it exists: a plugin that may have dispatched before the
+            // channel died produced no definite result, and collapsing that into
+            // a failure would turn "nobody knows" into "it did not happen".
+            nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&outcome)
+        })
+    }
+
     fn health<'a>(
         &'a self,
         context: PluginExecutionContext,
