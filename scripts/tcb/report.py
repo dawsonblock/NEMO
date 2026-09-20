@@ -307,6 +307,31 @@ def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dic
     return "\n".join(rows)
 
 
+def measured_kernel_unsafe(surface: str) -> int | None:
+    """Return the kernel-process unsafe figure from a rendered surface table."""
+    for line in surface.splitlines():
+        prefix = "kernel-process unsafe tokens:"
+        if prefix in line:
+            return int(line.split(prefix, 1)[1].strip())
+    return None
+
+
+def documented_kernel_unsafe(repo_root: pathlib.Path) -> int | None:
+    """Return the figure quoted by the milestone document, if it quotes one."""
+    document = pathlib.Path(repo_root) / "security" / "PLUGIN-ISOLATION.md"
+    if not document.exists():
+        return None
+    for line in document.read_text(encoding="utf-8").splitlines():
+        prefix = "kernel-process unsafe tokens:"
+        if prefix in line:
+            figure = line.split(prefix, 1)[1].strip().strip("`").strip()
+            try:
+                return int(figure)
+            except ValueError:
+                return None
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the TCB gate."""
     parser = argparse.ArgumentParser(description="Report and enforce the trusted computing base budget.")
@@ -347,11 +372,25 @@ def main(argv: list[str] | None = None) -> int:
 
     print(render(reports))
     print()
-    print(render_surface(metadata, identities, policy))
+    surface = render_surface(metadata, identities, policy)
+    print(surface)
     if problems:
         print(file=sys.stderr)
         for problem in problems:
             print(f"error: {problem}", file=sys.stderr)
+        return 1
+    # The document that describes the milestone quotes this number, and a quoted
+    # number that is maintained by hand drifts: a revision said 617 in one
+    # paragraph and 621 in another. The figure is checked here instead, so the
+    # prose cannot disagree with the measurement.
+    documented = documented_kernel_unsafe(arguments.repo_root)
+    measured = measured_kernel_unsafe(surface)
+    if documented is not None and measured is not None and documented != measured:
+        print(
+            f"error: security/PLUGIN-ISOLATION.md says kernel-process unsafe tokens: "
+            f"{documented}, and the measurement says {measured}",
+            file=sys.stderr,
+        )
         return 1
     print("\nTCB budgets satisfied.")
     return 0

@@ -24,11 +24,12 @@ fn host_executable() -> PathBuf {
 fn host_config() -> PluginHostSupervisorConfig {
     PluginHostSupervisorConfig {
         executable: host_executable(),
-        runtime_binding_digest: "test-runtime-binding".into(),
+        // The host is started with the runtime binding its operations must
+        // claim: the suite's contexts are bound to this runtime, and the host now
+        // refuses a context bound to another one.
+        runtime_binding_digest: "conformance-binding".into(),
         offered_read_capabilities: Vec::new(),
-        // Nothing can be proxied yet, and the boundary says so rather than
-        // loading a plugin whose callbacks it would then ignore.
-        supported_registration_operations: Vec::new(),
+        maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
         startup_timeout: Duration::from_secs(20),
     }
 }
@@ -37,7 +38,7 @@ fn context() -> PluginExecutionContext {
     PluginExecutionContext {
         operation_request_id: "operation-1".into(),
         protocol_version: PROTOCOL_VERSION,
-        runtime_binding_digest: "test-runtime-binding".into(),
+        runtime_binding_digest: "conformance-binding".into(),
         deadline_unix_ms: u64::MAX,
         remaining_budget_millis: 30_000,
         max_response_bytes: 1024,
@@ -67,6 +68,124 @@ async fn the_process_backend_satisfies_the_same_conformance_suite() {
         backend.process_id().is_some(),
         "the backend should hold a running host"
     );
+}
+
+#[tokio::test]
+async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
+    use nemo_relay::plugin::dynamic::plugin_artifact_identity;
+    use nemo_relay_plugin_protocol::{PluginArtifactIdentity, PluginLoadRequest};
+
+    let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-plugin-fixtures/debug/libnemo_relay_plugin_fixture.dylib")
+        });
+    assert!(
+        library.exists(),
+        "the native fixture is missing; run `just build-test-plugin-fixtures`: {}",
+        library.display()
+    );
+
+    // A manifest in its own directory, written here so this test says exactly
+    // what it loads rather than borrowing another suite's helper.
+    let manifest_dir = std::env::temp_dir().join(format!(
+        "nemo-ph-manifest-{}",
+        nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&manifest_dir).expect("a manifest directory");
+    let manifest = manifest_dir.join("relay-plugin.toml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "manifest_version = 1\n\n[plugin]\nid = \"fixture_native\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \"nemo_relay_fixture_native_plugin\"\n",
+            env!("CARGO_PKG_VERSION"),
+            library.display()
+        ),
+    )
+    .expect("write the manifest");
+
+    let artifact = manifest.to_string_lossy().into_owned();
+    let (manifest_sha256, library_sha256) =
+        plugin_artifact_identity(&artifact).expect("the identity of an existing artifact");
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+
+    // The identity the kernel approves is the identity the child verifies: an
+    // artifact that is not the approved one is refused rather than loaded.
+    let wrong = backend
+        .load(
+            PluginLoadRequest {
+                plugin_id: "fixture_native".into(),
+                artifact: artifact.clone(),
+                identity: PluginArtifactIdentity {
+                    manifest_sha256: "0".repeat(64),
+                    library_sha256: library_sha256.clone(),
+                },
+            },
+            context(),
+        )
+        .await
+        .expect_err("an artifact that is not the approved one");
+    assert_eq!(wrong.failure.code, PluginFailureCode::Rejected, "{wrong:?}");
+
+    let loaded = backend
+        .load(
+            PluginLoadRequest {
+                plugin_id: "fixture_native".into(),
+                artifact,
+                identity: PluginArtifactIdentity {
+                    manifest_sha256: manifest_sha256.clone(),
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect("the approved artifact");
+
+    // The approved digest, the verified digest and the reported one are the same
+    // value, so the evidence chain has no gap in it.
+    assert_eq!(
+        loaded.descriptor.manifest_digest.as_deref(),
+        Some(manifest_sha256.as_str())
+    );
+    assert_eq!(loaded.handle.plugin_id, "fixture_native");
+
+    // The child holds it, and says so on inspection.
+    let described = backend
+        .inspect(
+            nemo_relay_plugin_protocol::PluginInspectRequest {
+                handle: Some(loaded.handle.clone()),
+            },
+            context(),
+        )
+        .await
+        .expect("an inspection");
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0].plugin_id, "fixture_native");
+
+    // And unloading it leaves nothing behind.
+    backend
+        .unload(
+            nemo_relay_plugin_protocol::PluginUnloadRequest {
+                handle: loaded.handle,
+            },
+            context(),
+        )
+        .await
+        .expect("an unload");
+    let after = backend
+        .inspect(
+            nemo_relay_plugin_protocol::PluginInspectRequest { handle: None },
+            context(),
+        )
+        .await
+        .expect("an inspection");
+    assert!(after.is_empty(), "{after:#?}");
+
+    let _ = std::fs::remove_dir_all(&manifest_dir);
 }
 
 #[tokio::test]
@@ -132,7 +251,7 @@ async fn a_host_that_stops_answering_is_killed_at_the_deadline() {
     let budgeted = PluginExecutionContext {
         operation_request_id: "operation-budgeted".into(),
         protocol_version: PROTOCOL_VERSION,
-        runtime_binding_digest: "test-runtime-binding".into(),
+        runtime_binding_digest: "conformance-binding".into(),
         deadline_unix_ms: deadline,
         remaining_budget_millis: 500,
         max_response_bytes: 1024,
@@ -196,7 +315,7 @@ async fn an_operation_that_may_not_start_is_refused_before_it_crosses() {
     let expired = PluginExecutionContext {
         operation_request_id: "operation-expired".into(),
         protocol_version: PROTOCOL_VERSION,
-        runtime_binding_digest: "test-runtime-binding".into(),
+        runtime_binding_digest: "conformance-binding".into(),
         // A deadline already in the past: the host must not be asked to do work
         // the kernel has no time to wait for.
         deadline_unix_ms: 1,

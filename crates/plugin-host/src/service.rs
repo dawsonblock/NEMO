@@ -450,6 +450,18 @@ impl PluginHostService {
     ) -> Result<nemo_relay_plugin_protocol::PluginExecutionContext, PluginProtocolError> {
         self.established(session_id)?;
         let envelope = operation_envelope_from_wire(session_id, context)?;
+        // The host checks the context against this session itself rather than
+        // trusting the kernel to have done it: a peer that reaches this service
+        // could send a structurally valid context that is bound to another
+        // runtime, carries no budget, or is already out of time.
+        nemo_relay_plugin_protocol::check_execution_context(
+            &envelope.context,
+            &self.config.runtime_binding_digest,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+        )?;
         Ok(envelope.context)
     }
 }

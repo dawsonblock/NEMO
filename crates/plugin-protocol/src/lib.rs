@@ -1014,6 +1014,76 @@ impl PluginProtocolError {
 /// are separately deployed processes, and a mismatch means one of them is
 /// interpreting fields the other does not send. Guessing is worse than
 /// refusing.
+/// Validate an operation's context against the session it claims.
+///
+/// One function, called by both sides, because the contract has to be the same
+/// on both: the kernel refuses before it dispatches, and the host refuses before
+/// it acts, so a peer that reaches the service with a structurally valid but
+/// semantically unusable context is rejected by the host as well rather than
+/// only by the side that happened to check first. `runtime_binding_digest` is
+/// the session's binding, which is what makes this a check against the session
+/// rather than against the message.
+pub fn check_execution_context(
+    context: &PluginExecutionContext,
+    runtime_binding_digest: &str,
+    now_unix_ms: u64,
+) -> Result<(), PluginProtocolError> {
+    if context.protocol_version != PROTOCOL_VERSION {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::VersionMismatch {
+                expected: PROTOCOL_VERSION,
+                received: context.protocol_version,
+            },
+            "the operation declares a protocol version this side does not speak",
+        ));
+    }
+    if context.operation_request_id.trim().is_empty() {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "the operation carries no request identity",
+        ));
+    }
+    if context.runtime_binding_digest.trim().is_empty() {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "the operation carries no runtime binding",
+        ));
+    }
+    if !runtime_binding_digest.is_empty()
+        && context.runtime_binding_digest != runtime_binding_digest
+    {
+        // A context bound to another runtime is a message from another session
+        // wearing this one's identity.
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "the operation is bound to a different runtime than this session",
+        ));
+    }
+    if context.max_response_bytes == 0 || context.max_response_bytes > MAX_FRAME_BYTES {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::OversizedFrame {
+                observed: u64::from(context.max_response_bytes),
+                limit: MAX_FRAME_BYTES,
+            },
+            "the operation's response budget is outside the protocol's frame limit",
+        ));
+    }
+    if context.remaining_budget_millis == 0 {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::DeadlineExceeded,
+            "the operation carries no remaining budget to enforce",
+        ));
+    }
+    if deadline_expired(context.deadline_unix_ms, now_unix_ms) {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::DeadlineExceeded,
+            "the operation's deadline has already passed",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a peer that speaks another protocol version.
 pub fn check_protocol_version(received: u16) -> Result<(), PluginProtocolError> {
     if received == PROTOCOL_VERSION {
         return Ok(());

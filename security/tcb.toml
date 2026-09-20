@@ -51,6 +51,11 @@ crates = [
     # the loader crosses a process boundary. Counting it only in the target tier
     # would let an architecture diagram stand in for an accounting fact.
     "nemo-relay-plugin-host",
+    # The wire crate is linked into the kernel's process too: the supervisor
+    # converts and sends on the kernel's side of the boundary. It is budgeted on
+    # its own line because its transitive set is dominated by the protobuf and
+    # gRPC toolchain, but the tier is what says where its code runs.
+    "nemo-relay-plugin-proto",
     "nemo-relay-worker-proto",
 ]
 
@@ -139,7 +144,7 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 [limits.nemo-relay-plugin-protocol]
 max_direct_dependencies = 4
 max_transitive_packages = 24
-max_source_lines = 1252
+max_source_lines = 1322
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -236,7 +241,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 9
 max_transitive_packages = 239
-max_source_lines = 3265
+max_source_lines = 3367
 max_unsafe_occurrences = 1
 direct_dependency_digest = "f8ae7cbac9719aab3e714f825ac21b7fd1cf19cb2316ef5f8461efbf2e52e190"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

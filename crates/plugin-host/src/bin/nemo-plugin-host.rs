@@ -89,8 +89,16 @@ fn main() -> ExitCode {
         // dependency graph.
         let backend = std::sync::Arc::new(InProcessPluginBackend::new());
         let service = PluginHostService::new(backend, config);
+        // The transport decoder is configured from the same limit the handshake
+        // negotiates. A transport default that disagreed with the protocol would
+        // make the negotiated frame size declarative rather than enforced.
+        let frame_limit = nemo_relay_plugin_protocol::MAX_FRAME_BYTES as usize;
         let served = Server::builder()
-            .add_service(PluginHostServer::new(service))
+            .add_service(
+                PluginHostServer::new(service)
+                    .max_decoding_message_size(frame_limit)
+                    .max_encoding_message_size(frame_limit),
+            )
             .serve_with_incoming(UnixListenerStream::new(listener))
             .await;
         match served {

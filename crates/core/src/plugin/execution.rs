@@ -31,10 +31,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use nemo_relay_plugin_protocol::{
-    DispatchState, MAX_FRAME_BYTES, OutcomeCertainty, PROTOCOL_VERSION, PluginDescriptor,
-    PluginExecutionContext, PluginExecutionOutcome, PluginFailureCode, PluginHostHealth,
-    PluginInspectRequest, PluginLoadRequest, PluginLoadResponse, PluginProtocolError,
-    PluginSuccess, PluginUnloadRequest, check_deadline,
+    DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext,
+    PluginExecutionOutcome, PluginFailureCode, PluginHostHealth, PluginInspectRequest,
+    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginSuccess, PluginUnloadRequest,
+    check_execution_context,
 };
 
 /// A plugin operation in progress.
@@ -126,48 +126,10 @@ impl PluginManager {
     /// would have to re-derive the same rules, and the ones it forgot would be
     /// the ones nobody tested.
     fn begin(&self, context: &PluginExecutionContext) -> Result<InFlight<'_>, PluginProtocolError> {
-        if context.protocol_version != PROTOCOL_VERSION {
-            return Err(PluginProtocolError::new(
-                PluginFailureCode::VersionMismatch {
-                    expected: PROTOCOL_VERSION,
-                    received: context.protocol_version,
-                },
-                "the operation declares a protocol version this kernel does not speak",
-            ));
-        }
-        if context.runtime_binding_digest.trim().is_empty() {
-            return Err(PluginProtocolError::new(
-                PluginFailureCode::Rejected,
-                "the operation carries no runtime binding",
-            ));
-        }
-        if context.operation_request_id.trim().is_empty() {
-            return Err(PluginProtocolError::new(
-                PluginFailureCode::Rejected,
-                "the operation carries no request identity",
-            ));
-        }
-        if context.max_response_bytes == 0 || context.max_response_bytes > MAX_FRAME_BYTES {
-            // Rejected rather than clamped: silently shrinking a caller's limit
-            // would make it believe a response was truncated for another reason.
-            return Err(PluginProtocolError::new(
-                PluginFailureCode::OversizedFrame {
-                    observed: u64::from(context.max_response_bytes),
-                    limit: MAX_FRAME_BYTES,
-                },
-                "the operation's response budget is outside the protocol's frame limit",
-            ));
-        }
-        if context.remaining_budget_millis == 0 {
-            // The deadline check below catches an expiry the kernel can see.
-            // This catches a context that carries no budget at all, which the
-            // host could not enforce even if the deadline were in the future.
-            return Err(PluginProtocolError::new(
-                PluginFailureCode::DeadlineExceeded,
-                "the operation carries no remaining budget for the host to enforce",
-            ));
-        }
-        check_deadline(context.deadline_unix_ms)?;
+        // The same validator the host runs, so the two sides cannot drift into
+        // enforcing different contracts: whatever the kernel refuses here, the
+        // host refuses there.
+        check_execution_context(context, "", now_unix_ms())?;
         let mut in_flight = self.in_flight();
         if !in_flight.insert(context.operation_request_id.clone()) {
             return Err(PluginProtocolError::new(
@@ -262,6 +224,17 @@ pub fn outcome_from(
         certainty,
         result: result.map_err(|error| error.failure),
     }
+}
+
+/// Wall-clock milliseconds, for comparing against an absolute deadline.
+///
+/// A clock before the epoch reports zero rather than failing: every deadline
+/// then looks passed, which is the fail-closed reading.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

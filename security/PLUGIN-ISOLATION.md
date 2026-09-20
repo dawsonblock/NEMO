@@ -11,8 +11,12 @@ in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
 surface, and `just tcb-report` prints the number this milestone is judged on:
 
 ```
-kernel-process unsafe tokens: 617
+kernel-process unsafe tokens: 621
 ```
+
+`just tcb-report` checks that figure against the measurement rather than
+trusting this paragraph: a revision of this document said 617 here and 621 forty
+lines later, which is what a hand-maintained number does.
 
 Moving the loader into another Rust crate would improve the source layout and
 leave that number unchanged, because a memory-corruption bug in the loader would
@@ -477,11 +481,28 @@ holds the supervisor that starts it and the backend that reaches it.
   environment, and waits for the socket rather than sleeping a fixed time. The
   child serves the socket; stdout and stderr stay logs and never carry the
   protocol.
+- **The approved artifact is the loaded artifact.** The kernel computes the
+  manifest and library digests, the request carries them, and the host verifies
+  both against the files it is about to open, immediately before the loader
+  opens them. A mismatch is refused, and the descriptor reports the digest that
+  was verified, so the approved identity, the verified identity and the reported
+  one are the same value. An end-to-end test loads a real fixture through a real
+  child, mutates one digest, and asserts the child refuses it.
 - **What the handshake binds.** Protocol version, runtime binding and frame
   limit are all checked on both sides. A host started under one runtime is
   refused by another, and a host that accepted a read capability it was not
   offered is refused rather than believed: the offer is the kernel's decision,
   and the host can only accept or decline.
+- **Both sides validate the context.** The kernel refuses before it dispatches
+  and the host refuses before it acts, through one shared validator: protocol
+  version, request identity, runtime binding against the session's, response
+  budget within the frame limit, a non-zero budget, and a deadline that has not
+  passed. A peer that reaches the service with a structurally valid but
+  semantically unusable context is rejected by the host rather than only by the
+  side that happened to check first.
+- **The transport enforces the negotiated frame limit.** Client and server
+  decoders are configured from the same value the handshake negotiates, so the
+  limit is enforced rather than declared.
 - **Deadlines.** Every operation is sent under its remaining budget, computed
   from the context the kernel derived rather than from anything the caller
   chose; a budget that has already passed means no request is sent at all, and a
@@ -497,6 +518,17 @@ holds the supervisor that starts it and the backend that reaches it.
   from before the crash addressing nothing. Restarting with the previous plugins
   in place would imply a continuity the crash took away, and the loaded set is
   the kernel's record rather than the backend's.
+- **Lost transport integrity ends the session.** A channel that breaks while the
+  host is still running leaves nobody able to say whether it acted on the
+  request, so the host is killed rather than kept: the session's state becomes
+  certain again, which is what restarting from nothing depends on.
+- **Startup is one budget.** The socket appearing and the handshake completing
+  are covered by the same timeout. A host that binds, accepts and then never
+  answers is killed and its directory removed, rather than holding `spawn` open.
+- **The support set is derived, not supplied.** `ProcessPluginBackend` says which
+  registration classes it can proxy; a caller cannot enlarge it, because a
+  caller that could declare support the backend does not have would break the
+  guarantee that a load which cannot be served does not happen.
 - **A stuck host is killed at the deadline.** The test stops the host process
   mid-session — the socket stays open and nothing will ever answer on it — and
   asserts the operation ends as `DeadlineExceeded` rather than as `HostCrashed`,

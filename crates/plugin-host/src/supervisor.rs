@@ -48,13 +48,12 @@ pub struct PluginHostSupervisorConfig {
     pub runtime_binding_digest: String,
     /// Kernel-held state the host may read, if any.
     pub offered_read_capabilities: Vec<PluginHostReadCapability>,
-    /// Registration classes this backend can install a proxy for.
+    /// Largest frame either side will accept.
     ///
-    /// Empty means none: the host then refuses to load a plugin that registers
-    /// anything, which is the fail-closed answer while the proxy machinery is
-    /// still being built.
-    pub supported_registration_operations:
-        Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation>,
+    /// Carried so the transport decoder is configured from the same value the
+    /// handshake negotiates, rather than from a transport default that could
+    /// disagree with the protocol.
+    pub maximum_frame_bytes: u32,
     /// How long to wait for the host to start and handshake.
     pub startup_timeout: Duration,
 }
@@ -71,7 +70,7 @@ impl PluginHostSupervisorConfig {
             executable,
             runtime_binding_digest: runtime_binding_digest.into(),
             offered_read_capabilities: Vec::new(),
-            supported_registration_operations: Vec::new(),
+            maximum_frame_bytes: MAX_FRAME_BYTES,
             startup_timeout: Duration::from_secs(10),
         }
     }
@@ -139,37 +138,60 @@ impl PluginHostSupervisor {
         let process_id = child.id();
         let mut child = child;
 
-        let deadline = tokio::time::Instant::now() + config.startup_timeout;
-        let channel = loop {
-            match connect(&socket).await {
-                Ok(channel) => break channel,
-                Err(error) if tokio::time::Instant::now() < deadline => {
-                    let _ = error;
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => {
-                    let status = child.try_wait().ok().flatten();
-                    return Err(unavailable(format!(
-                        "plugin host did not accept a connection at '{}': {error}{}",
-                        socket.display(),
-                        match status {
-                            Some(status) => format!("; the host exited with {status}"),
-                            None => "; the host is still running".to_string(),
+        // One budget covers the whole startup: the socket appearing *and* the
+        // handshake completing. A host that binds, accepts and then never
+        // answers would otherwise hold `spawn` open forever, which would make the
+        // stated guarantee half true.
+        let startup = tokio::time::timeout(config.startup_timeout, async {
+            let channel = loop {
+                match connect(&socket).await {
+                    Ok(channel) => break channel,
+                    Err(error) => {
+                        // The startup budget bounds this loop, so a host that
+                        // never binds is killed when it expires rather than
+                        // retried forever.
+                        if let Some(status) = child.try_wait().ok().flatten() {
+                            return Err(unavailable(format!(
+                                "plugin host did not accept a connection at '{}': {error}; \
+                                 the host exited with {status}",
+                                socket.display()
+                            )));
                         }
-                    )));
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
                 }
+            };
+            let client = PluginHostClient::new(channel)
+                .max_decoding_message_size(config.maximum_frame_bytes as usize)
+                .max_encoding_message_size(config.maximum_frame_bytes as usize);
+            let mut client = client;
+            let session = handshake(
+                &mut client,
+                &credential,
+                &config.runtime_binding_digest,
+                &config.offered_read_capabilities,
+                &ProcessPluginBackend::supported_registration_operations(),
+            )
+            .await?;
+            Ok::<_, PluginProtocolError>((client, session))
+        })
+        .await;
+
+        let (client, session) = match startup {
+            Ok(Ok(started)) => started,
+            Ok(Err(error)) => {
+                let _ = child.kill().await;
+                return Err(error);
+            }
+            Err(_) => {
+                // A host that will not finish starting is not a host.
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&socket_dir);
+                return Err(unavailable(
+                    "the plugin host did not start and handshake within its startup budget",
+                ));
             }
         };
-
-        let mut client = PluginHostClient::new(channel);
-        let session = handshake(
-            &mut client,
-            &credential,
-            &config.runtime_binding_digest,
-            &config.offered_read_capabilities,
-            &config.supported_registration_operations,
-        )
-        .await?;
 
         Ok(Self {
             child: Mutex::new(child),
@@ -218,7 +240,19 @@ impl PluginHostSupervisor {
                 // consider the operation undone, so it is never guessed at.
                 Err(match self.exit_status().await {
                     Some(status) => crashed(format!("the plugin host exited: {status}")),
-                    None => unavailable(format!("the plugin host did not answer: {status}")),
+                    None => {
+                        // The channel broke while the host is still running, so
+                        // nobody can say whether it acted on the request. Keeping
+                        // it alive would leave a process whose state the kernel
+                        // cannot account for; killing it makes the session's
+                        // state certain again, which is what a restart from
+                        // nothing depends on.
+                        let _ = self.child.lock().await.kill().await;
+                        unavailable(format!(
+                            "the plugin host did not answer '{status}', so its state is unknown \
+                             and it was killed"
+                        ))
+                    }
                 })
             }
             Err(_) => {
@@ -251,6 +285,18 @@ pub struct ProcessPluginBackend {
 }
 
 impl ProcessPluginBackend {
+    /// Registration classes this backend can install a proxy for.
+    ///
+    /// Derived from what the backend implements rather than supplied by a
+    /// caller: a caller that could declare support the backend does not have
+    /// would break the guarantee that a load which cannot be served does not
+    /// happen. Empty means none, which is the truth until remote invocation
+    /// exists — and then it grows here, next to the code that makes it true.
+    pub fn supported_registration_operations()
+    -> Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation> {
+        Vec::new()
+    }
+
     /// Take ownership of a running host.
     pub fn new(supervisor: PluginHostSupervisor, config: PluginHostSupervisorConfig) -> Self {
         Self { supervisor, config }
