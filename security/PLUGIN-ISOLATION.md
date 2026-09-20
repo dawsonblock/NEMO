@@ -406,6 +406,51 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   messages the conversions produced and answers whether they fit, so the
   supervisor that owns the socket and the callbacks can stay about those.
 
+## Production cutover: the remaining work, written down
+
+Everything the cutover needs now exists and is tested; what remains is moving code.
+The list is here so the next session starts from a checklist rather than from
+archaeology, and so the ordering constraints are not rediscovered by breaking them.
+
+**What holds the metric up.** `libloading` reaches the kernel through exactly one
+edge, declared in `crates/core/Cargo.toml`. Behind it, `crates/core/src/plugin/dynamic/native.rs`
+is 6,455 lines with 280 `unsafe` occurrences, and core depends on
+`nemo-relay-plugin` for the ABI structs (252 more). Those two are 595 of the 621,
+so the number falls by the loader leaving rather than by any reclassification.
+
+**Why it cannot be done in pieces.** The loader calls core's runtime APIs to
+serve plugin callbacks — marks, scopes, codecs — and registers into core's
+registries, so it cannot be lifted into another crate while staying where it is.
+The move has to happen together with the composition change.
+
+**Step one: the ABI and the loader become their own crates.** The ABI types move
+out of `nemo-relay-plugin` into a crate both the SDK and the loader depend on;
+the loader and its host adapter move into a crate depending on core. Core then
+declares neither `libloading` nor `nemo-relay-plugin`. Wide but mechanical: the
+SDK, the two native fixtures, the Rust example, and the loader's own tests all
+name these types.
+
+**Step two: core's activation path moves behind a facade in `plugin-host`.**
+`crates/core/src/plugin/dynamic/` has to split into the kernel's interface and
+the implementation: `host.rs` (11 public items), `manifest.rs` (45), `native.rs`
+(23) and `registry.rs` (16). `load_native_plugins`, `NativePluginActivation` and
+`plugin_artifact_identity` are named from three core test files, `plugin-host`,
+and — through `PluginHostActivation` — the CLI, FFI, Node and Python. The facade
+is what those consumers call instead, and a crate implementing a core-owned trait
+has to depend on core, which is why this cannot be folded into step one.
+
+**Step three: production selects the process backend.** The CLI stops composing
+`LoadedPlugins` and the three bindings stop calling
+`activate_with_discovered_config`. This is the step the metric waits on: until
+shipped runtimes stop linking the loader, moving it changes a crate diagram and
+not an attack surface. It is also the step with three language test suites
+attached, and the one the cross-process tool call now qualifies.
+
+**Step four: re-measure and record.** Remove the moved crates from
+`[in_process]`, update `security/tcb.toml` and `security/BASELINE.md` with the
+new surface, and expect the number to land near 26 — the loader's 280 and the
+ABI's 252 having left, rather than having been renamed.
+
 Still open, in the order they need closing:
 
 1. **Serving the read capabilities.** Diagnostics and registration reads are
