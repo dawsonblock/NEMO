@@ -1390,6 +1390,8 @@ impl PostgresEffectStore {
              coalesce((select rolsuper from pg_roles where rolname = current_user), false), \
              coalesce((select rolbypassrls from pg_roles where rolname = current_user), false), \
              coalesce((select rolcreaterole from pg_roles where rolname = current_user), false), \
+             coalesce((select rolcreatedb from pg_roles where rolname = current_user), false), \
+             coalesce((select rolreplication from pg_roles where rolname = current_user), false), \
              coalesce((select pg_get_userbyid(nspowner) = current_user from pg_namespace \
                        where nspname = $1), false), \
              exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace \
@@ -1427,7 +1429,12 @@ impl PostgresEffectStore {
             ],
         )?;
         let role: String = row.get(0);
-        let violations: [(&str, bool); 14] = [
+        // Every attribute a data-only principal must not carry, including the
+        // two the inherited walk already considered. A role that can create
+        // databases or open replication connections is not data-only either,
+        // and checking the connected role for fewer attributes than its
+        // inherited roles was a gap rather than a policy.
+        let violations: [(&str, bool); 16] = [
             ("CREATE on schema", row.get::<_, bool>(1)),
             ("INSERT into effect_schema_migrations", row.get(3)),
             ("UPDATE of effect_schema_migrations", row.get(4)),
@@ -1440,8 +1447,10 @@ impl PostgresEffectStore {
             ("SUPERUSER role attribute", row.get(11)),
             ("BYPASSRLS role attribute", row.get(12)),
             ("CREATEROLE role attribute", row.get(13)),
-            ("ownership of the effect-store schema", row.get(14)),
-            ("ownership of an effect-store relation", row.get(15)),
+            ("CREATEDB role attribute", row.get(14)),
+            ("REPLICATION role attribute", row.get(15)),
+            ("ownership of the effect-store schema", row.get(16)),
+            ("ownership of an effect-store relation", row.get(17)),
         ];
         let mut granted: Vec<String> = violations
             .iter()
@@ -1453,13 +1462,13 @@ impl PostgresEffectStore {
         // carrying any of its attributes, so checking only the connected role
         // proves much less than it appears to. Both walks are transitive for the
         // same reason a chain of two memberships is no safer than one.
-        let inherited_dangerous: String = row.get(16);
+        let inherited_dangerous: String = row.get(18);
         if !inherited_dangerous.trim().is_empty() {
             granted.push(format!(
                 "inherited role(s) with dangerous attributes: {inherited_dangerous}"
             ));
         }
-        let inherited_owners: String = row.get(17);
+        let inherited_owners: String = row.get(19);
         if !inherited_owners.trim().is_empty() {
             granted.push(format!(
                 "inherited role(s) owning effect-store objects: {inherited_owners}"

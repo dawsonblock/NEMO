@@ -15,13 +15,59 @@
 //! silently laundered into domain state that core believes it can rely on.
 
 use nemo_relay_plugin_protocol::{
-    DispatchState, OutcomeCertainty, PluginCapability, PluginCapabilityKind, PluginDescriptor,
-    PluginExecutionContext, PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle,
-    PluginLoadResponse, PluginProtocolError, PluginRegistrationClass, PluginRegistrationDescriptor,
-    PluginRegistrationOrdering, PluginSuccess,
+    DispatchState, OutcomeCertainty, PluginArtifactIdentity, PluginCapability,
+    PluginCapabilityKind, PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome,
+    PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginInvokeResponse,
+    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginRegistrationClass,
+    PluginRegistrationDescriptor, PluginRegistrationOrdering, PluginSuccess,
 };
 
 use crate::v1;
+
+/// Build the wire form of a load request.
+///
+/// The approved digests travel with it. They are the runtime's statement of
+/// what it approved, so the side performing the load confirms an identity
+/// rather than deciding one.
+pub fn load_request_to_wire(request: &PluginLoadRequest) -> v1::LoadRequest {
+    v1::LoadRequest {
+        session_id: String::new(),
+        context: None,
+        plugin_id: request.plugin_id.clone(),
+        artifact: request.artifact.clone(),
+        manifest_digest: request.identity.manifest_sha256.clone(),
+        library_digest: request.identity.library_sha256.clone(),
+    }
+}
+
+/// Validate the wire form of a load request.
+pub fn load_request_from_wire(
+    wire: &v1::LoadRequest,
+) -> Result<PluginLoadRequest, PluginProtocolError> {
+    if wire.plugin_id.trim().is_empty() {
+        return Err(malformed("a load request with no plugin identity"));
+    }
+    if wire.artifact.trim().is_empty() {
+        return Err(malformed("a load request with no artifact reference"));
+    }
+    // Both digests are required. A load request without them would let whoever
+    // performs the load decide for itself what the reference points at, which
+    // is the hole the identity exists to close.
+    if wire.manifest_digest.trim().is_empty() {
+        return Err(malformed("a load request with no approved manifest digest"));
+    }
+    if wire.library_digest.trim().is_empty() {
+        return Err(malformed("a load request with no approved library digest"));
+    }
+    Ok(PluginLoadRequest {
+        plugin_id: wire.plugin_id.clone(),
+        artifact: wire.artifact.clone(),
+        identity: PluginArtifactIdentity {
+            manifest_sha256: wire.manifest_digest.clone(),
+            library_sha256: wire.library_digest.clone(),
+        },
+    })
+}
 
 /// Build the wire form of an execution context.
 ///
@@ -149,6 +195,12 @@ pub fn failure_from_wire(wire: &v1::PluginFailure) -> Result<PluginFailure, Plug
             else {
                 return Err(malformed("an ABI mismatch without both versions"));
             };
+            // The same exclusivity the other detailed codes enforce. Without
+            // it a message could claim an ABI mismatch and carry frame sizes,
+            // which describes nothing the domain can represent.
+            if wire.observed.is_some() || wire.limit.is_some() {
+                return Err(malformed("an ABI mismatch carrying frame-size detail"));
+            }
             PluginFailureCode::AbiMismatch {
                 supported: u16::try_from(supported)
                     .map_err(|_| malformed("a supported ABI outside the range this code speaks"))?,
@@ -296,28 +348,79 @@ pub fn load_response_from_wire(
         .descriptor
         .as_ref()
         .ok_or_else(|| malformed("a load response with no descriptor"))?;
+    let descriptor = descriptor_from_wire(descriptor)?;
+    // Both halves describe the same loaded instance. Individually valid fields
+    // that name different plugins would produce a handle which addresses one
+    // plugin while carrying another's description.
+    if descriptor.plugin_id != handle.plugin_id {
+        return Err(malformed(format!(
+            "a load response whose handle names {} and whose descriptor names {}",
+            handle.plugin_id, descriptor.plugin_id
+        )));
+    }
     Ok(PluginLoadResponse {
         handle: PluginHandle {
             plugin_id: handle.plugin_id.clone(),
             generation: handle.generation,
         },
-        descriptor: descriptor_from_wire(descriptor)?,
+        descriptor,
     })
 }
 
-/// Convert a domain success into its wire form.
-pub fn success_to_wire(success: &PluginSuccess) -> Result<v1::InvokeOutcome, PluginProtocolError> {
-    match success {
-        PluginSuccess::Invoked(response) => Ok(v1::InvokeOutcome {
-            dispatch_state: dispatch_to_wire(DispatchState::NotDispatched) as i32,
-            outcome_certainty: outcome_to_wire(OutcomeCertainty::ConfirmedSuccess) as i32,
-            result: Some(v1::invoke_outcome::Result::Output(response.output.clone())),
-        }),
-        other => Err(malformed(format!(
-            "{} has no invocation outcome representation",
-            success_name(other)
-        ))),
-    }
+/// Convert a domain outcome into its wire form.
+///
+/// The previous form took a bare success value and manufactured `NotDispatched`
+/// with `ConfirmedSuccess`, which discards precisely the dispatch information
+/// the outcome model exists to preserve: a caller would learn that an operation
+/// definitely did not reach an external system without anyone having
+/// established that. This takes the outcome, so what travels is what was
+/// actually known.
+pub fn execution_outcome_to_wire(
+    outcome: &PluginExecutionOutcome,
+) -> Result<v1::InvokeOutcome, PluginProtocolError> {
+    let result = match &outcome.result {
+        Ok(PluginSuccess::Invoked(response)) => {
+            v1::invoke_outcome::Result::Output(response.output.clone())
+        }
+        Ok(other) => {
+            return Err(malformed(format!(
+                "{} has no invocation outcome representation",
+                success_name(other)
+            )));
+        }
+        Err(failure) => v1::invoke_outcome::Result::Failure(failure_to_wire(failure)),
+    };
+    Ok(v1::InvokeOutcome {
+        dispatch_state: dispatch_to_wire(outcome.dispatch) as i32,
+        outcome_certainty: outcome_to_wire(outcome.certainty) as i32,
+        result: Some(result),
+    })
+}
+
+/// Read an invocation outcome, refusing one that erases what is known.
+pub fn execution_outcome_from_wire(
+    wire: &v1::InvokeOutcome,
+) -> Result<PluginExecutionOutcome, PluginProtocolError> {
+    let dispatch = dispatch_from_wire(wire.dispatch_state)?;
+    let certainty = certainty_from_wire(wire.outcome_certainty)?;
+    let result = match wire.result.as_ref() {
+        Some(v1::invoke_outcome::Result::Output(output)) => {
+            Ok(PluginSuccess::Invoked(PluginInvokeResponse {
+                output: output.clone(),
+            }))
+        }
+        Some(v1::invoke_outcome::Result::Failure(failure)) => Err(failure_from_wire(failure)?),
+        None => {
+            return Err(malformed(
+                "an invocation outcome that is neither an output nor a failure",
+            ));
+        }
+    };
+    Ok(PluginExecutionOutcome {
+        dispatch,
+        certainty,
+        result,
+    })
 }
 
 fn success_name(success: &PluginSuccess) -> &'static str {
@@ -456,6 +559,94 @@ mod tests {
 
     fn malformed_code(error: PluginProtocolError) -> PluginFailureCode {
         error.failure.code
+    }
+
+    #[test]
+    fn a_load_request_carries_the_identity_the_runtime_approved() {
+        let request = PluginLoadRequest {
+            plugin_id: "example".into(),
+            artifact: "relay-plugin.toml".into(),
+            identity: PluginArtifactIdentity {
+                manifest_sha256: "a".repeat(64),
+                library_sha256: "b".repeat(64),
+            },
+        };
+
+        let back = load_request_from_wire(&load_request_to_wire(&request)).expect("round trip");
+
+        assert_eq!(back, request);
+    }
+
+    #[test]
+    fn a_load_request_without_an_approved_identity_is_refused() {
+        // Without the digests the side performing the load would decide for
+        // itself what the reference points at, which is the hole the identity
+        // exists to close.
+        let wire = v1::LoadRequest {
+            plugin_id: "example".into(),
+            artifact: "relay-plugin.toml".into(),
+            manifest_digest: String::new(),
+            library_digest: "b".repeat(64),
+            ..Default::default()
+        };
+
+        assert!(load_request_from_wire(&wire).is_err());
+    }
+
+    #[test]
+    fn an_outcome_keeps_the_dispatch_certainty_it_was_given() {
+        // The converter that used to live here took a bare success and
+        // manufactured `NotDispatched` with `ConfirmedSuccess`. A caller would
+        // have learned that an operation definitely did not reach an external
+        // system without anyone having established that.
+        let outcome = PluginExecutionOutcome {
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+            result: Err(PluginFailure {
+                code: PluginFailureCode::HostCrashed,
+                message: "the host exited during dispatch".into(),
+            }),
+        };
+
+        let wire = execution_outcome_to_wire(&outcome).expect("encode outcome");
+        let back = execution_outcome_from_wire(&wire).expect("decode outcome");
+
+        assert_eq!(back, outcome);
+        assert_eq!(back.dispatch, DispatchState::DispatchAttempted);
+        assert_eq!(back.certainty, OutcomeCertainty::Unknown);
+    }
+
+    #[test]
+    fn an_abi_mismatch_carrying_frame_detail_is_refused() {
+        let wire = v1::PluginFailure {
+            code: v1::FailureCode::AbiMismatch as i32,
+            message: "mismatch".into(),
+            expected_version: Some(4),
+            received_version: Some(3),
+            observed: Some(9_000_000),
+            limit: Some(8_000_000),
+        };
+
+        assert!(failure_from_wire(&wire).is_err());
+    }
+
+    #[test]
+    fn a_load_response_whose_handle_and_descriptor_disagree_is_refused() {
+        // Individually valid fields naming different plugins would produce a
+        // handle that addresses one plugin while carrying another's
+        // description.
+        let wire = v1::LoadResponse {
+            handle: Some(v1::PluginHandle {
+                plugin_id: "plugin-a".into(),
+                generation: 17,
+            }),
+            descriptor: Some(v1::PluginDescriptor {
+                plugin_id: "plugin-b".into(),
+                ..Default::default()
+            }),
+        };
+
+        assert!(load_response_from_wire(&wire).is_err());
     }
 
     #[test]

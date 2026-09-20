@@ -26,9 +26,9 @@ use nemo_relay::plugin::dynamic::{
 };
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFuture, PluginManager};
 use nemo_relay_plugin_protocol::{
-    PROTOCOL_VERSION, PluginDescriptor, PluginExecutionContext, PluginFailure, PluginFailureCode,
-    PluginHandle, PluginHostHealth, PluginInspectRequest, PluginLoadRequest, PluginLoadResponse,
-    PluginProtocolError, PluginUnloadRequest,
+    PROTOCOL_VERSION, PluginArtifactIdentity, PluginDescriptor, PluginExecutionContext,
+    PluginFailure, PluginFailureCode, PluginHandle, PluginHostHealth, PluginInspectRequest,
+    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginUnloadRequest,
 };
 
 /// What the backend holds for one plugin identifier.
@@ -341,11 +341,21 @@ impl LoadedPlugins {
         let manager = PluginManager::new(backend.clone());
         let mut handles = Vec::new();
         for (plugin_id, artifact) in specs {
+            // The identity is approved here, before anything is loaded, so
+            // whatever performs the load confirms what it was told to load
+            // rather than deciding for itself what the reference points at.
+            let (manifest_sha256, library_sha256) =
+                nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                    .map_err(|error| refused(error.to_string()))?;
             let loaded = manager
                 .load(
                     PluginLoadRequest {
                         plugin_id,
                         artifact,
+                        identity: PluginArtifactIdentity {
+                            manifest_sha256,
+                            library_sha256,
+                        },
                     },
                     context_with_live_deadline(),
                 )
@@ -421,6 +431,10 @@ mod tests {
                     PluginLoadRequest {
                         plugin_id: "absent-plugin".into(),
                         artifact: "/nonexistent/relay-plugin.toml".into(),
+                        identity: PluginArtifactIdentity {
+                            manifest_sha256: "unused-for-this-attempt".into(),
+                            library_sha256: "unused-for-this-attempt".into(),
+                        },
                     },
                     context.clone(),
                 ))

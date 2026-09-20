@@ -251,15 +251,41 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   message they name to be vectored or explicitly pending, asserting first that
   it found at least twenty so it cannot pass by parsing nothing.
 
-One gap remains, and it is the large one:
+- **Approved artifact identity, in the domain and not only the wire.**
+  `PluginLoadRequest` carries a `PluginArtifactIdentity`, and
+  `plugin_artifact_identity` computes it on the trusted side, so the loader
+  confirms what it was told to load instead of deciding what the reference
+  points at. Without this the wire promised a guarantee the core request could
+  not provide.
+- **Validation fixes.** An ABI mismatch carrying frame-size detail is refused
+  like the other detailed codes, and a load response whose handle and descriptor
+  name different plugins is refused rather than accepted as two valid halves.
+  The converter that turned a bare success into `NotDispatched` with
+  `ConfirmedSuccess` is replaced by one that takes the outcome, so a
+  convenience path cannot invent certainty.
 
-**Complete callback mapping.** ABI v4 exposes far more than the typed calls in
-`RelayRuntime`: tool and LLM sanitizers, conditional execution, request and
-execution intercepts, streaming intercepts, async middleware, scopes and marks,
-codecs. Each needs a defined RPC representation, and the pull-based downstream
-LLM stream needs a streaming shape, because a unary call cannot carry open,
-pull, cancel and release. Until that mapping exists the process host would have
-to invent it, which is the outcome this closure work exists to prevent.
+Still open, in the order they need closing:
+
+1. **Structured lifecycle outcomes.** `InvokeOutcome` carries a failure in the
+   message, but `LoadResponse`, `UnloadResponse`, `InspectResponse`,
+   `HealthResponse` and `HandshakeResponse` do not. A lifecycle failure such as
+   `AlreadyLoaded` or `StaleHandle` would therefore have to travel as a gRPC
+   status, which conflates a peer that answered coherently with a channel that
+   failed.
+2. **Registration operation identity.** The six broad classes cannot reconstruct
+   a proxy: tool and LLM sanitizers, conditional execution, request and
+   execution intercepts and streaming intercepts all collapse into one class
+   while needing different installation points.
+3. **Complete callback mapping for ABI v4**, especially async continuation and
+   the pull-based downstream LLM stream, which cannot be a unary call because
+   the plugin controls when to pull and backpressure is explicit.
+4. **Conversions for every message the host uses**, and vectors for all of them
+   rather than nineteen declared pending.
+5. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
+   architecture guard currently grandfathers by crate name.
+
+Until those are closed the process host would still be architecture by
+exception, which is why the supervisor is not being written yet.
 
 This increment does not move `kernel-process unsafe tokens`, which is 621. The
 number falls when native loading physically crosses the process boundary, and a

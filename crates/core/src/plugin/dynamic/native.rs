@@ -513,6 +513,59 @@ fn validate_plugin_descriptor(
     Ok(())
 }
 
+/// Compute the identity of the artifact a manifest describes.
+///
+/// The runtime approves this identity, and whatever performs the load verifies
+/// it immediately before opening the library. That ordering is the point: if
+/// the side doing the loading computed the digests itself, it would be defining
+/// what it loaded rather than confirming what it was told to load, and a
+/// reference that is verified and then left in place could be replaced between
+/// the two.
+///
+/// Returns the manifest digest and the library digest, both SHA-256 in hex.
+pub fn plugin_artifact_identity(manifest_ref: &str) -> crate::plugin::Result<(String, String)> {
+    let manifest_path = PathBuf::from(manifest_ref);
+    let manifest_bytes =
+        std::fs::read(&manifest_path).map_err(|error| missing_artifact(manifest_ref, &error))?;
+
+    let (manifest, _resolved_manifest) = DynamicPluginManifest::load_from_path(manifest_ref)?;
+    let DynamicPluginManifestLoad::RustDynamic(load) = &manifest.load else {
+        return Err(PluginError::InvalidConfig(format!(
+            "dynamic plugin manifest {manifest_ref} is not a rust_dynamic load contract"
+        )));
+    };
+    let library_path = resolve_manifest_relative_path(
+        &manifest_path,
+        load.library.as_deref().ok_or_else(|| {
+            PluginError::InvalidConfig(format!("{manifest_ref} does not declare load.library"))
+        })?,
+    );
+    let library_bytes = std::fs::read(&library_path)
+        .map_err(|error| missing_artifact(&library_path.display().to_string(), &error))?;
+
+    Ok((sha256_hex(&manifest_bytes), sha256_hex(&library_bytes)))
+}
+
+/// Describe an artifact that could not be read.
+///
+/// A missing artifact says so plainly, because that is the common case and the
+/// one a caller has to act on. Anything else keeps the operating system's
+/// detail, which is what separates a permissions problem from a bad path.
+fn missing_artifact(reference: &str, error: &std::io::Error) -> PluginError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        PluginError::NotFound(format!("{reference} does not exist"))
+    } else {
+        PluginError::NotFound(format!("cannot read {reference}: {error}"))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn resolve_manifest_relative_path(manifest_path: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {

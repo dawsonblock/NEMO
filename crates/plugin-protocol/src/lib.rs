@@ -172,6 +172,20 @@ pub struct PluginHandshake {
     pub protocol_version: u16,
 }
 
+/// Identity of the artifact a load was approved against.
+///
+/// The runtime approves this; whatever performs the load verifies it
+/// immediately before opening the library. A reference alone is not enough,
+/// because a reference can be verified and then left in place while the file
+/// behind it is replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginArtifactIdentity {
+    /// SHA-256 of the manifest, which decides what is loaded and how.
+    pub manifest_sha256: String,
+    /// SHA-256 of the library the manifest names.
+    pub library_sha256: String,
+}
+
 /// Load a plugin into the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginLoadRequest {
@@ -179,6 +193,8 @@ pub struct PluginLoadRequest {
     pub plugin_id: String,
     /// Host-specific location of the plugin artifact.
     pub artifact: String,
+    /// What the runtime approved, for the loader to verify before opening.
+    pub identity: PluginArtifactIdentity,
 }
 
 /// Remove a loaded plugin.

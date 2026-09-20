@@ -344,6 +344,13 @@ mod tests {
         }
     }
 
+    fn test_identity() -> nemo_relay_plugin_protocol::PluginArtifactIdentity {
+        nemo_relay_plugin_protocol::PluginArtifactIdentity {
+            manifest_sha256: "manifest".into(),
+            library_sha256: "library".into(),
+        }
+    }
+
     fn context(deadline_unix_ms: u64) -> PluginExecutionContext {
         PluginExecutionContext {
             operation_request_id: "operation-1".into(),
@@ -364,6 +371,7 @@ mod tests {
         let load = |_context: PluginExecutionContext| PluginLoadRequest {
             plugin_id: "example".into(),
             artifact: "relay-plugin.toml".into(),
+            identity: test_identity(),
         };
 
         let mut wrong_version = context(live_deadline());
@@ -413,6 +421,7 @@ mod tests {
         let load = PluginLoadRequest {
             plugin_id: "example".into(),
             artifact: "relay-plugin.toml".into(),
+            identity: test_identity(),
         };
 
         for _ in 0..2 {
@@ -443,6 +452,7 @@ mod tests {
                 PluginLoadRequest {
                     plugin_id: "example".into(),
                     artifact: "relay-plugin.toml".into(),
+                    identity: test_identity(),
                 },
                 context(live_deadline()),
             )
@@ -465,6 +475,7 @@ mod tests {
                 PluginLoadRequest {
                     plugin_id: "example".into(),
                     artifact: "relay-plugin.toml".into(),
+                    identity: test_identity(),
                 },
                 context(expired_deadline()),
             )
