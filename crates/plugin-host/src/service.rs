@@ -25,8 +25,8 @@ use nemo_relay_plugin_proto::convert::{
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
-    LifecycleOutcome, PROTOCOL_VERSION, PluginProtocolError, PluginSessionIdentity, Uuid,
-    check_protocol_version,
+    LifecycleOutcome, PROTOCOL_VERSION, PluginProtocolError, PluginRegistrationOperation,
+    PluginSessionIdentity, Uuid, check_protocol_version,
 };
 use tonic::{Request, Response, Status};
 
@@ -55,6 +55,27 @@ impl Default for PluginHostConfig {
     }
 }
 
+/// The state of this host's one session.
+///
+/// A host serves one session and then it is done. That is not a limitation to
+/// work around later: the supervisor spawns a process per session, so a second
+/// handshake on the same process would be a session nobody owns, and allowing it
+/// would make "which session is this?" a question with two answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostSession {
+    /// Before the handshake.
+    New,
+    /// Serving a session.
+    Active {
+        session_id: String,
+        /// Registration classes the kernel can install a proxy for.
+        supported_registration_operations: Vec<PluginRegistrationOperation>,
+    },
+    /// After the session closed. Every later request is refused, including a
+    /// handshake that would start another one.
+    Closed,
+}
+
 /// The `PluginHost` service.
 pub struct PluginHostService {
     backend: Arc<dyn PluginExecutionBackend>,
@@ -62,7 +83,7 @@ pub struct PluginHostService {
     /// Identity of this host process.
     host_instance_id: String,
     /// The session this host established, if any.
-    session: Mutex<Option<String>>,
+    session: Mutex<HostSession>,
 }
 
 impl PluginHostService {
@@ -72,7 +93,7 @@ impl PluginHostService {
             backend,
             config,
             host_instance_id: Uuid::now_v7().to_string(),
-            session: Mutex::new(None),
+            session: Mutex::new(HostSession::New),
         }
     }
 
@@ -82,13 +103,66 @@ impl PluginHostService {
             .session
             .lock()
             .map_err(|error| refused(format!("the session lock was poisoned: {error}")))?;
-        match session.as_ref() {
-            Some(established) if established == session_id => Ok(()),
-            Some(_) => Err(refused(
+        match &*session {
+            HostSession::Active {
+                session_id: established,
+                ..
+            } if established == session_id => Ok(()),
+            HostSession::Active { .. } => Err(refused(
                 "this request names a session this host did not establish",
             )),
-            None => Err(refused("this host has not established a session yet")),
+            HostSession::New => Err(refused("this host has not established a session yet")),
+            HostSession::Closed => Err(refused(
+                "this host has already served its session and will not serve another",
+            )),
         }
+    }
+
+    /// The registration classes this session's kernel can install proxies for.
+    fn supported_operations(
+        &self,
+    ) -> Result<Vec<PluginRegistrationOperation>, PluginProtocolError> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|error| refused(format!("the session lock was poisoned: {error}")))?;
+        match &*session {
+            HostSession::Active {
+                supported_registration_operations,
+                ..
+            } => Ok(supported_registration_operations.clone()),
+            _ => Err(refused("this host has not established a session yet")),
+        }
+    }
+
+    /// Refuse a plugin whose registrations this session cannot serve.
+    ///
+    /// Failing closed means failing without a half-loaded plugin: the backend has
+    /// loaded it by the time this runs, so the caller unloads it rather than
+    /// leaving registrations the kernel will never call.
+    fn unsupported_registrations(
+        &self,
+        descriptor: &nemo_relay_plugin_protocol::PluginDescriptor,
+    ) -> Result<(), PluginProtocolError> {
+        let supported = self.supported_operations()?;
+        let unsupported: Vec<&str> = descriptor
+            .registrations
+            .iter()
+            .map(|registration| registration.operation)
+            .filter(|operation| !supported.contains(operation))
+            .map(|operation| operation.as_str())
+            .collect();
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+        let supported: Vec<&str> = supported
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect();
+        Err(refused(format!(
+            "plugin {} registers {unsupported:?}, and this session can serve {supported:?}",
+            descriptor.plugin_id
+        )))
     }
 }
 
@@ -153,7 +227,30 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
             accepted_read_capabilities: request.offered_read_capabilities.clone(),
         };
         match self.session.lock() {
-            Ok(mut session) => *session = Some(session_id),
+            Ok(mut session) => match &*session {
+                HostSession::New => {
+                    *session = HostSession::Active {
+                        session_id,
+                        supported_registration_operations: request
+                            .supported_registration_operations
+                            .clone(),
+                    };
+                }
+                HostSession::Active { .. } => {
+                    return Ok(Response::new(handshake_outcome_to_wire(
+                        LifecycleOutcome::Failed(
+                            refused("this host has already established a session").failure,
+                        ),
+                    )));
+                }
+                HostSession::Closed => {
+                    return Ok(Response::new(handshake_outcome_to_wire(
+                        LifecycleOutcome::Failed(
+                            refused("this host has already served its session").failure,
+                        ),
+                    )));
+                }
+            },
             Err(error) => {
                 return Ok(Response::new(handshake_outcome_to_wire(
                     LifecycleOutcome::Failed(
@@ -175,7 +272,30 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         let outcome = async {
             let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
             let request = load_request_from_wire(&wire)?;
-            self.backend.load(request, context).await
+            let response = self.backend.load(request, context.clone()).await?;
+            // A load that cannot be served in full is a load that does not
+            // happen: the backend has already loaded the plugin, so the refusal
+            // takes it back down rather than leaving registrations the kernel
+            // will never call.
+            if let Err(error) = self.unsupported_registrations(&response.descriptor) {
+                let unloaded = self
+                    .backend
+                    .unload(
+                        nemo_relay_plugin_protocol::PluginUnloadRequest {
+                            handle: response.handle.clone(),
+                        },
+                        context,
+                    )
+                    .await;
+                return Err(match unloaded {
+                    Ok(()) => error,
+                    Err(unload_error) => refused(format!(
+                        "{}; unloading it again failed: {}",
+                        error.failure.message, unload_error.failure.message
+                    )),
+                });
+            }
+            Ok(response)
         }
         .await;
         Ok(Response::new(load_outcome_to_wire(
@@ -306,7 +426,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
             // Closing is a state change the host makes: the session is gone
             // afterwards, so every later request is refused by the same check
             // that refuses one naming no session.
-            Ok(mut session) => *session = None,
+            Ok(mut session) => *session = HostSession::Closed,
             Err(error) => {
                 return Ok(Response::new(session_close_outcome_to_wire(
                     LifecycleOutcome::Failed(
@@ -338,8 +458,12 @@ impl PluginHostService {
 mod tests {
     use super::*;
     use nemo_relay_plugin_proto::convert::{handshake_outcome_from_wire, mark_request_from_wire};
-    use nemo_relay_plugin_protocol::{PluginFailureCode, PluginHostReadCapability};
+    use nemo_relay_plugin_protocol::{
+        PluginDescriptor, PluginFailure, PluginFailureCode, PluginHandle, PluginHostReadCapability,
+        PluginLoadResponse,
+    };
     use tonic::Request;
+    use v1::plugin_host_server::PluginHost;
 
     fn service() -> (PluginHostService, PluginHostConfig) {
         let backend = Arc::new(crate::InProcessPluginBackend::new());
@@ -365,26 +489,42 @@ mod tests {
                     PluginHostReadCapability::RuntimeDiagnostics,
                 ),
             ],
+            supported_registration_operations: vec![
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(
+                    nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept,
+                ),
+            ],
         }
     }
 
+    fn context() -> v1::PluginExecutionContext {
+        nemo_relay_plugin_proto::convert::context_to_wire(
+            &nemo_relay_plugin_protocol::PluginExecutionContext {
+                operation_request_id: "operation-1".into(),
+                protocol_version: PROTOCOL_VERSION,
+                runtime_binding_digest: "binding".into(),
+                deadline_unix_ms: u64::MAX,
+                remaining_budget_millis: 1_000,
+                max_response_bytes: 1024,
+            },
+        )
+    }
+
     async fn establish(service: &PluginHostService, config: &PluginHostConfig) -> String {
-        use v1::plugin_host_server::PluginHost;
         let outcome = service
             .handshake(Request::new(handshake_request(config)))
             .await
             .expect("a served handshake")
             .into_inner();
-        let identity = handshake_outcome_from_wire(&outcome)
+        handshake_outcome_from_wire(&outcome)
             .expect("a converted handshake")
             .into_result()
-            .expect("an established session");
-        identity.session_id
+            .expect("an established session")
+            .session_id
     }
 
     #[tokio::test]
-    async fn a_host_refuses_a_credential_it_was_not_started_with() {
-        use v1::plugin_host_server::PluginHost;
+    async fn a_host_refuses_a_credential_or_binding_it_was_not_started_with() {
         let (service, config) = service();
 
         // Knowing where the socket is must not be enough to be treated as the
@@ -422,7 +562,6 @@ mod tests {
     #[tokio::test]
     async fn a_host_accepts_the_read_capabilities_it_was_offered_and_no_others() {
         let (service, config) = service();
-        use v1::plugin_host_server::PluginHost;
         let outcome = service
             .handshake(Request::new(handshake_request(&config)))
             .await
@@ -442,92 +581,62 @@ mod tests {
 
     #[tokio::test]
     async fn an_operation_before_or_outside_the_session_is_refused() {
-        use v1::plugin_host_server::PluginHost;
         let (service, config) = service();
-        let request = || v1::LoadRequest {
-            session_id: "unknown".into(),
-            context: Some(nemo_relay_plugin_proto::convert::context_to_wire(
-                &nemo_relay_plugin_protocol::PluginExecutionContext {
-                    operation_request_id: "operation-1".into(),
-                    protocol_version: PROTOCOL_VERSION,
-                    runtime_binding_digest: "binding".into(),
-                    deadline_unix_ms: u64::MAX,
-                    remaining_budget_millis: 1_000,
-                    max_response_bytes: 1024,
-                },
-            )),
+        let load = |session_id: &str| v1::LoadRequest {
+            session_id: session_id.into(),
+            context: Some(context()),
             plugin_id: "absent".into(),
             artifact: "/nonexistent/relay-plugin.toml".into(),
             manifest_digest: "a".repeat(64),
             library_digest: "b".repeat(64),
         };
-
-        // Before a session exists, nothing is served.
-        let outcome = service
-            .load(Request::new(request()))
-            .await
-            .expect("a served load")
-            .into_inner();
-        assert!(
+        let refused = |outcome: v1::LoadOutcome| {
             nemo_relay_plugin_proto::convert::load_outcome_from_wire(&outcome)
                 .expect("a converted load")
                 .into_result()
                 .is_err()
-        );
+        };
+
+        // Before a session exists, nothing is served.
+        let outcome = service
+            .load(Request::new(load("unknown")))
+            .await
+            .expect("a served load")
+            .into_inner();
+        assert!(refused(outcome));
 
         // And a request naming a session this host did not establish is refused
         // rather than served.
         let session_id = establish(&service, &config).await;
-        let mut wire = request();
-        wire.session_id = "another-session".into();
         let outcome = service
-            .load(Request::new(wire))
+            .load(Request::new(load("another-session")))
             .await
             .expect("a served load")
             .into_inner();
-        assert!(
-            nemo_relay_plugin_proto::convert::load_outcome_from_wire(&outcome)
-                .expect("a converted load")
-                .into_result()
-                .is_err()
-        );
+        assert!(refused(outcome));
 
         // The established session is served, and the answer comes from the
         // backend rather than from the session check: an inspection of an empty
-        // host is an empty list, not a refusal.
+        // host is an empty list.
         let outcome = service
             .inspect(Request::new(v1::InspectRequest {
                 session_id: session_id.clone(),
-                context: request().context,
+                context: Some(context()),
                 handle: None,
             }))
             .await
             .expect("a served inspection")
             .into_inner();
-        let descriptors = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&outcome)
-            .expect("a converted inspection")
-            .into_result()
-            .expect("an answer from the backend");
-        assert!(descriptors.is_empty());
-
-        // And a load through that session reaches the loader: the manifest does
-        // not exist, so it is refused — by the loader, not by the session.
-        let mut wire = request();
-        wire.session_id = session_id;
-        let outcome = service
-            .load(Request::new(wire))
-            .await
-            .expect("a served load")
-            .into_inner();
         assert!(
-            nemo_relay_plugin_proto::convert::load_outcome_from_wire(&outcome)
-                .expect("a converted load")
+            nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&outcome)
+                .expect("a converted inspection")
                 .into_result()
-                .is_err()
+                .expect("an answer from the backend")
+                .is_empty()
         );
 
-        // A closing session stops serving, and later requests are refused by the
-        // same check that refused the one naming no session.
+        // A close naming another session is a refusal, and it reports itself as
+        // one rather than as a broken channel.
         let outcome = service
             .session_close(Request::new(v1::SessionCloseRequest {
                 session_id: "another-session".into(),
@@ -539,13 +648,33 @@ mod tests {
             nemo_relay_plugin_proto::convert::session_close_outcome_from_wire(&outcome)
                 .expect("a converted close")
                 .into_result()
-                .is_err(),
-            "a close naming a session this host did not establish is a refusal"
+                .is_err()
+        );
+        let _ = session_id;
+    }
+
+    #[tokio::test]
+    async fn a_host_serves_one_session_and_refuses_a_second() {
+        let (service, config) = service();
+        let session_id = establish(&service, &config).await;
+
+        // A second handshake would be a session nobody owns: the supervisor
+        // spawns a process per session, so a host that accepted another would
+        // make "which session is this?" a question with two answers.
+        let outcome = service
+            .handshake(Request::new(handshake_request(&config)))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        assert!(
+            handshake_outcome_from_wire(&outcome)
+                .expect("a converted handshake")
+                .into_result()
+                .is_err()
         );
 
-        // Closing the established session stops serving, and every later request
-        // is refused by the same check rather than by a broken channel.
-        let session_id = establish(&service, &config).await;
+        // Closing ends it, and nothing is served afterwards — including another
+        // handshake.
         let outcome = service
             .session_close(Request::new(v1::SessionCloseRequest {
                 session_id: session_id.clone(),
@@ -562,7 +691,7 @@ mod tests {
         let outcome = service
             .inspect(Request::new(v1::InspectRequest {
                 session_id,
-                context: request().context,
+                context: Some(context()),
                 handle: None,
             }))
             .await
@@ -574,6 +703,165 @@ mod tests {
                 .into_result()
                 .is_err()
         );
+        let outcome = service
+            .handshake(Request::new(handshake_request(&config)))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        assert!(
+            handshake_outcome_from_wire(&outcome)
+                .expect("a converted handshake")
+                .into_result()
+                .is_err(),
+            "a host that served its session does not start another"
+        );
+    }
+
+    /// A backend that loads a plugin registering classes this session cannot
+    /// serve, and refuses to unload it quietly.
+    struct RegisteringBackend {
+        unloaded: Arc<Mutex<Vec<String>>>,
+        operations: Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation>,
+    }
+
+    impl PluginExecutionBackend for RegisteringBackend {
+        fn load<'a>(
+            &'a self,
+            request: nemo_relay_plugin_protocol::PluginLoadRequest,
+            _context: nemo_relay_plugin_protocol::PluginExecutionContext,
+        ) -> nemo_relay::plugin::execution::PluginExecutionFuture<'a, PluginLoadResponse> {
+            let operations = self.operations.clone();
+            Box::pin(async move {
+                Ok(PluginLoadResponse {
+                    handle: PluginHandle {
+                        plugin_id: request.plugin_id.clone(),
+                        generation: 1,
+                    },
+                    descriptor: PluginDescriptor {
+                        plugin_id: request.plugin_id,
+                        plugin_version: None,
+                        negotiated_abi_version: None,
+                        manifest_digest: None,
+                        registration_kinds: Vec::new(),
+                        registrations: operations
+                            .into_iter()
+                            .map(|operation| {
+                                nemo_relay_plugin_protocol::PluginRegistrationDescriptor {
+                                    registration_id: "nemo-relay-plugin.v1.example:1:run".into(),
+                                    component_kind: "example".into(),
+                                    operation,
+                                    ordering:
+                                        nemo_relay_plugin_protocol::PluginRegistrationOrdering {
+                                            priority: None,
+                                            may_break_chain: None,
+                                        },
+                                    shape: nemo_relay_plugin_protocol::registration_shape(
+                                        operation,
+                                    ),
+                                    gated_registration: None,
+                                    config_keys: Vec::new(),
+                                    declared_digest: None,
+                                }
+                            })
+                            .collect(),
+                        capabilities: Vec::new(),
+                    },
+                })
+            })
+        }
+
+        fn unload<'a>(
+            &'a self,
+            request: nemo_relay_plugin_protocol::PluginUnloadRequest,
+            _context: nemo_relay_plugin_protocol::PluginExecutionContext,
+        ) -> nemo_relay::plugin::execution::PluginExecutionFuture<'a, ()> {
+            let unloaded = self.unloaded.clone();
+            Box::pin(async move {
+                unloaded
+                    .lock()
+                    .expect("the log")
+                    .push(request.handle.plugin_id);
+                Ok(())
+            })
+        }
+
+        fn inspect<'a>(
+            &'a self,
+            _request: nemo_relay_plugin_protocol::PluginInspectRequest,
+            _context: nemo_relay_plugin_protocol::PluginExecutionContext,
+        ) -> nemo_relay::plugin::execution::PluginExecutionFuture<'a, Vec<PluginDescriptor>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn health<'a>(
+            &'a self,
+            _context: nemo_relay_plugin_protocol::PluginExecutionContext,
+        ) -> nemo_relay::plugin::execution::PluginExecutionFuture<
+            'a,
+            nemo_relay_plugin_protocol::PluginHostHealth,
+        > {
+            Box::pin(async move {
+                Ok(nemo_relay_plugin_protocol::PluginHostHealth {
+                    protocol_version: PROTOCOL_VERSION,
+                    accepting_work: true,
+                    loaded: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_whose_registrations_cannot_be_served_is_refused_whole() {
+        use nemo_relay_plugin_protocol::PluginRegistrationOperation;
+
+        let unloaded = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(RegisteringBackend {
+            unloaded: unloaded.clone(),
+            operations: vec![
+                PluginRegistrationOperation::ToolRequestIntercept,
+                // The session was offered support for the first class only.
+                PluginRegistrationOperation::LlmStreamExecutionIntercept,
+            ],
+        });
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let session_id = establish(&service, &config).await;
+
+        let outcome = service
+            .load(Request::new(v1::LoadRequest {
+                session_id,
+                context: Some(context()),
+                plugin_id: "example".into(),
+                artifact: "relay-plugin.toml".into(),
+                manifest_digest: "a".repeat(64),
+                library_digest: "b".repeat(64),
+            }))
+            .await
+            .expect("a served load")
+            .into_inner();
+        let failure = nemo_relay_plugin_proto::convert::load_outcome_from_wire(&outcome)
+            .expect("a converted load")
+            .into_result()
+            .expect_err("a plugin registering what this session cannot serve");
+
+        // The refusal names both sides, so an operator reads what the plugin
+        // needs and what the session can do rather than a bare rejection.
+        assert!(
+            failure.message.contains("llm_stream_execution_intercept"),
+            "{failure:?}"
+        );
+        assert!(
+            failure.message.contains("tool_request_intercept"),
+            "{failure:?}"
+        );
+        // And the plugin is not left half-loaded for the kernel never to call.
+        assert_eq!(unloaded.lock().expect("the log").as_slice(), ["example"]);
     }
 
     #[test]
@@ -595,5 +883,18 @@ mod tests {
         let mark = mark_request_from_wire(&wire).expect("a mark");
         assert_eq!(mark.name, "example.mark");
         assert_eq!(mark.data_json.as_deref(), Some(r#"{"value":1}"#));
+    }
+
+    #[test]
+    fn a_failure_is_never_read_as_a_channel_problem() {
+        // The distinction the boundary exists to preserve, stated as a test: a
+        // structured failure is a result, and only the transport can produce the
+        // other kind.
+        let failure = PluginFailure {
+            code: PluginFailureCode::Rejected,
+            message: "the host refused".into(),
+        };
+        let outcome: LifecycleOutcome<()> = LifecycleOutcome::from_result(Err(failure));
+        assert!(matches!(outcome, LifecycleOutcome::Failed(_)));
     }
 }

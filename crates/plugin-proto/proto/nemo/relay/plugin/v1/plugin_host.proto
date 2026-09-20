@@ -219,6 +219,14 @@ message HandshakeRequest {
   // accept or decline, never ask for more. A call it cannot serve under what it
   // accepted fails, which is the fail-closed direction.
   repeated HostReadCapability offered_read_capabilities = 7;
+  // Registration classes the kernel can install a proxy for.
+  //
+  // A plugin whose registrations are not all in this set must not be loaded:
+  // the alternative is a load that reports success while a callback the plugin
+  // registered simply disappears, which is the failure this field exists to make
+  // impossible. Declared by the kernel because the kernel is the side that has
+  // to install the proxy.
+  repeated PluginRegistrationOperation supported_registration_operations = 8;
 }
 
 // The session the host establishes.

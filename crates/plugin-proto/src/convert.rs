@@ -1347,6 +1347,28 @@ fn capability_name(capability: PluginHostReadCapability) -> &'static str {
     }
 }
 
+/// Build the wire form of a handshake request.
+pub fn handshake_request_to_wire(request: &PluginHandshakeRequest) -> v1::HandshakeRequest {
+    v1::HandshakeRequest {
+        protocol_version: u32::from(request.protocol_version),
+        runtime_binding_digest: request.runtime_binding_digest.clone(),
+        client_nonce: request.client_nonce.clone(),
+        session_credential: request.session_credential.clone(),
+        maximum_frame_bytes: request.maximum_frame_bytes,
+        supported_features: request.supported_features.clone(),
+        offered_read_capabilities: request
+            .offered_read_capabilities
+            .iter()
+            .map(|capability| read_capability_to_wire(*capability))
+            .collect(),
+        supported_registration_operations: request
+            .supported_registration_operations
+            .iter()
+            .map(|operation| registration_operation_to_wire(*operation))
+            .collect(),
+    }
+}
+
 /// Validate a handshake request.
 pub fn handshake_request_from_wire(
     wire: &v1::HandshakeRequest,
@@ -1382,6 +1404,20 @@ pub fn handshake_request_from_wire(
             &wire.offered_read_capabilities,
             "a handshake request",
         )?,
+        supported_registration_operations: {
+            let mut operations = Vec::with_capacity(wire.supported_registration_operations.len());
+            for value in &wire.supported_registration_operations {
+                let operation = registration_operation_from_wire(*value)?;
+                if operations.contains(&operation) {
+                    return Err(malformed(format!(
+                        "a handshake declaring {} twice as supported",
+                        operation.as_str()
+                    )));
+                }
+                operations.push(operation);
+            }
+            operations
+        },
     })
 }
 
@@ -3410,6 +3446,9 @@ mod tests {
             maximum_frame_bytes: 1024,
             supported_features: vec!["streaming".into()],
             offered_read_capabilities: vec![v1::HostReadCapability::RuntimeDiagnostics as i32],
+            supported_registration_operations: vec![
+                v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept as i32,
+            ],
         })
         .expect("a request");
         assert_eq!(
@@ -3428,6 +3467,7 @@ mod tests {
                 maximum_frame_bytes: 1024,
                 supported_features: Vec::new(),
                 offered_read_capabilities: vec![capability],
+                supported_registration_operations: Vec::new(),
             };
             assert!(handshake_request_from_wire(&wire).is_err());
 

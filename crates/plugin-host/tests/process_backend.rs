@@ -26,6 +26,9 @@ fn host_config() -> PluginHostSupervisorConfig {
         executable: host_executable(),
         runtime_binding_digest: "test-runtime-binding".into(),
         offered_read_capabilities: Vec::new(),
+        // Nothing can be proxied yet, and the boundary says so rather than
+        // loading a plugin whose callbacks it would then ignore.
+        supported_registration_operations: Vec::new(),
         startup_timeout: Duration::from_secs(20),
     }
 }

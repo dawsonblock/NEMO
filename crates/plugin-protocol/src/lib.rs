@@ -289,6 +289,13 @@ pub struct PluginHandshakeRequest {
     pub supported_features: Vec<String>,
     /// Kernel-held state the host is offered.
     pub offered_read_capabilities: Vec<PluginHostReadCapability>,
+    /// Registration classes the kernel can install a proxy for.
+    ///
+    /// The host refuses to load a plugin whose registrations are not all in this
+    /// set, because the alternative is a load that reports success while a
+    /// registered callback disappears. It is per-session rather than per-plugin
+    /// because it is a property of the backend the kernel composed.
+    pub supported_registration_operations: Vec<PluginRegistrationOperation>,
 }
 
 /// A scope named by its canonical identity.

@@ -122,6 +122,10 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                 maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
                 supported_features: vec!["streaming".into(), "cancel".into()],
                 offered_read_capabilities: vec![v1::HostReadCapability::RuntimeDiagnostics as i32],
+                supported_registration_operations: vec![
+                    v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept
+                        as i32,
+                ],
             }
             .encode_to_vec(),
         ),

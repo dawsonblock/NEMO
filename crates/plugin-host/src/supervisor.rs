@@ -48,6 +48,13 @@ pub struct PluginHostSupervisorConfig {
     pub runtime_binding_digest: String,
     /// Kernel-held state the host may read, if any.
     pub offered_read_capabilities: Vec<PluginHostReadCapability>,
+    /// Registration classes this backend can install a proxy for.
+    ///
+    /// Empty means none: the host then refuses to load a plugin that registers
+    /// anything, which is the fail-closed answer while the proxy machinery is
+    /// still being built.
+    pub supported_registration_operations:
+        Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation>,
     /// How long to wait for the host to start and handshake.
     pub startup_timeout: Duration,
 }
@@ -64,6 +71,7 @@ impl PluginHostSupervisorConfig {
             executable,
             runtime_binding_digest: runtime_binding_digest.into(),
             offered_read_capabilities: Vec::new(),
+            supported_registration_operations: Vec::new(),
             startup_timeout: Duration::from_secs(10),
         }
     }
@@ -159,6 +167,7 @@ impl PluginHostSupervisor {
             &credential,
             &config.runtime_binding_digest,
             &config.offered_read_capabilities,
+            &config.supported_registration_operations,
         )
         .await?;
 
@@ -466,6 +475,7 @@ async fn handshake(
     credential: &str,
     runtime_binding_digest: &str,
     offered_read_capabilities: &[PluginHostReadCapability],
+    supported_registration_operations: &[nemo_relay_plugin_protocol::PluginRegistrationOperation],
 ) -> Result<PluginSessionIdentity, PluginProtocolError> {
     let request = v1::HandshakeRequest {
         protocol_version: u32::from(PROTOCOL_VERSION),
@@ -478,6 +488,12 @@ async fn handshake(
             .iter()
             .map(|capability| {
                 nemo_relay_plugin_proto::convert::read_capability_to_wire(*capability)
+            })
+            .collect(),
+        supported_registration_operations: supported_registration_operations
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
             })
             .collect(),
     };
