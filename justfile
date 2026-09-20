@@ -882,6 +882,7 @@ prepend_go_bin_to_path() {
 prepare_test_plugin_fixtures() {
     local target_dir="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures"
     local native_library=""
+    local intercept_library=""
     local worker_executable="nemo-relay-worker-plugin-fixture"
     local host_os=""
 
@@ -889,13 +890,16 @@ prepare_test_plugin_fixtures() {
     case "${RUNNER_OS:-}:${OSTYPE:-}:$host_os" in
         Windows:*|*:msys*:*|*:win32*:*|*:*:MINGW*|*:*:MSYS*|*:*:CYGWIN*)
             native_library="nemo_relay_plugin_fixture.dll"
+            intercept_library="nemo_relay_native_intercept_fixture.dll"
             worker_executable="${worker_executable}.exe"
             ;;
         *:darwin*:*|*:*:Darwin)
             native_library="libnemo_relay_plugin_fixture.dylib"
+            intercept_library="libnemo_relay_native_intercept_fixture.dylib"
             ;;
         *)
             native_library="libnemo_relay_plugin_fixture.so"
+            intercept_library="libnemo_relay_native_intercept_fixture.so"
             ;;
     esac
 
@@ -904,10 +908,14 @@ prepare_test_plugin_fixtures() {
         --manifest-path crates/core/tests/fixtures/native_plugin/Cargo.toml \
         --target-dir "$target_dir"
     cargo build --quiet --locked \
+        --manifest-path crates/core/tests/fixtures/native_intercept_plugin/Cargo.toml \
+        --target-dir "$target_dir"
+    cargo build --quiet --locked \
         --manifest-path crates/core/tests/fixtures/worker_plugin/Cargo.toml \
         --target-dir "$target_dir"
 
     export NEMO_RELAY_TEST_NATIVE_PLUGIN="$target_dir/debug/$native_library"
+    export NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN="$target_dir/debug/$intercept_library"
     export NEMO_RELAY_TEST_WORKER_PLUGIN="$target_dir/debug/$worker_executable"
     if [[ ! -f "$NEMO_RELAY_TEST_NATIVE_PLUGIN" ]]; then
         echo "ERROR: missing native plugin test fixture: $NEMO_RELAY_TEST_NATIVE_PLUGIN" >&2
@@ -1108,6 +1116,7 @@ build-test-plugin-fixtures:
     {{ bash_helpers }}
     prepare_test_plugin_fixtures
     printf 'Native plugin fixture: %s\n' "$NEMO_RELAY_TEST_NATIVE_PLUGIN"
+    printf 'Single-registration fixture: %s\n' "$NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN"
     printf 'Worker plugin fixture: %s\n' "$NEMO_RELAY_TEST_WORKER_PLUGIN"
 
 

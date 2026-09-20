@@ -189,6 +189,122 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
 }
 
 #[tokio::test]
+async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
+    use nemo_relay_plugin_protocol::{PluginActivateRequest, PluginComponentConfiguration};
+
+    // A plugin that registers exactly one class, which is what a kernel that can
+    // proxy one class needs: the other fixture registers sixteen, and activating
+    // it against a one-class session is refused — correctly, but uselessly for
+    // this test.
+    let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                "../../target/test-plugin-fixtures/debug/libnemo_relay_native_intercept_fixture.dylib",
+            )
+        });
+    assert!(
+        library.exists(),
+        "the single-registration fixture is missing; run `just build-test-plugin-fixtures`"
+    );
+
+    let manifest_dir = std::env::temp_dir().join(format!(
+        "nemo-ph-intercept-{}",
+        nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&manifest_dir).expect("a manifest directory");
+    let manifest = manifest_dir.join("relay-plugin.toml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "manifest_version = 1\n\n[plugin]\nid = \"fixture_intercept\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \"nemo_relay_native_intercept_fixture\"\n",
+            env!("CARGO_PKG_VERSION"),
+            library.display()
+        ),
+    )
+    .expect("write the manifest");
+
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    let artifact = manifest.to_string_lossy().into_owned();
+    let (manifest_sha256, library_sha256) =
+        nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+            .expect("the fixture's identity");
+
+    // The child loads it and runs its register callback; what comes back is the
+    // registration, which is what the kernel installs a proxy from.
+    let loaded = backend
+        .load(
+            nemo_relay_plugin_protocol::PluginLoadRequest {
+                plugin_id: "fixture_intercept".into(),
+                artifact,
+                identity: nemo_relay_plugin_protocol::PluginArtifactIdentity {
+                    manifest_sha256,
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect("the fixture should load");
+    let descriptors = backend
+        .activate(
+            PluginActivateRequest {
+                components: vec![PluginComponentConfiguration {
+                    kind: "fixture_intercept".into(),
+                    config_json: "{}".into(),
+                }],
+            },
+            context(),
+        )
+        .await
+        .expect("the one class this backend can serve");
+    let descriptor = descriptors
+        .iter()
+        .find(|descriptor| descriptor.plugin_id == "fixture_intercept")
+        .expect("the activated plugin");
+
+    // The kernel installs the proxy, then makes a real call through its own
+    // chain: the chain runs in this process, the registration runs in the child.
+    let binding = backend.runtime_binding_digest().to_owned();
+    let proxies = nemo_relay_plugin_host::proxy::install(
+        std::sync::Arc::new(backend),
+        descriptor,
+        loaded.handle.clone(),
+        &binding,
+    )
+    .expect("the kernel can proxy a tool request intercept");
+
+    let rewritten = nemo_relay::api::tool::tool_request_intercepts(
+        "example_tool",
+        serde_json::json!({"input": true}),
+    )
+    .await
+    .expect("the chain should reach the child");
+    assert_eq!(
+        rewritten["native_intercept"], true,
+        "the rewrite came from the plugin process: {rewritten}"
+    );
+
+    // And dropping the proxies takes the registration out of the kernel's chain.
+    drop(proxies);
+    let after = nemo_relay::api::tool::tool_request_intercepts(
+        "example_tool",
+        serde_json::json!({"input": true}),
+    )
+    .await
+    .expect("the chain");
+    assert_eq!(
+        after["native_intercept"],
+        serde_json::Value::Null,
+        "{after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&manifest_dir);
+}
+
+#[tokio::test]
 async fn a_host_that_has_exited_is_a_crash_and_not_an_answer() {
     let backend = ProcessPluginBackend::launch(host_config())
         .await

@@ -344,6 +344,15 @@ impl ProcessPluginBackend {
         self.supervisor.session()
     }
 
+    /// The runtime binding this backend's host was started with.
+    ///
+    /// The kernel knows it — it sent it — and the host checks every operation
+    /// against it, so anything the kernel asks on the session's behalf has to
+    /// carry it.
+    pub fn runtime_binding_digest(&self) -> &str {
+        &self.config.runtime_binding_digest
+    }
+
     /// The host's process id, while it is running.
     pub fn process_id(&self) -> Option<u32> {
         self.supervisor.process_id()

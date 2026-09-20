@@ -75,7 +75,9 @@ pub fn install(
     backend: Arc<dyn PluginExecutionBackend>,
     descriptor: &PluginDescriptor,
     handle: PluginHandle,
+    runtime_binding_digest: &str,
 ) -> Result<RegistrationProxies, PluginProtocolError> {
+    let runtime_binding_digest = runtime_binding_digest.to_owned();
     let mut installed = RegistrationProxies {
         tool_request_intercepts: Vec::new(),
     };
@@ -83,7 +85,12 @@ pub fn install(
     for registration in &descriptor.registrations {
         match registration.operation {
             PluginRegistrationOperation::ToolRequestIntercept => {
-                install_tool_request_intercept(&backend, registration, &handle)?;
+                install_tool_request_intercept(
+                    &backend,
+                    registration,
+                    &handle,
+                    &runtime_binding_digest,
+                )?;
                 installed
                     .tool_request_intercepts
                     .push(registration.registration_id.clone());
@@ -112,9 +119,11 @@ fn install_tool_request_intercept(
     backend: &Arc<dyn PluginExecutionBackend>,
     registration: &PluginRegistrationDescriptor,
     handle: &PluginHandle,
+    runtime_binding_digest: &str,
 ) -> Result<(), PluginProtocolError> {
     let registration_id = registration.registration_id.clone();
     let handle = handle.clone();
+    let runtime_binding_digest = runtime_binding_digest.to_owned();
     let priority = registration.ordering.priority.unwrap_or_default();
     let break_chain = registration.ordering.may_break_chain.unwrap_or(false);
     let backend = Arc::clone(backend);
@@ -123,6 +132,7 @@ fn install_tool_request_intercept(
         let backend = Arc::clone(&backend);
         let handle = handle.clone();
         let registration_id = registration_id.clone();
+        let runtime_binding_digest = runtime_binding_digest.clone();
         Box::pin(async move {
             // The payload shape is the class's, not the wire's: the host reads
             // the tool name and the arguments out of one object.
@@ -133,7 +143,7 @@ fn install_tool_request_intercept(
                 arguments: payload.to_string(),
                 budget_millis: PROXY_BUDGET_MILLIS,
             };
-            let context = proxy_context();
+            let context = proxy_context(&runtime_binding_digest);
             let outcome = backend.invoke(request, context).await.map_err(|error| {
                 nemo_relay::error::FlowError::Internal(format!(
                     "the plugin host could not be reached: {}",
@@ -182,7 +192,11 @@ fn install_tool_request_intercept(
 }
 
 /// What a proxy tells the seam about the operation it is making.
-fn proxy_context() -> PluginExecutionContext {
+///
+/// The binding is the session's, not the proxy's invention: the host checks it
+/// against the session it established, and a proxy that sent none would be
+/// refused — which is how this was found.
+fn proxy_context(runtime_binding_digest: &str) -> PluginExecutionContext {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -190,9 +204,7 @@ fn proxy_context() -> PluginExecutionContext {
     PluginExecutionContext {
         operation_request_id: nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
         protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
-        // Filled by the composition that owns the runtime identity; a proxy that
-        // invented one would be claiming a binding it does not know.
-        runtime_binding_digest: String::new(),
+        runtime_binding_digest: runtime_binding_digest.to_owned(),
         deadline_unix_ms: now.saturating_add(PROXY_BUDGET_MILLIS),
         remaining_budget_millis: PROXY_BUDGET_MILLIS,
         max_response_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
@@ -340,6 +352,7 @@ mod tests {
                 plugin_id: "example".into(),
                 generation: 1,
             },
+            "test-binding",
         )
         .expect("the one class this kernel proxies");
         assert_eq!(
@@ -389,6 +402,7 @@ mod tests {
                 plugin_id: "example".into(),
                 generation: 1,
             },
+            "test-binding",
         )
         .expect_err("a class this kernel cannot proxy");
 
