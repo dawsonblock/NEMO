@@ -418,6 +418,39 @@ Still open, in the order they need closing:
    as `HostCrashed`, the backend can replace it, and the kernel decides whether
    to keep using the replacement, because only the kernel knows what the
    previous session was holding.
+
+   The work decomposes into four pieces, in this order, because each needs the
+   one before it:
+
+   1. **A registration operation on the wire.** Registration is config-driven:
+      the kernel initializes a plugin's components and the callbacks arrive
+      then. In process the kernel both sends the configuration and receives the
+      registrations, so the wire needs an operation that carries a component
+      configuration to the host and returns the descriptors its registrations
+      produced. `Load` cannot do it: it has no configuration to send and runs
+      before any component exists.
+   2. **Invoking one registration by name.** The kernel installs one proxy per
+      reported registration, at the priority the plugin declared, and each proxy
+      has to run *that* registration. Running the host's local chain instead
+      would run every registration the plugin made on each call, so the host
+      needs a narrow entry point in core — invoke the registration named N of
+      class C with this input. Core's chain entry points are keyed by name and
+      are not that.
+   3. **The proxy, and `invoke` on the seam.** The kernel-side proxy is most
+      naturally a `Plugin` implementation in `plugin-host` registering through
+      `PluginRegistrationContext`, which is already public; the trait gains
+      `invoke`, returning an outcome carrying `dispatch_state` and
+      `outcome_certainty` so a channel that dies after a plugin may have
+      dispatched becomes `UNKNOWN` rather than `FAILED`.
+   4. **One class, then the next.** A unary class end to end — a tool request
+      intercept is the smallest complete one — with the conformance suite
+      extended to run it against both backends. Then continuations, deferred
+      completions, pull streams, streaming intercepts and dynamic
+      registrations, in that order, so no two state machines arrive at once.
+
+   The `invoke` and `invoke_stream` RPCs already answer with structured refusals,
+   so a host that cannot serve an invocation says so rather than looking like an
+   empty success.
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 4. **Resource limits beyond process separation and the deadline.** The child
@@ -425,6 +458,12 @@ Still open, in the order they need closing:
    memory, file and child limits, platform sandboxing and destination network
    policy are not applied yet, and capabilities do not declare the profile they
    need.
+
+After invocation, the cutover milestones are what move the metric: production
+selects the process backend and refuses the in-process one, the bindings stop
+reaching the loader at all, and the native loader and its `unsafe` leave the
+kernel's dependency graph. Only then does `kernel-process unsafe tokens` fall
+from 621, by the loader's own weight rather than by reclassification.
 
 ## The process boundary
 
@@ -458,6 +497,11 @@ holds the supervisor that starts it and the backend that reaches it.
   from before the crash addressing nothing. Restarting with the previous plugins
   in place would imply a continuity the crash took away, and the loaded set is
   the kernel's record rather than the backend's.
+- **A stuck host is killed at the deadline.** The test stops the host process
+  mid-session — the socket stays open and nothing will ever answer on it — and
+  asserts the operation ends as `DeadlineExceeded` rather than as `HostCrashed`,
+  because the kernel is the one that ended the process. The child is reaped, not
+  abandoned, so nothing is left holding a socket nobody will read.
 - **Closing is an outcome too.** `SessionClose` answers with a failure arm like
   every other lifecycle operation. It was the last one reporting a refusal as a
   transport status, which is the conflation the rest of the schema exists to

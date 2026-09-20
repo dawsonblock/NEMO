@@ -44,6 +44,14 @@ fn context() -> PluginExecutionContext {
     }
 }
 
+/// Wall-clock milliseconds, for an absolute deadline.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_millis() as u64
+}
+
 #[tokio::test]
 async fn the_process_backend_satisfies_the_same_conformance_suite() {
     let backend = ProcessPluginBackend::launch(host_config())
@@ -102,6 +110,53 @@ async fn killing_the_host_does_not_kill_the_kernel() {
             .expect_err("a host that exited cannot be inspected");
         assert_eq!(error.failure.code, PluginFailureCode::HostCrashed);
     }
+}
+
+#[tokio::test]
+async fn a_host_that_stops_answering_is_killed_at_the_deadline() {
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    let process_id = backend.process_id().expect("a running host");
+
+    // Stopping the process is what a plugin that hangs looks like from the
+    // kernel's side: the socket is still open and nothing will ever answer on
+    // it.
+    let stopped = std::process::Command::new("kill")
+        .args(["-STOP", &process_id.to_string()])
+        .status()
+        .expect("the stop signal");
+    assert!(stopped.success(), "the host should be stoppable");
+
+    let deadline = now_unix_ms() + 500;
+    let budgeted = PluginExecutionContext {
+        operation_request_id: "operation-budgeted".into(),
+        protocol_version: PROTOCOL_VERSION,
+        runtime_binding_digest: "test-runtime-binding".into(),
+        deadline_unix_ms: deadline,
+        remaining_budget_millis: 500,
+        max_response_bytes: 1024,
+    };
+    let error = backend
+        .health(budgeted)
+        .await
+        .expect_err("a stopped host cannot answer");
+
+    // A deadline that passed is a deadline, not a crash: the kernel is the one
+    // that ended the process, and reporting that as `HostCrashed` would blame
+    // the plugin for the kernel's own decision.
+    assert_eq!(
+        error.failure.code,
+        PluginFailureCode::DeadlineExceeded,
+        "{error:?}"
+    );
+
+    // And it is gone: the kernel killed it rather than waiting for a plugin to
+    // honour a cancellation token it never agreed to.
+    assert!(
+        backend.exit_status().await.is_some(),
+        "the host should have been killed, not merely abandoned"
+    );
 }
 
 #[tokio::test]
