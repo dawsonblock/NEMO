@@ -316,12 +316,58 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   asserts the recorded set is exactly the sixteen attachment points and nothing
   else.
 
+- **The duplex channel, and what a registered callback needs while it runs.**
+  Most calls between the two sides are one request and one answer, and those
+  keep one typed representation each. Two families are not. A completion is
+  settled *after* the callback that produced it has returned, so its answer
+  belongs to no call in flight, and the kernel also has to tell the plugin that
+  the awaiting runtime cancelled it. A downstream stream is opened, pulled one
+  item at a time by the plugin, and may be cancelled or released while a pull is
+  outstanding, so its pace is the plugin's and cancellation travels the other
+  way. `RelayRuntime.Session` carries both, with a session id, a call id, an
+  operation id and a stream id on the messages that need them, and the
+  conversions refuse a message that names no session, no stream, no completion,
+  or an empty payload. The chain continuation — a plugin's "run the rest of the
+  chain" — is `RelayRuntime.Continue`, a typed request, because it is exactly
+  one request and one answer with nothing pushed in between.
+
+  The complete ABI-v4 host callback inventory, each callback classified by how
+  it reaches the other side. Nothing here is left unnamed: the operations that
+  are not yet on the wire say what they need rather than waiting to be
+  rediscovered.
+
+  | Native host callback | Remote representation |
+  |---|---|
+  | `plugin_context_register_*` (fourteen hooks, above) | registration descriptors with the attachment point |
+  | `plugin_runtime_register_conditional_middleware_guardrail` (+ `_callback`), `plugin_context_register_conditional_middleware_guardrail` (+ `_callback`), `plugin_runtime_deregister_conditional_middleware_guardrail` | registration descriptors, one entry per gated kind, dropped when the gate is removed |
+  | `async_completion_resolve_json`, `async_completion_reject` | session `CompletionSettle`, answered by `CompletionOutcome` so a settlement that was already cancelled is refused rather than silently dropped |
+  | `async_completion_is_cancelled` | session `CompletionCancelled`, pushed by the kernel |
+  | `async_next_invoke`, `async_next_invoke_result` | `RelayRuntime.Continue` |
+  | `async_next_open_llm_stream` | session `StreamOpen` → `StreamOpened` or `StreamOpenFailed` |
+  | `async_llm_stream_pull` | session `StreamPull` → `StreamItem`, `StreamEnd` or `StreamFailed` |
+  | `async_llm_stream_cancel`, `async_llm_stream_release` | session `StreamCancel`, `StreamRelease` |
+  | `async_stream_push_json`, `async_stream_finish`, `async_stream_reject` | `InvokeStream`'s `StreamChunk` |
+  | `async_stream_is_cancelled` | `CancelOperation`, which the host reports to the plugin |
+  | `scope_get_current`, `scope_push`, `scope_pop`, `scope_handle_free`, `scope_stack_create`, `scope_stack_free` | `ScopeStack` typed request — **incomplete**: `operation` is a free-form string on the wire, and a scope handle has no wire identity, so an unknown operation cannot be refused |
+  | `emit_mark`, `emit_mark_v2` | `EmitMark` typed request — **incomplete**: the wire carries a name and a data payload, while v2 also passes a parent scope handle, metadata, a data schema, a severity and a timestamp |
+  | `llm_request_codec_encode`, `llm_request_codec_decode`, `llm_response_codec_decode`, `async_completion_llm_*_codec_*` | `ResolveCodec` typed request — the same free-form `kind` caveat |
+  | `async_next_invoke_stream` | **not yet mapped**: the runtime pushes chunks into the plugin's callback and the callback's return value decides whether production continues, so it needs one answer per chunk rather than one per call |
+  | `async_stream_is_backpressured` and the `Backpressured` status | **not yet mapped**: the host's bounded non-blocking queue has to be translated into the transport's flow control, and that translation is the host's to demonstrate, not to assume |
+  | `get_runtime_diagnostics` | **not yet mapped**: it reads kernel-held state from a less-trusted process, which is a decision about what the host may learn rather than a mechanical translation |
+  | `plugin_runtime_list_registrations` | **not yet mapped**: the same shape as diagnostics, one level narrower |
+  | `scope_stack_set_thread`, `scope_stack_capture_thread`, `scope_stack_restore_thread`, `with_scope_stack` | host-local: they bind a runtime-issued stack to a thread inside the host process |
+  | `string_new`, `string_data`, `string_len`, `string_free`, `last_error_clear`, `last_error_set` | host-local: allocation and the plugin's error channel inside the host process |
+  | `async_completion_release`, `async_completion_retain`, `async_next_release`, `async_stream_release`, `plugin_context_runtime`, `plugin_runtime_retain`, `plugin_runtime_release` | host-local: reference counting for handles the host owns |
+
 Still open, in the order they need closing:
 
-1. **Async continuation and the pull-based downstream LLM stream**, which cannot
-   be a unary call because the plugin controls when to pull and backpressure is
-   explicit. The registration side of the ABI is now mapped; the callbacks a
-   registered component makes while it runs are not.
+1. **The five callbacks the inventory above marks as not yet on the wire**, each
+   of which needs a decision rather than a translation: a per-chunk answer for
+   the push-style stream continuation, a backpressure story the host can
+   demonstrate, and a decision about what a less-trusted process may read of
+   kernel diagnostics and registration state. `ScopeStack` and `EmitMark` also
+   need closing out: their operations are free-form strings and their payloads
+   are missing the v2 mark fields and scope-handle identity.
 2. **Conversions for every message the host uses**, and vectors for all of them
    rather than fourteen declared pending.
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the

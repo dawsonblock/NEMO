@@ -364,6 +364,199 @@ pub struct PluginExecutionContext {
     pub max_response_bytes: u32,
 }
 
+/// A request to continue the interceptor chain.
+///
+/// A plugin's interceptor that rewrites a request and then continues is asking
+/// the runtime to run everything after it: the other interceptors, then the
+/// call itself. In process that work is the runtime's, so the request crosses;
+/// the operation identity is what lets the runtime resume the right chain
+/// position rather than starting a new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationRequest {
+    /// Correlation identifier for the operation being continued.
+    pub operation_request_id: String,
+    /// Identity of this call, distinct from the operation it belongs to.
+    pub host_call_id: String,
+    /// The invocation to continue with, after any rewriting.
+    pub invocation_json: String,
+}
+
+/// The rest of the chain's answer, or the failure that replaced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationOutcome {
+    /// The answer, or the failure.
+    pub result: Result<String, PluginFailure>,
+}
+
+/// One message on the duplex channel between the kernel and a plugin host.
+///
+/// This channel carries the two families of call that one request and one
+/// answer cannot express: a completion the plugin settles after the callback
+/// that produced it has returned, and a downstream stream the plugin opens,
+/// paces one pull at a time, and may cancel or release while a pull is
+/// outstanding. Everything else — operations, marks, scope stack, codec
+/// resolution, registration — keeps its own single representation as a typed
+/// request; a second way to perform one of those would be a second thing that
+/// can disagree with the first.
+///
+/// The session is part of every message rather than of the channel, so a peer
+/// that receives a message from a session it no longer holds can say so instead
+/// of acting on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSessionMessage {
+    /// The session this message belongs to.
+    pub session_id: String,
+    /// What the message is.
+    pub message: PluginSessionPayload,
+}
+
+/// The messages a session carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "message")]
+pub enum PluginSessionPayload {
+    /// Open a downstream stream for one operation.
+    StreamOpen(PluginStreamOpenRequest),
+    /// The stream the kernel opened.
+    StreamOpened(PluginStreamOpened),
+    /// The kernel refused to open it.
+    StreamOpenFailed(PluginStreamOpenFailed),
+    /// Pull the next item.
+    StreamPull(PluginStreamPullRequest),
+    /// One item.
+    StreamItem(PluginStreamItem),
+    /// The stream produced everything it had.
+    StreamEnd(PluginStreamEnd),
+    /// The stream failed.
+    StreamFailed(PluginStreamFailed),
+    /// Stop producing.
+    StreamCancel(PluginStreamControl),
+    /// Drop the plugin's reference to the stream.
+    StreamRelease(PluginStreamControl),
+    /// Settle a callback that returned before its result existed.
+    CompletionSettle(PluginCompletionSettlement),
+    /// The kernel's answer to a settlement.
+    CompletionOutcome(PluginCompletionOutcome),
+    /// The awaiting runtime cancelled a pending completion.
+    CompletionCancelled(PluginCompletionCancelled),
+}
+
+/// A request to open a downstream stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamOpenRequest {
+    /// Identity of this call, distinct from the operation it belongs to.
+    pub host_call_id: String,
+    /// The operation the stream is opened for.
+    pub operation_request_id: String,
+    /// The request to send downstream.
+    pub request_json: String,
+}
+
+/// The stream the kernel opened, addressed by identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamOpened {
+    /// Identity of the open call being answered.
+    pub host_call_id: String,
+    /// Identity of the stream every later message names.
+    pub stream_id: String,
+}
+
+/// A refusal to open a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamOpenFailed {
+    /// Identity of the open call being answered.
+    pub host_call_id: String,
+    /// Why it was refused.
+    pub failure: PluginFailure,
+}
+
+/// A request for the next item of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamPullRequest {
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// The stream to pull from.
+    pub stream_id: String,
+}
+
+/// One item of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamItem {
+    /// Identity of the pull being answered.
+    pub host_call_id: String,
+    /// The stream it belongs to.
+    pub stream_id: String,
+    /// The item.
+    pub chunk_json: String,
+}
+
+/// Clean completion of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamEnd {
+    /// Identity of the pull being answered.
+    pub host_call_id: String,
+    /// The stream that ended.
+    pub stream_id: String,
+}
+
+/// Failed completion of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamFailed {
+    /// Identity of the pull being answered.
+    pub host_call_id: String,
+    /// The stream that failed.
+    pub stream_id: String,
+    /// Why it failed.
+    pub failure: PluginFailure,
+}
+
+/// A stream control message that names only the call and the stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamControl {
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// The stream to act on.
+    pub stream_id: String,
+}
+
+/// A settlement of a callback that returned before its result existed.
+///
+/// The value and the failure share a `Result` rather than two fields, because a
+/// settlement that carried both would describe two outcomes for one callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCompletionSettlement {
+    /// Identity of the completion being settled.
+    pub completion_id: String,
+    /// The operation the callback belonged to.
+    pub operation_request_id: String,
+    /// The settled value, or the failure that replaced it.
+    pub result: Result<String, PluginFailure>,
+}
+
+/// The kernel's answer to a settlement.
+///
+/// `Ok(())` means the settlement was taken. A failure means it was refused —
+/// because the completion was already settled or already cancelled — and the
+/// plugin has to learn that rather than assume its result arrived, since
+/// nothing else is waiting on that callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCompletionOutcome {
+    /// Identity of the completion this answers.
+    pub completion_id: String,
+    /// Whether the settlement was taken.
+    pub result: Result<(), PluginFailure>,
+}
+
+/// Notification that the runtime awaiting a callback cancelled it.
+///
+/// The plugin is under no obligation to stop — the kernel does not trust a
+/// plugin to honour cancellation, and enforces its own deadline regardless —
+/// but a plugin that knows can release what it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCompletionCancelled {
+    /// Identity of the cancelled completion.
+    pub completion_id: String,
+}
+
 /// Result of one operation together with what is known about dispatch.
 ///
 /// A failure alone is not enough to decide what happens next. If a plugin that

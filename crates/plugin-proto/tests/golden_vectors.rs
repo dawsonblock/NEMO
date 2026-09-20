@@ -248,6 +248,79 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             }
             .encode_to_vec(),
         ),
+        // The duplex session, once for each family it exists to carry: a
+        // downstream stream the plugin paces one pull at a time, and a
+        // completion settled after its callback returned. Three vectors share
+        // the envelope's name because the envelope is one message; what differs
+        // is which arm it carries.
+        (
+            "PluginSessionMessage",
+            v1::PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: Some(v1::plugin_session_message::Message::StreamOpen(
+                    v1::DownstreamStreamOpenRequest {
+                        host_call_id: "call-1".into(),
+                        operation_request_id: "operation-1".into(),
+                        request_json: r#"{"model":"example"}"#.into(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "PluginSessionMessage",
+            v1::PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: Some(v1::plugin_session_message::Message::StreamItem(
+                    v1::DownstreamStreamItem {
+                        host_call_id: "call-2".into(),
+                        stream_id: "stream-1".into(),
+                        chunk_json: r#"{"delta":"hi"}"#.into(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "PluginSessionMessage",
+            v1::PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: Some(v1::plugin_session_message::Message::CompletionSettle(
+                    v1::CompletionSettle {
+                        completion_id: "completion-1".into(),
+                        operation_request_id: "operation-1".into(),
+                        result: Some(v1::completion_settle::Result::Failure(v1::PluginFailure {
+                            code: v1::FailureCode::Unavailable as i32,
+                            message: "the downstream provider refused".into(),
+                            observed: None,
+                            limit: None,
+                            expected_version: None,
+                            received_version: None,
+                        })),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ContinuationRequest",
+            v1::ContinuationRequest {
+                session_id: "session-1".into(),
+                operation_request_id: "operation-1".into(),
+                host_call_id: "call-1".into(),
+                invocation_json: r#"{"input":true}"#.into(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ContinuationOutcome",
+            v1::ContinuationOutcome {
+                result: Some(v1::continuation_outcome::Result::ValueJson(
+                    r#"{"ok":true}"#.into(),
+                )),
+            }
+            .encode_to_vec(),
+        ),
     ]
 }
 
@@ -376,6 +449,15 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
                 .encode_to_vec(),
             "HealthOutcome" => v1::HealthOutcome::decode(bytes.as_slice())
                 .expect("decode HealthOutcome")
+                .encode_to_vec(),
+            "PluginSessionMessage" => v1::PluginSessionMessage::decode(bytes.as_slice())
+                .expect("decode PluginSessionMessage")
+                .encode_to_vec(),
+            "ContinuationRequest" => v1::ContinuationRequest::decode(bytes.as_slice())
+                .expect("decode ContinuationRequest")
+                .encode_to_vec(),
+            "ContinuationOutcome" => v1::ContinuationOutcome::decode(bytes.as_slice())
+                .expect("decode ContinuationOutcome")
                 .encode_to_vec(),
             other => panic!("no decoder for recorded vector {other}"),
         };

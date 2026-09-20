@@ -16,11 +16,15 @@
 
 use nemo_relay_plugin_protocol::{
     DispatchState, LifecycleOutcome, MAX_FRAME_BYTES, OutcomeCertainty, PluginArtifactIdentity,
-    PluginCapability, PluginCapabilityKind, PluginDescriptor, PluginExecutionContext,
-    PluginExecutionOutcome, PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle,
-    PluginHostHealth, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
-    PluginProtocolError, PluginRegistrationDescriptor, PluginRegistrationOperation,
-    PluginRegistrationOrdering, PluginSessionIdentity, PluginSuccess, registration_shape,
+    PluginCapability, PluginCapabilityKind, PluginCompletionCancelled, PluginCompletionOutcome,
+    PluginCompletionSettlement, PluginContinuationOutcome, PluginContinuationRequest,
+    PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome, PluginExecutionShape,
+    PluginFailure, PluginFailureCode, PluginHandle, PluginHostHealth, PluginInvokeResponse,
+    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginRegistrationDescriptor,
+    PluginRegistrationOperation, PluginRegistrationOrdering, PluginSessionIdentity,
+    PluginSessionMessage, PluginSessionPayload, PluginStreamControl, PluginStreamEnd,
+    PluginStreamFailed, PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest,
+    PluginStreamOpened, PluginStreamPullRequest, PluginSuccess, registration_shape,
 };
 
 use crate::v1;
@@ -757,6 +761,348 @@ pub fn execution_outcome_from_wire(
         certainty,
         result,
     })
+}
+
+/// Validate a continuation request.
+///
+/// The operation identity is required: a continuation without it could not be
+/// resumed at the right chain position, and the runtime would have to guess
+/// which chain the invocation belongs to.
+pub fn continuation_request_from_wire(
+    wire: &v1::ContinuationRequest,
+) -> Result<PluginContinuationRequest, PluginProtocolError> {
+    if wire.session_id.trim().is_empty() {
+        return Err(malformed("a continuation that names no session"));
+    }
+    Ok(PluginContinuationRequest {
+        operation_request_id: required_text(
+            &wire.operation_request_id,
+            "a continuation that belongs to no operation",
+        )?,
+        host_call_id: required_text(&wire.host_call_id, "a continuation with no call identity")?,
+        invocation_json: required_text(
+            &wire.invocation_json,
+            "a continuation with nothing to run",
+        )?,
+    })
+}
+
+/// Build the wire form of a continuation request.
+pub fn continuation_request_to_wire(
+    request: &PluginContinuationRequest,
+    session_id: &str,
+) -> v1::ContinuationRequest {
+    v1::ContinuationRequest {
+        session_id: session_id.to_owned(),
+        operation_request_id: request.operation_request_id.clone(),
+        host_call_id: request.host_call_id.clone(),
+        invocation_json: request.invocation_json.clone(),
+    }
+}
+
+/// Read a continuation outcome, refusing one that carries neither arm.
+///
+/// A continuation that answered nothing would leave the plugin's callback
+/// waiting for a result that is never coming, which is the one outcome the
+/// plugin cannot recover from.
+pub fn continuation_outcome_from_wire(
+    wire: &v1::ContinuationOutcome,
+) -> Result<PluginContinuationOutcome, PluginProtocolError> {
+    let result = match wire.result.as_ref() {
+        Some(v1::continuation_outcome::Result::ValueJson(value)) => Ok(required_text(
+            value,
+            "a continuation that answered with nothing",
+        )?),
+        Some(v1::continuation_outcome::Result::Failure(failure)) => {
+            Err(failure_from_wire(failure)?)
+        }
+        None => {
+            return Err(malformed(
+                "a continuation outcome that is neither a value nor a failure",
+            ));
+        }
+    };
+    Ok(PluginContinuationOutcome { result })
+}
+
+/// Build the wire form of a continuation outcome.
+pub fn continuation_outcome_to_wire(
+    outcome: &PluginContinuationOutcome,
+) -> v1::ContinuationOutcome {
+    v1::ContinuationOutcome {
+        result: Some(match &outcome.result {
+            Ok(value) => v1::continuation_outcome::Result::ValueJson(value.clone()),
+            Err(failure) => v1::continuation_outcome::Result::Failure(failure_to_wire(failure)),
+        }),
+    }
+}
+
+/// Read one message from the duplex session.
+///
+/// The identities are the point of the channel: a stream item that named no
+/// stream, or a settlement that named no completion, would have to be matched
+/// to whatever was outstanding, and the side that guessed would be the trusted
+/// one.
+pub fn session_message_from_wire(
+    wire: &v1::PluginSessionMessage,
+) -> Result<PluginSessionMessage, PluginProtocolError> {
+    if wire.session_id.trim().is_empty() {
+        return Err(malformed("a session message naming no session"));
+    }
+    let message = match wire.message.as_ref() {
+        Some(v1::plugin_session_message::Message::StreamOpen(open)) => {
+            PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
+                host_call_id: required_text(
+                    &open.host_call_id,
+                    "a stream open with no call identity",
+                )?,
+                operation_request_id: required_text(
+                    &open.operation_request_id,
+                    "a stream open that belongs to no operation",
+                )?,
+                request_json: required_text(&open.request_json, "a stream open with no request")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamOpened(opened)) => {
+            PluginSessionPayload::StreamOpened(PluginStreamOpened {
+                host_call_id: required_text(
+                    &opened.host_call_id,
+                    "an opened stream with no call identity",
+                )?,
+                stream_id: required_text(&opened.stream_id, "an opened stream with no identity")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamOpenFailed(failed)) => {
+            PluginSessionPayload::StreamOpenFailed(PluginStreamOpenFailed {
+                host_call_id: required_text(
+                    &failed.host_call_id,
+                    "a refused stream with no call identity",
+                )?,
+                failure: match failed.failure.as_ref() {
+                    Some(failure) => failure_from_wire(failure)?,
+                    None => return Err(malformed("a refused stream with no reason")),
+                },
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamPull(pull)) => {
+            PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                host_call_id: required_text(&pull.host_call_id, "a pull with no call identity")?,
+                stream_id: required_text(&pull.stream_id, "a pull naming no stream")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamItem(item)) => {
+            PluginSessionPayload::StreamItem(PluginStreamItem {
+                host_call_id: required_text(
+                    &item.host_call_id,
+                    "a stream item with no call identity",
+                )?,
+                stream_id: required_text(&item.stream_id, "a stream item naming no stream")?,
+                chunk_json: required_text(&item.chunk_json, "a stream item with no chunk")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamEnd(end)) => {
+            PluginSessionPayload::StreamEnd(PluginStreamEnd {
+                host_call_id: required_text(
+                    &end.host_call_id,
+                    "a stream end with no call identity",
+                )?,
+                stream_id: required_text(&end.stream_id, "a stream end naming no stream")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamFailed(failed)) => {
+            PluginSessionPayload::StreamFailed(PluginStreamFailed {
+                host_call_id: required_text(
+                    &failed.host_call_id,
+                    "a stream failure with no call identity",
+                )?,
+                stream_id: required_text(&failed.stream_id, "a stream failure naming no stream")?,
+                failure: match failed.failure.as_ref() {
+                    Some(failure) => failure_from_wire(failure)?,
+                    None => return Err(malformed("a stream failure with no reason")),
+                },
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamCancel(cancel)) => {
+            PluginSessionPayload::StreamCancel(PluginStreamControl {
+                host_call_id: required_text(
+                    &cancel.host_call_id,
+                    "a stream cancel with no call identity",
+                )?,
+                stream_id: required_text(&cancel.stream_id, "a stream cancel naming no stream")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::StreamRelease(release)) => {
+            PluginSessionPayload::StreamRelease(PluginStreamControl {
+                host_call_id: required_text(
+                    &release.host_call_id,
+                    "a stream release with no call identity",
+                )?,
+                stream_id: required_text(&release.stream_id, "a stream release naming no stream")?,
+            })
+        }
+        Some(v1::plugin_session_message::Message::CompletionSettle(settle)) => {
+            let completion_id =
+                required_text(&settle.completion_id, "a settlement naming no completion")?;
+            let operation_request_id = required_text(
+                &settle.operation_request_id,
+                "a settlement that belongs to no operation",
+            )?;
+            let result = match settle.result.as_ref() {
+                Some(v1::completion_settle::Result::ValueJson(value)) => {
+                    Ok(required_text(value, "a settlement with an empty value")?)
+                }
+                Some(v1::completion_settle::Result::Failure(failure)) => {
+                    Err(failure_from_wire(failure)?)
+                }
+                None => {
+                    return Err(malformed(
+                        "a settlement that is neither a value nor a failure",
+                    ));
+                }
+            };
+            PluginSessionPayload::CompletionSettle(PluginCompletionSettlement {
+                completion_id,
+                operation_request_id,
+                result,
+            })
+        }
+        Some(v1::plugin_session_message::Message::CompletionOutcome(outcome)) => {
+            let completion_id =
+                required_text(&outcome.completion_id, "an outcome naming no completion")?;
+            let result = match outcome.result.as_ref() {
+                Some(v1::completion_outcome::Result::Accepted(_)) => Ok(()),
+                Some(v1::completion_outcome::Result::Failure(failure)) => {
+                    Err(failure_from_wire(failure)?)
+                }
+                None => {
+                    return Err(malformed(
+                        "a completion outcome that says neither accepted nor refused",
+                    ));
+                }
+            };
+            PluginSessionPayload::CompletionOutcome(PluginCompletionOutcome {
+                completion_id,
+                result,
+            })
+        }
+        Some(v1::plugin_session_message::Message::CompletionCancelled(cancelled)) => {
+            PluginSessionPayload::CompletionCancelled(PluginCompletionCancelled {
+                completion_id: required_text(
+                    &cancelled.completion_id,
+                    "a cancellation naming no completion",
+                )?,
+            })
+        }
+        None => return Err(malformed("a session message that carries nothing")),
+    };
+    Ok(PluginSessionMessage {
+        session_id: wire.session_id.clone(),
+        message,
+    })
+}
+
+/// Build the wire form of a session message.
+///
+/// Total: every domain variant has exactly one wire counterpart, because the
+/// two vocabularies are the same vocabulary and a variant without one would
+/// make a message the far side could not receive.
+pub fn session_message_to_wire(message: &PluginSessionMessage) -> v1::PluginSessionMessage {
+    use v1::plugin_session_message::Message as Wire;
+    let wire_message = match &message.message {
+        PluginSessionPayload::StreamOpen(open) => {
+            Wire::StreamOpen(v1::DownstreamStreamOpenRequest {
+                host_call_id: open.host_call_id.clone(),
+                operation_request_id: open.operation_request_id.clone(),
+                request_json: open.request_json.clone(),
+            })
+        }
+        PluginSessionPayload::StreamOpened(opened) => {
+            Wire::StreamOpened(v1::DownstreamStreamOpened {
+                host_call_id: opened.host_call_id.clone(),
+                stream_id: opened.stream_id.clone(),
+            })
+        }
+        PluginSessionPayload::StreamOpenFailed(failed) => {
+            Wire::StreamOpenFailed(v1::DownstreamStreamOpenFailed {
+                host_call_id: failed.host_call_id.clone(),
+                failure: Some(failure_to_wire(&failed.failure)),
+            })
+        }
+        PluginSessionPayload::StreamPull(pull) => {
+            Wire::StreamPull(v1::DownstreamStreamPullRequest {
+                host_call_id: pull.host_call_id.clone(),
+                stream_id: pull.stream_id.clone(),
+            })
+        }
+        PluginSessionPayload::StreamItem(item) => Wire::StreamItem(v1::DownstreamStreamItem {
+            host_call_id: item.host_call_id.clone(),
+            stream_id: item.stream_id.clone(),
+            chunk_json: item.chunk_json.clone(),
+        }),
+        PluginSessionPayload::StreamEnd(end) => Wire::StreamEnd(v1::DownstreamStreamEnd {
+            host_call_id: end.host_call_id.clone(),
+            stream_id: end.stream_id.clone(),
+        }),
+        PluginSessionPayload::StreamFailed(failed) => {
+            Wire::StreamFailed(v1::DownstreamStreamFailed {
+                host_call_id: failed.host_call_id.clone(),
+                stream_id: failed.stream_id.clone(),
+                failure: Some(failure_to_wire(&failed.failure)),
+            })
+        }
+        PluginSessionPayload::StreamCancel(cancel) => {
+            Wire::StreamCancel(v1::DownstreamStreamCancel {
+                host_call_id: cancel.host_call_id.clone(),
+                stream_id: cancel.stream_id.clone(),
+            })
+        }
+        PluginSessionPayload::StreamRelease(release) => {
+            Wire::StreamRelease(v1::DownstreamStreamRelease {
+                host_call_id: release.host_call_id.clone(),
+                stream_id: release.stream_id.clone(),
+            })
+        }
+        PluginSessionPayload::CompletionSettle(settle) => {
+            Wire::CompletionSettle(v1::CompletionSettle {
+                completion_id: settle.completion_id.clone(),
+                operation_request_id: settle.operation_request_id.clone(),
+                result: Some(match &settle.result {
+                    Ok(value) => v1::completion_settle::Result::ValueJson(value.clone()),
+                    Err(failure) => {
+                        v1::completion_settle::Result::Failure(failure_to_wire(failure))
+                    }
+                }),
+            })
+        }
+        PluginSessionPayload::CompletionOutcome(outcome) => {
+            Wire::CompletionOutcome(v1::CompletionOutcome {
+                completion_id: outcome.completion_id.clone(),
+                result: Some(match &outcome.result {
+                    Ok(()) => v1::completion_outcome::Result::Accepted(v1::CompletionAccepted {}),
+                    Err(failure) => {
+                        v1::completion_outcome::Result::Failure(failure_to_wire(failure))
+                    }
+                }),
+            })
+        }
+        PluginSessionPayload::CompletionCancelled(cancelled) => {
+            Wire::CompletionCancelled(v1::CompletionCancelled {
+                completion_id: cancelled.completion_id.clone(),
+            })
+        }
+    };
+    v1::PluginSessionMessage {
+        session_id: message.session_id.clone(),
+        message: Some(wire_message),
+    }
+}
+
+/// A required identity or payload that must not be blank.
+fn required_text(value: &str, what: &str) -> Result<String, PluginProtocolError> {
+    if value.trim().is_empty() {
+        return Err(malformed(what));
+    }
+    Ok(value.to_owned())
 }
 
 fn success_name(success: &PluginSuccess) -> &'static str {
@@ -1613,5 +1959,238 @@ mod tests {
         let error = registration_from_wire(&wire).expect_err("a gate needs a target");
 
         assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+    }
+
+    fn unavailable() -> PluginFailure {
+        PluginFailure {
+            code: PluginFailureCode::Unavailable,
+            message: "the downstream provider refused".into(),
+        }
+    }
+
+    fn session_payloads() -> Vec<PluginSessionPayload> {
+        vec![
+            PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
+                host_call_id: "call-1".into(),
+                operation_request_id: "operation-1".into(),
+                request_json: r#"{"model":"example"}"#.into(),
+            }),
+            PluginSessionPayload::StreamOpened(PluginStreamOpened {
+                host_call_id: "call-1".into(),
+                stream_id: "stream-1".into(),
+            }),
+            PluginSessionPayload::StreamOpenFailed(PluginStreamOpenFailed {
+                host_call_id: "call-1".into(),
+                failure: unavailable(),
+            }),
+            PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                host_call_id: "call-2".into(),
+                stream_id: "stream-1".into(),
+            }),
+            PluginSessionPayload::StreamItem(PluginStreamItem {
+                host_call_id: "call-2".into(),
+                stream_id: "stream-1".into(),
+                chunk_json: r#"{"delta":"hi"}"#.into(),
+            }),
+            PluginSessionPayload::StreamEnd(PluginStreamEnd {
+                host_call_id: "call-3".into(),
+                stream_id: "stream-1".into(),
+            }),
+            PluginSessionPayload::StreamFailed(PluginStreamFailed {
+                host_call_id: "call-3".into(),
+                stream_id: "stream-1".into(),
+                failure: unavailable(),
+            }),
+            PluginSessionPayload::StreamCancel(PluginStreamControl {
+                host_call_id: "call-4".into(),
+                stream_id: "stream-1".into(),
+            }),
+            PluginSessionPayload::StreamRelease(PluginStreamControl {
+                host_call_id: "call-5".into(),
+                stream_id: "stream-1".into(),
+            }),
+            PluginSessionPayload::CompletionSettle(PluginCompletionSettlement {
+                completion_id: "completion-1".into(),
+                operation_request_id: "operation-1".into(),
+                result: Ok(r#"{"ok":true}"#.into()),
+            }),
+            PluginSessionPayload::CompletionSettle(PluginCompletionSettlement {
+                completion_id: "completion-1".into(),
+                operation_request_id: "operation-1".into(),
+                result: Err(unavailable()),
+            }),
+            PluginSessionPayload::CompletionOutcome(PluginCompletionOutcome {
+                completion_id: "completion-1".into(),
+                result: Ok(()),
+            }),
+            PluginSessionPayload::CompletionOutcome(PluginCompletionOutcome {
+                completion_id: "completion-1".into(),
+                result: Err(PluginFailure {
+                    code: PluginFailureCode::Cancelled,
+                    message: "the awaiting runtime cancelled it".into(),
+                }),
+            }),
+            PluginSessionPayload::CompletionCancelled(PluginCompletionCancelled {
+                completion_id: "completion-1".into(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_session_message_survives_the_wire() {
+        for payload in session_payloads() {
+            let message = PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: payload,
+            };
+
+            let back = session_message_from_wire(&session_message_to_wire(&message))
+                .expect("a session message this side built");
+
+            assert_eq!(back, message);
+        }
+    }
+
+    #[test]
+    fn a_continuation_round_trips_and_refuses_to_carry_nothing() {
+        let request = PluginContinuationRequest {
+            operation_request_id: "operation-1".into(),
+            host_call_id: "call-1".into(),
+            invocation_json: r#"{"input":true}"#.into(),
+        };
+        assert_eq!(
+            continuation_request_from_wire(&continuation_request_to_wire(&request, "session-1"))
+                .expect("a continuation this side built"),
+            request
+        );
+
+        // Without the operation identity the runtime could not resume the right
+        // chain position, and it would have to guess which chain this belongs
+        // to — a guess made by the trusted side, which is the wrong side to make
+        // it.
+        let mut wire = continuation_request_to_wire(&request, "session-1");
+        wire.operation_request_id = "  ".into();
+        assert!(continuation_request_from_wire(&wire).is_err());
+
+        let value = PluginContinuationOutcome {
+            result: Ok(r#"{"ok":true}"#.into()),
+        };
+        assert_eq!(
+            continuation_outcome_from_wire(&continuation_outcome_to_wire(&value)).expect("a value"),
+            value
+        );
+
+        let failed = PluginContinuationOutcome {
+            result: Err(unavailable()),
+        };
+        assert_eq!(
+            continuation_outcome_from_wire(&continuation_outcome_to_wire(&failed))
+                .expect("a failure"),
+            failed
+        );
+
+        // A continuation that answered nothing would leave the plugin's
+        // callback waiting for a result that never comes.
+        let error = continuation_outcome_from_wire(&v1::ContinuationOutcome { result: None })
+            .expect_err("an outcome with no arm");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+    }
+
+    #[test]
+    fn a_session_message_that_names_nothing_is_refused() {
+        // The identities are what let several calls share one channel. A
+        // message without them would have to be matched to whatever happened to
+        // be outstanding, and the side that guessed would be the trusted one.
+        let item = v1::PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: Some(v1::plugin_session_message::Message::StreamItem(
+                v1::DownstreamStreamItem {
+                    host_call_id: "call-1".into(),
+                    stream_id: String::new(),
+                    chunk_json: r#"{"delta":"hi"}"#.into(),
+                },
+            )),
+        };
+        assert!(session_message_from_wire(&item).is_err());
+
+        let no_session = v1::PluginSessionMessage {
+            session_id: "  ".into(),
+            message: Some(v1::plugin_session_message::Message::StreamEnd(
+                v1::DownstreamStreamEnd {
+                    host_call_id: "call-1".into(),
+                    stream_id: "stream-1".into(),
+                },
+            )),
+        };
+        assert!(session_message_from_wire(&no_session).is_err());
+
+        let empty = v1::PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: Some(v1::plugin_session_message::Message::StreamEnd(
+                v1::DownstreamStreamEnd {
+                    host_call_id: "call-1".into(),
+                    stream_id: "stream-1".into(),
+                },
+            )),
+        };
+        let mut empty_chunk = empty.clone();
+        empty_chunk.message = Some(v1::plugin_session_message::Message::StreamItem(
+            v1::DownstreamStreamItem {
+                host_call_id: "call-1".into(),
+                stream_id: "stream-1".into(),
+                chunk_json: "   ".into(),
+            },
+        ));
+        assert!(session_message_from_wire(&empty_chunk).is_err());
+
+        // A message carrying no arm at all said nothing, which is not the same
+        // as reporting something.
+        let nothing = v1::PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: None,
+        };
+        let error = session_message_from_wire(&nothing).expect_err("no message");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+    }
+
+    #[test]
+    fn a_settlement_or_outcome_without_a_result_is_refused() {
+        // Both are oneofs on the wire, so a message with neither arm is the one
+        // shape that can express "no answer" — and a plugin waiting on a
+        // settlement would wait forever rather than learn the truth.
+        let settle = v1::PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: Some(v1::plugin_session_message::Message::CompletionSettle(
+                v1::CompletionSettle {
+                    completion_id: "completion-1".into(),
+                    operation_request_id: "operation-1".into(),
+                    result: None,
+                },
+            )),
+        };
+        assert!(session_message_from_wire(&settle).is_err());
+
+        let empty_value = v1::PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: Some(v1::plugin_session_message::Message::CompletionSettle(
+                v1::CompletionSettle {
+                    completion_id: "completion-1".into(),
+                    operation_request_id: "operation-1".into(),
+                    result: Some(v1::completion_settle::Result::ValueJson(String::new())),
+                },
+            )),
+        };
+        assert!(session_message_from_wire(&empty_value).is_err());
+
+        let outcome = v1::PluginSessionMessage {
+            session_id: "session-1".into(),
+            message: Some(v1::plugin_session_message::Message::CompletionOutcome(
+                v1::CompletionOutcome {
+                    completion_id: "completion-1".into(),
+                    result: None,
+                },
+            )),
+        };
+        assert!(session_message_from_wire(&outcome).is_err());
     }
 }

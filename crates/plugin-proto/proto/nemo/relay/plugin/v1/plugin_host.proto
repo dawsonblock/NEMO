@@ -388,6 +388,160 @@ message ResolveCodecResponse {
   }
 }
 
+// Continues the interceptor chain for one operation.
+//
+// A plugin's interceptor calls "next" to mean "run the rest of the chain",
+// which includes other plugins' interceptors and the base call. In process it is
+// the runtime that runs the rest, so the call has to cross. It is a typed
+// request rather than a session message because it is exactly one request and
+// one answer, and the kernel answers it on the same call — the plugin's
+// callback or completion is what the host settles from that answer.
+message ContinuationRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  // The invocation to continue with, after any rewriting the plugin did.
+  string invocation_json = 4;
+}
+
+// The rest of the chain's answer, or the failure that replaced it.
+message ContinuationOutcome {
+  oneof result {
+    string value_json = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// A duplex control channel for the calls that one request and one answer cannot
+// express.
+//
+// Most calls between the two sides are one request and one answer, and those
+// stay typed unary RPCs. Two families are not. A completion is settled *after*
+// the callback that produced it has already returned, so its answer is not the
+// answer to any call in flight. A downstream stream is opened, pulled one item
+// at a time by the plugin, and possibly cancelled or released while a pull is
+// outstanding — its pace is the plugin's, and cancellation travels the other
+// way while a pull is pending. Splitting those into independent unary calls
+// would put the correlation between them in the transport, where neither side
+// could check it.
+//
+// Every message carries the session it belongs to and its own identity, so
+// several calls and several streams stay distinguishable on one channel. A
+// changed runtime binding requires a new session, as it does everywhere else.
+//
+// What deliberately does not travel here: operation requests and outcomes, and
+// the one-shot host calls (marks, scope stack, codec resolution). Each of those
+// already has exactly one typed representation, and a second way to perform the
+// same operation is a second thing that can disagree with the first.
+message PluginSessionMessage {
+  string session_id = 1;
+  oneof message {
+    DownstreamStreamOpenRequest stream_open = 2;
+    DownstreamStreamOpened stream_opened = 3;
+    DownstreamStreamOpenFailed stream_open_failed = 4;
+    DownstreamStreamPullRequest stream_pull = 5;
+    DownstreamStreamItem stream_item = 6;
+    DownstreamStreamEnd stream_end = 7;
+    DownstreamStreamFailed stream_failed = 8;
+    DownstreamStreamCancel stream_cancel = 9;
+    DownstreamStreamRelease stream_release = 10;
+    CompletionSettle completion_settle = 11;
+    CompletionOutcome completion_outcome = 12;
+    CompletionCancelled completion_cancelled = 13;
+  }
+}
+
+// Opens an independent downstream LLM stream for one operation.
+//
+// The kernel answers with a stream the plugin addresses by identity, or with a
+// structured failure. The answer is a message rather than a return value
+// because opening is asynchronous on the plugin's side: its callback receives
+// the result.
+message DownstreamStreamOpenRequest {
+  string host_call_id = 1;
+  string operation_request_id = 2;
+  string request_json = 3;
+}
+
+message DownstreamStreamOpened {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+message DownstreamStreamOpenFailed {
+  string host_call_id = 1;
+  PluginFailure failure = 2;
+}
+
+// One item at a time. The plugin paces the stream: production advances when a
+// pull arrives, so a plugin that stops pulling stops the work behind it rather
+// than buffering it.
+message DownstreamStreamPullRequest {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+message DownstreamStreamItem {
+  string host_call_id = 1;
+  string stream_id = 2;
+  string chunk_json = 3;
+}
+
+// Clean completion: the stream produced everything it had.
+message DownstreamStreamEnd {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+message DownstreamStreamFailed {
+  string host_call_id = 1;
+  string stream_id = 2;
+  PluginFailure failure = 3;
+}
+
+message DownstreamStreamCancel {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+// Releases the plugin's reference. A released stream is not pulled again.
+message DownstreamStreamRelease {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+// Settles a callback that returned before its result existed.
+//
+// Exactly one arm is present: a value, or the failure that replaced it. The
+// kernel answers with the outcome, because a completion that has already been
+// cancelled or settled has an answer, and a settlement that silently did
+// nothing would leave the callback's owner waiting forever.
+message CompletionSettle {
+  string completion_id = 1;
+  string operation_request_id = 2;
+  oneof result {
+    string value_json = 3;
+    PluginFailure failure = 4;
+  }
+}
+
+message CompletionOutcome {
+  string completion_id = 1;
+  oneof result {
+    CompletionAccepted accepted = 2;
+    PluginFailure failure = 3;
+  }
+}
+
+message CompletionAccepted {}
+
+// The runtime that was awaiting the callback has cancelled it. The plugin is
+// not obliged to stop — the kernel does not trust a plugin to honour
+// cancellation — but it is told, so it can release what it holds.
+message CompletionCancelled {
+  string completion_id = 1;
+}
+
 // Served by the plugin host process.
 // Semantic outcomes for the lifecycle operations.
 //
@@ -462,4 +616,8 @@ service RelayRuntime {
   rpc EmitMark(EmitMarkRequest) returns (EmitMarkResponse);
   rpc ScopeStack(ScopeStackRequest) returns (ScopeStackResponse);
   rpc ResolveCodec(ResolveCodecRequest) returns (ResolveCodecResponse);
+  rpc Continue(ContinuationRequest) returns (ContinuationOutcome);
+  // The duplex channel for completions and downstream stream control. One
+  // session carries both directions; the messages name what they belong to.
+  rpc Session(stream PluginSessionMessage) returns (stream PluginSessionMessage);
 }
