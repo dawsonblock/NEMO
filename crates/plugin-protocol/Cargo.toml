@@ -16,6 +16,10 @@ workspace = true
 nemo-relay-types.workspace = true
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# The scope identity a mark names is a UUID, and it is the same UUID the runtime
+# uses: carrying it as text here and parsing it there would put two spellings of
+# one identity on the boundary.
+uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
 serde_json = "1"

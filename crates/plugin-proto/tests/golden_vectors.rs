@@ -121,6 +121,9 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                 session_credential: "session-credential".into(),
                 maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
                 supported_features: vec!["streaming".into(), "cancel".into()],
+                requested_read_capabilities: vec![
+                    v1::HostReadCapability::RuntimeDiagnostics as i32,
+                ],
             }
             .encode_to_vec(),
         ),
@@ -188,6 +191,9 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                         host_nonce: "host-nonce".into(),
                         maximum_frame_bytes: nemo_relay_plugin_proto::MAX_FRAME_BYTES,
                         supported_features: vec!["streaming".into()],
+                        granted_read_capabilities: vec![
+                            v1::HostReadCapability::RuntimeDiagnostics as i32,
+                        ],
                     },
                 )),
             }
@@ -317,6 +323,166 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             v1::ContinuationOutcome {
                 result: Some(v1::continuation_outcome::Result::ValueJson(
                     r#"{"ok":true}"#.into(),
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        // The remaining host-used messages, so a field that is renumbered or
+        // retyped shows up here rather than at a peer.
+        (
+            "EmitMarkRequest",
+            v1::EmitMarkRequest {
+                session_id: "session-1".into(),
+                operation_request_id: "operation-1".into(),
+                host_call_id: "call-1".into(),
+                name: "example.mark".into(),
+                data_json: Some(r#"{"value":1}"#.into()),
+                parent: Some(v1::ScopeReference {
+                    scope_id: "018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b".into(),
+                }),
+                metadata_json: Some(r#"{"source":"fixture"}"#.into()),
+                data_schema: Some(v1::MarkDataSchema {
+                    name: "example".into(),
+                    version: "1".into(),
+                }),
+                severity: Some(v1::MarkSeverity::Warn as i32),
+                timestamp_unix_micros: Some(1_700_000_000_000_000),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ScopeStackRequest",
+            v1::ScopeStackRequest {
+                session_id: "session-1".into(),
+                operation_request_id: "operation-1".into(),
+                host_call_id: "call-1".into(),
+                operation: v1::ScopeOperation::Push as i32,
+                payload_json: Some(r#"{"name":"step"}"#.into()),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ResolveCodecRequest",
+            v1::ResolveCodecRequest {
+                session_id: "session-1".into(),
+                operation_request_id: "operation-1".into(),
+                host_call_id: "call-1".into(),
+                operation: v1::CodecOperation::LlmRequestDecode as i32,
+                payload_json: r#"{"model":"example"}"#.into(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ContinuationChunk",
+            v1::ContinuationChunk {
+                host_call_id: "call-1".into(),
+                sequence: 1,
+                chunk_json: r#"{"delta":"hi"}"#.into(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ContinuationChunkDisposition",
+            v1::ContinuationChunkDisposition {
+                host_call_id: "call-1".into(),
+                sequence: 1,
+                disposition: Some(v1::continuation_chunk_disposition::Disposition::Decision(
+                    v1::ChunkDisposition::Continue as i32,
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "UnloadRequest",
+            v1::UnloadRequest {
+                session_id: "session-1".into(),
+                context: Some(context("operation-2")),
+                handle: Some(handle()),
+            }
+            .encode_to_vec(),
+        ),
+        ("UnloadResponse", v1::UnloadResponse {}.encode_to_vec()),
+        (
+            "InspectRequest",
+            v1::InspectRequest {
+                session_id: "session-1".into(),
+                context: Some(context("operation-3")),
+                handle: None,
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "InvokeRequest",
+            v1::InvokeRequest {
+                session_id: "session-1".into(),
+                context: Some(context("operation-4")),
+                handle: Some(handle()),
+                capability_id: "example.run".into(),
+                arguments: r#"{"input":true}"#.into(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "StreamChunk",
+            v1::StreamChunk {
+                operation_request_id: "operation-4".into(),
+                chunk: Some(v1::stream_chunk::Chunk::Data(r#"{"delta":"hi"}"#.into())),
+                dispatch_state: v1::DispatchState::NotDispatched as i32,
+                outcome_certainty: v1::OutcomeCertainty::ConfirmedSuccess as i32,
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "CancelOperationRequest",
+            v1::CancelOperationRequest {
+                session_id: "session-1".into(),
+                context: Some(context("operation-5")),
+                operation_request_id: "operation-4".into(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "CancelOperationResponse",
+            v1::CancelOperationResponse {}.encode_to_vec(),
+        ),
+        (
+            "HealthRequest",
+            v1::HealthRequest {
+                session_id: "session-1".into(),
+                context: Some(context("operation-6")),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "SessionCloseRequest",
+            v1::SessionCloseRequest {
+                session_id: "session-1".into(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "SessionCloseResponse",
+            v1::SessionCloseResponse {}.encode_to_vec(),
+        ),
+        ("EmitMarkResponse", v1::EmitMarkResponse {}.encode_to_vec()),
+        (
+            "ScopeStackResponse",
+            v1::ScopeStackResponse {
+                result: Some(v1::scope_stack_response::Result::Output(
+                    r#"{"scope_id":"018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b"}"#.into(),
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ResolveCodecResponse",
+            v1::ResolveCodecResponse {
+                result: Some(v1::resolve_codec_response::Result::Failure(
+                    v1::PluginFailure {
+                        code: v1::FailureCode::Unavailable as i32,
+                        message: "no codec is attached to this call".into(),
+                        ..Default::default()
+                    },
                 )),
             }
             .encode_to_vec(),
@@ -458,6 +624,62 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
                 .encode_to_vec(),
             "ContinuationOutcome" => v1::ContinuationOutcome::decode(bytes.as_slice())
                 .expect("decode ContinuationOutcome")
+                .encode_to_vec(),
+            "EmitMarkRequest" => v1::EmitMarkRequest::decode(bytes.as_slice())
+                .expect("decode EmitMarkRequest")
+                .encode_to_vec(),
+            "ScopeStackRequest" => v1::ScopeStackRequest::decode(bytes.as_slice())
+                .expect("decode ScopeStackRequest")
+                .encode_to_vec(),
+            "ResolveCodecRequest" => v1::ResolveCodecRequest::decode(bytes.as_slice())
+                .expect("decode ResolveCodecRequest")
+                .encode_to_vec(),
+            "ContinuationChunk" => v1::ContinuationChunk::decode(bytes.as_slice())
+                .expect("decode ContinuationChunk")
+                .encode_to_vec(),
+            "ContinuationChunkDisposition" => {
+                v1::ContinuationChunkDisposition::decode(bytes.as_slice())
+                    .expect("decode ContinuationChunkDisposition")
+                    .encode_to_vec()
+            }
+            "UnloadRequest" => v1::UnloadRequest::decode(bytes.as_slice())
+                .expect("decode UnloadRequest")
+                .encode_to_vec(),
+            "UnloadResponse" => v1::UnloadResponse::decode(bytes.as_slice())
+                .expect("decode UnloadResponse")
+                .encode_to_vec(),
+            "InspectRequest" => v1::InspectRequest::decode(bytes.as_slice())
+                .expect("decode InspectRequest")
+                .encode_to_vec(),
+            "InvokeRequest" => v1::InvokeRequest::decode(bytes.as_slice())
+                .expect("decode InvokeRequest")
+                .encode_to_vec(),
+            "StreamChunk" => v1::StreamChunk::decode(bytes.as_slice())
+                .expect("decode StreamChunk")
+                .encode_to_vec(),
+            "CancelOperationRequest" => v1::CancelOperationRequest::decode(bytes.as_slice())
+                .expect("decode CancelOperationRequest")
+                .encode_to_vec(),
+            "CancelOperationResponse" => v1::CancelOperationResponse::decode(bytes.as_slice())
+                .expect("decode CancelOperationResponse")
+                .encode_to_vec(),
+            "HealthRequest" => v1::HealthRequest::decode(bytes.as_slice())
+                .expect("decode HealthRequest")
+                .encode_to_vec(),
+            "SessionCloseRequest" => v1::SessionCloseRequest::decode(bytes.as_slice())
+                .expect("decode SessionCloseRequest")
+                .encode_to_vec(),
+            "SessionCloseResponse" => v1::SessionCloseResponse::decode(bytes.as_slice())
+                .expect("decode SessionCloseResponse")
+                .encode_to_vec(),
+            "EmitMarkResponse" => v1::EmitMarkResponse::decode(bytes.as_slice())
+                .expect("decode EmitMarkResponse")
+                .encode_to_vec(),
+            "ScopeStackResponse" => v1::ScopeStackResponse::decode(bytes.as_slice())
+                .expect("decode ScopeStackResponse")
+                .encode_to_vec(),
+            "ResolveCodecResponse" => v1::ResolveCodecResponse::decode(bytes.as_slice())
+                .expect("decode ResolveCodecResponse")
                 .encode_to_vec(),
             other => panic!("no decoder for recorded vector {other}"),
         };

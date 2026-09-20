@@ -15,16 +15,21 @@
 //! silently laundered into domain state that core believes it can rely on.
 
 use nemo_relay_plugin_protocol::{
-    DispatchState, LifecycleOutcome, MAX_FRAME_BYTES, OutcomeCertainty, PluginArtifactIdentity,
-    PluginCapability, PluginCapabilityKind, PluginCompletionCancelled, PluginCompletionOutcome,
-    PluginCompletionSettlement, PluginContinuationOutcome, PluginContinuationRequest,
-    PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome, PluginExecutionShape,
-    PluginFailure, PluginFailureCode, PluginHandle, PluginHostHealth, PluginInvokeResponse,
-    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginRegistrationDescriptor,
-    PluginRegistrationOperation, PluginRegistrationOrdering, PluginSessionIdentity,
-    PluginSessionMessage, PluginSessionPayload, PluginStreamControl, PluginStreamEnd,
-    PluginStreamFailed, PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest,
-    PluginStreamOpened, PluginStreamPullRequest, PluginSuccess, registration_shape,
+    DataSchema, DispatchState, LifecycleOutcome, LogSeverity, MAX_FRAME_BYTES, OutcomeCertainty,
+    PluginArtifactIdentity, PluginCapability, PluginCapabilityKind, PluginChunkDecision,
+    PluginCodecOperation, PluginCompletionCancelled, PluginCompletionOutcome,
+    PluginCompletionSettlement, PluginContinuationChunk, PluginContinuationDisposition,
+    PluginContinuationRequest, PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome,
+    PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginHandshakeRequest,
+    PluginHostCallOutcome, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
+    PluginInvokeRequest, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
+    PluginMarkEmit, PluginOperationEnvelope, PluginProtocolError, PluginRegistrationDescriptor,
+    PluginRegistrationOperation, PluginRegistrationOrdering, PluginResolveCodecRequest,
+    PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest, PluginSessionIdentity,
+    PluginSessionMessage, PluginSessionPayload, PluginStreamChunk, PluginStreamChunkKind,
+    PluginStreamControl, PluginStreamEnd, PluginStreamFailed, PluginStreamItem,
+    PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened, PluginStreamPullRequest,
+    PluginSuccess, PluginUnloadRequest, registration_shape,
 };
 
 use crate::v1;
@@ -189,6 +194,13 @@ fn session_identity_from_wire(
         host_nonce: wire.host_nonce.clone(),
         maximum_frame_bytes: wire.maximum_frame_bytes,
         supported_features: wire.supported_features.clone(),
+        // What was granted, not what was asked for. The host compares this
+        // against its own request, so a session that granted something nobody
+        // requested is caught here rather than used.
+        read_capabilities: read_capabilities_from_wire(
+            &wire.granted_read_capabilities,
+            "a session",
+        )?,
     })
 }
 
@@ -452,11 +464,40 @@ pub fn descriptor_from_wire(
         if capability.id.trim().is_empty() {
             return Err(malformed("a capability with no identity"));
         }
+        if capabilities
+            .iter()
+            .any(|existing: &PluginCapability| existing.id == capability.id)
+        {
+            // Two capabilities with one identity describe different things
+            // under one name, and a caller that resolved either would get
+            // whichever it happened to find first.
+            return Err(malformed(format!(
+                "a capability named {} twice",
+                capability.id
+            )));
+        }
         capabilities.push(PluginCapability {
             id: capability.id.clone(),
             kind: capability_kind_from_wire(capability.kind)?,
             declared_digest: capability.declared_digest.clone(),
         });
+    }
+    let mut registrations = Vec::with_capacity(wire.registrations.len());
+    for registration in &wire.registrations {
+        let registration = registration_from_wire(registration)?;
+        if registrations
+            .iter()
+            .any(|existing: &PluginRegistrationDescriptor| {
+                existing.registration_id == registration.registration_id
+                    && existing.operation == registration.operation
+            })
+        {
+            return Err(malformed(format!(
+                "a registration named {} twice at the same attachment point",
+                registration.registration_id
+            )));
+        }
+        registrations.push(registration);
     }
     Ok(PluginDescriptor {
         plugin_id: wire.plugin_id.clone(),
@@ -471,11 +512,7 @@ pub fn descriptor_from_wire(
         },
         manifest_digest: wire.manifest_digest.clone(),
         registration_kinds: wire.registration_kinds.clone(),
-        registrations: wire
-            .registrations
-            .iter()
-            .map(registration_from_wire)
-            .collect::<Result<Vec<_>, _>>()?,
+        registrations,
         capabilities,
     })
 }
@@ -800,6 +837,539 @@ pub fn continuation_request_to_wire(
     }
 }
 
+/// Validate the envelope every host operation carries.
+///
+/// This is the first layer: the parts of a message that are the same whatever
+/// the operation is. A payload is only looked at once these hold, so a request
+/// that names no session or carries no context is refused before anything is
+/// converted from it.
+pub fn operation_envelope_from_wire(
+    session_id: &str,
+    context: Option<&v1::PluginExecutionContext>,
+) -> Result<PluginOperationEnvelope, PluginProtocolError> {
+    let session_id = required_text(session_id, "an operation that names no session")?;
+    let context = match context {
+        Some(context) => context_from_wire(context)?,
+        None => {
+            return Err(malformed(
+                "an operation with no context, and therefore no budget",
+            ));
+        }
+    };
+    Ok(PluginOperationEnvelope {
+        session_id,
+        context,
+    })
+}
+
+/// Validate a handle a host operation names.
+///
+/// A handle addresses exactly one loaded instance: without an identity it names
+/// nothing, and at generation zero it names an instance no load produced.
+pub fn plugin_handle_from_wire(
+    handle: Option<&v1::PluginHandle>,
+    what: &str,
+) -> Result<PluginHandle, PluginProtocolError> {
+    let handle = handle.ok_or_else(|| malformed(format!("{what} with no handle")))?;
+    if handle.generation == 0 {
+        return Err(malformed(format!("{what} at generation zero")));
+    }
+    Ok(PluginHandle {
+        plugin_id: required_text(
+            &handle.plugin_id,
+            &format!("{what} with no plugin identity"),
+        )?,
+        generation: handle.generation,
+    })
+}
+
+/// Validate an unload request.
+pub fn unload_request_from_wire(
+    wire: &v1::UnloadRequest,
+) -> Result<PluginUnloadRequest, PluginProtocolError> {
+    Ok(PluginUnloadRequest {
+        handle: plugin_handle_from_wire(wire.handle.as_ref(), "an unload")?,
+    })
+}
+
+/// Validate an inspection request.
+///
+/// A missing handle means "everything loaded", which is a question rather than
+/// a gap, so this is the one operation where an absent handle is not refused.
+pub fn inspect_request_from_wire(
+    wire: &v1::InspectRequest,
+) -> Result<PluginInspectRequest, PluginProtocolError> {
+    Ok(PluginInspectRequest {
+        handle: match wire.handle.as_ref() {
+            Some(handle) => Some(plugin_handle_from_wire(Some(handle), "an inspection")?),
+            None => None,
+        },
+    })
+}
+
+/// Validate an invocation request against the context it belongs to.
+///
+/// The budget is not on the request: it comes from the context, which is the
+/// value the kernel derives and the host enforces. Reading it from anywhere else
+/// would let a caller choose its own deadline.
+pub fn invoke_request_from_wire(
+    wire: &v1::InvokeRequest,
+    context: &PluginExecutionContext,
+) -> Result<PluginInvokeRequest, PluginProtocolError> {
+    Ok(PluginInvokeRequest {
+        handle: plugin_handle_from_wire(wire.handle.as_ref(), "an invocation")?,
+        capability_id: required_text(
+            &wire.capability_id,
+            "an invocation with no capability to invoke",
+        )?,
+        arguments: required_text(&wire.arguments, "an invocation with no arguments")?,
+        budget_millis: context.remaining_budget_millis,
+    })
+}
+
+/// Read a scope operation.
+fn scope_operation_from_wire(value: i32) -> Result<PluginScopeOperation, PluginProtocolError> {
+    let wire = v1::ScopeOperation::try_from(value)
+        .map_err(|_| malformed(format!("an unknown scope operation {value}")))?;
+    Ok(match wire {
+        v1::ScopeOperation::Unspecified => {
+            return Err(malformed("a scope call that does not say what to do"));
+        }
+        v1::ScopeOperation::Current => PluginScopeOperation::Current,
+        v1::ScopeOperation::Push => PluginScopeOperation::Push,
+        v1::ScopeOperation::Pop => PluginScopeOperation::Pop,
+        v1::ScopeOperation::CreateIsolated => PluginScopeOperation::CreateIsolated,
+        v1::ScopeOperation::ReleaseIsolated => PluginScopeOperation::ReleaseIsolated,
+    })
+}
+
+/// Build the wire form of a scope operation.
+pub fn scope_operation_to_wire(operation: PluginScopeOperation) -> i32 {
+    let wire = match operation {
+        PluginScopeOperation::Current => v1::ScopeOperation::Current,
+        PluginScopeOperation::Push => v1::ScopeOperation::Push,
+        PluginScopeOperation::Pop => v1::ScopeOperation::Pop,
+        PluginScopeOperation::CreateIsolated => v1::ScopeOperation::CreateIsolated,
+        PluginScopeOperation::ReleaseIsolated => v1::ScopeOperation::ReleaseIsolated,
+    };
+    wire as i32
+}
+
+/// Read a codec operation.
+fn codec_operation_from_wire(value: i32) -> Result<PluginCodecOperation, PluginProtocolError> {
+    let wire = v1::CodecOperation::try_from(value)
+        .map_err(|_| malformed(format!("an unknown codec operation {value}")))?;
+    Ok(match wire {
+        v1::CodecOperation::Unspecified => {
+            return Err(malformed("a codec call that does not say what to do"));
+        }
+        v1::CodecOperation::LlmRequestDecode => PluginCodecOperation::LlmRequestDecode,
+        v1::CodecOperation::LlmRequestEncode => PluginCodecOperation::LlmRequestEncode,
+        v1::CodecOperation::LlmResponseDecode => PluginCodecOperation::LlmResponseDecode,
+    })
+}
+
+/// Build the wire form of a codec operation.
+pub fn codec_operation_to_wire(operation: PluginCodecOperation) -> i32 {
+    let wire = match operation {
+        PluginCodecOperation::LlmRequestDecode => v1::CodecOperation::LlmRequestDecode,
+        PluginCodecOperation::LlmRequestEncode => v1::CodecOperation::LlmRequestEncode,
+        PluginCodecOperation::LlmResponseDecode => v1::CodecOperation::LlmResponseDecode,
+    };
+    wire as i32
+}
+
+/// Read a mark severity. Absence is absence; a present `UNSPECIFIED` is not.
+fn severity_from_wire(value: i32) -> Result<LogSeverity, PluginProtocolError> {
+    let wire = v1::MarkSeverity::try_from(value)
+        .map_err(|_| malformed(format!("an unknown mark severity {value}")))?;
+    Ok(match wire {
+        v1::MarkSeverity::Unspecified => {
+            return Err(malformed("a mark that says its severity is unspecified"));
+        }
+        v1::MarkSeverity::Trace => LogSeverity::Trace,
+        v1::MarkSeverity::Debug => LogSeverity::Debug,
+        v1::MarkSeverity::Info => LogSeverity::Info,
+        v1::MarkSeverity::Warn => LogSeverity::Warn,
+        v1::MarkSeverity::Error => LogSeverity::Error,
+    })
+}
+
+/// Build the wire form of a mark severity.
+pub fn severity_to_wire(severity: LogSeverity) -> i32 {
+    let wire = match severity {
+        LogSeverity::Trace => v1::MarkSeverity::Trace,
+        LogSeverity::Debug => v1::MarkSeverity::Debug,
+        LogSeverity::Info => v1::MarkSeverity::Info,
+        LogSeverity::Warn => v1::MarkSeverity::Warn,
+        LogSeverity::Error => v1::MarkSeverity::Error,
+    };
+    wire as i32
+}
+
+/// Read a chunk decision. `UNSPECIFIED` is refused: an answer that says nothing
+/// would leave the runtime neither producing nor stopping.
+fn chunk_disposition_from_wire(value: i32) -> Result<PluginChunkDecision, PluginProtocolError> {
+    let wire = v1::ChunkDisposition::try_from(value)
+        .map_err(|_| malformed(format!("an unknown chunk disposition {value}")))?;
+    Ok(match wire {
+        v1::ChunkDisposition::Unspecified => {
+            return Err(malformed(
+                "a chunk answer that says neither continue nor stop",
+            ));
+        }
+        v1::ChunkDisposition::Continue => PluginChunkDecision::Continue,
+        v1::ChunkDisposition::Stop => PluginChunkDecision::Stop,
+    })
+}
+
+/// Build the wire form of a chunk decision.
+pub fn chunk_disposition_to_wire(decision: PluginChunkDecision) -> i32 {
+    let wire = match decision {
+        PluginChunkDecision::Continue => v1::ChunkDisposition::Continue,
+        PluginChunkDecision::Stop => v1::ChunkDisposition::Stop,
+    };
+    wire as i32
+}
+
+/// Read one requested or granted kernel read capability.
+fn read_capability_from_wire(value: i32) -> Result<PluginHostReadCapability, PluginProtocolError> {
+    let wire = v1::HostReadCapability::try_from(value)
+        .map_err(|_| malformed(format!("an unknown read capability {value}")))?;
+    Ok(match wire {
+        v1::HostReadCapability::Unspecified => {
+            return Err(malformed("a read capability that is unspecified"));
+        }
+        v1::HostReadCapability::RuntimeDiagnostics => PluginHostReadCapability::RuntimeDiagnostics,
+        v1::HostReadCapability::RegistrationInventory => {
+            PluginHostReadCapability::RegistrationInventory
+        }
+    })
+}
+
+/// Build the wire form of a read capability.
+pub fn read_capability_to_wire(capability: PluginHostReadCapability) -> i32 {
+    let wire = match capability {
+        PluginHostReadCapability::RuntimeDiagnostics => v1::HostReadCapability::RuntimeDiagnostics,
+        PluginHostReadCapability::RegistrationInventory => {
+            v1::HostReadCapability::RegistrationInventory
+        }
+    };
+    wire as i32
+}
+
+/// Read a list of read capabilities, refusing names this side does not know.
+///
+/// An unknown *offered* feature can be ignored, because ignoring it grants
+/// nothing. A requested or granted capability is not an offer: it decides what a
+/// less-trusted process may read, so a name this side cannot resolve is refused
+/// rather than dropped.
+fn read_capabilities_from_wire(
+    values: &[i32],
+    what: &str,
+) -> Result<Vec<PluginHostReadCapability>, PluginProtocolError> {
+    let mut capabilities = Vec::with_capacity(values.len());
+    for value in values {
+        let capability = read_capability_from_wire(*value)?;
+        if capabilities.contains(&capability) {
+            return Err(malformed(format!(
+                "{} naming {} twice",
+                what,
+                capability_name(capability)
+            )));
+        }
+        capabilities.push(capability);
+    }
+    Ok(capabilities)
+}
+
+fn capability_name(capability: PluginHostReadCapability) -> &'static str {
+    match capability {
+        PluginHostReadCapability::RuntimeDiagnostics => "runtime diagnostics",
+        PluginHostReadCapability::RegistrationInventory => "registration inventory",
+    }
+}
+
+/// Validate a handshake request.
+pub fn handshake_request_from_wire(
+    wire: &v1::HandshakeRequest,
+) -> Result<PluginHandshakeRequest, PluginProtocolError> {
+    if wire.runtime_binding_digest.trim().is_empty() {
+        return Err(malformed("a handshake naming no runtime binding"));
+    }
+    if wire.client_nonce.trim().is_empty() {
+        return Err(malformed("a handshake with no client nonce"));
+    }
+    if wire.session_credential.trim().is_empty() {
+        return Err(malformed("a handshake with no session credential"));
+    }
+    if wire.maximum_frame_bytes == 0 {
+        return Err(malformed("a handshake that will not accept a frame at all"));
+    }
+    if wire.maximum_frame_bytes > MAX_FRAME_BYTES {
+        return Err(malformed(format!(
+            "a handshake offering a frame limit of {} bytes, above the {} this side speaks",
+            wire.maximum_frame_bytes, MAX_FRAME_BYTES
+        )));
+    }
+    Ok(PluginHandshakeRequest {
+        protocol_version: u16::try_from(wire.protocol_version).map_err(|_| {
+            malformed("a handshake at a protocol version outside the range this code speaks")
+        })?,
+        runtime_binding_digest: wire.runtime_binding_digest.clone(),
+        client_nonce: wire.client_nonce.clone(),
+        session_credential: wire.session_credential.clone(),
+        maximum_frame_bytes: wire.maximum_frame_bytes,
+        supported_features: wire.supported_features.clone(),
+        requested_read_capabilities: read_capabilities_from_wire(
+            &wire.requested_read_capabilities,
+            "a handshake request",
+        )?,
+    })
+}
+
+/// Validate a mark.
+///
+/// The optional fields stay optional, and a present-but-empty one is refused
+/// rather than treated as absence: a payload that is the empty string is not a
+/// payload, and a schema with no name describes nothing.
+pub fn mark_request_from_wire(
+    wire: &v1::EmitMarkRequest,
+) -> Result<PluginMarkEmit, PluginProtocolError> {
+    if wire.session_id.trim().is_empty() {
+        return Err(malformed("a mark that names no session"));
+    }
+    let data_schema = match wire.data_schema.as_ref() {
+        Some(schema) => Some(DataSchema {
+            name: required_text(&schema.name, "a mark schema with no name")?,
+            version: required_text(&schema.version, "a mark schema with no version")?,
+        }),
+        None => None,
+    };
+    let timestamp_unix_micros = match wire.timestamp_unix_micros {
+        Some(timestamp) => Some(u64::try_from(timestamp).map_err(|_| {
+            malformed("a mark timestamped before the Unix epoch, which cannot be ordered")
+        })?),
+        None => None,
+    };
+    Ok(PluginMarkEmit {
+        operation_request_id: required_text(
+            &wire.operation_request_id,
+            "a mark that belongs to no operation",
+        )?,
+        host_call_id: required_text(&wire.host_call_id, "a mark with no call identity")?,
+        name: required_text(&wire.name, "a mark with no name")?,
+        data_json: optional_text(&wire.data_json, "a mark with an empty payload")?,
+        parent: match wire.parent.as_ref() {
+            Some(parent) => Some(PluginScopeReference::from_canonical(&parent.scope_id)?),
+            None => None,
+        },
+        metadata_json: optional_text(&wire.metadata_json, "a mark with empty metadata")?,
+        data_schema,
+        severity: match wire.severity {
+            Some(severity) => Some(severity_from_wire(severity)?),
+            None => None,
+        },
+        timestamp_unix_micros,
+    })
+}
+
+/// Validate a scope stack call.
+///
+/// Whether a payload belongs is a property of the operation, so a request that
+/// carries one where it has no meaning, or omits one it needs, says two things
+/// at once and is refused rather than resolved by preference.
+pub fn scope_stack_request_from_wire(
+    wire: &v1::ScopeStackRequest,
+) -> Result<PluginScopeStackRequest, PluginProtocolError> {
+    if wire.session_id.trim().is_empty() {
+        return Err(malformed("a scope call that names no session"));
+    }
+    let operation = scope_operation_from_wire(wire.operation)?;
+    let payload_json = optional_text(&wire.payload_json, "a scope call with an empty payload")?;
+    if operation.carries_payload() != payload_json.is_some() {
+        return Err(malformed(format!(
+            "a scope call that {} a payload",
+            if operation.carries_payload() {
+                "omits"
+            } else {
+                "carries"
+            }
+        )));
+    }
+    Ok(PluginScopeStackRequest {
+        operation_request_id: required_text(
+            &wire.operation_request_id,
+            "a scope call that belongs to no operation",
+        )?,
+        host_call_id: required_text(&wire.host_call_id, "a scope call with no call identity")?,
+        operation,
+        payload_json,
+    })
+}
+
+/// Validate a cancellation request, returning the operation it names.
+///
+/// The operation identity is the whole payload: a cancellation that named
+/// nothing would have to be matched to whatever was in flight.
+pub fn cancel_operation_request_from_wire(
+    wire: &v1::CancelOperationRequest,
+) -> Result<String, PluginProtocolError> {
+    required_text(
+        &wire.operation_request_id,
+        "a cancellation that names no operation",
+    )
+}
+
+/// Read a host call's answer, refusing one that carries neither arm.
+///
+/// A host call that answered nothing would leave the plugin's call outstanding
+/// with nothing coming, which is the one outcome it cannot recover from.
+pub fn host_call_response_from_wire(
+    output: Option<&String>,
+    failure: Option<&v1::PluginFailure>,
+    what: &str,
+) -> Result<PluginHostCallOutcome, PluginProtocolError> {
+    let result = match (output, failure) {
+        (Some(output), None) => Ok(required_text(
+            output,
+            &format!("{what} with an empty answer"),
+        )?),
+        (None, Some(failure)) => Err(failure_from_wire(failure)?),
+        (Some(_), Some(_)) => {
+            return Err(malformed(format!("{what} that both answered and failed")));
+        }
+        (None, None) => {
+            return Err(malformed(format!(
+                "{what} that is neither an answer nor a failure"
+            )));
+        }
+    };
+    Ok(PluginHostCallOutcome { result })
+}
+
+/// Validate a scope stack answer.
+pub fn scope_stack_response_from_wire(
+    wire: &v1::ScopeStackResponse,
+) -> Result<PluginHostCallOutcome, PluginProtocolError> {
+    let (output, failure) = match wire.result.as_ref() {
+        Some(v1::scope_stack_response::Result::Output(output)) => (Some(output), None),
+        Some(v1::scope_stack_response::Result::Failure(failure)) => (None, Some(failure)),
+        None => (None, None),
+    };
+    host_call_response_from_wire(output, failure, "a scope answer")
+}
+
+/// Validate a codec answer.
+pub fn resolve_codec_response_from_wire(
+    wire: &v1::ResolveCodecResponse,
+) -> Result<PluginHostCallOutcome, PluginProtocolError> {
+    let (output, failure) = match wire.result.as_ref() {
+        Some(v1::resolve_codec_response::Result::Output(output)) => (Some(output), None),
+        Some(v1::resolve_codec_response::Result::Failure(failure)) => (None, Some(failure)),
+        None => (None, None),
+    };
+    host_call_response_from_wire(output, failure, "a codec answer")
+}
+
+/// Validate one frame of a streaming invocation.
+///
+/// A frame has to say what it is and what is known about it: a stream that
+/// simply stops is a truncation, and the terminal frame is the only place the
+/// dispatch state can be reported.
+pub fn stream_chunk_from_wire(
+    wire: &v1::StreamChunk,
+) -> Result<PluginStreamChunk, PluginProtocolError> {
+    let chunk = match wire.chunk.as_ref() {
+        Some(v1::stream_chunk::Chunk::Data(data)) => {
+            PluginStreamChunkKind::Data(required_text(data, "a stream frame with no data")?)
+        }
+        Some(v1::stream_chunk::Chunk::Failure(failure)) => {
+            PluginStreamChunkKind::Failed(failure_from_wire(failure)?)
+        }
+        Some(v1::stream_chunk::Chunk::End(end)) if *end => PluginStreamChunkKind::End,
+        Some(v1::stream_chunk::Chunk::End(_)) => {
+            // `end = false` is a frame that says the stream has not ended, which
+            // is what every non-terminal frame already says by carrying data.
+            return Err(malformed("a stream frame that says it is not the end"));
+        }
+        None => return Err(malformed("a stream frame that carries nothing")),
+    };
+    Ok(PluginStreamChunk {
+        operation_request_id: required_text(
+            &wire.operation_request_id,
+            "a stream frame that belongs to no operation",
+        )?,
+        chunk,
+        dispatch: dispatch_from_wire(wire.dispatch_state)?,
+        certainty: certainty_from_wire(wire.outcome_certainty)?,
+    })
+}
+
+/// Validate a codec resolution.
+pub fn resolve_codec_request_from_wire(
+    wire: &v1::ResolveCodecRequest,
+) -> Result<PluginResolveCodecRequest, PluginProtocolError> {
+    if wire.session_id.trim().is_empty() {
+        return Err(malformed("a codec call that names no session"));
+    }
+    Ok(PluginResolveCodecRequest {
+        operation_request_id: required_text(
+            &wire.operation_request_id,
+            "a codec call that belongs to no operation",
+        )?,
+        host_call_id: required_text(&wire.host_call_id, "a codec call with no call identity")?,
+        operation: codec_operation_from_wire(wire.operation)?,
+        payload_json: required_text(&wire.payload_json, "a codec call with nothing to convert")?,
+    })
+}
+
+/// Read one chunk of a continuation stream.
+pub fn continuation_chunk_from_wire(
+    wire: &v1::ContinuationChunk,
+) -> Result<PluginContinuationChunk, PluginProtocolError> {
+    if wire.sequence == 0 {
+        // Sequences are one-based. Zero is what a default-constructed message
+        // carries, and a chunk nobody ordered cannot be answered in order.
+        return Err(malformed("a continuation chunk at sequence zero"));
+    }
+    Ok(PluginContinuationChunk {
+        host_call_id: required_text(
+            &wire.host_call_id,
+            "a continuation chunk with no call identity",
+        )?,
+        sequence: wire.sequence,
+        chunk_json: required_text(&wire.chunk_json, "a continuation chunk with no chunk")?,
+    })
+}
+
+/// Read a plugin's answer about one chunk.
+pub fn continuation_disposition_from_wire(
+    wire: &v1::ContinuationChunkDisposition,
+) -> Result<PluginContinuationDisposition, PluginProtocolError> {
+    if wire.sequence == 0 {
+        return Err(malformed("a chunk answer at sequence zero"));
+    }
+    let disposition = match wire.disposition.as_ref() {
+        Some(v1::continuation_chunk_disposition::Disposition::Decision(decision)) => {
+            Ok(chunk_disposition_from_wire(*decision)?)
+        }
+        Some(v1::continuation_chunk_disposition::Disposition::Failure(failure)) => {
+            Err(failure_from_wire(failure)?)
+        }
+        None => {
+            return Err(malformed(
+                "a chunk answer that says neither continue, stop, nor failure",
+            ));
+        }
+    };
+    Ok(PluginContinuationDisposition {
+        host_call_id: required_text(&wire.host_call_id, "a chunk answer with no call identity")?,
+        sequence: wire.sequence,
+        disposition,
+    })
+}
+
 /// Read a continuation outcome, refusing one that carries neither arm.
 ///
 /// A continuation that answered nothing would leave the plugin's callback
@@ -807,7 +1377,7 @@ pub fn continuation_request_to_wire(
 /// plugin cannot recover from.
 pub fn continuation_outcome_from_wire(
     wire: &v1::ContinuationOutcome,
-) -> Result<PluginContinuationOutcome, PluginProtocolError> {
+) -> Result<PluginHostCallOutcome, PluginProtocolError> {
     let result = match wire.result.as_ref() {
         Some(v1::continuation_outcome::Result::ValueJson(value)) => Ok(required_text(
             value,
@@ -822,13 +1392,11 @@ pub fn continuation_outcome_from_wire(
             ));
         }
     };
-    Ok(PluginContinuationOutcome { result })
+    Ok(PluginHostCallOutcome { result })
 }
 
 /// Build the wire form of a continuation outcome.
-pub fn continuation_outcome_to_wire(
-    outcome: &PluginContinuationOutcome,
-) -> v1::ContinuationOutcome {
+pub fn continuation_outcome_to_wire(outcome: &PluginHostCallOutcome) -> v1::ContinuationOutcome {
     v1::ContinuationOutcome {
         result: Some(match &outcome.result {
             Ok(value) => v1::continuation_outcome::Result::ValueJson(value.clone()),
@@ -993,6 +1561,14 @@ pub fn session_message_from_wire(
                 )?,
             })
         }
+        Some(v1::plugin_session_message::Message::ContinuationChunk(chunk)) => {
+            PluginSessionPayload::ContinuationChunk(continuation_chunk_from_wire(chunk)?)
+        }
+        Some(v1::plugin_session_message::Message::ContinuationDisposition(disposition)) => {
+            PluginSessionPayload::ContinuationDisposition(continuation_disposition_from_wire(
+                disposition,
+            )?)
+        }
         None => return Err(malformed("a session message that carries nothing")),
     };
     Ok(PluginSessionMessage {
@@ -1090,6 +1666,27 @@ pub fn session_message_to_wire(message: &PluginSessionMessage) -> v1::PluginSess
                 completion_id: cancelled.completion_id.clone(),
             })
         }
+        PluginSessionPayload::ContinuationChunk(chunk) => {
+            Wire::ContinuationChunk(v1::ContinuationChunk {
+                host_call_id: chunk.host_call_id.clone(),
+                sequence: chunk.sequence,
+                chunk_json: chunk.chunk_json.clone(),
+            })
+        }
+        PluginSessionPayload::ContinuationDisposition(disposition) => {
+            Wire::ContinuationDisposition(v1::ContinuationChunkDisposition {
+                host_call_id: disposition.host_call_id.clone(),
+                sequence: disposition.sequence,
+                disposition: Some(match &disposition.disposition {
+                    Ok(decision) => v1::continuation_chunk_disposition::Disposition::Decision(
+                        chunk_disposition_to_wire(*decision),
+                    ),
+                    Err(failure) => v1::continuation_chunk_disposition::Disposition::Failure(
+                        failure_to_wire(failure),
+                    ),
+                }),
+            })
+        }
     };
     v1::PluginSessionMessage {
         session_id: message.session_id.clone(),
@@ -1103,6 +1700,18 @@ fn required_text(value: &str, what: &str) -> Result<String, PluginProtocolError>
         return Err(malformed(what));
     }
     Ok(value.to_owned())
+}
+
+/// An optional payload: absent stays absent, present-but-blank is refused.
+fn optional_text(
+    value: &Option<String>,
+    what: &str,
+) -> Result<Option<String>, PluginProtocolError> {
+    match value {
+        Some(text) if text.trim().is_empty() => Err(malformed(what)),
+        Some(text) => Ok(Some(text.clone())),
+        None => Ok(None),
+    }
 }
 
 fn success_name(success: &PluginSuccess) -> &'static str {
@@ -1656,6 +2265,7 @@ mod tests {
             host_nonce: "nonce".into(),
             maximum_frame_bytes,
             supported_features: vec!["streaming".into()],
+            granted_read_capabilities: Vec::new(),
         };
 
         let established = handshake_outcome_from_wire(&v1::HandshakeOutcome {
@@ -2072,7 +2682,7 @@ mod tests {
         wire.operation_request_id = "  ".into();
         assert!(continuation_request_from_wire(&wire).is_err());
 
-        let value = PluginContinuationOutcome {
+        let value = PluginHostCallOutcome {
             result: Ok(r#"{"ok":true}"#.into()),
         };
         assert_eq!(
@@ -2080,7 +2690,7 @@ mod tests {
             value
         );
 
-        let failed = PluginContinuationOutcome {
+        let failed = PluginHostCallOutcome {
             result: Err(unavailable()),
         };
         assert_eq!(
@@ -2192,5 +2802,579 @@ mod tests {
             )),
         };
         assert!(session_message_from_wire(&outcome).is_err());
+    }
+
+    fn wire_mark() -> v1::EmitMarkRequest {
+        v1::EmitMarkRequest {
+            session_id: "session-1".into(),
+            operation_request_id: "operation-1".into(),
+            host_call_id: "call-1".into(),
+            name: "example.mark".into(),
+            data_json: Some(r#"{"value":1}"#.into()),
+            parent: Some(v1::ScopeReference {
+                scope_id: "018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b".into(),
+            }),
+            metadata_json: Some(r#"{"source":"fixture"}"#.into()),
+            data_schema: Some(v1::MarkDataSchema {
+                name: "example".into(),
+                version: "1".into(),
+            }),
+            severity: Some(v1::MarkSeverity::Warn as i32),
+            timestamp_unix_micros: Some(1_700_000_000_000_000),
+        }
+    }
+
+    #[test]
+    fn a_mark_keeps_every_field_the_abi_passes() {
+        // The earlier shape carried a name and a payload. The parent scope,
+        // metadata, schema and severity all change the event a subscriber sees,
+        // so a mark that dropped them would not be the mark the plugin emitted.
+        let mark = mark_request_from_wire(&wire_mark()).expect("a complete mark");
+
+        assert_eq!(mark.name, "example.mark");
+        assert_eq!(mark.data_json.as_deref(), Some(r#"{"value":1}"#));
+        assert_eq!(
+            mark.parent.expect("a parent scope").scope_id.to_string(),
+            "018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b"
+        );
+        assert_eq!(
+            mark.metadata_json.as_deref(),
+            Some(r#"{"source":"fixture"}"#)
+        );
+        assert_eq!(mark.data_schema.expect("a schema").name, "example");
+        assert_eq!(mark.severity, Some(LogSeverity::Warn));
+        assert_eq!(mark.timestamp_unix_micros, Some(1_700_000_000_000_000));
+
+        // Absence stays absence rather than becoming a default nobody chose.
+        let bare = mark_request_from_wire(&v1::EmitMarkRequest {
+            data_json: None,
+            parent: None,
+            metadata_json: None,
+            data_schema: None,
+            severity: None,
+            timestamp_unix_micros: None,
+            ..wire_mark()
+        })
+        .expect("a mark with only a name");
+        assert_eq!(bare.data_json, None);
+        assert_eq!(bare.severity, None);
+        assert_eq!(bare.timestamp_unix_micros, None);
+    }
+
+    #[test]
+    fn a_mark_that_cannot_mean_what_it_says_is_refused() {
+        // A scope identity has one canonical spelling; anything else is a
+        // different string for the same value, and two spellings of one
+        // identity eventually disagree.
+        let not_canonical = [
+            "not-a-uuid",
+            // The same value without its hyphens.
+            "018f0b3c5f5a7c3e9a2b1c2d3e4f5a6b",
+            // A v4 UUID: parseable, but this fixture is a v7 and the check is
+            // about the text, so a braced form of a real one is the case that
+            // matters.
+            "{018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b}",
+        ];
+        for scope_id in not_canonical {
+            let mut wire = wire_mark();
+            wire.parent = Some(v1::ScopeReference {
+                scope_id: scope_id.into(),
+            });
+            assert!(
+                mark_request_from_wire(&wire).is_err(),
+                "{scope_id} is not a canonical scope identity"
+            );
+        }
+
+        // A mark cannot have happened before the epoch, and a peer that says it
+        // did is writing an event the runtime cannot order.
+        let mut before_epoch = wire_mark();
+        before_epoch.timestamp_unix_micros = Some(-1);
+        assert!(mark_request_from_wire(&before_epoch).is_err());
+
+        // A present-but-empty payload is a claim of an empty payload, and the
+        // empty string is not JSON.
+        let mut empty_payload = wire_mark();
+        empty_payload.data_json = Some("  ".into());
+        assert!(mark_request_from_wire(&empty_payload).is_err());
+
+        // A schema with no name describes nothing.
+        let mut nameless_schema = wire_mark();
+        nameless_schema.data_schema = Some(v1::MarkDataSchema {
+            name: String::new(),
+            version: "1".into(),
+        });
+        assert!(mark_request_from_wire(&nameless_schema).is_err());
+
+        // A present severity of `UNSPECIFIED` says the severity is a severity.
+        let mut unspecified = wire_mark();
+        unspecified.severity = Some(v1::MarkSeverity::Unspecified as i32);
+        assert!(mark_request_from_wire(&unspecified).is_err());
+
+        // And a name is the minimum: a mark without one addresses nothing.
+        let mut nameless = wire_mark();
+        nameless.name = "   ".into();
+        assert!(mark_request_from_wire(&nameless).is_err());
+    }
+
+    #[test]
+    fn a_scope_or_codec_call_must_name_a_known_operation() {
+        let scope = |operation: v1::ScopeOperation, payload: Option<&str>| v1::ScopeStackRequest {
+            session_id: "session-1".into(),
+            operation_request_id: "operation-1".into(),
+            host_call_id: "call-1".into(),
+            operation: operation as i32,
+            payload_json: payload.map(str::to_owned),
+        };
+
+        let push = scope(
+            v1::ScopeOperation::Push,
+            Some(r#"{"name":"step","scope_type":"function"}"#),
+        );
+        assert_eq!(
+            scope_stack_request_from_wire(&push)
+                .expect("a push with a payload")
+                .operation,
+            PluginScopeOperation::Push
+        );
+        assert_eq!(
+            scope_stack_request_from_wire(&scope(v1::ScopeOperation::Current, None))
+                .expect("a read with nothing to describe")
+                .operation,
+            PluginScopeOperation::Current
+        );
+
+        // A payload is a property of the operation: carrying one where it means
+        // nothing, or omitting one that needs it, says two things at once.
+        assert!(
+            scope_stack_request_from_wire(&scope(v1::ScopeOperation::Current, Some("{}"))).is_err()
+        );
+        assert!(scope_stack_request_from_wire(&scope(v1::ScopeOperation::Push, None)).is_err());
+
+        // A peer cannot manufacture an operation by writing a new name or a
+        // number this side does not know.
+        for operation in [v1::ScopeOperation::Unspecified as i32, 9_999] {
+            let mut wire = scope(v1::ScopeOperation::Push, Some("{}"));
+            wire.operation = operation;
+            assert!(scope_stack_request_from_wire(&wire).is_err());
+        }
+
+        let codec = |operation: i32| v1::ResolveCodecRequest {
+            session_id: "session-1".into(),
+            operation_request_id: "operation-1".into(),
+            host_call_id: "call-1".into(),
+            operation,
+            payload_json: r#"{"model":"example"}"#.into(),
+        };
+        assert_eq!(
+            resolve_codec_request_from_wire(&codec(v1::CodecOperation::LlmRequestDecode as i32))
+                .expect("a known codec operation")
+                .operation,
+            PluginCodecOperation::LlmRequestDecode
+        );
+        for operation in [v1::CodecOperation::Unspecified as i32, 9_999] {
+            assert!(resolve_codec_request_from_wire(&codec(operation)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_chunk_and_its_answer_carry_the_sequence_that_binds_them() {
+        let chunk = continuation_chunk_from_wire(&v1::ContinuationChunk {
+            host_call_id: "call-1".into(),
+            sequence: 1,
+            chunk_json: r#"{"delta":"hi"}"#.into(),
+        })
+        .expect("a first chunk");
+        assert_eq!(chunk.sequence, 1);
+
+        // Sequences are one-based, so zero is what a default-constructed
+        // message carries; a chunk nobody ordered cannot be answered in order.
+        assert!(
+            continuation_chunk_from_wire(&v1::ContinuationChunk {
+                host_call_id: "call-1".into(),
+                sequence: 0,
+                chunk_json: r#"{"delta":"hi"}"#.into(),
+            })
+            .is_err()
+        );
+
+        let disposition = continuation_disposition_from_wire(&v1::ContinuationChunkDisposition {
+            host_call_id: "call-1".into(),
+            sequence: 1,
+            disposition: Some(v1::continuation_chunk_disposition::Disposition::Decision(
+                v1::ChunkDisposition::Stop as i32,
+            )),
+        })
+        .expect("an answer");
+        assert_eq!(disposition.sequence, 1);
+        assert_eq!(disposition.disposition, Ok(PluginChunkDecision::Stop));
+
+        // An answer that says nothing would leave the runtime neither producing
+        // nor stopping.
+        assert!(
+            continuation_disposition_from_wire(&v1::ContinuationChunkDisposition {
+                host_call_id: "call-1".into(),
+                sequence: 1,
+                disposition: None,
+            })
+            .is_err()
+        );
+        assert!(
+            continuation_disposition_from_wire(&v1::ContinuationChunkDisposition {
+                host_call_id: "call-1".into(),
+                sequence: 1,
+                disposition: Some(v1::continuation_chunk_disposition::Disposition::Decision(
+                    v1::ChunkDisposition::Unspecified as i32
+                )),
+            })
+            .is_err()
+        );
+
+        // And a failure arm is validated like every other failure.
+        let failed = continuation_disposition_from_wire(&v1::ContinuationChunkDisposition {
+            host_call_id: "call-1".into(),
+            sequence: 2,
+            disposition: Some(v1::continuation_chunk_disposition::Disposition::Failure(
+                v1::PluginFailure {
+                    code: v1::FailureCode::HostCrashed as i32,
+                    message: "the consumer went away".into(),
+                    ..Default::default()
+                },
+            )),
+        })
+        .expect("a failure");
+        assert_eq!(
+            failed.disposition,
+            Err(unavailable_with(PluginFailureCode::HostCrashed))
+        );
+    }
+
+    #[test]
+    fn a_handshake_carries_the_read_capabilities_it_asks_for_and_gets() {
+        let requested = handshake_request_from_wire(&v1::HandshakeRequest {
+            protocol_version: 1,
+            runtime_binding_digest: "binding".into(),
+            client_nonce: "nonce".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: 1024,
+            supported_features: vec!["streaming".into()],
+            requested_read_capabilities: vec![v1::HostReadCapability::RuntimeDiagnostics as i32],
+        })
+        .expect("a request");
+        assert_eq!(
+            requested.requested_read_capabilities,
+            vec![PluginHostReadCapability::RuntimeDiagnostics]
+        );
+
+        // A capability this side cannot resolve is refused rather than dropped:
+        // it decides what a less-trusted process may read.
+        for capability in [v1::HostReadCapability::Unspecified as i32, 9_999] {
+            let mut wire = v1::HandshakeRequest {
+                protocol_version: 1,
+                runtime_binding_digest: "binding".into(),
+                client_nonce: "nonce".into(),
+                session_credential: "credential".into(),
+                maximum_frame_bytes: 1024,
+                supported_features: Vec::new(),
+                requested_read_capabilities: vec![capability],
+            };
+            assert!(handshake_request_from_wire(&wire).is_err());
+
+            // The same rule for what a kernel says it granted.
+            wire.requested_read_capabilities = Vec::new();
+            assert!(
+                session_identity_from_wire(&v1::HandshakeResponse {
+                    protocol_version: 1,
+                    session_id: "session-1".into(),
+                    host_instance_id: "host-1".into(),
+                    host_nonce: "nonce".into(),
+                    maximum_frame_bytes: 1024,
+                    supported_features: Vec::new(),
+                    granted_read_capabilities: vec![capability],
+                })
+                .is_err()
+            );
+        }
+
+        // And a list naming one capability twice is not a list of two.
+        assert!(
+            session_identity_from_wire(&v1::HandshakeResponse {
+                protocol_version: 1,
+                session_id: "session-1".into(),
+                host_instance_id: "host-1".into(),
+                host_nonce: "nonce".into(),
+                maximum_frame_bytes: 1024,
+                supported_features: Vec::new(),
+                granted_read_capabilities: vec![
+                    v1::HostReadCapability::RegistrationInventory as i32,
+                    v1::HostReadCapability::RegistrationInventory as i32,
+                ],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_descriptor_cannot_name_one_thing_twice() {
+        let capability = |id: &str| v1::PluginCapability {
+            id: id.into(),
+            kind: v1::PluginCapabilityKind::Tool as i32,
+            declared_digest: None,
+        };
+        let error = descriptor_from_wire(&v1::PluginDescriptor {
+            plugin_id: "example".into(),
+            capabilities: vec![capability("run"), capability("run")],
+            ..Default::default()
+        })
+        .expect_err("two capabilities under one name");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+
+        let registration = v1::PluginRegistrationDescriptor {
+            registration_id: "nemo-relay-plugin.v1.example:1:run".into(),
+            component_kind: "example".into(),
+            operation: v1::PluginRegistrationOperation::RegistrationOperationToolRequestIntercept
+                as i32,
+            shape: v1::PluginExecutionShape::ShapeUnary as i32,
+            ..Default::default()
+        };
+        let error = descriptor_from_wire(&v1::PluginDescriptor {
+            plugin_id: "example".into(),
+            registrations: vec![registration.clone(), registration],
+            ..Default::default()
+        })
+        .expect_err("one registration named twice at one attachment point");
+        assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
+    }
+
+    #[test]
+    fn an_operation_envelope_is_validated_before_its_payload() {
+        let context = PluginExecutionContext {
+            operation_request_id: "operation-1".into(),
+            protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            deadline_unix_ms: u64::MAX,
+            remaining_budget_millis: 2_500,
+            max_response_bytes: 1024,
+        };
+
+        // An operation with no session, or with no context, has no budget, and
+        // the kernel does not start work it cannot time out.
+        assert!(operation_envelope_from_wire("  ", Some(&context_to_wire(&context))).is_err());
+        assert!(operation_envelope_from_wire("session-1", None).is_err());
+        assert_eq!(
+            operation_envelope_from_wire("session-1", Some(&context_to_wire(&context)))
+                .expect("an envelope")
+                .session_id,
+            "session-1"
+        );
+    }
+
+    #[test]
+    fn a_handle_is_validated_when_a_request_names_one() {
+        let handle = v1::PluginHandle {
+            plugin_id: "example".into(),
+            generation: 7,
+        };
+
+        // A handle addresses one instance: without an identity, or at
+        // generation zero, it addresses nothing.
+        assert!(unload_request_from_wire(&v1::UnloadRequest::default()).is_err());
+        assert!(
+            unload_request_from_wire(&v1::UnloadRequest {
+                handle: Some(v1::PluginHandle {
+                    plugin_id: "example".into(),
+                    generation: 0,
+                }),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            unload_request_from_wire(&v1::UnloadRequest {
+                handle: Some(v1::PluginHandle {
+                    plugin_id: "  ".into(),
+                    generation: 7,
+                }),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            unload_request_from_wire(&v1::UnloadRequest {
+                handle: Some(handle.clone()),
+                ..Default::default()
+            })
+            .expect("an unload")
+            .handle,
+            PluginHandle {
+                plugin_id: "example".into(),
+                generation: 7
+            }
+        );
+
+        // An inspection with no handle asks about everything loaded, which is a
+        // question rather than a gap.
+        assert_eq!(
+            inspect_request_from_wire(&v1::InspectRequest {
+                handle: None,
+                ..Default::default()
+            })
+            .expect("an inspection of everything")
+            .handle,
+            None
+        );
+        assert_eq!(
+            inspect_request_from_wire(&v1::InspectRequest {
+                handle: Some(handle),
+                ..Default::default()
+            })
+            .expect("an inspection of one")
+            .handle
+            .expect("a handle")
+            .generation,
+            7
+        );
+    }
+
+    #[test]
+    fn an_invocation_takes_its_budget_from_the_context() {
+        let context = PluginExecutionContext {
+            operation_request_id: "operation-1".into(),
+            protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            deadline_unix_ms: u64::MAX,
+            remaining_budget_millis: 2_500,
+            max_response_bytes: 1024,
+        };
+        let invoke = invoke_request_from_wire(
+            &v1::InvokeRequest {
+                handle: Some(v1::PluginHandle {
+                    plugin_id: "example".into(),
+                    generation: 7,
+                }),
+                capability_id: "run".into(),
+                arguments: r#"{"input":true}"#.into(),
+                ..Default::default()
+            },
+            &context,
+        )
+        .expect("an invocation");
+
+        // A caller that could choose its own deadline could choose an infinite
+        // one, so the budget comes from the context the kernel derives.
+        assert_eq!(invoke.budget_millis, 2_500);
+        assert!(
+            invoke_request_from_wire(
+                &v1::InvokeRequest {
+                    capability_id: "run".into(),
+                    arguments: "  ".into(),
+                    ..Default::default()
+                },
+                &context
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_cancellation_that_names_no_operation_is_refused() {
+        assert!(
+            cancel_operation_request_from_wire(&v1::CancelOperationRequest {
+                operation_request_id: String::new(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            cancel_operation_request_from_wire(&v1::CancelOperationRequest {
+                operation_request_id: "operation-4".into(),
+                ..Default::default()
+            })
+            .expect("a cancellation"),
+            "operation-4"
+        );
+    }
+
+    #[test]
+    fn a_host_call_answer_is_an_answer_or_a_failure() {
+        // Neither arm is a message that says nothing, and both at once says two
+        // things.
+        let empty = host_call_response_from_wire(None, None, "an answer")
+            .expect_err("an answer with no arm");
+        assert_eq!(malformed_code(empty), PluginFailureCode::MalformedResponse);
+
+        let failure = v1::PluginFailure {
+            code: v1::FailureCode::Unavailable as i32,
+            message: "the runtime is not serving codecs".into(),
+            ..Default::default()
+        };
+        assert!(
+            scope_stack_response_from_wire(&v1::ScopeStackResponse {
+                result: Some(v1::scope_stack_response::Result::Failure(failure.clone())),
+            })
+            .expect("a failure is an answer")
+            .result
+            .is_err()
+        );
+        assert_eq!(
+            resolve_codec_response_from_wire(&v1::ResolveCodecResponse {
+                result: Some(v1::resolve_codec_response::Result::Output(
+                    r#"{"model":"example"}"#.into()
+                )),
+            })
+            .expect("an answer")
+            .result,
+            Ok(r#"{"model":"example"}"#.to_owned())
+        );
+        assert!(
+            resolve_codec_response_from_wire(&v1::ResolveCodecResponse {
+                result: Some(v1::resolve_codec_response::Result::Output("  ".into())),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_stream_frame_says_what_it_carries() {
+        assert!(stream_chunk_from_wire(&v1::StreamChunk::default()).is_err());
+        assert!(
+            stream_chunk_from_wire(&v1::StreamChunk {
+                operation_request_id: "operation-1".into(),
+                chunk: Some(v1::stream_chunk::Chunk::End(false)),
+                dispatch_state: v1::DispatchState::NotDispatched as i32,
+                outcome_certainty: v1::OutcomeCertainty::ConfirmedSuccess as i32,
+            })
+            .is_err()
+        );
+
+        // A stream that simply stops is a truncation, so the terminal frame is
+        // where the dispatch state is reported and it has to be known.
+        let end = stream_chunk_from_wire(&v1::StreamChunk {
+            operation_request_id: "operation-1".into(),
+            chunk: Some(v1::stream_chunk::Chunk::End(true)),
+            dispatch_state: v1::DispatchState::DispatchAttempted as i32,
+            outcome_certainty: v1::OutcomeCertainty::Unknown as i32,
+        })
+        .expect("a terminal frame");
+        assert_eq!(end.chunk, PluginStreamChunkKind::End);
+        assert_eq!(end.dispatch, DispatchState::DispatchAttempted);
+        assert_eq!(end.certainty, OutcomeCertainty::Unknown);
+
+        assert!(
+            stream_chunk_from_wire(&v1::StreamChunk {
+                operation_request_id: "operation-1".into(),
+                chunk: Some(v1::stream_chunk::Chunk::End(true)),
+                dispatch_state: v1::DispatchState::Unspecified as i32,
+                outcome_certainty: v1::OutcomeCertainty::ConfirmedSuccess as i32,
+            })
+            .is_err()
+        );
+    }
+
+    fn unavailable_with(code: PluginFailureCode) -> PluginFailure {
+        PluginFailure {
+            code,
+            message: "the consumer went away".into(),
+        }
     }
 }

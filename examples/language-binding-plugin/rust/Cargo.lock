@@ -1136,6 +1136,7 @@ dependencies = [
  "nemo-relay-types",
  "serde",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

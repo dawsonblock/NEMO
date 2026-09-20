@@ -23,7 +23,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use nemo_relay_types::api::event::{DataSchema, LogSeverity};
+pub use nemo_relay_types::api::scope::ScopeType;
 pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
+pub use uuid::Uuid;
 
 /// The exact attachment point a registration installs itself at.
 ///
@@ -238,6 +241,209 @@ pub struct PluginSessionIdentity {
     pub maximum_frame_bytes: u32,
     /// Features both sides agreed on.
     pub supported_features: Vec<String>,
+    /// Kernel-held state this host may read, and nothing else.
+    ///
+    /// Empty is the default and means the host reads nothing: granting is a
+    /// decision the kernel makes, and reading these in process is not a reason
+    /// for another process to read them.
+    pub read_capabilities: Vec<PluginHostReadCapability>,
+}
+
+/// Kernel-held state a plugin host may be allowed to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHostReadCapability {
+    /// The runtime's own diagnostics snapshot.
+    RuntimeDiagnostics,
+    /// The runtime's global registration inventory.
+    RegistrationInventory,
+}
+
+/// What a host asks for when it establishes a session.
+///
+/// The request is a request: what the host may read is what the kernel granted
+/// in the session it established, never what it asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHandshakeRequest {
+    /// Protocol version the host speaks.
+    pub protocol_version: u16,
+    /// Digest of the runtime identity the host expects to be bound to.
+    pub runtime_binding_digest: String,
+    /// Nonce the host chose for this session.
+    pub client_nonce: String,
+    /// Credential the supervisor passed out of band.
+    pub session_credential: String,
+    /// Largest frame the host will accept.
+    pub maximum_frame_bytes: u32,
+    /// Features the host offers.
+    pub supported_features: Vec<String>,
+    /// Kernel-held state the host asks to read.
+    pub requested_read_capabilities: Vec<PluginHostReadCapability>,
+}
+
+/// A scope named by its canonical identity.
+///
+/// The UUID, not a name and not an opaque token: a name is not unique, and a
+/// token would have to be resolved before it meant anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginScopeReference {
+    /// The scope's UUID.
+    pub scope_id: Uuid,
+}
+
+impl PluginScopeReference {
+    /// Parse a scope identity from its canonical text.
+    ///
+    /// Canonical means the hyphenated form: `Uuid` also accepts simple, braced
+    /// and URN spellings of the same value, and accepting those would give the
+    /// boundary several spellings of one identity, so a log, a gate or a
+    /// comparison that used the text rather than the value would disagree with
+    /// itself.
+    pub fn from_canonical(text: &str) -> Result<Self, PluginProtocolError> {
+        let text = text.trim();
+        let scope_id = Uuid::parse_str(text).map_err(|_| {
+            PluginProtocolError::new(
+                PluginFailureCode::MalformedResponse,
+                format!("a scope identity that is not a UUID: {text:?}"),
+            )
+        })?;
+        if scope_id.hyphenated().to_string() != text {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::MalformedResponse,
+                format!("a scope identity that is not in canonical form: {text:?}"),
+            ));
+        }
+        Ok(Self { scope_id })
+    }
+}
+
+/// The complete payload of a mark.
+///
+/// Every field the ABI may omit is optional here rather than defaulted: the
+/// parent scope, metadata, data schema and severity all change the event a
+/// subscriber sees, and a default would be an event nobody asked for. The name
+/// is the minimum, because a mark without one addresses nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginMarkEmit {
+    /// Correlation identifier for the operation that emitted it.
+    pub operation_request_id: String,
+    /// Identity of this call, distinct from the operation it belongs to.
+    pub host_call_id: String,
+    /// The mark's name.
+    pub name: String,
+    /// The mark's payload, when it has one.
+    pub data_json: Option<String>,
+    /// The scope the mark belongs to, when it has one.
+    pub parent: Option<PluginScopeReference>,
+    /// Metadata attached to the mark, when it has any.
+    pub metadata_json: Option<String>,
+    /// The schema the payload is written against, when it declares one.
+    pub data_schema: Option<DataSchema>,
+    /// How severe the mark is, when it declares that.
+    pub severity: Option<LogSeverity>,
+    /// Microseconds since the Unix epoch, when the caller supplies a time.
+    pub timestamp_unix_micros: Option<u64>,
+}
+
+/// What a caller wants done with the scope stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginScopeOperation {
+    /// Read the current scope.
+    Current,
+    /// Push a new scope.
+    Push,
+    /// Pop a scope.
+    Pop,
+    /// Create an isolated stack.
+    CreateIsolated,
+    /// Release an isolated stack.
+    ReleaseIsolated,
+}
+
+impl PluginScopeOperation {
+    /// Whether this operation carries a payload.
+    ///
+    /// Push and pop describe a scope; the others name one that already exists
+    /// or needs no description. A payload on the wrong one is a request that
+    /// says two things, and the two cannot both be true.
+    pub const fn carries_payload(self) -> bool {
+        matches!(self, Self::Push | Self::Pop)
+    }
+}
+
+/// One call against the scope stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginScopeStackRequest {
+    /// Correlation identifier for the operation it belongs to.
+    pub operation_request_id: String,
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// What to do.
+    pub operation: PluginScopeOperation,
+    /// What to do it with, when the operation carries one.
+    pub payload_json: Option<String>,
+}
+
+/// Which codec operation is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCodecOperation {
+    /// Decode an LLM request.
+    LlmRequestDecode,
+    /// Encode an annotated LLM request.
+    LlmRequestEncode,
+    /// Decode an LLM response.
+    LlmResponseDecode,
+}
+
+/// One codec resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginResolveCodecRequest {
+    /// Correlation identifier for the operation it belongs to.
+    pub operation_request_id: String,
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// What to do.
+    pub operation: PluginCodecOperation,
+    /// What to do it with.
+    pub payload_json: String,
+}
+
+/// One chunk of a stream the runtime produces for a callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationChunk {
+    /// The continuation call this chunk belongs to.
+    pub host_call_id: String,
+    /// One-based order within that call.
+    pub sequence: u64,
+    /// The chunk.
+    pub chunk_json: String,
+}
+
+/// What a plugin decided about the chunk it received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginChunkDecision {
+    /// Produce the next chunk.
+    Continue,
+    /// Stop producing.
+    Stop,
+}
+
+/// The plugin's answer about one chunk.
+///
+/// The runtime does not produce the next chunk until this arrives, which is what
+/// makes the in-process callback's return value mean the same thing here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationDisposition {
+    /// The continuation call this answers.
+    pub host_call_id: String,
+    /// Which chunk it answers, so an answer cannot be applied to whichever
+    /// chunk happened to be outstanding.
+    pub sequence: u64,
+    /// Whether to continue, or the failure that ended the stream.
+    pub disposition: Result<PluginChunkDecision, PluginFailure>,
 }
 
 /// The result of one lifecycle operation.
@@ -364,6 +570,21 @@ pub struct PluginExecutionContext {
     pub max_response_bytes: u32,
 }
 
+/// The session and context every host operation carries.
+///
+/// Validated before the payload is looked at, so a message that names no
+/// session, or carries no context, or carries one this side cannot use, is
+/// refused as an envelope rather than while half of a payload has already been
+/// converted. The context is what the operation's budget comes from, so a
+/// request without one has no deadline at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOperationEnvelope {
+    /// The session the operation belongs to.
+    pub session_id: String,
+    /// Identity, binding and budget for the operation.
+    pub context: PluginExecutionContext,
+}
+
 /// A request to continue the interceptor chain.
 ///
 /// A plugin's interceptor that rewrites a request and then continues is asking
@@ -381,11 +602,40 @@ pub struct PluginContinuationRequest {
     pub invocation_json: String,
 }
 
-/// The rest of the chain's answer, or the failure that replaced it.
+/// The answer to a host call that returns a value or a structured failure.
+///
+/// One type rather than one per call: the shape is the same for every host call
+/// that answers with a payload, and a second copy would be a second place for
+/// "the peer refused" to be represented differently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginContinuationOutcome {
-    /// The answer, or the failure.
+pub struct PluginHostCallOutcome {
+    /// The answer, or the failure that replaced it.
     pub result: Result<String, PluginFailure>,
+}
+
+/// One frame of a streaming invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamChunk {
+    /// The operation the stream belongs to.
+    pub operation_request_id: String,
+    /// What this frame carries.
+    pub chunk: PluginStreamChunkKind,
+    /// Whether the plugin may have reached an external system.
+    pub dispatch: DispatchState,
+    /// What the runtime can prove about the outcome.
+    pub certainty: OutcomeCertainty,
+}
+
+/// What one frame of a streaming invocation carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginStreamChunkKind {
+    /// One frame of output.
+    Data(String),
+    /// The stream ended because the plugin finished.
+    End,
+    /// The stream ended because the plugin failed.
+    Failed(PluginFailure),
 }
 
 /// One message on the duplex channel between the kernel and a plugin host.
@@ -438,6 +688,10 @@ pub enum PluginSessionPayload {
     CompletionOutcome(PluginCompletionOutcome),
     /// The awaiting runtime cancelled a pending completion.
     CompletionCancelled(PluginCompletionCancelled),
+    /// One chunk of a stream the runtime produces for a callback.
+    ContinuationChunk(PluginContinuationChunk),
+    /// The plugin's answer about one chunk.
+    ContinuationDisposition(PluginContinuationDisposition),
 }
 
 /// A request to open a downstream stream.

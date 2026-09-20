@@ -211,6 +211,12 @@ message HandshakeRequest {
   string session_credential = 4;
   uint32 maximum_frame_bytes = 5;
   repeated string supported_features = 6;
+  // What the host asks to read of kernel-held state.
+  //
+  // Reading the old ABI's diagnostics or registration inventory in process is
+  // not a reason for another process to read them: each is a capability the
+  // kernel grants, and a request is not a grant.
+  repeated HostReadCapability requested_read_capabilities = 7;
 }
 
 // The session the host establishes.
@@ -226,6 +232,20 @@ message HandshakeResponse {
   string host_nonce = 4;
   uint32 maximum_frame_bytes = 5;
   repeated string supported_features = 6;
+  // What the kernel granted. The host may read exactly these and no more.
+  repeated HostReadCapability granted_read_capabilities = 7;
+}
+
+// Kernel-held state a plugin host may be allowed to read.
+//
+// These exist because a less-trusted process asking for them is a decision
+// about what it may learn, not a translation of what the in-process ABI could
+// reach. Enum values are siblings of their type rather than children of it, so
+// these are prefixed to stay unique within the package.
+enum HostReadCapability {
+  HOST_READ_CAPABILITY_UNSPECIFIED = 0;
+  HOST_READ_CAPABILITY_RUNTIME_DIAGNOSTICS = 1;
+  HOST_READ_CAPABILITY_REGISTRATION_INVENTORY = 2;
 }
 
 // Load a plugin.
@@ -348,22 +368,80 @@ message SessionCloseResponse {}
 // security boundary is better served by one canonical representation for each
 // operation. A typed RPC is also the only shape that can express streaming
 // semantics: a unary call cannot carry open, pull, cancel and release.
+// A scope a mark belongs to.
+//
+// The identity is the scope's canonical UUID text, not a name and not an
+// opaque token: a name is not unique and a token would have to be resolved
+// before it meant anything. Conversion rejects anything that is not a UUID.
+message ScopeReference {
+  string scope_id = 1;
+}
+
+// The schema a mark's payload is written against.
+message MarkDataSchema {
+  string name = 1;
+  string version = 2;
+}
+
+// How severe a mark is. Protobuf enum values are siblings of their type rather
+// than children of it, so these are prefixed to stay unique within the package.
+enum MarkSeverity {
+  MARK_SEVERITY_UNSPECIFIED = 0;
+  MARK_SEVERITY_TRACE = 1;
+  MARK_SEVERITY_DEBUG = 2;
+  MARK_SEVERITY_INFO = 3;
+  MARK_SEVERITY_WARN = 4;
+  MARK_SEVERITY_ERROR = 5;
+}
+
+// Emit a mark.
+//
+// This is the complete payload the ABI passes, not the subset an earlier shape
+// carried: the parent scope, metadata, data schema, severity and timestamp all
+// affect the event a subscriber sees, and dropping any of them would make the
+// remote mark a different event than the in-process one. Each field that the
+// ABI may omit is optional here, so absence stays absence rather than becoming
+// a default nobody chose.
 message EmitMarkRequest {
   string session_id = 1;
   string operation_request_id = 2;
   string host_call_id = 3;
   string name = 4;
-  string data_json = 5;
+  optional string data_json = 5;
+  optional ScopeReference parent = 6;
+  optional string metadata_json = 7;
+  optional MarkDataSchema data_schema = 8;
+  optional MarkSeverity severity = 9;
+  // Microseconds since the Unix epoch. Negative values are refused: a mark
+  // cannot have happened before the epoch, and accepting one would let a peer
+  // write an event the runtime cannot order.
+  optional int64 timestamp_unix_micros = 10;
 }
 
 message EmitMarkResponse {}
+
+// What the caller wants done with the scope stack.
+//
+// The set is what the ABI exposes rather than a guess at what it might: a
+// free-form string let a less-trusted peer manufacture an operation name, and
+// nothing could refuse one it did not recognize.
+enum ScopeOperation {
+  SCOPE_OPERATION_UNSPECIFIED = 0;
+  SCOPE_OPERATION_CURRENT = 1;
+  SCOPE_OPERATION_PUSH = 2;
+  SCOPE_OPERATION_POP = 3;
+  SCOPE_OPERATION_CREATE_ISOLATED = 4;
+  SCOPE_OPERATION_RELEASE_ISOLATED = 5;
+}
 
 message ScopeStackRequest {
   string session_id = 1;
   string operation_request_id = 2;
   string host_call_id = 3;
-  string operation = 4;
-  string payload_json = 5;
+  ScopeOperation operation = 4;
+  // Present exactly when the operation carries one: a push describes the scope
+  // it pushes, and reading the current scope describes nothing.
+  optional string payload_json = 5;
 }
 
 message ScopeStackResponse {
@@ -373,11 +451,21 @@ message ScopeStackResponse {
   }
 }
 
+// Which codec operation is being asked for. Closed for the same reason as
+// `ScopeOperation`: the three operations are what the ABI exposes, and a peer
+// cannot invent a fourth by writing a new string.
+enum CodecOperation {
+  CODEC_OPERATION_UNSPECIFIED = 0;
+  CODEC_OPERATION_LLM_REQUEST_DECODE = 1;
+  CODEC_OPERATION_LLM_REQUEST_ENCODE = 2;
+  CODEC_OPERATION_LLM_RESPONSE_DECODE = 3;
+}
+
 message ResolveCodecRequest {
   string session_id = 1;
   string operation_request_id = 2;
   string host_call_id = 3;
-  string kind = 4;
+  CodecOperation operation = 4;
   string payload_json = 5;
 }
 
@@ -448,6 +536,8 @@ message PluginSessionMessage {
     CompletionSettle completion_settle = 11;
     CompletionOutcome completion_outcome = 12;
     CompletionCancelled completion_cancelled = 13;
+    ContinuationChunk continuation_chunk = 14;
+    ContinuationChunkDisposition continuation_disposition = 15;
   }
 }
 
@@ -508,6 +598,41 @@ message DownstreamStreamCancel {
 message DownstreamStreamRelease {
   string host_call_id = 1;
   string stream_id = 2;
+}
+
+// One chunk of a stream the runtime produces and the plugin consumes through a
+// callback.
+//
+// This is the other half of the pull stream's pacing: there the plugin pulls
+// and the runtime answers, here the runtime produces and the plugin answers
+// whether to continue. The sequence is per continuation call and one-based, so
+// an answer names the chunk it decides rather than whichever chunk was
+// outstanding.
+message ContinuationChunk {
+  string host_call_id = 1;
+  uint64 sequence = 2;
+  string chunk_json = 3;
+}
+
+// What the plugin decided about the chunk it just received.
+//
+// The runtime does not produce chunk N+1 until this message permits it, which
+// is what makes the in-process callback's return value mean the same thing
+// here: a plugin that stops consuming stops production rather than merely
+// ignoring what arrives.
+enum ChunkDisposition {
+  CHUNK_DISPOSITION_UNSPECIFIED = 0;
+  CHUNK_DISPOSITION_CONTINUE = 1;
+  CHUNK_DISPOSITION_STOP = 2;
+}
+
+message ContinuationChunkDisposition {
+  string host_call_id = 1;
+  uint64 sequence = 2;
+  oneof disposition {
+    ChunkDisposition decision = 3;
+    PluginFailure failure = 4;
+  }
 }
 
 // Settles a callback that returned before its result existed.

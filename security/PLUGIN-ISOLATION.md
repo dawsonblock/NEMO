@@ -348,28 +348,57 @@ before closing that gap would have forced ad hoc exceptions. Closed:
   | `async_llm_stream_cancel`, `async_llm_stream_release` | session `StreamCancel`, `StreamRelease` |
   | `async_stream_push_json`, `async_stream_finish`, `async_stream_reject` | `InvokeStream`'s `StreamChunk` |
   | `async_stream_is_cancelled` | `CancelOperation`, which the host reports to the plugin |
-  | `scope_get_current`, `scope_push`, `scope_pop`, `scope_handle_free`, `scope_stack_create`, `scope_stack_free` | `ScopeStack` typed request — **incomplete**: `operation` is a free-form string on the wire, and a scope handle has no wire identity, so an unknown operation cannot be refused |
-  | `emit_mark`, `emit_mark_v2` | `EmitMark` typed request — **incomplete**: the wire carries a name and a data payload, while v2 also passes a parent scope handle, metadata, a data schema, a severity and a timestamp |
-  | `llm_request_codec_encode`, `llm_request_codec_decode`, `llm_response_codec_decode`, `async_completion_llm_*_codec_*` | `ResolveCodec` typed request — the same free-form `kind` caveat |
-  | `async_next_invoke_stream` | **not yet mapped**: the runtime pushes chunks into the plugin's callback and the callback's return value decides whether production continues, so it needs one answer per chunk rather than one per call |
-  | `async_stream_is_backpressured` and the `Backpressured` status | **not yet mapped**: the host's bounded non-blocking queue has to be translated into the transport's flow control, and that translation is the host's to demonstrate, not to assume |
-  | `get_runtime_diagnostics` | **not yet mapped**: it reads kernel-held state from a less-trusted process, which is a decision about what the host may learn rather than a mechanical translation |
-  | `plugin_runtime_list_registrations` | **not yet mapped**: the same shape as diagnostics, one level narrower |
+  | `scope_get_current`, `scope_push`, `scope_pop`, `scope_handle_free`, `scope_stack_create`, `scope_stack_free` | `ScopeStack` typed request with a closed `ScopeOperation` (`Current`, `Push`, `Pop`, `CreateIsolated`, `ReleaseIsolated`) — the set the ABI exposes, so a peer cannot manufacture one; a payload is accepted exactly where the operation carries one |
+  | `emit_mark`, `emit_mark_v2` | `EmitMark` typed request carrying the whole v2 payload — parent scope, metadata, schema, severity and timestamp included — with the scope named by its canonical UUID and a negative timestamp refused |
+  | `llm_request_codec_encode`, `llm_request_codec_decode`, `llm_response_codec_decode`, `async_completion_llm_*_codec_*` | `ResolveCodec` typed request with a closed `CodecOperation` naming one of the three |
+  | `async_next_invoke_stream` | session `ContinuationChunk` (kernel → plugin, one-based `sequence`) and `ContinuationChunkDisposition` (plugin → kernel: `Continue`, `Stop`, or a failure). The kernel does not produce chunk N+1 until the disposition for N permits it, which is what the callback's return value means in process |
+  | `async_stream_is_backpressured` and the `Backpressured` status | **not yet mapped**: the invariant is stated below, and it is the host's to demonstrate rather than to assume |
+  | `get_runtime_diagnostics`, `plugin_runtime_list_registrations` | **decided, not yet served**: each is a read capability (`RuntimeDiagnostics`, `RegistrationInventory`) that the kernel grants in the handshake. Requesting one is not being granted it, an unknown capability is refused rather than dropped, and the default grant is empty |
   | `scope_stack_set_thread`, `scope_stack_capture_thread`, `scope_stack_restore_thread`, `with_scope_stack` | host-local: they bind a runtime-issued stack to a thread inside the host process |
   | `string_new`, `string_data`, `string_len`, `string_free`, `last_error_clear`, `last_error_set` | host-local: allocation and the plugin's error channel inside the host process |
   | `async_completion_release`, `async_completion_retain`, `async_next_release`, `async_stream_release`, `plugin_context_runtime`, `plugin_runtime_retain`, `plugin_runtime_release` | host-local: reference counting for handles the host owns |
 
+  Three invariants the inventory implies, stated so they can be checked rather
+  than assumed:
+
+  - **Backpressure means the same thing on both sides.** In process, a full
+    bounded queue makes the push return `Backpressured` and the plugin retries.
+    Remotely, "the producer may continue" holds exactly when the transport has
+    granted equivalent capacity, and transport flow control alone says only that
+    bytes are not being consumed quickly. The host must demonstrate the
+    equivalence, and if it cannot, the answer is explicit credit messages rather
+    than an assumption.
+  - **A settlement is answered.** A plugin that settles a completion learns
+    whether the settlement was taken, so a completion that was already
+    cancelled cannot leave the callback's owner waiting forever.
+  - **A sequence binds an answer to a chunk.** Chunks are one-based and
+    per-call, and the kernel produces the next one only after the disposition
+    for the current one arrives; an answer naming sequence zero is refused at
+    the boundary.
+
+  Conversion is the only legal crossing point, and the manifest in
+  `crates/plugin-proto/tests/conversion_coverage.rs` is what enforces that it
+  stays exhaustive: every message a service signature or the session envelope
+  can carry is listed with the converter that owns it, the vector that records
+  its bytes and the tests that refuse a malformed version, and the build fails
+  when a message reaches either without an entry. The same file refuses an
+  `impl From` for a wire type, so a later `.into()` shortcut cannot compile.
+
 Still open, in the order they need closing:
 
-1. **The five callbacks the inventory above marks as not yet on the wire**, each
-   of which needs a decision rather than a translation: a per-chunk answer for
-   the push-style stream continuation, a backpressure story the host can
-   demonstrate, and a decision about what a less-trusted process may read of
-   kernel diagnostics and registration state. `ScopeStack` and `EmitMark` also
-   need closing out: their operations are free-form strings and their payloads
-   are missing the v2 mark fields and scope-handle identity.
-2. **Conversions for every message the host uses**, and vectors for all of them
-   rather than fourteen declared pending.
+1. **The output queue's backpressure equivalence**, which is a host obligation:
+   the host must show that the transport grants the producer equivalent
+   capacity, or the protocol gains explicit credit messages. Diagnostics and
+   registration reads still have to be *served* under the capabilities the
+   handshake now negotiates; deciding what they may return is the kernel's
+   authorization step, not a conversion step.
+2. **The session state machine.** The conversions refuse a message that cannot
+   mean what it says, but the invariants that need memory — a settlement for a
+   completion that never existed, a settlement after cancellation, a stream item
+   after the terminal frame, a replayed or regressed sequence, a reused
+   `host_call_id` — belong to the session that owns those identities. They are
+   listed here rather than implemented, because the session has no
+   implementation until the supervisor exists.
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 
