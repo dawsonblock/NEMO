@@ -3995,6 +3995,91 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_failure_that_may_have_dispatched_is_unknown_and_is_never_redispatched() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        // The shape a managed call returns when a remote registration entered
+        // the backend and the answer was lost: nobody can say the plugin did not
+        // reach the external system.
+        let plugin_failure = crate::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::HostCrashed,
+                message: "the host exited while the call was in flight".into(),
+            },
+            dispatch: nemo_relay_executor::unstable::DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+        };
+        *effect.effect_error.lock().unwrap() = Some(
+            crate::plugin::execution::plugin_failure_as_effect_error(&plugin_failure)
+                .expect("a plugin invocation failure describes an effect"),
+        );
+
+        let request = invocation_with_request_id("plugin-post-dispatch");
+        let action_id = match kernel.begin(&request) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("a plugin that may have dispatched cannot be a definite failure"),
+        };
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+        assert_eq!(
+            effect.calls.load(Ordering::SeqCst),
+            1,
+            "the plugin ran exactly once"
+        );
+
+        let existing = match kernel.begin(&request) {
+            Ok(InvocationOutcome::ExistingAction(status)) => status,
+            _ => panic!("a retry of an unknown action must not reach the plugin"),
+        };
+        assert_eq!(existing.action_id, action_id);
+        assert_eq!(existing.state, ExecutionState::Unknown);
+        assert!(existing.reconciliation_required);
+        assert_eq!(
+            effect.calls.load(Ordering::SeqCst),
+            1,
+            "an action whose plugin may have dispatched is never dispatched again"
+        );
+    }
+
+    #[test]
+    fn a_plugin_refusal_before_the_backend_is_a_definite_failure_rather_than_an_unknown() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        // The other half of the same boundary: the runtime refused the call
+        // before the plugin ran, which is the one plugin failure that *is* a
+        // definite outcome.
+        let plugin_refusal = crate::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::Unavailable,
+                message: "no host is serving this registration".into(),
+            },
+            dispatch: nemo_relay_executor::unstable::DispatchState::NotDispatched,
+            certainty: OutcomeCertainty::ConfirmedFailure,
+        };
+        *effect.effect_error.lock().unwrap() = Some(
+            crate::plugin::execution::plugin_failure_as_effect_error(&plugin_refusal)
+                .expect("a plugin invocation failure describes an effect"),
+        );
+
+        let action_id = match kernel.begin(&invocation_with_request_id("plugin-refused")) {
+            Err(KernelError::EffectFailed { action, .. }) => {
+                assert_eq!(action.state, ExecutionState::Failed);
+                action.action_id
+            }
+            _ => panic!("a refusal before the backend is a definite failure"),
+        };
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Failed)
+        );
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn mismatched_grants_cancel_the_pre_dispatch_action() {
         let (kernel, _authority, _function, effect, actions, receipts) =
             kernel(ExecutionClass::Mutation, Decision::MismatchedGrant);

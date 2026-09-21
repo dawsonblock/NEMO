@@ -274,6 +274,71 @@ pub fn outcome_from(
     }
 }
 
+/// How a plugin invocation failure is described at the effect boundary.
+///
+/// A registration that may have dispatched is an effect that may have happened.
+/// A durable action records that as `UNKNOWN`: not a failure it may retry,
+/// because the plugin may already have reached the external system, and not a
+/// success, because nothing proves one. A registration the runtime refused
+/// *before* the backend never ran, so the same action may be finished as a
+/// definite failure with no reconciliation.
+///
+/// The conversion copies the dispatch state and the certainty the plugin
+/// boundary already established rather than deriving them again from the failure
+/// code. A second derivation would be a second place to get certainty wrong, and
+/// certainty is the value here that must never be softened: the code says what
+/// went wrong, the certainty says whether anyone can still say it did not
+/// happen. `HostCrashed` and `MalformedResponse` are different things to a
+/// plugin author and the same thing to an action deciding whether its effect is
+/// still unaccounted for.
+///
+/// The effect vocabulary belongs to the hardening feature rather than the SDK, so
+/// this exists only when that feature does — `UNKNOWN` means nothing to a build
+/// that has no durable action to record it on.
+///
+/// `None` means the error is not a plugin invocation failure, and the caller
+/// classifies it by its own rules rather than by these.
+#[cfg(feature = "unstable-hardening")]
+pub fn plugin_failure_as_effect_error(
+    error: &crate::error::FlowError,
+) -> Option<nemo_relay_executor::unstable::EffectExecutionError> {
+    use nemo_relay_executor::unstable::{EffectExecutionError, state_for_error};
+    use nemo_relay_ledger::unstable::ExecutionState;
+
+    let crate::error::FlowError::PluginInvocation {
+        registration,
+        failure,
+        dispatch,
+        certainty,
+    } = error
+    else {
+        return None;
+    };
+    let mut translated = EffectExecutionError {
+        code: match certainty {
+            OutcomeCertainty::Unknown => "PLUGIN_DISPATCH_UNATTESTED",
+            _ => "PLUGIN_REFUSED_BEFORE_BACKEND",
+        }
+        .to_owned(),
+        dispatch_state: *dispatch,
+        outcome_certainty: *certainty,
+        provider_request_id: None,
+        retryable: false,
+        reconciliation_required: false,
+        message: format!(
+            "plugin registration '{registration}' reported {:?}: {}",
+            failure.code, failure.message
+        ),
+    };
+    // Derived rather than asserted, from the same function the kernel uses to
+    // classify a backend error: the flag has to agree with the state the kernel
+    // will derive from this error, or two readers of one failure would disagree
+    // about whether anyone can still say what happened.
+    translated.reconciliation_required =
+        matches!(state_for_error(&translated), ExecutionState::Unknown);
+    Some(translated)
+}
+
 /// Wall-clock milliseconds, for comparing against an absolute deadline.
 ///
 /// A clock before the epoch reports zero rather than failing: every deadline
@@ -292,6 +357,50 @@ mod tests {
         PluginCapability, PluginExecutionContext, PluginFailureCode, PluginHandle,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The two halves of the effect-boundary contract that a kernel test cannot
+    /// see: an error that is not a plugin failure is left alone, and the flag a
+    /// durable reader uses is derived from the state rather than asserted
+    /// separately.
+    #[cfg(feature = "unstable-hardening")]
+    #[test]
+    fn only_a_plugin_failure_is_translated_and_its_reconciliation_flag_follows_certainty() {
+        assert!(
+            plugin_failure_as_effect_error(&crate::error::FlowError::Internal("other".into()))
+                .is_none(),
+            "an error the plugin boundary did not produce has no effect-boundary meaning here"
+        );
+
+        let dispatch_attempted = crate::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: PluginFailureCode::MalformedResponse,
+                message: "the answer could not be decoded".into(),
+            },
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+        };
+        let translated = plugin_failure_as_effect_error(&dispatch_attempted)
+            .expect("a plugin invocation failure describes an effect");
+        assert_eq!(translated.code, "PLUGIN_DISPATCH_UNATTESTED");
+        assert!(translated.reconciliation_required);
+        assert!(!translated.retryable);
+        assert_eq!(translated.dispatch_state, DispatchState::DispatchAttempted);
+
+        let refused = crate::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: PluginFailureCode::Rejected,
+                message: "the registration was refused".into(),
+            },
+            dispatch: DispatchState::NotDispatched,
+            certainty: OutcomeCertainty::ConfirmedFailure,
+        };
+        let translated = plugin_failure_as_effect_error(&refused)
+            .expect("a plugin invocation failure describes an effect");
+        assert_eq!(translated.code, "PLUGIN_REFUSED_BEFORE_BACKEND");
+        assert!(!translated.reconciliation_required);
+    }
 
     /// A backend that records whether it was reached.
     struct RecordingBackend {

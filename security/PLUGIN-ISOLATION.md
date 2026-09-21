@@ -513,7 +513,12 @@ Still open, in the order they need closing:
    configured cap. Nothing composes a production plugin path yet, so nothing
    requires a production deployment to state those caps: an unstated cap
    publishes no budget, which a registration across the boundary refuses — fail
-   closed, but silent until the composition that owns the decision exists.
+  closed, but silent until the composition that owns the decision exists.
+6. **A consequential capability that actually runs a plugin.** The conversion
+   from a plugin failure to a durable outcome exists and is tested against the
+   kernel, but nothing in the tree composes a plugin-backed effect, so the
+   conversion has no production caller yet. That is the provider-isolation
+   milestone rather than a gap in the contract.
 
 After invocation, the cutover milestones are what move the metric: production
 selects the process backend and refuses the in-process one, the bindings stop
@@ -584,11 +589,25 @@ holds the supervisor that starts it and the backend that reaches it.
   and a registration across the boundary refuses, since a deadline chosen inside
   the plugin path is the invention the trusted budget exists to prevent. Two
   gaps are named rather than hidden: nothing in the tree *states* the caps yet
-  (item 5 below), and the streaming LLM path does not publish a budget, which is
+  (item 5 above), and the streaming LLM path does not publish a budget, which is
   safe only because no remotely supported registration class is reachable from
   it. The kernel's own `kernel_deadline_unix_ms` still hard-codes 29 seconds for
   an action's deadline; that constant is the same shape of finding and moves when
   runtime policy owns the action budget rather than the per-call cap alone.
+- **Uncertainty survives the crossing into a durable record.** A plugin failure
+  that may have dispatched is not a failure the kernel may treat as definite, and
+  the conversion from one to the other is now a single function rather than a
+  rule every adapter re-derives. The dispatch state and the certainty the plugin
+  boundary established are *copied* — not recomputed from the failure code, since
+  a second derivation is a second place to get certainty wrong — and the
+  reconciliation flag is itself derived from the state the kernel will compute,
+  so two readers of one failure cannot disagree about whether anyone can still
+  say what happened. Two kernel tests pin the halves: a plugin that may have
+  dispatched becomes durable `UNKNOWN`, and retrying returns the same action
+  without reaching the plugin a second time; a refusal *before* the backend
+  finishes the action as a definite failure. Nothing in the tree calls the
+  conversion yet (item 6 above), so this is the join being correct rather than the
+  join being used.
 - **Failure vocabulary.** A transport failure is reported as `HostCrashed` when
   the child has exited and as `Unavailable` when it is still running. The two
   call for different responses — one is a process that ended, the other is a
