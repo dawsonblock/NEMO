@@ -20,9 +20,8 @@ use std::sync::Arc;
 use nemo_relay::api::runtime::ToolInterceptFn;
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
-    DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext, PluginFailureCode,
-    PluginHandle, PluginInvokeRequest, PluginProtocolError, PluginRegistrationDescriptor,
-    PluginRegistrationOperation, PluginSuccess,
+    PluginDescriptor, PluginExecutionContext, PluginFailureCode, PluginHandle, PluginInvokeRequest,
+    PluginProtocolError, PluginRegistrationDescriptor, PluginRegistrationOperation, PluginSuccess,
 };
 
 /// What a proxy needs to invoke a registration safely.
@@ -171,11 +170,14 @@ fn install_tool_request_intercept(
                 .await
                 .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
                     registration: registration_id.clone(),
+                    // The phase decides what may be asserted: a refusal before
+                    // the backend means nothing ran, and an error after it means
+                    // the callback's execution is unaccounted for — which is a
+                    // different statement, and the one the caller has to see
+                    // rather than a definite negative.
+                    dispatch: error.dispatch(),
+                    certainty: error.certainty(),
                     failure: error.failure,
-                    // The call never reached the plugin: the manager refuses
-                    // before dispatch, so nothing was attempted.
-                    dispatch: DispatchState::NotDispatched,
-                    certainty: OutcomeCertainty::ConfirmedFailure,
                 })?;
             match outcome.result {
                 Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
@@ -263,14 +265,23 @@ mod tests {
         PluginExecutionBackend, PluginExecutionFuture, PluginManager,
     };
     use nemo_relay_plugin_protocol::{
-        PluginDescriptor, PluginExecutionOutcome, PluginInvokeResponse,
+        DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionOutcome,
+        PluginInvokeResponse,
     };
     use std::sync::Mutex;
+
+    /// Core's registration chains are process-global, so the tests that install
+    /// into them take turns: two suites sharing one registry would each observe
+    /// the other's proxies.
+    static PROXY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A backend that records what it was asked to run.
     #[derive(Default)]
     struct RecordingProxyBackend {
         invocations: Mutex<Vec<(String, String)>>,
+        /// When set, the backend fails *after* being entered, which is the case
+        /// the phase distinction exists for.
+        fails_after_being_entered: bool,
     }
 
     impl PluginExecutionBackend for RecordingProxyBackend {
@@ -313,6 +324,12 @@ mod tests {
                     .lock()
                     .expect("the record")
                     .push((request.registration_id.clone(), request.arguments.clone()));
+                if self.fails_after_being_entered {
+                    return Err(PluginProtocolError::new(
+                        PluginFailureCode::Unavailable,
+                        "the plugin host did not answer",
+                    ));
+                }
                 Ok(PluginExecutionOutcome {
                     dispatch: DispatchState::NotDispatched,
                     certainty: OutcomeCertainty::ConfirmedSuccess,
@@ -363,6 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_proxy_reaches_the_backend_and_the_answer_returns_through_the_chain() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
         // Core's registries are process-global, so this is the only test in this
         // module that touches them.
         let backend = Arc::new(RecordingProxyBackend::default());
@@ -418,6 +436,108 @@ mod tests {
         .await
         .expect("the chain");
         assert_eq!(after["rewritten"], serde_json::Value::Null, "{after}");
+    }
+
+    /// The P0 the audit found: an error from a backend that was entered is not
+    /// proof that nothing ran, and a proxy that said so would state a fact it
+    /// cannot account for.
+    #[tokio::test]
+    async fn a_failure_after_the_backend_was_entered_is_uncertain_and_not_a_definite_negative() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let backend = Arc::new(RecordingProxyBackend {
+            invocations: Mutex::new(Vec::new()),
+            fails_after_being_entered: true,
+        });
+        let context = ProxyContext::new(
+            Arc::new(PluginManager::new(
+                backend.clone() as Arc<dyn PluginExecutionBackend>
+            )),
+            5_000,
+            "test-binding",
+        )
+        .expect("a budget to run in");
+        let installed = install(
+            context,
+            &descriptor(PluginRegistrationOperation::ToolRequestIntercept),
+            PluginHandle {
+                plugin_id: "example".into(),
+                generation: 1,
+            },
+        )
+        .expect("the one class this kernel proxies");
+
+        let error = nemo_relay::api::tool::tool_request_intercepts(
+            "example_tool",
+            serde_json::json!({"input": true}),
+        )
+        .await
+        .expect_err("the backend failed after it was entered");
+
+        // The plugin's own reason survives, and so does the honest answer about
+        // what happened: an attempt was made and the outcome is unknown.
+        match error {
+            nemo_relay::error::FlowError::PluginInvocation {
+                dispatch,
+                certainty,
+                failure,
+                ..
+            } => {
+                assert_eq!(dispatch, DispatchState::DispatchAttempted);
+                assert_eq!(certainty, OutcomeCertainty::Unknown);
+                assert_eq!(failure.code, PluginFailureCode::Unavailable);
+            }
+            other => panic!("expected a structured invocation failure, got {other:?}"),
+        }
+        assert_eq!(
+            backend.invocations.lock().expect("the record").len(),
+            1,
+            "the backend was reached before it failed"
+        );
+        drop(installed);
+    }
+
+    /// And the other half: a refusal the manager made *before* the backend is
+    /// proof that nothing ran, so it stays a definite negative.
+    #[tokio::test]
+    async fn a_manager_refusal_is_distinguishable_from_an_entered_backend() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let backend = Arc::new(RecordingProxyBackend::default());
+        let manager = PluginManager::new(backend.clone() as Arc<dyn PluginExecutionBackend>);
+        let expired = PluginExecutionContext {
+            operation_request_id: "operation-expired".into(),
+            protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+            runtime_binding_digest: "test-binding".into(),
+            // Already past: the manager refuses before reaching a backend.
+            deadline_unix_ms: 1,
+            remaining_budget_millis: 5_000,
+            max_response_bytes: 1024,
+        };
+        let error = manager
+            .invoke(
+                PluginInvokeRequest {
+                    handle: PluginHandle {
+                        plugin_id: "example".into(),
+                        generation: 1,
+                    },
+                    registration_id: "nemo-relay-plugin.v1.example:1:rewrite".into(),
+                    arguments: serde_json::json!({"tool": "t", "args": {}}).to_string(),
+                    budget_millis: 5_000,
+                },
+                expired,
+            )
+            .await
+            .expect_err("an operation that is already out of time");
+
+        assert_eq!(
+            error.phase,
+            nemo_relay_plugin_protocol::PluginInvocationPhase::RefusedBeforeBackend
+        );
+        assert_eq!(error.dispatch(), DispatchState::NotDispatched);
+        assert_eq!(error.certainty(), OutcomeCertainty::ConfirmedFailure);
+        assert!(
+            backend.invocations.lock().expect("the record").is_empty(),
+            "a refusal before the backend means the backend was never reached"
+        );
     }
 
     #[test]

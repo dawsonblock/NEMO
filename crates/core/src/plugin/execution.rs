@@ -33,8 +33,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use nemo_relay_plugin_protocol::{
     DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext,
     PluginExecutionOutcome, PluginFailureCode, PluginHostHealth, PluginInspectRequest,
-    PluginInvokeRequest, PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginSuccess,
-    PluginUnloadRequest, check_execution_context,
+    PluginInvocationError, PluginInvocationPhase, PluginInvokeRequest, PluginLoadRequest,
+    PluginLoadResponse, PluginProtocolError, PluginSuccess, PluginUnloadRequest,
+    check_execution_context,
 };
 
 /// A plugin operation in progress.
@@ -196,13 +197,29 @@ impl PluginManager {
     /// reserved so two live operations cannot share one, and the backend is
     /// reached only through here. That is what makes a kernel-side proxy a
     /// caller of the manager rather than a second path into the boundary.
+    ///
+    /// The error says how far the invocation got, because that is what a caller
+    /// may assert about effects: a refusal from `begin` proves nothing ran, and
+    /// an error from the backend proves nothing at all — the request may have
+    /// reached the plugin before the channel ended it.
     pub async fn invoke(
         &self,
         request: PluginInvokeRequest,
         context: PluginExecutionContext,
-    ) -> Result<PluginExecutionOutcome, PluginProtocolError> {
-        let _in_flight = self.begin(&context)?;
-        self.backend.invoke(request, context).await
+    ) -> Result<PluginExecutionOutcome, PluginInvocationError> {
+        let _in_flight = self
+            .begin(&context)
+            .map_err(|error| PluginInvocationError {
+                failure: error.failure,
+                phase: PluginInvocationPhase::RefusedBeforeBackend,
+            })?;
+        self.backend
+            .invoke(request, context)
+            .await
+            .map_err(|error| PluginInvocationError {
+                failure: error.failure,
+                phase: PluginInvocationPhase::BackendEntered,
+            })
     }
 
     /// Report backend health.

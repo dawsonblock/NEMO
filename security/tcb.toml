@@ -119,7 +119,7 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 [limits.nemo-relay]
 max_direct_dependencies = 40
 max_transitive_packages = 265
-max_source_lines = 72501
+max_source_lines = 72518
 max_unsafe_occurrences = 299
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
@@ -144,7 +144,7 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 [limits.nemo-relay-plugin-protocol]
 max_direct_dependencies = 4
 max_transitive_packages = 24
-max_source_lines = 1347
+max_source_lines = 1400
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -241,7 +241,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 10
 max_transitive_packages = 239
-max_source_lines = 4465
+max_source_lines = 4571
 max_unsafe_occurrences = 1
 direct_dependency_digest = "c1194b7bc7779bc35c8211fa7d87a9e2a439200177d387fe133b9e77ddc4a473"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

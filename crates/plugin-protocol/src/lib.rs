@@ -668,6 +668,59 @@ pub struct PluginContinuationRequest {
     pub invocation_json: String,
 }
 
+/// How far an invocation got before it stopped.
+///
+/// The distinction is the difference between a fact and a guess. A refusal the
+/// manager made before reaching a backend is proof that nothing ran; an error
+/// that came back *after* the backend was entered is not proof of anything,
+/// because the request may have reached the plugin before the channel, the
+/// process or the deadline ended it. Collapsing the two would let a runtime
+/// state "this did not happen" about work it cannot account for, which is the
+/// one claim NEMO's effect machinery exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInvocationPhase {
+    /// The invocation was refused before any backend was reached.
+    RefusedBeforeBackend,
+    /// The backend was entered and no trustworthy terminal outcome came back.
+    BackendEntered,
+}
+
+/// Why an invocation produced no outcome, and how far it got.
+///
+/// The failure is the plugin's own vocabulary; the phase is what the caller
+/// needs to decide what may be asserted about effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInvocationError {
+    /// Why the invocation stopped.
+    pub failure: PluginFailure,
+    /// How far it got.
+    pub phase: PluginInvocationPhase,
+}
+
+impl PluginInvocationError {
+    /// What may be asserted about dispatch, given only the phase.
+    ///
+    /// A refusal before the backend means nothing was attempted. Anything after
+    /// that leaves the callback's execution unaccounted for, so the honest answer
+    /// is "an attempt was made and the outcome is unknown" rather than a
+    /// definite negative.
+    pub fn dispatch(&self) -> DispatchState {
+        match self.phase {
+            PluginInvocationPhase::RefusedBeforeBackend => DispatchState::NotDispatched,
+            PluginInvocationPhase::BackendEntered => DispatchState::DispatchAttempted,
+        }
+    }
+
+    /// What the caller can prove about the outcome, given only the phase.
+    pub fn certainty(&self) -> OutcomeCertainty {
+        match self.phase {
+            PluginInvocationPhase::RefusedBeforeBackend => OutcomeCertainty::ConfirmedFailure,
+            PluginInvocationPhase::BackendEntered => OutcomeCertainty::Unknown,
+        }
+    }
+}
+
 /// The answer to a host call that returns a value or a structured failure.
 ///
 /// One type rather than one per call: the shape is the same for every host call
