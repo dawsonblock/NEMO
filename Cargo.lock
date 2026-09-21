@@ -2041,6 +2041,7 @@ dependencies = [
 name = "nemo-relay-plugin-host"
 version = "0.9.1-rc.4"
 dependencies = [
+ "chrono",
  "hyper-util",
  "nemo-relay",
  "nemo-relay-plugin",

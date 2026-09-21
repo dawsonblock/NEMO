@@ -27,6 +27,7 @@ use nemo_relay_plugin_proto::convert::{
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_proto::v1::plugin_host_client::PluginHostClient;
+use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
 use nemo_relay_plugin_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_VERSION, PluginDescriptor, PluginExecutionContext, PluginFailure,
     PluginFailureCode, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
@@ -36,8 +37,11 @@ use nemo_relay_plugin_protocol::{
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tonic::transport::Server;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
+
+use crate::runtime_service::{RelayRuntimeConfig, RelayRuntimeService};
 
 /// How to start a plugin host.
 #[derive(Debug, Clone)]
@@ -93,6 +97,14 @@ pub struct PluginHostSupervisor {
     process_id: Option<u32>,
     /// Removed when the supervisor drops, so nothing outlives the session.
     socket_dir: PathBuf,
+    /// The socket this kernel serves for the child's own calls.
+    kernel_endpoint: PathBuf,
+    /// The task serving it, aborted with the session.
+    ///
+    /// The handle keeps the task's own result rather than discarding it: a
+    /// server that stopped serving says so where the session ends, instead of
+    /// looking like a kernel whose socket merely went quiet.
+    runtime_server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     session: PluginSessionIdentity,
     client: PluginHostClient<Channel>,
 }
@@ -103,6 +115,23 @@ impl PluginHostSupervisor {
         let socket_dir = create_runtime_dir()?;
         let socket = socket_dir.join("s");
         let credential = Uuid::now_v7().to_string();
+        // The kernel's own socket, in the same private directory. The child is
+        // told about it and given a credential of its own: a call back into the
+        // kernel is a different relationship than a call into the host, and each
+        // side checks the credential the other was given rather than the path,
+        // which anybody who can read the environment already knows.
+        let kernel_endpoint = socket_dir.join("k");
+        let kernel_credential = Uuid::now_v7().to_string();
+        // Bound before the child starts, so the path it is told about exists by
+        // the time it could want it. Accepting begins once the session is
+        // established, because the service is bound to that session.
+        let kernel_listener =
+            tokio::net::UnixListener::bind(&kernel_endpoint).map_err(|error| {
+                unavailable(format!(
+                    "failed to bind the kernel's socket at '{}': {error}",
+                    kernel_endpoint.display()
+                ))
+            })?;
         let mut command = Command::new(&config.executable);
         // A filtered environment: the child gets what it needs to be this host
         // and nothing about the kernel's own environment that it has no business
@@ -115,6 +144,8 @@ impl PluginHostSupervisor {
             )
             .env("NEMO_RELAY_PLUGIN_HOST_SOCKET", &socket)
             .env("NEMO_RELAY_PLUGIN_HOST_CREDENTIAL", &credential)
+            .env("NEMO_RELAY_KERNEL_SOCKET", &kernel_endpoint)
+            .env("NEMO_RELAY_KERNEL_CREDENTIAL", &kernel_credential)
             .env(
                 "NEMO_RELAY_PLUGIN_HOST_BINDING",
                 &config.runtime_binding_digest,
@@ -193,10 +224,31 @@ impl PluginHostSupervisor {
             }
         };
 
+        // The kernel's side of the boundary, serving the session that was just
+        // established. It is spawned rather than awaited: nothing calls it until
+        // a plugin's host does, and holding `spawn` open for that would make
+        // starting a host depend on a call nobody has made.
+        let runtime_server = tokio::spawn(
+            Server::builder()
+                .add_service(RelayRuntimeServer::new(RelayRuntimeService::new(
+                    RelayRuntimeConfig {
+                        session_id: session.session_id.clone(),
+                        session_credential: kernel_credential,
+                        protocol_version: PROTOCOL_VERSION,
+                        runtime_binding_digest: config.runtime_binding_digest.clone(),
+                    },
+                )))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                    kernel_listener,
+                )),
+        );
+
         Ok(Self {
             child: Mutex::new(child),
             process_id,
             socket_dir,
+            kernel_endpoint,
+            runtime_server,
             session,
             client,
         })
@@ -205,6 +257,16 @@ impl PluginHostSupervisor {
     /// The session this host established.
     pub fn session(&self) -> &PluginSessionIdentity {
         &self.session
+    }
+
+    /// The socket this kernel serves for the child's own calls.
+    ///
+    /// The path is not a secret — the child is told it, and knowing it is not
+    /// enough to be served — so exposing it lets a caller point a host's client
+    /// at the right socket without also exposing the credential that authorises
+    /// it.
+    pub fn kernel_endpoint(&self) -> &Path {
+        &self.kernel_endpoint
     }
 
     /// The host's process id, as it was while the process was running.
@@ -270,6 +332,8 @@ impl PluginHostSupervisor {
 
 impl Drop for PluginHostSupervisor {
     fn drop(&mut self) {
+        // The server is this session's, and it goes when the session does.
+        self.runtime_server.abort();
         // The directory holds the socket and nothing else, and it is removed
         // with the session it belonged to.
         let _ = std::fs::remove_dir_all(&self.socket_dir);
@@ -356,6 +420,11 @@ impl ProcessPluginBackend {
     /// The host's process id, while it is running.
     pub fn process_id(&self) -> Option<u32> {
         self.supervisor.process_id()
+    }
+
+    /// The socket this backend's kernel serves for the child's own calls.
+    pub fn kernel_endpoint(&self) -> &Path {
+        self.supervisor.kernel_endpoint()
     }
 
     /// End the host process.

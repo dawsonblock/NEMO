@@ -605,6 +605,30 @@ holds the supervisor that starts it and the backend that reaches it.
   by collapsing `StaleHandle` into `UnknownPlugin` in the contract and watching
   both runs fail — the distinction between "never there" and "not there any
   more" is the thing the suite exists to hold.
+- **The other direction exists.** The protocol's service pair has always been
+  two-sided, and only one side was served: the host answered the kernel, and a
+  plugin's own host functions had nowhere to go, so a mark a plugin emitted went
+  into the child's copy of the runtime and stopped there. The kernel now serves
+  `RelayRuntime` on a second socket in the same private directory, bound before
+  the child starts so the path it is told about exists by the time it could want
+  it. The credential is a header rather than a payload field — it belongs to the
+  channel — and the service refuses a caller without it even when the caller
+  names the right session, which is the property the test asserts. `EmitMark` is
+  served in full: the mark is resolved against *this* runtime's scope stack,
+  converted through the same validator the wire uses, and emitted into this
+  process's event stream, so a subscriber here sees a mark a plugin raised in
+  another process. The parent is resolved under the lock and used after it is
+  released, so emitting cannot deadlock against a lock the emit itself takes. A
+  mark naming a scope this runtime does not have is refused rather than dropped
+  or re-parented: a mark attached to the wrong scope is a different event than
+  the one that was asked for. The other four operations are refused by name
+  (`unimplemented`) rather than answered as empty successes, and arrive with the
+  pieces that serve them — the scope and codec reads with the read capabilities,
+  the continuation and the duplex channel with the session driver.
+  **The host does not call back yet.** It is told the endpoint and given the
+  credential, and nothing in the child uses them; the routing that makes a
+  plugin's host functions cross is the next piece, and until it lands this is the
+  kernel being able to answer rather than the boundary being used.
 - **The transport enforces the negotiated frame limit.** Client and server
   decoders are configured from the same value the handshake negotiates, so the
   limit is enforced rather than declared.

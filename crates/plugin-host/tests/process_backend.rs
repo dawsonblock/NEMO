@@ -290,6 +290,51 @@ async fn the_process_backend_satisfies_the_shared_lifecycle_suite() {
 }
 
 #[tokio::test]
+async fn the_kernel_serves_its_socket_and_refuses_a_caller_without_the_credential() {
+    use nemo_relay_plugin_host::runtime_service::{SESSION_CREDENTIAL_HEADER, connect_to_kernel};
+    use tonic::metadata::MetadataValue;
+
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    let mut client = connect_to_kernel(
+        backend.kernel_endpoint(),
+        nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+    )
+    .await
+    .expect("the kernel serves the socket its child was told about");
+
+    let mark = |session_id: String| nemo_relay_plugin_proto::v1::EmitMarkRequest {
+        session_id,
+        operation_request_id: "operation-1".into(),
+        host_call_id: "call-1".into(),
+        name: "native.mark".into(),
+        ..Default::default()
+    };
+
+    // The path is not a secret — the child is told it, and a caller that knows
+    // it still has to be this session's host. Naming the right session
+    // deliberately: the credential is what makes the caller, not the identity it
+    // claims.
+    let anonymous = client
+        .emit_mark(mark(backend.session().session_id.clone()))
+        .await
+        .expect_err("a caller with no credential");
+    assert_eq!(anonymous.code(), tonic::Code::PermissionDenied);
+
+    let mut wrong = tonic::Request::new(mark(backend.session().session_id.clone()));
+    wrong.metadata_mut().insert(
+        SESSION_CREDENTIAL_HEADER,
+        MetadataValue::try_from("not-the-credential").expect("a header value"),
+    );
+    let refused = client
+        .emit_mark(wrong)
+        .await
+        .expect_err("a caller with another session's credential");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
 async fn a_host_that_has_exited_is_a_crash_and_not_an_answer() {
     let backend = ProcessPluginBackend::launch(host_config())
         .await
