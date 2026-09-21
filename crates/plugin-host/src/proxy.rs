@@ -22,7 +22,7 @@ use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
     DispatchState, OutcomeCertainty, PluginDescriptor, PluginExecutionContext, PluginFailureCode,
     PluginHandle, PluginInvokeRequest, PluginProtocolError, PluginRegistrationDescriptor,
-    PluginRegistrationOperation, PluginSuccess, deadline_expired,
+    PluginRegistrationOperation, PluginSuccess,
 };
 
 /// What a proxy needs to invoke a registration safely.
@@ -254,20 +254,6 @@ fn other_name(success: &PluginSuccess) -> &'static str {
         PluginSuccess::Inspected(_) => "an inspection",
         PluginSuccess::Health(_) => "a health report",
     }
-}
-
-/// Whether an outcome says the operation never started.
-pub fn never_dispatched(outcome: &nemo_relay_plugin_protocol::PluginExecutionOutcome) -> bool {
-    outcome.dispatch == DispatchState::NotDispatched
-        && matches!(
-            outcome.certainty,
-            OutcomeCertainty::ConfirmedFailure | OutcomeCertainty::ConfirmedSuccess
-        )
-}
-
-/// Whether the outcome's deadline has passed by the time it was reported.
-pub fn expired(context: &PluginExecutionContext, now_unix_ms: u64) -> bool {
-    deadline_expired(context.deadline_unix_ms, now_unix_ms)
 }
 
 #[cfg(test)]

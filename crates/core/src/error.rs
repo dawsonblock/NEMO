@@ -148,12 +148,13 @@ pub enum FlowError {
     /// being rendered into a message: a caller deciding whether an effect may
     /// have happened cannot read that off a string, and "the plugin may have
     /// dispatched" is not the same fact as "the plugin failed".
-    #[error("plugin registration '{registration}' failed: {}",
+    #[error("plugin registration '{registration}' {}: {}",
         match certainty {
             nemo_relay_plugin_protocol::OutcomeCertainty::Unknown =>
-                "the plugin may have dispatched; the outcome is unknown",
-            _ => "the plugin reported a failure",
-        })]
+                "may have dispatched, so the outcome is unknown",
+            _ => "reported a failure",
+        },
+        failure.message)]
     PluginInvocation {
         /// The registration that was invoked.
         registration: String,
