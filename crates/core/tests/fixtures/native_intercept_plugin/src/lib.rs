@@ -1,24 +1,30 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A native fixture that registers exactly one class.
+//! A native fixture that registers exactly the classes a kernel can serve.
 //!
 //! The other fixture registers on every surface the ABI exposes, which is what a
 //! completeness test wants and what a *qualification* test cannot use: a kernel
-//! that can proxy one class must refuse a plugin registering sixteen, so a test
-//! that drives one registration through a real process needs a plugin that made
-//! exactly one.
+//! that can proxy two classes must refuse a plugin registering sixteen, so a test
+//! that drives the servable classes through a real process needs a plugin that
+//! made exactly those registrations and no others. It grows with the kernel''s
+//! proxy coverage, which is the point: a plugin whose registrations are all
+//! servable is a plugin that can be isolated.
 //!
 //! What it does is deliberately trivial — it marks the arguments — because what
 //! is being qualified is the path, not the callback.
 
 use nemo_relay_plugin::{
-    ConfigDiagnostic, Json, NativePlugin, PluginContext, Result, nemo_relay_plugin,
+    ConfigDiagnostic, Json, LlmRequestInterceptOutcome, NativePlugin, PluginContext, Result,
+    nemo_relay_plugin,
 };
 use serde_json::{Map, json};
 
 /// Marker the rewrite adds, so a caller can see the callback ran.
 pub const REWRITE_MARKER: &str = "native_intercept";
+
+/// Marker the LLM rewrite adds.
+pub const LLM_MARKER: &str = "native_llm_intercept";
 
 struct InterceptPlugin;
 
@@ -32,6 +38,17 @@ impl NativePlugin for InterceptPlugin {
     }
 
     fn register(&mut self, _config: &Map<String, Json>, ctx: &mut PluginContext<'_>) -> Result<()> {
+        ctx.register_llm_request_intercept(
+            "fixture_intercept_llm_rewrite",
+            0,
+            false,
+            |_name, mut request, annotated| async move {
+                if let Json::Object(content) = &mut request.content {
+                    content.insert(LLM_MARKER.into(), json!(true));
+                }
+                Ok(LlmRequestInterceptOutcome::new(request, annotated))
+            },
+        )?;
         ctx.register_tool_request_intercept(
             "fixture_intercept_rewrite",
             0,

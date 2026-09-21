@@ -2094,6 +2094,77 @@ pub async fn llm_request_intercepts(
     Ok(outcome)
 }
 
+/// What one LLM request intercept is invoked with.
+///
+/// The chain holds both the request and whatever annotation a codec produced for
+/// it, and the callback may rewrite either, so both cross. A second shape that
+/// carried only the request would be a different invocation than the one the
+/// in-process chain makes, and a callback that rewrites `content` through the
+/// annotation would silently do nothing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LlmRequestInterceptInvocation {
+    /// The LLM call's logical name, as the chain passes it to callbacks.
+    pub name: String,
+    /// The provider request as the chain holds it.
+    pub request: LlmRequest,
+    /// The normalized annotation, when a request codec produced one.
+    #[serde(default)]
+    pub annotated_request: Option<AnnotatedLlmRequest>,
+}
+
+/// Run exactly one LLM request intercept, named by its registration.
+///
+/// The chain entry point runs every intercept for a name, which is what an LLM
+/// call needs and what a host cannot use: a host holding one plugin's
+/// registrations has to run *that* registration when the kernel asks, or the
+/// kernel's chain — which holds one proxy per registration — would run the
+/// plugin's whole set once per proxy. The callback is invoked with the same
+/// request, the same annotation and the same error handling it would have had
+/// from the chain, because it *is* the chain runner with one entry: identity is
+/// the only thing this changes.
+///
+/// The outcome crosses whole rather than as a rewritten request, because the
+/// callback may also schedule marks and record optimization evidence, and an
+/// invocation that dropped those would be a different invocation than the
+/// in-process one.
+///
+/// # Errors
+/// `NotFound` when nothing is registered under that name, which is the answer a
+/// caller needs to refuse the invocation rather than silently do nothing.
+pub async fn invoke_llm_request_intercept_registration(
+    registration: &str,
+    invocation: LlmRequestInterceptInvocation,
+) -> Result<LlmRequestInterceptOutcome> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.llm_request_intercepts);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_request_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no LLM request intercept is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::llm_request_intercepts_snapshot_chain(
+        &invocation.name,
+        invocation.request,
+        invocation.annotated_request,
+        &[entry],
+        false,
+    )
+    .await
+}
+
 /// Run only the LLM conditional-execution guardrail chain.
 ///
 /// This evaluates whether an LLM call should be allowed to proceed without

@@ -377,7 +377,14 @@ impl ProcessPluginBackend {
     /// host can run.
     pub fn supported_registration_operations()
     -> Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation> {
-        vec![nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept]
+        // The classes this kernel can install a proxy for and this host can run.
+        // A class appearing here without a proxy would let a load report success
+        // for a callback the runtime never calls, so the list grows one entry at
+        // a time, next to the proxy that makes the entry true.
+        vec![
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmRequestIntercept,
+        ]
     }
 
     /// Ask the host to activate components and report what they registered.

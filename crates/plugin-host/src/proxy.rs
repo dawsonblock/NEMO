@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use crate::operation_scopes::OperationScopes;
-use nemo_relay::api::runtime::ToolInterceptFn;
+use nemo_relay::api::llm::LlmRequest;
+use nemo_relay::api::runtime::{LlmRequestInterceptFn, ToolInterceptFn};
+use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
     PluginDescriptor, PluginExecutionContext, PluginFailureCode, PluginHandle, PluginInvokeRequest,
@@ -85,6 +87,7 @@ impl ProxyContext {
 /// that can only fail.
 pub struct RegistrationProxies {
     tool_request_intercepts: Vec<String>,
+    llm_request_intercepts: Vec<String>,
 }
 
 impl std::fmt::Debug for RegistrationProxies {
@@ -92,6 +95,7 @@ impl std::fmt::Debug for RegistrationProxies {
         formatter
             .debug_struct("RegistrationProxies")
             .field("tool_request_intercepts", &self.tool_request_intercepts)
+            .field("llm_request_intercepts", &self.llm_request_intercepts)
             .finish()
     }
 }
@@ -101,6 +105,7 @@ impl RegistrationProxies {
     pub fn registration_ids(&self) -> Vec<&str> {
         self.tool_request_intercepts
             .iter()
+            .chain(self.llm_request_intercepts.iter())
             .map(String::as_str)
             .collect()
     }
@@ -110,6 +115,9 @@ impl Drop for RegistrationProxies {
     fn drop(&mut self) {
         for registration in &self.tool_request_intercepts {
             let _ = nemo_relay::api::registry::deregister_tool_request_intercept(registration);
+        }
+        for registration in &self.llm_request_intercepts {
+            let _ = nemo_relay::api::registry::deregister_llm_request_intercept(registration);
         }
     }
 }
@@ -122,6 +130,7 @@ pub fn install(
 ) -> Result<RegistrationProxies, PluginProtocolError> {
     let mut installed = RegistrationProxies {
         tool_request_intercepts: Vec::new(),
+        llm_request_intercepts: Vec::new(),
     };
 
     for registration in &descriptor.registrations {
@@ -130,6 +139,12 @@ pub fn install(
                 install_tool_request_intercept(&context, registration, &handle)?;
                 installed
                     .tool_request_intercepts
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::LlmRequestIntercept => {
+                install_llm_request_intercept(&context, registration, &handle)?;
+                installed
+                    .llm_request_intercepts
                     .push(registration.registration_id.clone());
             }
             other => {
@@ -274,6 +289,104 @@ impl ProxyContext {
             max_response_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
         })
     }
+}
+
+/// Install the proxy for one LLM request intercept.
+///
+/// The same shape as the tool class, one level up: the kernel sends the
+/// invocation its own chain holds — the request *and* the annotation a codec
+/// produced, because a callback may rewrite either — and the child runs exactly
+/// the registration the kernel named. The outcome crosses whole, so the marks a
+/// callback schedules and the evidence it records arrive with it.
+fn install_llm_request_intercept(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let break_chain = registration.ordering.may_break_chain.unwrap_or(false);
+    let context = context.clone();
+
+    let callable: LlmRequestInterceptFn = Arc::new(
+        move |name: String, request: LlmRequest, annotated: Option<AnnotatedLlmRequest>| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            Box::pin(async move {
+                let invocation = nemo_relay::api::llm::LlmRequestInterceptInvocation {
+                    name,
+                    request,
+                    annotated_request: annotated,
+                };
+                let payload = serde_json::to_string(&invocation).map_err(|error| {
+                    nemo_relay::error::FlowError::Internal(format!(
+                        "an LLM request intercept invocation could not be serialized: {error}"
+                    ))
+                })?;
+                let execution = context.execution_context()?;
+                let request = PluginInvokeRequest {
+                    handle,
+                    registration_id: registration_id.clone(),
+                    arguments: payload,
+                    budget_millis: execution.remaining_budget_millis,
+                };
+                let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                    scopes.enter(
+                        &execution.operation_request_id,
+                        nemo_relay::api::runtime::current_scope_stack(),
+                    )
+                });
+                let outcome =
+                    context
+                        .manager
+                        .invoke(request, execution)
+                        .await
+                        .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        })?;
+                match outcome.result {
+                    Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
+                        .map_err(|error| {
+                            nemo_relay::error::FlowError::Internal(format!(
+                                "a proxied registration answered with something that is not an \
+                                 outcome: {error}"
+                            ))
+                        }),
+                    Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                        "a proxied registration answered with {}",
+                        other_name(&other)
+                    ))),
+                    Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id,
+                        dispatch: outcome.dispatch,
+                        certainty: outcome.certainty,
+                        failure,
+                    }),
+                }
+            })
+        },
+    );
+
+    nemo_relay::api::registry::register_llm_request_intercept(
+        &registration.registration_id,
+        priority,
+        break_chain,
+        callable,
+    )
+    .map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
 }
 
 /// The name of a success a proxy cannot turn into arguments.

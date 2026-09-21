@@ -361,11 +361,49 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     .await
     .expect("a plugin served from another process");
     assert_eq!(loaded.handles().len(), 1, "one plugin was loaded");
+    let mut registrations = loaded.registrations();
+    registrations.sort_unstable();
     assert_eq!(
-        loaded.registrations().len(),
-        1,
-        "the registration the plugin made is proxied here"
+        registrations,
+        vec![
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite"
+        ],
+        "every registration the plugin made is proxied here, in the classes this kernel serves"
     );
+
+    // The second class reaches the child the same way, under the same trusted
+    // budget the first does: the proxy refuses an invocation with nothing to
+    // inherit, so this is one rule reaching two chains rather than a second
+    // timeout source.
+    let called = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::llm::llm_call_execute(
+                nemo_relay::api::llm::LlmCallExecuteParams::builder()
+                    .name("example-model")
+                    .request(nemo_relay::api::llm::LlmRequest {
+                        headers: serde_json::Map::new(),
+                        content: serde_json::json!({"model": "example"}),
+                    })
+                    .func(std::sync::Arc::new(|request| {
+                        Box::pin(async move {
+                            Ok(nemo_relay::json::Json::Object(
+                                request.content.as_object().cloned().unwrap_or_default(),
+                            ))
+                        })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("the LLM chain should reach the child");
+    assert_eq!(called["native_llm_intercept"], true, "{called}");
 
     // And the chain reaches it: the rewrite happens in the child, and this call
     // reads as an ordinary tool request intercept.

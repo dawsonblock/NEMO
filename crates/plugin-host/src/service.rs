@@ -195,20 +195,21 @@ impl PluginHostService {
         let outcome: Result<
             nemo_relay_plugin_protocol::PluginExecutionOutcome,
             PluginProtocolError,
-        > = async {
-            if let Err(error) = self.established(&wire.session_id) {
-                return Ok(refusal(error.failure.message));
-            }
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
-            let request = invoke_request_from_wire(&wire, &context)?;
+        > =
+            async {
+                if let Err(error) = self.established(&wire.session_id) {
+                    return Ok(refusal(error.failure.message));
+                }
+                let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+                let request = invoke_request_from_wire(&wire, &context)?;
 
-            // Which registration this is comes from the host's own record of
-            // what the plugin registered, not from what the caller says: a
-            // caller that could name an arbitrary operation against a
-            // registration would be choosing the semantics of a call it did not
-            // make.
-            let operation = self.registration_operation(&request, &context).await?;
-            match operation {
+                // Which registration this is comes from the host's own record of
+                // what the plugin registered, not from what the caller says: a
+                // caller that could name an arbitrary operation against a
+                // registration would be choosing the semantics of a call it did not
+                // make.
+                let operation = self.registration_operation(&request, &context).await?;
+                match operation {
                 // The first class that crosses the boundary. Its payload is the
                 // tool name and the arguments to rewrite; the callback runs in
                 // this process, through the runtime this host links.
@@ -245,6 +246,36 @@ impl PluginHostService {
                         Err(error) => refusal(error.to_string()),
                     })
                 }
+                // The second class, and the same shape as the first: the
+                // kernel sends the invocation the chain holds, this process runs
+                // the one registration the kernel named, and the outcome travels
+                // back whole — including the marks the callback scheduled and any
+                // evidence it recorded, because an invocation that dropped those
+                // would not be the invocation the kernel's chain makes.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmRequestIntercept => {
+                    let invocation: nemo_relay::api::llm::LlmRequestInterceptInvocation =
+                        serde_json::from_str(&request.arguments).map_err(|error| {
+                            refused(format!(
+                                "an LLM request intercept payload must be an invocation: {error}"
+                            ))
+                        })?;
+                    let rewritten =
+                        nemo_relay::api::llm::invoke_llm_request_intercept_registration(
+                            &request.registration_id,
+                            invocation,
+                        )
+                        .await;
+                    Ok(match rewritten {
+                        Ok(outcome) => success(serde_json::to_string(&outcome).map_err(|error| {
+                            refused(format!(
+                                "the rewritten request could not be serialized: {error}"
+                            ))
+                        })?),
+                        // A registration that refused did not dispatch anything
+                        // anywhere else: this hook runs before the call.
+                        Err(error) => refusal(error.to_string()),
+                    })
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.
@@ -253,8 +284,8 @@ impl PluginHostService {
                     other.as_str()
                 ))),
             }
-        }
-        .await;
+            }
+            .await;
         outcome
     }
 

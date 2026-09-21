@@ -375,6 +375,63 @@ fn no_new_native_loading_appears_outside_the_grandfathered_paths() {
     );
 }
 
+/// Tokens that mean a crate is assembling the boundary itself.
+///
+/// `ProcessLoadedPlugins` exists so the four consumers that will select isolated
+/// plugins compose it once. A consumer that spawned its own supervisor, loaded
+/// through its own backend and installed its own proxies would be four subtly
+/// different lifecycle semantics wearing one interface, and the differences
+/// would show up as failures only one of them could reproduce.
+const COMPOSITION_TOKENS: &[&str] = &[
+    "ProcessPluginBackend::launch(",
+    "PluginHostSupervisor::spawn(",
+    "proxy::install(",
+];
+
+/// The crate that owns the composition, and the only one that may assemble it.
+const COMPOSITION_OWNER: &str = "plugin-host";
+
+#[test]
+fn only_the_composition_owner_assembles_the_process_boundary() {
+    let workspace = workspace_root();
+    let mut offenders = Vec::new();
+
+    for member in workspace_members(&workspace) {
+        let crate_name = member
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if crate_name == COMPOSITION_OWNER {
+            continue;
+        }
+        for directory in ["src", "tests"] {
+            let root = member.join(directory);
+            if !root.is_dir() {
+                continue;
+            }
+            let mut sources = Vec::new();
+            rust_sources(&root, &mut sources);
+            for (path, source) in sources {
+                for (index, line) in production_lines(&source) {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    for token in COMPOSITION_TOKENS {
+                        if line.contains(token) {
+                            offenders.push(format!(
+                                "{path}:{index} assembles the boundary with {token}; \
+                                 call ProcessLoadedPlugins instead"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(offenders.is_empty(), "{offenders:#?}");
+}
+
 #[test]
 fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the_implementation() {
     let workspace = workspace_root();

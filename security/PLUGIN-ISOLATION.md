@@ -649,6 +649,26 @@ holds the supervisor that starts it and the backend that reaches it.
   host's `invoke` is lost at that hop, and the mark lands in the child's own
   runtime exactly as before. Every seam below that hop is tested; the gap is the
   hop itself.
+- **A second class crosses: LLM request intercepts.** The same shape as the tool
+  class, one level up. The kernel sends the invocation its own chain holds — the
+  request *and* the annotation a codec produced, because a callback may rewrite
+  either — and the child runs exactly the registration the kernel named. The
+  outcome travels back whole, marks and evidence included, because an invocation
+  that dropped those would not be the invocation the kernel's chain makes; that is
+  also why this class was not treated as "generic JSON host call". Two things the
+  composition test now proves: a plugin that registers both servable classes
+  loads through `ProcessLoadedPlugins` with both registrations proxied, and an LLM
+  request through this chain comes back rewritten by native code in the other
+  process, under the same trusted budget the tool chain uses. What the kernel
+  still owns is unchanged — ordering, priority, chain-break, budget and
+  registration identity — and what the child owns is still "execute this exact
+  registration". A plugin that registers anything else is still refused whole,
+  which is the honest state until the remaining classes cross.
+- **One composition, and a test that keeps it that way.** A new architecture
+  check refuses `ProcessPluginBackend::launch`, `PluginHostSupervisor::spawn` and
+  `proxy::install` outside `plugin-host`, so the CLI, FFI, Python and Node cannot
+  each grow their own lifecycle semantics: they compose `ProcessLoadedPlugins` or
+  they load in process.
 - **A runtime can select the process backend.** `ProcessLoadedPlugins` is the
   composition that decision implies, in the order the boundary requires: start a
   host and handshake, load each approved artifact through the backend rather than
