@@ -770,6 +770,50 @@ holds the supervisor that starts it and the backend that reaches it.
   which is a signature rather than a load — and the token list no longer treats
   it as one.
 
+## Cutover matrix
+
+Which registration families can cross today, and what the ones that cannot need.
+The counts are how often each family is registered across the shipped fixtures,
+examples and integrations, because the question this matrix answers is *coverage
+per unit of added complexity* rather than protocol completeness.
+
+| family | wire | host invoke | kernel proxy | registrations | what it needs |
+|---|---|---|---|---|---|
+| tool request intercept | yes | yes | yes | 7 | — |
+| LLM request intercept | yes | yes | yes | 7 | — |
+| tool conditional guardrail | shape known | no | no | 6 | the exact-registration entry point; its lifecycle events need nothing new |
+| LLM conditional guardrail | shape known | no | no | 6 | the same |
+| subscriber | event | no | no | 27 | one shared decision: what an event is on the wire, and what a remote observer's failure means |
+| event metadata injector | event | no | no | 4 | that same decision |
+| mark sanitize guardrail | event | no | no | 9 | that same decision |
+| scope sanitize start/end guardrail | event | no | no | 6 + 6 | that same decision |
+| tool/LLM sanitize request/response guardrail | event | no | no | 6 + 6 + 6 + 6 | that same decision |
+| tool execution intercept | continuation | no | no | 11 | the duplex session: it wraps the call, so the child has to call back |
+| LLM execution intercept, stream intercept, continuations, completions, pull streams | continuation | no | no | 6 + 6 | the duplex session |
+
+Two conclusions the counts support.
+
+**The cheapest next class is a conditional guardrail.** Its callback is
+`(name, args) -> Option<String>` — the same payload as the tool request intercept
+that already crosses — and, unlike a stream or an execution intercept, it needs no
+second direction. Its observable behaviour needs nothing new either: the kernel's
+own chain emits the guardrail's scope start/end around the *proxy* entry, with the
+kernel's subscribers, so a remote guardrail is exactly as observable as an
+in-process one. What the child emits for its own copy of the call goes to a
+runtime with no subscribers, which is where the duplicate belongs.
+
+**The largest win is one decision, not one class.** Nine families and about
+seventy registration sites in this repository are event-shaped: something the
+runtime already holds is shown to a plugin, and the plugin may transform it. They
+differ in which fields they may change, not in what has to cross, so one vocabulary
+decision — what an event is on the wire, and what a remote observer's failure
+means — unlocks all nine at once. That is a better return than a fourth and fifth
+unary class taken one at a time, and it is the decision to take after the
+conditional guardrails.
+
+Nothing in this matrix changes the ordering that moves the metric: coverage, then
+the cutover, then the loader leaving, which is what finally drops the 621.
+
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process
 implementation the kernel used before. That is deliberate — the boundary and its
