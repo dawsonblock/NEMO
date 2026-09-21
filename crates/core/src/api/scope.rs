@@ -159,6 +159,44 @@ pub struct PopScopeParams<'a> {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
+/// One mark in the shape a host process forwards it.
+///
+/// The correlation identities are absent by design: the process running the
+/// callback knows which operation it is in, and the event parameters do not
+/// carry that.
+fn forwarded_mark(
+    params: &EmitMarkEventParams<'_>,
+) -> Result<crate::plugin::execution::ForwardedMark> {
+    let encode = |value: &Json, what: &str| -> Result<String> {
+        serde_json::to_string(value).map_err(|error| {
+            FlowError::InvalidArgument(format!("{what} cannot be encoded: {error}"))
+        })
+    };
+    Ok(crate::plugin::execution::ForwardedMark {
+        name: params.name.to_string(),
+        parent: params
+            .parent
+            .map(|handle| nemo_relay_plugin_protocol::PluginScopeReference {
+                scope_id: handle.uuid,
+            }),
+        data_json: params
+            .data
+            .as_ref()
+            .map(|data| encode(data, "mark data"))
+            .transpose()?,
+        metadata_json: params
+            .metadata
+            .as_ref()
+            .map(|metadata| encode(metadata, "mark metadata"))
+            .transpose()?,
+        data_schema: params.data_schema.clone(),
+        severity: params.severity,
+        timestamp_unix_micros: params
+            .timestamp
+            .and_then(|timestamp| u64::try_from(timestamp.timestamp_micros()).ok()),
+    })
+}
+
 /// Builder parameters for [`event`].
 #[derive(TypedBuilder)]
 #[builder(field_defaults(setter(strip_option(ignore_invalid, fallback_suffix = "_opt"))))]
@@ -452,6 +490,13 @@ fn pop_scope_inner(
 /// from the active scope stack.
 pub fn event(params: EmitMarkEventParams<'_>) -> Result<()> {
     ensure_runtime_owner()?;
+    // A host process runs a plugin's callbacks, and the marks those raise belong
+    // to the kernel's event stream rather than to this process's copy of it. When
+    // a forwarder is in scope the mark leaves instead of being emitted here:
+    // emitting both would show subscribers two events for one mark.
+    if let Some(forwarder) = crate::plugin::execution::current_mark_forwarder() {
+        return forwarder.forward(&forwarded_mark(&params)?);
+    }
     let parent_uuid = resolve_parent_uuid(params.parent);
     let metadata = metadata_with_log_severity(params.metadata, params.severity)?;
     let scope_stack = current_scope_stack();

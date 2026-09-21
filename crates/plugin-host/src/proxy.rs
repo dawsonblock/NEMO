@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::operation_scopes::OperationScopes;
 use nemo_relay::api::runtime::ToolInterceptFn;
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
@@ -43,6 +44,12 @@ pub struct ProxyContext {
     ///
     /// A cap, not a budget: it can only shorten what the runtime published.
     local_cap_millis: u64,
+    /// Where an in-flight operation's scope is registered, when this kernel has a
+    /// host that forwards a plugin's marks back to it.
+    ///
+    /// Optional because a kernel that forwards nothing has no use for it, and a
+    /// proxy without one simply leaves the registry alone.
+    operation_scopes: Option<Arc<OperationScopes>>,
 }
 
 impl ProxyContext {
@@ -56,7 +63,18 @@ impl ProxyContext {
             manager,
             runtime_binding_digest: runtime_binding_digest.into(),
             local_cap_millis,
+            operation_scopes: None,
         }
+    }
+
+    /// Register in-flight operations in `scopes`.
+    ///
+    /// What this buys is attribution: a mark a plugin raises while its
+    /// registration runs arrives on the kernel's server task, and the operation's
+    /// scope is what says which call the mark belongs to.
+    pub fn with_operation_scopes(mut self, scopes: Arc<OperationScopes>) -> Self {
+        self.operation_scopes = Some(scopes);
+        self
     }
 }
 
@@ -160,6 +178,15 @@ fn install_tool_request_intercept(
                 arguments: payload.to_string(),
                 budget_millis: execution.remaining_budget_millis,
             };
+            // The operation is registered for as long as it is in flight, so a
+            // mark the host forwards while this registration runs reaches the
+            // scope of the call that raised it rather than the server task's.
+            let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                scopes.enter(
+                    &execution.operation_request_id,
+                    nemo_relay::api::runtime::current_scope_stack(),
+                )
+            });
             let outcome = context
                 .manager
                 .invoke(request, execution)

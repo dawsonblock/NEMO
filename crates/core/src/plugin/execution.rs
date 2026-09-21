@@ -339,6 +339,65 @@ pub fn plugin_failure_as_effect_error(
     Some(translated)
 }
 
+/// One mark a plugin emitted, on its way to the runtime that owns the stream.
+///
+/// The fields are the ABI's, without the correlation identities: which operation
+/// and which host call a mark belongs to is known by the process running the
+/// callback, and a mark cannot name either from the event parameters alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedMark {
+    /// The mark's name.
+    pub name: String,
+    /// The scope the mark named, as the emitting process knows it.
+    pub parent: Option<nemo_relay_plugin_protocol::PluginScopeReference>,
+    /// The mark's payload, as JSON text.
+    pub data_json: Option<String>,
+    /// Metadata attached to the mark, as JSON text.
+    pub metadata_json: Option<String>,
+    /// The schema the payload is written against, when it declares one.
+    pub data_schema: Option<nemo_relay_plugin_protocol::DataSchema>,
+    /// How severe the mark is, when it declares that.
+    pub severity: Option<nemo_relay_plugin_protocol::LogSeverity>,
+    /// Microseconds since the Unix epoch, when the emitter supplied a time.
+    pub timestamp_unix_micros: Option<u64>,
+}
+
+/// Where a host process sends the marks its plugins emit.
+///
+/// A native plugin's callbacks run in the host process, but the event stream
+/// they belong to is the kernel's: a mark that stayed in the child would be seen
+/// by no subscriber that matters. The host installs one of these around the
+/// window in which it runs a plugin's callback, and this runtime hands every
+/// mark raised in that window over instead of emitting it locally.
+///
+/// Synchronous because emitting a mark is: the callback is inside the runtime's
+/// own mark path, and an asynchronous sink would have to block it.
+pub trait MarkForwarder: Send + Sync {
+    /// Hand one mark to wherever it is going.
+    fn forward(&self, mark: &ForwardedMark) -> crate::error::Result<()>;
+}
+
+tokio::task_local! {
+    static MARK_FORWARDER: Arc<dyn MarkForwarder>;
+}
+
+/// Run a future with every mark it raises sent to `forwarder`.
+///
+/// The window is the caller's decision, and the host sets it around a plugin's
+/// callback rather than around the process: a mark raised outside that window is
+/// this runtime's own and belongs here.
+pub async fn with_mark_forwarder<F>(forwarder: Arc<dyn MarkForwarder>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    MARK_FORWARDER.scope(forwarder, future).await
+}
+
+/// The forwarder in scope, when this process is hosting a plugin's callback.
+pub(crate) fn current_mark_forwarder() -> Option<Arc<dyn MarkForwarder>> {
+    MARK_FORWARDER.try_with(Arc::clone).ok()
+}
+
 /// Wall-clock milliseconds, for comparing against an absolute deadline.
 ///
 /// A clock before the epoch reports zero rather than failing: every deadline

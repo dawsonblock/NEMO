@@ -21,8 +21,9 @@
 //! for facts the status already names.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use nemo_relay::api::runtime::current_scope_stack;
+use crate::operation_scopes::OperationScopes;
 use nemo_relay::api::scope::EmitMarkEventParams;
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_proto::v1::relay_runtime_client::RelayRuntimeClient;
@@ -77,6 +78,8 @@ pub struct RelayRuntimeConfig {
     pub protocol_version: u16,
     /// Digest of the runtime identity this session is bound to.
     pub runtime_binding_digest: String,
+    /// The scope stack each in-flight operation belongs to.
+    pub operation_scopes: Arc<OperationScopes>,
 }
 
 /// Serves the calls a plugin's host makes back into the kernel.
@@ -124,7 +127,32 @@ impl RelayRuntime for RelayRuntimeService {
         }
         let mark = nemo_relay_plugin_proto::convert::mark_request_from_wire(&wire)
             .map_err(|error| Status::invalid_argument(error.failure.message))?;
-        emit(&mark).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        // A scope the host process names is a scope identity from *that*
+        // process, and this kernel cannot resolve it to one of its own. Refusing
+        // is the only honest answer: attaching the mark to a guessed scope would
+        // be a different event than the one that was asked for, and dropping the
+        // name would attach it to the invocation's scope without saying so.
+        if mark.parent.is_some() {
+            return Err(Status::failed_precondition(
+                "a mark naming a scope cannot be attributed: a scope identity from the host \
+                 process means nothing to this kernel until scope operations cross the boundary",
+            ));
+        }
+        // The invocation's own scope, not the server task's: the mark belongs to
+        // the call that raised it, and a mark with no invocation in flight is
+        // refused rather than attached to whatever this task happens to be in.
+        let stack = self
+            .config
+            .operation_scopes
+            .stack_for(&mark.operation_request_id)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "no invocation of that operation is in flight in this kernel, so the mark \
+                     cannot be attributed to one",
+                )
+            })?;
+        nemo_relay::api::runtime::with_scope_stack(stack, || emit(&mark))
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(v1::EmitMarkResponse {}))
     }
 
@@ -184,26 +212,10 @@ impl RelayRuntime for RelayRuntimeService {
 /// is refused rather than dropped or re-parented, because a mark attached to the
 /// wrong scope is a different event than the one that was asked for.
 fn emit(mark: &PluginMarkEmit) -> nemo_relay::error::Result<()> {
-    let parent = match mark.parent.as_ref() {
-        Some(reference) => {
-            let resolved = {
-                let stack = current_scope_stack();
-                let stack = stack
-                    .read()
-                    .map_err(|error| nemo_relay::error::FlowError::Internal(error.to_string()))?;
-                stack.find(&reference.scope_id).cloned()
-            };
-            // Resolved under the lock and used after releasing it, so emitting
-            // cannot deadlock against a lock the emit itself takes.
-            Some(resolved.ok_or_else(|| {
-                nemo_relay::error::FlowError::NotFound(format!(
-                    "the mark names scope {} which this runtime does not have",
-                    reference.scope_id
-                ))
-            })?)
-        }
-        None => None,
-    };
+    // The caller has already refused a named parent and put this emit inside the
+    // invocation's scope, so the mark attaches to that scope rather than to one
+    // the host process named.
+    let parent: Option<nemo_relay::api::scope::ScopeHandle> = None;
     let json = |text: &str, what: &str| -> nemo_relay::error::Result<nemo_relay::json::Json> {
         serde_json::from_str(text).map_err(|error| {
             nemo_relay::error::FlowError::InvalidArgument(format!("{what} is not JSON: {error}"))
@@ -264,13 +276,16 @@ mod tests {
     const SESSION_ID: &str = "runtime-service-session";
     const CREDENTIAL: &str = "runtime-service-credential";
 
-    fn service() -> RelayRuntimeService {
-        RelayRuntimeService::new(RelayRuntimeConfig {
+    fn service() -> (RelayRuntimeService, Arc<OperationScopes>) {
+        let scopes = Arc::new(OperationScopes::new());
+        let service = RelayRuntimeService::new(RelayRuntimeConfig {
             session_id: SESSION_ID.into(),
             session_credential: CREDENTIAL.into(),
             protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
             runtime_binding_digest: "runtime-service-binding".into(),
-        })
+            operation_scopes: Arc::clone(&scopes),
+        });
+        (service, scopes)
     }
 
     fn request() -> v1::EmitMarkRequest {
@@ -300,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_back_into_the_kernel_needs_this_session_s_credential() {
         let _guard = RUNTIME_SERVICE_LOCK.lock().await;
-        let service = service();
+        let (service, _scopes) = service();
 
         // Knowing where the socket is, and even which session it serves, is not
         // being the host of that session.
@@ -346,7 +361,13 @@ mod tests {
         )
         .expect("a subscriber");
 
-        let service = service();
+        let (service, scopes) = service();
+        // The kernel registers the operation while it is in flight; the mark is
+        // attributed to that scope rather than to the server task's.
+        let _in_flight = scopes.enter(
+            "operation-1",
+            nemo_relay::api::runtime::create_scope_stack(),
+        );
         service
             .emit_mark(authenticated(request()))
             .await
@@ -380,18 +401,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mark_naming_a_scope_this_runtime_does_not_have_is_refused() {
+    async fn a_mark_that_cannot_be_attributed_is_refused() {
         let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, scopes) = service();
+
+        // Nothing is running this operation in this kernel, so the mark has no
+        // invocation to belong to. Attaching it to whatever scope the server task
+        // happens to be in would be an event nobody asked for.
+        let unknown = service
+            .emit_mark(authenticated(request()))
+            .await
+            .expect_err("a mark for an operation nothing is running");
+        assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
+
+        let _in_flight = scopes.enter(
+            "operation-1",
+            nemo_relay::api::runtime::create_scope_stack(),
+        );
+
+        // A parent is a scope identity from the host process, which this kernel
+        // cannot resolve: refusing says so, and ignoring the name would attach
+        // the mark somewhere the plugin did not ask for.
         let mut orphaned = request();
         orphaned.parent = Some(v1::ScopeReference {
             scope_id: nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
         });
-        let refused = service()
+        let refused = service
             .emit_mark(authenticated(orphaned))
             .await
-            .expect_err("a mark attached to a scope this runtime does not have");
-        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
-        assert!(refused.message().contains("does not have"), "{refused}");
+            .expect_err("a mark naming a scope from the host process");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     }
 
     /// The wire form the tests above send is the one a host would send.

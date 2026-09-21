@@ -85,6 +85,77 @@ pub struct PluginHostService {
     host_instance_id: String,
     /// The session this host established, if any.
     session: Mutex<HostSession>,
+    /// Where the marks this host's plugins raise are sent, when this host was
+    /// given a kernel to send them to.
+    mark_forwarding: Option<tokio::sync::mpsc::UnboundedSender<ForwardedStep>>,
+}
+
+/// One step on the path a forwarded mark takes back to the kernel.
+///
+/// The marks and the flush travel on one channel so they cannot overtake each
+/// other: a flush that arrived before the marks it waits for would report
+/// success while they were still queued.
+#[derive(Debug)]
+pub enum ForwardedStep {
+    /// Send this mark to the kernel that owns the event stream.
+    Mark {
+        /// The session the mark belongs to.
+        session_id: String,
+        /// The mark itself, boxed so the flush arm is not dwarfed by it: the
+        /// arms travel on one channel, and a size difference between them is
+        /// paid by every message.
+        mark: Box<nemo_relay_plugin_protocol::PluginMarkEmit>,
+    },
+    /// Everything sent before this arrived; answer on `done`.
+    Flush {
+        /// Receives the first delivery failure since the last flush, if any.
+        done: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// The sink a plugin's callback raises marks into.
+struct ForwardingSink {
+    sender: tokio::sync::mpsc::UnboundedSender<ForwardedStep>,
+    session_id: String,
+    /// The operation this host is running, which every mark belongs to.
+    operation_request_id: String,
+    /// A distinct identity per mark, minted here because a callback can raise
+    /// several marks within one operation.
+    host_calls: std::sync::atomic::AtomicU64,
+}
+
+impl nemo_relay::plugin::execution::MarkForwarder for ForwardingSink {
+    fn forward(
+        &self,
+        mark: &nemo_relay::plugin::execution::ForwardedMark,
+    ) -> nemo_relay::error::Result<()> {
+        let host_call_id = format!(
+            "{}-{}",
+            self.operation_request_id,
+            self.host_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        self.sender
+            .send(ForwardedStep::Mark {
+                session_id: self.session_id.clone(),
+                mark: Box::new(nemo_relay_plugin_protocol::PluginMarkEmit {
+                    operation_request_id: self.operation_request_id.clone(),
+                    host_call_id,
+                    name: mark.name.clone(),
+                    data_json: mark.data_json.clone(),
+                    parent: mark.parent,
+                    metadata_json: mark.metadata_json.clone(),
+                    data_schema: mark.data_schema.clone(),
+                    severity: mark.severity,
+                    timestamp_unix_micros: mark.timestamp_unix_micros,
+                }),
+            })
+            .map_err(|_| {
+                nemo_relay::error::FlowError::Internal(
+                    "the kernel this host forwards marks to is no longer reachable".to_string(),
+                )
+            })
+    }
 }
 
 impl PluginHostService {
@@ -95,7 +166,96 @@ impl PluginHostService {
             config,
             host_instance_id: Uuid::now_v7().to_string(),
             session: Mutex::new(HostSession::New),
+            mark_forwarding: None,
         }
+    }
+
+    /// Forward the marks this host's plugins raise to the kernel.
+    ///
+    /// The sender is this host's end of one channel; whoever holds the other end
+    /// has the connection back to the kernel. Without one, a mark a plugin raises
+    /// is emitted into this process's own runtime, where the kernel's subscribers
+    /// cannot see it.
+    pub fn with_mark_forwarding(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<ForwardedStep>,
+    ) -> Self {
+        self.mark_forwarding = Some(sender);
+        self
+    }
+
+    /// Run one registration for a validated invocation.
+    ///
+    /// Split out of the service method so the window in which a plugin's marks
+    /// are forwarded can be wrapped around exactly this work.
+    async fn serve_invocation(
+        &self,
+        wire: v1::InvokeRequest,
+    ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
+        let outcome: Result<
+            nemo_relay_plugin_protocol::PluginExecutionOutcome,
+            PluginProtocolError,
+        > = async {
+            if let Err(error) = self.established(&wire.session_id) {
+                return Ok(refusal(error.failure.message));
+            }
+            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let request = invoke_request_from_wire(&wire, &context)?;
+
+            // Which registration this is comes from the host's own record of
+            // what the plugin registered, not from what the caller says: a
+            // caller that could name an arbitrary operation against a
+            // registration would be choosing the semantics of a call it did not
+            // make.
+            let operation = self.registration_operation(&request, &context).await?;
+            match operation {
+                // The first class that crosses the boundary. Its payload is the
+                // tool name and the arguments to rewrite; the callback runs in
+                // this process, through the runtime this host links.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept => {
+                    let payload: serde_json::Value = serde_json::from_str(&request.arguments)
+                        .map_err(|error| {
+                            refused(format!(
+                                "a tool request intercept payload must be JSON: {error}"
+                            ))
+                        })?;
+                    let tool = payload
+                        .get("tool")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| refused("a tool request intercept payload names no tool"))?
+                        .to_string();
+                    let args = payload.get("args").cloned().ok_or_else(|| {
+                        refused("a tool request intercept payload carries no arguments")
+                    })?;
+                    let rewritten =
+                        nemo_relay::api::tool::invoke_tool_request_intercept_registration(
+                            &request.registration_id,
+                            &tool,
+                            args,
+                        )
+                        .await;
+                    Ok(match rewritten {
+                        Ok(value) => success(serde_json::to_string(&value).map_err(|error| {
+                            refused(format!(
+                                "the rewritten arguments could not be serialized: {error}"
+                            ))
+                        })?),
+                        // A registration that refused did not dispatch anything
+                        // anywhere else: this hook runs before the call.
+                        Err(error) => refusal(error.to_string()),
+                    })
+                }
+                // Every other class is refused by name rather than answered as
+                // an empty success, because a caller cannot tell the two apart
+                // and would read one as the other.
+                other => Ok(refusal(format!(
+                    "this host does not serve {} invocations yet",
+                    other.as_str()
+                ))),
+            }
+        }
+        .await;
+        outcome
     }
 
     /// Validate the session every later request has to name.
@@ -453,69 +613,52 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 "an invocation must carry a context naming the operation it belongs to",
             ));
         };
-        let outcome: Result<
-            nemo_relay_plugin_protocol::PluginExecutionOutcome,
-            PluginProtocolError,
-        > = async {
-            if let Err(error) = self.established(&wire.session_id) {
-                return Ok(refusal(error.failure.message));
-            }
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
-            let request = invoke_request_from_wire(&wire, &context)?;
-
-            // Which registration this is comes from the host's own record of
-            // what the plugin registered, not from what the caller says: a
-            // caller that could name an arbitrary operation against a
-            // registration would be choosing the semantics of a call it did not
-            // make.
-            let operation = self.registration_operation(&request, &context).await?;
-            match operation {
-                // The first class that crosses the boundary. Its payload is the
-                // tool name and the arguments to rewrite; the callback runs in
-                // this process, through the runtime this host links.
-                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept => {
-                    let payload: serde_json::Value = serde_json::from_str(&request.arguments)
-                        .map_err(|error| {
-                            refused(format!(
-                                "a tool request intercept payload must be JSON: {error}"
-                            ))
-                        })?;
-                    let tool = payload
-                        .get("tool")
-                        .and_then(|value| value.as_str())
-                        .ok_or_else(|| refused("a tool request intercept payload names no tool"))?
-                        .to_string();
-                    let args = payload.get("args").cloned().ok_or_else(|| {
-                        refused("a tool request intercept payload carries no arguments")
-                    })?;
-                    let rewritten =
-                        nemo_relay::api::tool::invoke_tool_request_intercept_registration(
-                            &request.registration_id,
-                            &tool,
-                            args,
-                        )
-                        .await;
-                    Ok(match rewritten {
-                        Ok(value) => success(serde_json::to_string(&value).map_err(|error| {
-                            refused(format!(
-                                "the rewritten arguments could not be serialized: {error}"
-                            ))
-                        })?),
-                        // A registration that refused did not dispatch anything
-                        // anywhere else: this hook runs before the call.
-                        Err(error) => refusal(error.to_string()),
-                    })
+        // The window in which a plugin's callback runs is the window in which
+        // its marks belong to the kernel rather than to this process, so the
+        // forwarder is installed around exactly that call.
+        let outcome = match &self.mark_forwarding {
+            Some(sender) => {
+                let sink = std::sync::Arc::new(ForwardingSink {
+                    sender: sender.clone(),
+                    session_id: wire.session_id.clone(),
+                    operation_request_id: operation_request_id.clone(),
+                    host_calls: std::sync::atomic::AtomicU64::new(0),
+                });
+                let answered = nemo_relay::plugin::execution::with_mark_forwarder(
+                    sink,
+                    self.serve_invocation(wire),
+                )
+                .await;
+                // What the invocation raised is delivered before the answer that
+                // ends it. A mark that could not be delivered is not a lost log
+                // line: the invocation produced evidence this kernel will never
+                // see, so the answer it would have given is not one the kernel
+                // may read as complete.
+                let (done, delivered) = tokio::sync::oneshot::channel();
+                if sender.send(ForwardedStep::Flush { done }).is_err() {
+                    return Err(Status::unavailable(
+                        "this host can no longer reach the kernel its plugins' marks belong to",
+                    ));
                 }
-                // Every other class is refused by name rather than answered as
-                // an empty success, because a caller cannot tell the two apart
-                // and would read one as the other.
-                other => Ok(refusal(format!(
-                    "this host does not serve {} invocations yet",
-                    other.as_str()
-                ))),
+                match delivered.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return Err(Status::unavailable(format!(
+                            "the marks this invocation raised could not be delivered: {error}"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(Status::unavailable(
+                            "this host stopped forwarding before this invocation's marks were \
+                             delivered",
+                        ));
+                    }
+                }
+                answered
             }
-        }
-        .await;
+            None => self.serve_invocation(wire).await,
+        };
+
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => refusal(error.failure.message),

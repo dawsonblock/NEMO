@@ -279,8 +279,8 @@ const MANIFEST: &[Entry] = &[
     ),
     entry(
         "EmitMarkRequest",
-        "wire->domain",
-        &["mark_request_from_wire"],
+        "both",
+        &["mark_request_from_wire", "mark_request_to_wire"],
         &["EmitMarkRequest"],
         &["a_mark_that_cannot_mean_what_it_says_is_refused"],
     ),

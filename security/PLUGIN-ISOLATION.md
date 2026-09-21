@@ -629,6 +629,26 @@ holds the supervisor that starts it and the backend that reaches it.
   credential, and nothing in the child uses them; the routing that makes a
   plugin's host functions cross is the next piece, and until it lands this is the
   kernel being able to answer rather than the boundary being used.
+- **Routing a mark back, and the hop that is not covered yet.** The host now
+  connects to the kernel at startup and forwards the marks its plugins raise:
+  core has a `MarkForwarder` seam that a host installs around a callback and the
+  child drains one channel with a flush step, so a mark is delivered *before* the
+  answer that ends the invocation, and a mark that could not be delivered fails
+  the invocation rather than disappearing. Attribution is explicit rather than
+  guessed: the kernel's proxy registers an in-flight operation in
+  `OperationScopes` while a registration runs, the service emits a forwarded mark
+  inside that operation's scope, and a mark for an operation nothing is running —
+  or one naming a scope from the host process — is refused rather than attached
+  to whatever scope happened to be current on the server task. Kernel-side tests
+  cover the credential, the session, attribution, an unnamed mark, a payload that
+  is not JSON, and both refusals. **The end-to-end path does not work yet, and
+  the reason is structural rather than a detail:** the SDK's `PluginContext`
+  spawns a plugin's callback body onto its own executor
+  (`crates/plugin/src/…`, `executor.spawn(...)`), so the callback runs in a task
+  the host's forwarder window does not cover — a task-local set around the
+  host's `invoke` is lost at that hop, and the mark lands in the child's own
+  runtime exactly as before. Every seam below that hop is tested; the gap is the
+  hop itself.
 - **The transport enforces the negotiated frame limit.** Client and server
   decoders are configured from the same value the handshake negotiates, so the
   limit is enforced rather than declared.

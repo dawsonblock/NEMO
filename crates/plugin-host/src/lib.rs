@@ -421,6 +421,8 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 }
 
 pub mod conformance;
+/// Which scope stack each in-flight operation belongs to.
+pub mod operation_scopes;
 /// The kernel-side proxies for a plugin's registrations.
 pub mod proxy;
 /// The kernel's side of the boundary: the calls a running plugin makes back.

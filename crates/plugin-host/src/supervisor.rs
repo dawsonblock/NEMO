@@ -41,6 +41,7 @@ use tonic::transport::Server;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
+use crate::operation_scopes::OperationScopes;
 use crate::runtime_service::{RelayRuntimeConfig, RelayRuntimeService};
 
 /// How to start a plugin host.
@@ -105,6 +106,12 @@ pub struct PluginHostSupervisor {
     /// server that stopped serving says so where the session ends, instead of
     /// looking like a kernel whose socket merely went quiet.
     runtime_server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    /// The scope stack each in-flight operation belongs to.
+    ///
+    /// Held here because both sides of the kernel need the same map: the proxy
+    /// registers an operation while it runs, and the service looks the operation
+    /// up when the host forwards a mark a plugin raised during it.
+    operation_scopes: Arc<OperationScopes>,
     session: PluginSessionIdentity,
     client: PluginHostClient<Channel>,
 }
@@ -122,6 +129,7 @@ impl PluginHostSupervisor {
         // which anybody who can read the environment already knows.
         let kernel_endpoint = socket_dir.join("k");
         let kernel_credential = Uuid::now_v7().to_string();
+        let operation_scopes = Arc::new(OperationScopes::new());
         // Bound before the child starts, so the path it is told about exists by
         // the time it could want it. Accepting begins once the session is
         // established, because the service is bound to that session.
@@ -236,6 +244,7 @@ impl PluginHostSupervisor {
                         session_credential: kernel_credential,
                         protocol_version: PROTOCOL_VERSION,
                         runtime_binding_digest: config.runtime_binding_digest.clone(),
+                        operation_scopes: Arc::clone(&operation_scopes),
                     },
                 )))
                 .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
@@ -249,6 +258,7 @@ impl PluginHostSupervisor {
             socket_dir,
             kernel_endpoint,
             runtime_server,
+            operation_scopes,
             session,
             client,
         })
@@ -267,6 +277,14 @@ impl PluginHostSupervisor {
     /// it.
     pub fn kernel_endpoint(&self) -> &Path {
         &self.kernel_endpoint
+    }
+
+    /// The registry that says which scope an in-flight operation belongs to.
+    ///
+    /// Whoever installs a proxy registers into it, so a mark the host forwards
+    /// during an operation is attached to the call that raised it.
+    pub fn operation_scopes(&self) -> Arc<OperationScopes> {
+        Arc::clone(&self.operation_scopes)
     }
 
     /// The host's process id, as it was while the process was running.
@@ -425,6 +443,11 @@ impl ProcessPluginBackend {
     /// The socket this backend's kernel serves for the child's own calls.
     pub fn kernel_endpoint(&self) -> &Path {
         self.supervisor.kernel_endpoint()
+    }
+
+    /// The registry that says which scope an in-flight operation belongs to.
+    pub fn operation_scopes(&self) -> Arc<OperationScopes> {
+        self.supervisor.operation_scopes()
     }
 
     /// End the host process.

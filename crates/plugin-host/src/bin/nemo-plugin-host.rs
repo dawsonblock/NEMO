@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use nemo_relay_plugin_host::InProcessPluginBackend;
-use nemo_relay_plugin_host::service::{PluginHostConfig, PluginHostService};
+use nemo_relay_plugin_host::service::{ForwardedStep, PluginHostConfig, PluginHostService};
 use nemo_relay_plugin_proto::v1::plugin_host_server::PluginHostServer;
 use nemo_relay_plugin_protocol::PROTOCOL_VERSION;
 use tokio::net::UnixListener;
@@ -33,6 +33,10 @@ const CREDENTIAL: &str = "NEMO_RELAY_PLUGIN_HOST_CREDENTIAL";
 const BINDING: &str = "NEMO_RELAY_PLUGIN_HOST_BINDING";
 /// Protocol version the supervisor speaks.
 const PROTOCOL: &str = "NEMO_RELAY_PLUGIN_HOST_PROTOCOL";
+/// Socket the kernel serves for this host's own calls.
+const KERNEL_SOCKET: &str = "NEMO_RELAY_KERNEL_SOCKET";
+/// Credential the kernel gave this host for those calls.
+const KERNEL_CREDENTIAL: &str = "NEMO_RELAY_KERNEL_CREDENTIAL";
 
 fn main() -> ExitCode {
     let socket = match std::env::var_os(SOCKET) {
@@ -88,7 +92,83 @@ fn main() -> ExitCode {
         // makes the two comparable while the loader is still in the kernel's
         // dependency graph.
         let backend = std::sync::Arc::new(InProcessPluginBackend::new());
+        // The kernel's own socket: a plugin's marks belong to the kernel's event
+        // stream, so this process forwards them rather than emitting them into a
+        // runtime whose subscribers nobody reads. A host started without one
+        // emits them locally, which is all a host outside a kernel can do.
+        let forwarding = match (
+            std::env::var_os(KERNEL_SOCKET).map(PathBuf::from),
+            std::env::var(KERNEL_CREDENTIAL),
+        ) {
+            (Some(endpoint), Ok(kernel_credential)) if !kernel_credential.is_empty() => {
+                match nemo_relay_plugin_host::runtime_service::connect_to_kernel(
+                    &endpoint,
+                    nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+                )
+                .await
+                {
+                    Ok(mut client) => {
+                        let (sender, mut steps) =
+                            tokio::sync::mpsc::unbounded_channel::<ForwardedStep>();
+                        tokio::spawn(async move {
+                            let mut failure: Option<String> = None;
+                            while let Some(step) = steps.recv().await {
+                                match step {
+                                    ForwardedStep::Mark { session_id, mark } => {
+                                        if failure.is_some() {
+                                            // Already unusable: keep draining so a
+                                            // flush reports the first fault rather
+                                            // than waiting for a mark that will not
+                                            // be sent.
+                                            continue;
+                                        }
+                                        let wire =
+                                            nemo_relay_plugin_proto::convert::mark_request_to_wire(
+                                                &mark,
+                                                &session_id,
+                                            );
+                                        let mut request = tonic::Request::new(wire);
+                                        match kernel_credential.parse() {
+                                            Ok(value) => {
+                                                request.metadata_mut().insert(
+                                                    nemo_relay_plugin_host::runtime_service::SESSION_CREDENTIAL_HEADER,
+                                                    value,
+                                                );
+                                            }
+                                            Err(error) => {
+                                                failure =
+                                                    Some(format!("unusable credential: {error}"));
+                                                continue;
+                                            }
+                                        }
+                                        if let Err(status) = client.emit_mark(request).await {
+                                            failure = Some(status.to_string());
+                                        }
+                                    }
+                                    ForwardedStep::Flush { done } => {
+                                        let _ = done.send(failure.take().map_or(Ok(()), Err));
+                                    }
+                                }
+                            }
+                        });
+                        Some(sender)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "failed to reach the kernel at '{}': {error}",
+                            endpoint.display()
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let service = PluginHostService::new(backend, config);
+        let service = match forwarding {
+            Some(sender) => service.with_mark_forwarding(sender),
+            None => service,
+        };
         // The transport decoder is configured from the same limit the handshake
         // negotiates. A transport default that disagreed with the protocol would
         // make the negotiated frame size declarative rather than enforced.

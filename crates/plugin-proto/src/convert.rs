@@ -1559,6 +1559,34 @@ pub fn handshake_request_from_wire(
     })
 }
 
+/// Encode one mark for the wire.
+///
+/// This is the direction the forward path uses: a host process sends the marks
+/// its plugins raised to the kernel that owns the event stream. Encoding cannot
+/// fail — every field is already a validated domain value — so unlike the
+/// decoders this returns the message rather than a result.
+pub fn mark_request_to_wire(mark: &PluginMarkEmit, session_id: &str) -> v1::EmitMarkRequest {
+    v1::EmitMarkRequest {
+        session_id: session_id.to_owned(),
+        operation_request_id: mark.operation_request_id.clone(),
+        host_call_id: mark.host_call_id.clone(),
+        name: mark.name.clone(),
+        data_json: mark.data_json.clone(),
+        parent: mark.parent.map(|parent| v1::ScopeReference {
+            scope_id: parent.scope_id.hyphenated().to_string(),
+        }),
+        metadata_json: mark.metadata_json.clone(),
+        data_schema: mark.data_schema.as_ref().map(|schema| v1::MarkDataSchema {
+            name: schema.name.clone(),
+            version: schema.version.clone(),
+        }),
+        severity: mark.severity.map(severity_to_wire),
+        timestamp_unix_micros: mark
+            .timestamp_unix_micros
+            .and_then(|micros| i64::try_from(micros).ok()),
+    }
+}
+
 /// Validate a mark.
 ///
 /// The optional fields stay optional, and a present-but-empty one is refused
