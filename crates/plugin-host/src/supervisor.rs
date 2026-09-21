@@ -492,7 +492,14 @@ impl PluginExecutionBackend for ProcessPluginBackend {
             // the reason it exists: a plugin that may have dispatched before the
             // channel died produced no definite result, and collapsing that into
             // a failure would turn "nobody knows" into "it did not happen".
-            nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&outcome)
+            //
+            // It also has to be the outcome for *this* invocation: the answer
+            // names the operation the host accepted, and an answer that names a
+            // different one is refused here rather than attributed to this call.
+            nemo_relay_plugin_proto::convert::invocation_answer_from_wire(
+                &outcome,
+                &context.operation_request_id,
+            )
         })
     }
 

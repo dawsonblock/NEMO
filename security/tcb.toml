@@ -241,7 +241,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 10
 max_transitive_packages = 239
-max_source_lines = 4625
+max_source_lines = 4700
 max_unsafe_occurrences = 1
 direct_dependency_digest = "c1194b7bc7779bc35c8211fa7d87a9e2a439200177d387fe133b9e77ddc4a473"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -252,7 +252,7 @@ transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9e
 [limits.nemo-relay-plugin-proto]
 max_direct_dependencies = 4
 max_transitive_packages = 108
-max_source_lines = 3997
+max_source_lines = 4062
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"

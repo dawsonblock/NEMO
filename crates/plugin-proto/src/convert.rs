@@ -1012,6 +1012,7 @@ pub fn load_response_from_wire(
 /// actually known.
 pub fn execution_outcome_to_wire(
     outcome: &PluginExecutionOutcome,
+    operation_request_id: &str,
 ) -> Result<v1::InvokeOutcome, PluginProtocolError> {
     let result = match &outcome.result {
         Ok(PluginSuccess::Invoked(response)) => {
@@ -1029,7 +1030,36 @@ pub fn execution_outcome_to_wire(
         dispatch_state: dispatch_to_wire(outcome.dispatch) as i32,
         outcome_certainty: outcome_to_wire(outcome.certainty) as i32,
         result: Some(result),
+        operation_request_id: operation_request_id.to_owned(),
     })
+}
+
+/// Read an invocation outcome that names the invocation it answers.
+///
+/// A host names the operation it accepted when it answers one, and the kernel
+/// checks that name rather than trusting the channel to have kept the pairing.
+/// An answer that names a different operation, or names none, is a malformed
+/// response: it is evidence about work this call cannot account for, and
+/// attributing it to this invocation would invent a fact about that work. The
+/// caller keeps the certainty that makes the invocation `UNKNOWN`, because an
+/// unattributable answer is not proof that nothing ran.
+pub fn invocation_answer_from_wire(
+    wire: &v1::InvokeOutcome,
+    expected_operation_request_id: &str,
+) -> Result<PluginExecutionOutcome, PluginProtocolError> {
+    let named = wire.operation_request_id.trim();
+    if named.is_empty() {
+        return Err(malformed(
+            "an invocation answer that names no operation cannot be attributed to one",
+        ));
+    }
+    if named != expected_operation_request_id {
+        return Err(malformed(format!(
+            "an invocation answer names '{named}' but arrived for \
+             '{expected_operation_request_id}'"
+        )));
+    }
+    execution_outcome_from_wire(wire)
 }
 
 /// Read an invocation outcome, refusing one that erases what is known.
@@ -2387,12 +2417,47 @@ mod tests {
             }),
         };
 
-        let wire = execution_outcome_to_wire(&outcome).expect("encode outcome");
+        let wire = execution_outcome_to_wire(&outcome, "operation-1").expect("encode outcome");
         let back = execution_outcome_from_wire(&wire).expect("decode outcome");
 
         assert_eq!(back, outcome);
         assert_eq!(back.dispatch, DispatchState::DispatchAttempted);
         assert_eq!(back.certainty, OutcomeCertainty::Unknown);
+        assert_eq!(wire.operation_request_id, "operation-1");
+    }
+
+    #[test]
+    fn an_answer_that_does_not_name_the_invocation_is_refused() {
+        // The kernel can only attribute an answer if the answer says which
+        // invocation it belongs to. An answer naming another operation is
+        // evidence about that operation, and an answer naming none is evidence
+        // about nothing; reading either as this invocation's outcome would put a
+        // fact into the record that nobody established.
+        let answered = |operation_request_id: &str| v1::InvokeOutcome {
+            dispatch_state: v1::DispatchState::DispatchAttempted as i32,
+            outcome_certainty: v1::OutcomeCertainty::Unknown as i32,
+            result: Some(v1::invoke_outcome::Result::Output("rewritten".into())),
+            operation_request_id: operation_request_id.into(),
+        };
+
+        let anonymous = invocation_answer_from_wire(&answered(""), "operation-1")
+            .expect_err("an answer that names no operation");
+        assert_eq!(
+            malformed_code(anonymous),
+            PluginFailureCode::MalformedResponse
+        );
+
+        let elsewhere = invocation_answer_from_wire(&answered("operation-2"), "operation-1")
+            .expect_err("an answer that names another operation");
+        assert_eq!(
+            malformed_code(elsewhere),
+            PluginFailureCode::MalformedResponse
+        );
+
+        let answered = invocation_answer_from_wire(&answered("operation-1"), "operation-1")
+            .expect("the invocation that asked");
+        assert_eq!(answered.dispatch, DispatchState::DispatchAttempted);
+        assert_eq!(answered.certainty, OutcomeCertainty::Unknown);
     }
 
     #[test]

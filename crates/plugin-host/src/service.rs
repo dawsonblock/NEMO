@@ -438,6 +438,21 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         request: Request<v1::InvokeRequest>,
     ) -> Result<Response<v1::InvokeOutcome>, Status> {
         let wire = request.into_inner();
+        // Every answer names the invocation it answers, so a request that
+        // carries no operation to name is refused at the transport level: an
+        // outcome nobody could attribute to this call is not an answer, and
+        // sending one in this message's shape would invite the kernel to read it
+        // as one.
+        let named = wire
+            .context
+            .as_ref()
+            .map(|context| context.operation_request_id.trim().to_owned())
+            .filter(|operation_request_id| !operation_request_id.is_empty());
+        let Some(operation_request_id) = named else {
+            return Err(Status::invalid_argument(
+                "an invocation must carry a context naming the operation it belongs to",
+            ));
+        };
         let outcome: Result<
             nemo_relay_plugin_protocol::PluginExecutionOutcome,
             PluginProtocolError,
@@ -505,7 +520,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
             Ok(outcome) => outcome,
             Err(error) => refusal(error.failure.message),
         };
-        let outcome = execution_outcome_to_wire(&outcome)
+        let outcome = execution_outcome_to_wire(&outcome, &operation_request_id)
             .map_err(|error| Status::internal(error.failure.message))?;
         Ok(Response::new(outcome))
     }
@@ -542,13 +557,20 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
 
     async fn invoke_stream(
         &self,
-        _request: Request<v1::InvokeRequest>,
+        request: Request<v1::InvokeRequest>,
     ) -> Result<Response<Self::InvokeStreamStream>, Status> {
         // No stream is produced, and the stream says so: a stream that simply
         // stopped would be a truncation the kernel cannot distinguish from a
         // host that died mid-answer.
         let refusal = v1::StreamChunk {
-            operation_request_id: String::new(),
+            // Named when the caller named one, for the same reason a unary
+            // answer names its invocation: a terminal frame that belongs to no
+            // operation is not a terminal frame.
+            operation_request_id: request
+                .into_inner()
+                .context
+                .map(|context| context.operation_request_id)
+                .unwrap_or_default(),
             chunk: Some(v1::stream_chunk::Chunk::Failure(v1::PluginFailure {
                 code: nemo_relay_plugin_proto::v1::FailureCode::Rejected as i32,
                 message: "this host does not serve streaming invocations".to_string(),
@@ -1398,6 +1420,10 @@ mod tests {
         let outcome = nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&invoked)
             .expect("a converted invocation");
         assert_eq!(
+            invoked.operation_request_id, "operation-1",
+            "the answer names the invocation the host accepted"
+        );
+        assert_eq!(
             outcome.dispatch,
             nemo_relay_plugin_protocol::DispatchState::NotDispatched
         );
@@ -1425,8 +1451,50 @@ mod tests {
         let outcome = nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&unknown)
             .expect("a converted invocation");
         assert!(outcome.result.is_err(), "{outcome:?}");
+        assert_eq!(
+            unknown.operation_request_id, "operation-1",
+            "a refusal names the invocation it refuses, so the kernel can attribute it"
+        );
 
         let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
+    #[tokio::test]
+    async fn an_invocation_that_names_no_operation_is_not_answered() {
+        // The host cannot attribute an outcome it cannot name, so it refuses the
+        // request at the transport level rather than answering in the shape of a
+        // result. A kernel that received such an answer could not tell whether it
+        // belonged to the invocation it sent, and would have to treat its own
+        // record as evidence about work nobody can account for.
+        let (service, config) = service();
+        let session_id = establish(&service, &config).await;
+        let handle = nemo_relay_plugin_proto::convert::handle_to_wire(
+            &nemo_relay_plugin_protocol::PluginHandle {
+                plugin_id: "fixture_native".into(),
+                generation: 1,
+            },
+        );
+        let invocation = |context: Option<v1::PluginExecutionContext>| v1::InvokeRequest {
+            session_id: session_id.clone(),
+            context,
+            handle: Some(handle.clone()),
+            registration_id: "registration-1".into(),
+            arguments: "{}".into(),
+        };
+
+        let absent = service
+            .invoke(Request::new(invocation(None)))
+            .await
+            .expect_err("an invocation with no context has no operation to name");
+        assert_eq!(absent.code(), tonic::Code::InvalidArgument, "{absent:?}");
+
+        let mut unnamed = context();
+        unnamed.operation_request_id = "  ".into();
+        let blank = service
+            .invoke(Request::new(invocation(Some(unnamed))))
+            .await
+            .expect_err("an invocation whose context names no operation");
+        assert_eq!(blank.code(), tonic::Code::InvalidArgument, "{blank:?}");
     }
 
     #[test]

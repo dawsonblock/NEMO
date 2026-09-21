@@ -569,6 +569,18 @@ holds the supervisor that starts it and the backend that reaches it.
   passed. A peer that reaches the service with a structurally valid but
   semantically unusable context is rejected by the host rather than only by the
   side that happened to check first.
+- **An answer names the invocation it answers.** The host states the operation
+  it accepted in the outcome it returns, and the kernel checks that name instead
+  of trusting the channel to have kept the pairing: an answer naming a different
+  operation, or naming none, is refused as malformed rather than attributed to
+  the call that asked. The host holds the same rule from its side — an invocation
+  whose context names no operation is refused at the transport level, because an
+  outcome nobody can attribute is not an answer, and answering in that message's
+  shape would invite the kernel to read it as one. Correlation that lives only
+  inside the transport is a property of the channel; a protocol that wants to be
+  checkable has to carry it. This is the one wire change so far, so the recorded
+  `InvokeOutcome` vector moves with it — `vectors.json` is regenerated
+  deliberately, and the diff is the new field and nothing else.
 - **The transport enforces the negotiated frame limit.** Client and server
   decoders are configured from the same value the handshake negotiates, so the
   limit is enforced rather than declared.

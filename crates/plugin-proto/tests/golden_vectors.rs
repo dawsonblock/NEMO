@@ -174,6 +174,9 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                     expected_version: None,
                     received_version: None,
                 })),
+                // The answer names the invocation it answers: an outcome that
+                // belongs to no operation is not one the kernel may attribute.
+                operation_request_id: "operation-1".into(),
             }
             .encode_to_vec(),
         ),

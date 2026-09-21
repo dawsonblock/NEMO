@@ -373,6 +373,15 @@ message InvokeOutcome {
     string output = 3;
     PluginFailure failure = 4;
   }
+  // The invocation this answer belongs to, named by the side that accepted it.
+  //
+  // The call carries the operation in its context; the answer names it back, so
+  // the kernel can check that the outcome it received is the outcome it asked
+  // for. Correlation that exists only inside the transport is a property of the
+  // channel rather than of the protocol, and a peer that answered a different
+  // operation — by confusion or by design — would otherwise have its answer
+  // attributed to this one.
+  string operation_request_id = 5;
 }
 
 // One frame of a streaming invocation. The stream ends with `end`, or with a

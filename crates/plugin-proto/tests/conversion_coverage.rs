@@ -189,9 +189,16 @@ const MANIFEST: &[Entry] = &[
     entry(
         "InvokeOutcome",
         "both",
-        &["execution_outcome_from_wire", "execution_outcome_to_wire"],
+        &[
+            "execution_outcome_from_wire",
+            "execution_outcome_to_wire",
+            "invocation_answer_from_wire",
+        ],
         &["InvokeOutcome"],
-        &["an_outcome_keeps_the_dispatch_certainty_it_was_given"],
+        &[
+            "an_outcome_keeps_the_dispatch_certainty_it_was_given",
+            "an_answer_that_does_not_name_the_invocation_is_refused",
+        ],
     ),
     entry(
         "StreamChunk",
