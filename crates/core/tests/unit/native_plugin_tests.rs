@@ -505,6 +505,7 @@ fn native_test_adapter(
             relay_compat: "^0.8".into(),
             allows_multiple_components: false,
             plugin: Mutex::new(plugin),
+            _staging: None,
             registrations: Mutex::new(Vec::new()),
             _library: libloading::os::unix::Library::this().into(),
         }),
@@ -4758,6 +4759,7 @@ fn native_registration_entrypoints_reject_invalid_host_contexts_and_names() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
         registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
@@ -5195,6 +5197,7 @@ fn assert_async_request_registration_rejects_legacy_relay_contract() {
         relay_compat: "^0.5".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
         registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
@@ -5245,6 +5248,7 @@ async fn native_async_wrappers_validate_callback_result_shapes() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
         registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
@@ -6111,6 +6115,7 @@ async fn native_callback_wrappers_release_error_outputs_and_preserve_reasons() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
         registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
@@ -7031,4 +7036,79 @@ fn native_stream_continuation_covers_success_and_error() {
         unsafe { native_llm_stream_next(ptr::null(), ptr::null_mut(), ptr::null_mut()) },
         NemoRelayStatus::NullPointer
     );
+}
+
+#[test]
+fn a_verified_artifact_is_loaded_from_a_private_copy_and_not_from_its_source_path() {
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    std::fs::write(&source, b"the approved bytes").expect("write the source");
+    let approved = super::sha256_hex(b"the approved bytes");
+
+    let stage = super::stage_verified_library(&source, &approved).expect("a matching artifact");
+    let (staged_path, guard) = stage;
+    assert_ne!(
+        staged_path, source,
+        "the path that gets loaded is the copy, not the source"
+    );
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read the copy"),
+        b"the approved bytes",
+        "the copy holds the verified bytes"
+    );
+    assert!(
+        staged_path.starts_with(std::env::temp_dir()),
+        "the copy lives in this process's own directory: {}",
+        staged_path.display()
+    );
+
+    // The source is not what was loaded: replacing it now changes nothing about
+    // the staged copy, which is the whole point of staging.
+    std::fs::write(&source, b"something else entirely").expect("replace the source");
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read the copy"),
+        b"the approved bytes"
+    );
+
+    drop(guard);
+    assert!(
+        !staged_path.exists(),
+        "dropping the copy removes it: the mapping it backed is already gone"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_digest_mismatch_never_reaches_a_staging_directory() {
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    std::fs::write(&source, b"the approved bytes").expect("write the source");
+    let approved = super::sha256_hex(b"the approved bytes");
+    // The file is not the approved one.
+    std::fs::write(&source, b"not the approved bytes").expect("replace the source");
+
+    let error = super::stage_verified_library(&source, &approved)
+        .expect_err("an artifact that is not the approved one");
+    assert!(
+        error.to_string().contains("hashes to"),
+        "the refusal names the digests: {error}"
+    );
+    // Nothing is left behind for a later load to pick up.
+    let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .expect("the temp directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("nemo-native-artifacts-"))
+                && path.join(&approved[..32]).exists()
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a refused artifact leaves no staging directory: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
 }

@@ -406,6 +406,11 @@ struct NativePluginInstance {
     relay_compat: String,
     allows_multiple_components: bool,
     plugin: Mutex<NemoRelayNativePluginV1>,
+    /// Where the verified copy this instance was loaded from lives.
+    ///
+    /// Held so the directory outlives the mapping: the file inside it is the one
+    /// `dlopen` opened, and nothing else may write there.
+    _staging: Option<StagedArtifact>,
     /// What this plugin's register callbacks installed.
     ///
     /// Written where the attachment point is known — inside each host
@@ -476,6 +481,127 @@ fn drop_native_plugin_descriptor(plugin: &mut NemoRelayNativePluginV1) {
         unsafe { native_string_free(plugin.plugin_kind) };
         plugin.plugin_kind = ptr::null_mut();
     }
+}
+
+/// A verified copy of a plugin artifact, in a directory only this process can write.
+///
+/// The copy is what gets loaded. A pathname can be repointed between the hash and
+/// the `dlopen` that follows it, so the loader never executes the source path: it
+/// executes a file this process wrote, in a directory nothing else can write to.
+pub(crate) struct StagedArtifact {
+    dir: PathBuf,
+}
+
+impl std::fmt::Debug for StagedArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedArtifact")
+            .field("dir", &self.dir)
+            .finish()
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        // Best effort: the library stays mapped after this, which is what makes
+        // removing the file safe on the platforms this runs on.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy a verified artifact into a private directory and return the copy's path.
+///
+/// The source is read through an open handle so the digest describes an instance
+/// rather than a name, and the copy is re-hashed before it is handed back: the
+/// bytes that will be loaded are bytes this function has read twice.
+pub(crate) fn stage_verified_library(
+    library_path: &Path,
+    approved_library_sha256: &str,
+) -> crate::plugin::Result<(PathBuf, StagedArtifact)> {
+    use std::io::Read;
+
+    let mut source = std::fs::File::open(library_path).map_err(|error| {
+        PluginError::NotFound(format!(
+            "native plugin library '{}' could not be opened: {error}",
+            library_path.display()
+        ))
+    })?;
+    // One handle, read twice: hashing consumes it, so it is rewound rather than
+    // cloned — a clone would share the offset and the copy would then start at
+    // the end of the file, which is exactly the bug this comment replaces.
+    let source_digest = sha256_of_reader(&mut source)?;
+    {
+        use std::io::Seek;
+        source.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+            PluginError::Internal(format!(
+                "failed to rewind '{}': {error}",
+                library_path.display()
+            ))
+        })?;
+    }
+    if source_digest != approved_library_sha256 {
+        return Err(PluginError::RegistrationFailed(format!(
+            "native plugin library '{}' hashes to {source_digest}, while \
+             {approved_library_sha256} was approved",
+            library_path.display()
+        )));
+    }
+
+    // The directory name is derived from the digest rather than from any part of
+    // the source path, so nothing an attacker controls decides where the copy
+    // lands, and two loads of one artifact cannot collide.
+    let root = std::env::temp_dir().join(format!("nemo-native-artifacts-{}", std::process::id()));
+    let dir = root.join(&source_digest[..source_digest.len().min(32)]);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.recursive(true).create(&dir).map_err(|error| {
+        PluginError::Internal(format!(
+            "failed to create the staging directory '{}': {error}",
+            dir.display()
+        ))
+    })?;
+
+    let staged = dir.join("library");
+    let mut destination = std::fs::File::create(&staged).map_err(|error| {
+        PluginError::Internal(format!(
+            "failed to create the staged artifact '{}': {error}",
+            staged.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).map_err(|error| {
+            PluginError::Internal(format!(
+                "failed to read '{}': {error}",
+                library_path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        std::io::Write::write_all(&mut destination, &buffer[..read]).map_err(|error| {
+            PluginError::Internal(format!("failed to write '{}': {error}", staged.display()))
+        })?;
+    }
+    destination.sync_all().map_err(|error| {
+        PluginError::Internal(format!("failed to flush '{}': {error}", staged.display()))
+    })?;
+    let staged_digest = hex_digest(hasher.finalize());
+    if staged_digest != approved_library_sha256 {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(PluginError::RegistrationFailed(format!(
+            "the staged copy of '{}' hashes to {staged_digest}, while \
+             {approved_library_sha256} was approved",
+            library_path.display()
+        )));
+    }
+    Ok((staged, StagedArtifact { dir }))
 }
 
 fn load_one_native_plugin(
@@ -574,28 +700,22 @@ fn load_one_native_plugin(
     // The approved library identity is checked against the bytes of an open
     // handle, immediately before the loader is given the path: the digest and
     // the file it describes are then the same instance rather than two lookups.
-    let verified_library_sha256 = match &spec.approved_identity {
+    // An approved load never executes the source path: the verified bytes are
+    // copied into a directory only this process can write, re-hashed there, and
+    // the copy is what the loader opens. A load with nothing approved keeps the
+    // old in-place behaviour and its post-load re-check, because there is no
+    // identity to bind it to.
+    let (library_path, staging) = match &spec.approved_identity {
         Some(approved) => {
-            let file = std::fs::File::open(&library_path).map_err(|error| {
-                PluginError::NotFound(format!(
-                    "native plugin library '{}' could not be opened: {error}",
-                    library_path.display()
-                ))
-            })?;
-            let digest = sha256_of_reader(file)?;
-            if digest != approved.library_sha256 {
-                return Err(PluginError::RegistrationFailed(format!(
-                    "dynamic plugin '{}' is not the approved artifact: library '{}' hashes to \
-                     {digest}, while {} was approved",
-                    spec.plugin_id,
-                    library_path.display(),
-                    approved.library_sha256
-                )));
-            }
-            Some(digest)
+            let (staged, guard) = stage_verified_library(&library_path, &approved.library_sha256)?;
+            (staged, Some(guard))
         }
-        None => None,
+        None => (library_path.clone(), None),
     };
+    let verified_library_sha256 = spec
+        .approved_identity
+        .as_ref()
+        .map(|approved| approved.library_sha256.clone());
     let symbol = load
         .symbol
         .as_deref()
@@ -607,12 +727,12 @@ fn load_one_native_plugin(
             library_path.display()
         ))
     })?;
-    // The loader resolved the path a second time, so the library that is now
-    // mapped is confirmed to be the one that was verified. A change in that
-    // window is refused rather than attributed to the plugin: refusing to
-    // activate is the fail-closed answer, and `dlopen` offers nothing stronger
-    // without loading from a copy whose directory this process owns.
-    if let Some(verified) = &verified_library_sha256 {
+    // A staged load needs no second look: the file it opened is one this process
+    // wrote and nothing else can rewrite. A load with no approved identity still
+    // re-checks the path, which is the weaker guarantee it can offer.
+    if staging.is_none()
+        && let Some(verified) = &verified_library_sha256
+    {
         let mapped = sha256_of_path(&library_path)?;
         if &mapped != verified {
             drop(library);
@@ -676,6 +796,7 @@ fn load_one_native_plugin(
         allows_multiple_components: plugin.allows_multiple_components,
         plugin: Mutex::new(plugin),
         registrations: Mutex::new(Vec::new()),
+        _staging: staging,
         _library: library,
     }))
 }
@@ -765,7 +886,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Reading a handle rather than a path is what ties the digest to a specific
 /// file instance: a path can be repointed between the hash and the open, and a
 /// handle cannot.
-fn sha256_of_reader(reader: std::fs::File) -> crate::plugin::Result<String> {
+fn sha256_of_reader(reader: &mut std::fs::File) -> crate::plugin::Result<String> {
     use std::io::Read;
 
     let mut reader = std::io::BufReader::new(reader);
