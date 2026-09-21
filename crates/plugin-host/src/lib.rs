@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
 use nemo_relay::plugin::dynamic::{
     NativePluginActivation, NativePluginLoadSpec, load_native_plugins,
 };
@@ -448,6 +449,159 @@ pub struct LoadedPlugins {
     handles: Vec<PluginHandle>,
 }
 
+/// Plugins loaded in a host process, with their registrations proxied here.
+///
+/// This is the composition a runtime selects when it wants native plugins out of
+/// its own process. It does the four things that decision implies, in the order
+/// the boundary requires: start a host and handshake with it; load each approved
+/// artifact through the backend rather than through a loader here; activate the
+/// components each plugin was loaded for, so its register callbacks run where its
+/// library is; and install one proxy per registration the host reported, at the
+/// priority the plugin declared.
+///
+/// It fails closed on a plugin whose registrations this kernel cannot serve: a
+/// load that reported success while a callback disappeared would be worse than a
+/// refused load, because the plugin would believe it had registered something the
+/// runtime never calls.
+///
+/// Dropping this removes the proxies and kills the host, so a plugin's callbacks
+/// cannot outlive the runtime that installed them.
+pub struct ProcessLoadedPlugins {
+    backend: Arc<ProcessPluginBackend>,
+    proxies: Vec<crate::proxy::RegistrationProxies>,
+    handles: Vec<PluginHandle>,
+}
+
+impl ProcessLoadedPlugins {
+    /// Load, activate and proxy every plugin in `specs`.
+    ///
+    /// `components` is what each loaded plugin should activate: in this runtime's
+    /// plugin model a library load does not run a plugin's register callbacks, so
+    /// the components the deployment asked for are what make them happen — in the
+    /// host, where the library is.
+    pub async fn load<I, J>(
+        config: PluginHostSupervisorConfig,
+        registration_cap_millis: u64,
+        specs: I,
+        components: J,
+    ) -> Result<Self, PluginProtocolError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+        J: IntoIterator<Item = nemo_relay_plugin_protocol::PluginComponentConfiguration>,
+    {
+        // A registration is never given more than the action it serves can
+        // afford, and this is the second limit on top of that. Zero would mean
+        // "no time at all", which nobody means, so it is refused rather than
+        // treated as a default.
+        if registration_cap_millis == 0 {
+            return Err(refused(
+                "a registration cap of zero milliseconds would refuse every invocation",
+            ));
+        }
+        let backend = Arc::new(ProcessPluginBackend::launch(config).await?);
+        let binding = backend.runtime_binding_digest().to_owned();
+        let manager = Arc::new(PluginManager::new(
+            Arc::clone(&backend) as Arc<dyn PluginExecutionBackend>
+        ));
+
+        let mut handles = Vec::new();
+        for (plugin_id, artifact) in specs {
+            // The identity is approved here, before anything is loaded, so the
+            // host confirms what it was told to load rather than deciding for
+            // itself what the reference points at.
+            let (manifest_sha256, library_sha256) =
+                nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                    .map_err(|error| refused(error.to_string()))?;
+            let loaded = manager
+                .load(
+                    PluginLoadRequest {
+                        plugin_id,
+                        artifact,
+                        identity: PluginArtifactIdentity {
+                            manifest_sha256,
+                            library_sha256,
+                        },
+                    },
+                    lifecycle_context(&binding, "load"),
+                )
+                .await
+                .map_err(|error| PluginProtocolError {
+                    failure: PluginFailure {
+                        code: error.failure.code,
+                        message: error.failure.message,
+                    },
+                })?;
+            handles.push(loaded.handle);
+        }
+
+        let components: Vec<_> = components.into_iter().collect();
+        let descriptors = if components.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .activate(
+                    nemo_relay_plugin_protocol::PluginActivateRequest { components },
+                    lifecycle_context(&binding, "activate"),
+                )
+                .await?
+        };
+
+        // One proxy per registration, installable only for the classes this
+        // backend can serve. The manager is the only path to the backend, and
+        // the operation scopes are what attach a mark the plugin raises to the
+        // call that raised it.
+        let context = crate::proxy::ProxyContext::new(
+            manager,
+            binding,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES as u64,
+        )
+        .with_operation_scopes(backend.operation_scopes());
+        let mut proxies = Vec::new();
+        for descriptor in &descriptors {
+            let handle = handles
+                .iter()
+                .find(|handle| handle.plugin_id == descriptor.plugin_id)
+                .cloned()
+                .ok_or_else(|| {
+                    refused(format!(
+                        "the host activated {} without having loaded it",
+                        descriptor.plugin_id
+                    ))
+                })?;
+            proxies.push(crate::proxy::install(context.clone(), descriptor, handle)?);
+        }
+
+        Ok(Self {
+            backend,
+            proxies,
+            handles,
+        })
+    }
+
+    /// The identity of every loaded plugin.
+    pub fn handles(&self) -> &[PluginHandle] {
+        &self.handles
+    }
+
+    /// Whether nothing was loaded.
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// The registrations currently proxied here.
+    pub fn registrations(&self) -> Vec<&str> {
+        self.proxies
+            .iter()
+            .flat_map(crate::proxy::RegistrationProxies::registration_ids)
+            .collect()
+    }
+
+    /// The backend holding the loaded plugins.
+    pub fn backend(&self) -> &Arc<ProcessPluginBackend> {
+        &self.backend
+    }
+}
+
 impl LoadedPlugins {
     /// Load every `(plugin id, artifact)` pair, or fail without leaving any loaded.
     pub async fn load<I>(specs: I) -> Result<Self, PluginProtocolError>
@@ -495,6 +649,26 @@ impl LoadedPlugins {
     /// Return the backend holding the loaded plugins.
     pub fn backend(&self) -> &Arc<InProcessPluginBackend> {
         &self.backend
+    }
+}
+
+/// A bounded context for one lifecycle operation of a session.
+///
+/// Bounded rather than open-ended, and bound to the session's own runtime digest:
+/// the host refuses an operation that claims a runtime it was not started for, so
+/// a placeholder digest here would make every load fail rather than making it
+/// lenient.
+fn lifecycle_context(runtime_binding_digest: &str, operation: &str) -> PluginExecutionContext {
+    PluginExecutionContext {
+        operation_request_id: format!(
+            "{operation}-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ),
+        protocol_version: PROTOCOL_VERSION,
+        runtime_binding_digest: runtime_binding_digest.to_owned(),
+        deadline_unix_ms: nemo_relay::api::runtime::budget_now_unix_ms().saturating_add(30_000),
+        remaining_budget_millis: 30_000,
+        max_response_bytes: 1024,
     }
 }
 

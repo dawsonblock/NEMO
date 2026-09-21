@@ -649,6 +649,25 @@ holds the supervisor that starts it and the backend that reaches it.
   host's `invoke` is lost at that hop, and the mark lands in the child's own
   runtime exactly as before. Every seam below that hop is tested; the gap is the
   hop itself.
+- **A runtime can select the process backend.** `ProcessLoadedPlugins` is the
+  composition that decision implies, in the order the boundary requires: start a
+  host and handshake, load each approved artifact through the backend rather than
+  through a loader in this process, activate the components each plugin was
+  loaded for — so its register callbacks run where its library is — and install
+  one proxy per registration the host reported, at the priority the plugin
+  declared. It fails closed on a plugin whose registrations this kernel cannot
+  serve: a load reporting success while a callback disappeared is worse than a
+  refused load, because the plugin would believe it had registered something the
+  runtime never calls. Lifecycle operations carry the session's own runtime
+  binding and a bounded budget rather than a placeholder, so the checks the host
+  enforces stay meaningful; the registration cap is a parameter and zero is
+  refused, since "no time at all" is not a limit anybody means. Dropping the
+  composition removes the proxies and kills the host, so a plugin's callback
+  cannot outlive the runtime that installed it. **The CLI and the bindings do not
+  select it yet**, and should not: the process backend refuses a plugin whose
+  registrations it cannot all proxy, and the ABI covers one class today, so a
+  cutover now would trade a working loader for a regressed plugin set. This is the
+  piece the cutover will adopt once the classes cross.
 - **The transport enforces the negotiated frame limit.** Client and server
   decoders are configured from the same value the handshake negotiates, so the
   limit is enforced rather than declared.

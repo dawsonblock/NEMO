@@ -335,6 +335,98 @@ async fn the_kernel_serves_its_socket_and_refuses_a_caller_without_the_credentia
 }
 
 #[tokio::test]
+async fn the_composition_installs_a_plugin_from_another_process_into_this_chain() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+    use nemo_relay_plugin_protocol::PluginComponentConfiguration;
+
+    // The composition a runtime selects when it wants native plugins out of its
+    // own process: it starts the host, loads the approved artifact there,
+    // activates the component there, and installs a proxy here — with no loader
+    // call in this process at all.
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-composed",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let loaded = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        [PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: "{}".into(),
+        }],
+    )
+    .await
+    .expect("a plugin served from another process");
+    assert_eq!(loaded.handles().len(), 1, "one plugin was loaded");
+    assert_eq!(
+        loaded.registrations().len(),
+        1,
+        "the registration the plugin made is proxied here"
+    );
+
+    // And the chain reaches it: the rewrite happens in the child, and this call
+    // reads as an ordinary tool request intercept.
+    let rewritten = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_request_intercepts(
+                "example_tool",
+                serde_json::json!({"input": true}),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("the chain should reach the child");
+    assert_eq!(rewritten["native_intercept"], true, "{rewritten}");
+
+    // Dropping the composition takes the registration out of the chain and ends
+    // the host: a plugin's callback may not outlive the runtime that installed it.
+    drop(loaded);
+    let after = nemo_relay::api::tool::tool_request_intercepts(
+        "example_tool",
+        serde_json::json!({"input": true}),
+    )
+    .await
+    .expect("the chain");
+    assert_eq!(
+        after["native_intercept"],
+        serde_json::Value::Null,
+        "{after}"
+    );
+}
+
+#[tokio::test]
+async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-zerocap",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let error = match ProcessLoadedPlugins::load(
+        host_config(),
+        0,
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        Vec::new(),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a cap of zero would refuse every invocation"),
+    };
+    assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+}
+
+#[tokio::test]
 async fn a_host_that_has_exited_is_a_crash_and_not_an_answer() {
     let backend = ProcessPluginBackend::launch(host_config())
         .await
