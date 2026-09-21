@@ -16,6 +16,8 @@ use nemo_relay_plugin_host::conformance;
 use nemo_relay_plugin_host::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
 use nemo_relay_plugin_protocol::{PROTOCOL_VERSION, PluginExecutionContext, PluginFailureCode};
 
+mod support;
+
 /// The host binary this crate builds, handed to the test by cargo.
 fn host_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_nemo-plugin-host"))
@@ -75,37 +77,13 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
     use nemo_relay::plugin::dynamic::plugin_artifact_identity;
     use nemo_relay_plugin_protocol::{PluginArtifactIdentity, PluginLoadRequest};
 
-    let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_PLUGIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/test-plugin-fixtures/debug/libnemo_relay_plugin_fixture.dylib")
-        });
-    assert!(
-        library.exists(),
-        "the native fixture is missing; run `just build-test-plugin-fixtures`: {}",
-        library.display()
+    let fixture = support::PreparedFixture::write(
+        "fixture_native",
+        "nemo-ph-manifest",
+        support::native_fixture(),
+        "nemo_relay_fixture_native_plugin",
     );
-
-    // A manifest in its own directory, written here so this test says exactly
-    // what it loads rather than borrowing another suite's helper.
-    let manifest_dir = std::env::temp_dir().join(format!(
-        "nemo-ph-manifest-{}",
-        nemo_relay_plugin_protocol::Uuid::now_v7().simple()
-    ));
-    std::fs::create_dir_all(&manifest_dir).expect("a manifest directory");
-    let manifest = manifest_dir.join("relay-plugin.toml");
-    std::fs::write(
-        &manifest,
-        format!(
-            "manifest_version = 1\n\n[plugin]\nid = \"fixture_native\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \"nemo_relay_fixture_native_plugin\"\n",
-            env!("CARGO_PKG_VERSION"),
-            library.display()
-        ),
-    )
-    .expect("write the manifest");
-
-    let artifact = manifest.to_string_lossy().into_owned();
+    let artifact = fixture.artifact();
     let (manifest_sha256, library_sha256) =
         plugin_artifact_identity(&artifact).expect("the identity of an existing artifact");
     let backend = ProcessPluginBackend::launch(host_config())
@@ -184,8 +162,6 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
         .await
         .expect("an inspection");
     assert!(after.is_empty(), "{after:#?}");
-
-    let _ = std::fs::remove_dir_all(&manifest_dir);
 }
 
 #[tokio::test]
@@ -196,38 +172,17 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     // proxy one class needs: the other fixture registers sixteen, and activating
     // it against a one-class session is refused — correctly, but uselessly for
     // this test.
-    let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-                "../../target/test-plugin-fixtures/debug/libnemo_relay_native_intercept_fixture.dylib",
-            )
-        });
-    assert!(
-        library.exists(),
-        "the single-registration fixture is missing; run `just build-test-plugin-fixtures`"
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-intercept",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
     );
-
-    let manifest_dir = std::env::temp_dir().join(format!(
-        "nemo-ph-intercept-{}",
-        nemo_relay_plugin_protocol::Uuid::now_v7().simple()
-    ));
-    std::fs::create_dir_all(&manifest_dir).expect("a manifest directory");
-    let manifest = manifest_dir.join("relay-plugin.toml");
-    std::fs::write(
-        &manifest,
-        format!(
-            "manifest_version = 1\n\n[plugin]\nid = \"fixture_intercept\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \"nemo_relay_native_intercept_fixture\"\n",
-            env!("CARGO_PKG_VERSION"),
-            library.display()
-        ),
-    )
-    .expect("write the manifest");
 
     let backend = ProcessPluginBackend::launch(host_config())
         .await
         .expect("a plugin host should start and handshake");
-    let artifact = manifest.to_string_lossy().into_owned();
+    let artifact = fixture.artifact();
     let (manifest_sha256, library_sha256) =
         nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
             .expect("the fixture's identity");
@@ -312,8 +267,26 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
         serde_json::Value::Null,
         "{after}"
     );
+}
 
-    let _ = std::fs::remove_dir_all(&manifest_dir);
+#[tokio::test]
+async fn the_process_backend_satisfies_the_shared_lifecycle_suite() {
+    // The same walk the in-process backend runs, with no forked expectations:
+    // a load, a duplicate load, an unload, a reload and a stale handle, answered
+    // by a child process.
+    let fixture = support::PreparedFixture::write(
+        "fixture_native",
+        "nemo-ph-lifecycle",
+        support::native_fixture(),
+        "nemo_relay_fixture_native_plugin",
+    );
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+
+    let findings = conformance::check_lifecycle(&backend, &fixture.lifecycle()).await;
+
+    assert!(findings.is_empty(), "{findings:#?}");
 }
 
 #[tokio::test]

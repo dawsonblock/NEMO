@@ -570,6 +570,75 @@ pub struct PluginInspectRequest {
     pub handle: Option<PluginHandle>,
 }
 
+/// What a side of the boundary knows about one plugin identifier.
+///
+/// This is the lifecycle as a value rather than as a convention inside one
+/// implementation. The rules below are the ones every backend has to follow, and
+/// they are stated here because the backend that runs in a child process and the
+/// one that runs in the caller's process must refuse the same requests with the
+/// same codes — a caller cannot act on a refusal it cannot classify, and two
+/// implementations that disagree would make the same request succeed or fail
+/// depending on which one was composed.
+///
+/// `Unloading` is not a state: an unload takes the instance out of the table
+/// while it holds the lock, so no request can observe it half-removed. A state
+/// nothing can observe would be a claim about concurrency that no reader could
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum PluginLifecycle {
+    /// Nothing is known about this identifier.
+    Absent,
+    /// A load is in progress and holds the identifier.
+    Loading,
+    /// An instance is loaded at exactly this generation.
+    Loaded {
+        /// The generation this instance was loaded at.
+        generation: u64,
+    },
+}
+
+impl PluginLifecycle {
+    /// Whether a load may start from this state.
+    ///
+    /// A load is admitted only from `Absent`. `Loading` is a reservation: a
+    /// second load that also saw "not loaded" would run the loader twice and
+    /// leave one of the two instances unreachable, so the reservation is what
+    /// makes the answer a fact rather than a race.
+    pub fn admit_load(&self) -> Result<(), PluginFailureCode> {
+        match self {
+            Self::Absent => Ok(()),
+            Self::Loading => Err(PluginFailureCode::AlreadyLoading),
+            Self::Loaded { .. } => Err(PluginFailureCode::AlreadyLoaded),
+        }
+    }
+
+    /// Whether an operation naming one instance may proceed.
+    ///
+    /// Every operation that names a generation — inspect, unload, invoke —
+    /// follows the same rule, because the refusal is the same fact in each case:
+    /// the identifier is unknown, the instance is still loading, or the handle
+    /// is from a generation that no longer exists. A handle from before a reload
+    /// must not reach the instance that replaced it, which is the one thing the
+    /// generation exists to prevent.
+    pub fn admit_generation(&self, generation: u64) -> Result<(), PluginFailureCode> {
+        match self {
+            Self::Absent => Err(PluginFailureCode::UnknownPlugin),
+            Self::Loading => Err(PluginFailureCode::AlreadyLoading),
+            Self::Loaded { generation: loaded } if *loaded == generation => Ok(()),
+            Self::Loaded { .. } => Err(PluginFailureCode::StaleHandle),
+        }
+    }
+
+    /// The generation this state names, when it names one.
+    pub fn generation(&self) -> Option<u64> {
+        match self {
+            Self::Loaded { generation } => Some(*generation),
+            Self::Absent | Self::Loading => None,
+        }
+    }
+}
+
 /// One component the kernel wants activated.
 ///
 /// The kind names the component the plugin was loaded as, and the configuration
@@ -1217,6 +1286,60 @@ pub fn check_deadline(deadline_unix_ms: u64) -> Result<(), PluginProtocolError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lifecycle_refuses_a_load_from_anything_but_absent() {
+        assert!(PluginLifecycle::Absent.admit_load().is_ok());
+        assert_eq!(
+            PluginLifecycle::Loading.admit_load().unwrap_err(),
+            PluginFailureCode::AlreadyLoading
+        );
+        assert_eq!(
+            PluginLifecycle::Loaded { generation: 3 }
+                .admit_load()
+                .unwrap_err(),
+            PluginFailureCode::AlreadyLoaded
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_refuses_every_generation_that_is_not_the_loaded_one() {
+        // Four facts stay four facts: never there, not there yet, no longer
+        // there, and the instance the handle names. Collapsing any pair would
+        // leave a caller unable to tell a retry from a stale handle.
+        assert_eq!(
+            PluginLifecycle::Absent.admit_generation(1).unwrap_err(),
+            PluginFailureCode::UnknownPlugin
+        );
+        assert_eq!(
+            PluginLifecycle::Loading.admit_generation(1).unwrap_err(),
+            PluginFailureCode::AlreadyLoading
+        );
+        for generation in [3, 5] {
+            assert_eq!(
+                PluginLifecycle::Loaded { generation: 4 }
+                    .admit_generation(generation)
+                    .unwrap_err(),
+                PluginFailureCode::StaleHandle,
+                "generation {generation} is not the loaded one"
+            );
+        }
+        assert!(
+            PluginLifecycle::Loaded { generation: 4 }
+                .admit_generation(4)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_a_loaded_state_names_a_generation() {
+        assert_eq!(PluginLifecycle::Absent.generation(), None);
+        assert_eq!(PluginLifecycle::Loading.generation(), None);
+        assert_eq!(
+            PluginLifecycle::Loaded { generation: 7 }.generation(),
+            Some(7)
+        );
+    }
 
     #[test]
     fn every_message_this_crate_declares_survives_its_own_serialization() {

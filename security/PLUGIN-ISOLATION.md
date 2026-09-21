@@ -581,6 +581,30 @@ holds the supervisor that starts it and the backend that reaches it.
   checkable has to carry it. This is the one wire change so far, so the recorded
   `InvokeOutcome` vector moves with it — `vectors.json` is regenerated
   deliberately, and the diff is the new field and nothing else.
+- **The lifecycle is a contract, not a convention.** `PluginLifecycle`
+  (`Absent`, `Loading`, `Loaded { generation }`) and the two rules that say what
+  each state admits live in the contract crate, and the in-process backend asks
+  them instead of deciding for itself: a backend that answered the wrong code
+  would be a backend its caller cannot act on, and two implementations that
+  disagreed would make the same request succeed or fail depending on which one
+  was composed. `Loading` is a reservation rather than a status report, because
+  a second load that also saw "not loaded" would run the loader twice and leave
+  one instance unreachable. There is no `Unloading` state: an unload takes the
+  instance out of the table while it holds the lock, so nothing can observe it
+  half-removed, and a state no reader can observe would be a claim about
+  concurrency that no reader could check.
+- **The shared suite walks the lifecycle, on both backends.** `check_lifecycle`
+  loads a real fixture, refuses an unapproved artifact and then loads the
+  approved one — which is what proves a failed load released its reservation —
+  inspects the handle, refuses another generation as `StaleHandle`, refuses a
+  duplicate load as `AlreadyLoaded`, unloads, proves the identifier is now
+  `UnknownPlugin` *rather than* stale, reloads, refuses the old handle as
+  `StaleHandle` now that an instance exists at another generation, and leaves
+  nothing loaded. The same function runs against `InProcessPluginBackend` and
+  against a real child, so a case added for one is a case for the other. Verified
+  by collapsing `StaleHandle` into `UnknownPlugin` in the contract and watching
+  both runs fail — the distinction between "never there" and "not there any
+  more" is the thing the suite exists to hold.
 - **The transport enforces the negotiated frame limit.** Client and server
   decoders are configured from the same value the handshake negotiates, so the
   limit is enforced rather than declared.

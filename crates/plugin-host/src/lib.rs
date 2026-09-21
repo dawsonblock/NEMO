@@ -28,8 +28,9 @@ use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFutur
 use nemo_relay_plugin_protocol::{
     PROTOCOL_VERSION, PluginArtifactIdentity, PluginDescriptor, PluginExecutionContext,
     PluginFailure, PluginFailureCode, PluginHandle, PluginHostHealth, PluginInspectRequest,
-    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginRegistrationDescriptor,
-    PluginRegistrationOrdering, PluginUnloadRequest, registration_shape,
+    PluginLifecycle, PluginLoadRequest, PluginLoadResponse, PluginProtocolError,
+    PluginRegistrationDescriptor, PluginRegistrationOrdering, PluginUnloadRequest,
+    registration_shape,
 };
 
 /// What the backend holds for one plugin identifier.
@@ -175,6 +176,47 @@ fn refused(message: impl Into<String>) -> PluginProtocolError {
     }
 }
 
+/// What this backend knows about one identifier, from the entry it holds.
+///
+/// The rules about what each state admits live in the contract, not here: a
+/// backend that decided for itself which requests its own states allow would be
+/// a second place for the lifecycle to be wrong, and the two sides of the
+/// boundary have to refuse the same request with the same code.
+fn lifecycle_of(entry: Option<&Entry>) -> PluginLifecycle {
+    match entry {
+        None => PluginLifecycle::Absent,
+        Some(Entry::Loading) => PluginLifecycle::Loading,
+        Some(Entry::Loaded(loaded)) => PluginLifecycle::Loaded {
+            generation: loaded.handle.generation,
+        },
+    }
+}
+
+/// The refusal a state gives, with the detail only this side can supply.
+///
+/// The code comes from the contract's lifecycle and the text is built here, so
+/// the two can describe the same fact in one place rather than at each call
+/// site.
+fn lifecycle_refusal(
+    state: PluginLifecycle,
+    plugin_id: &str,
+    requested_generation: Option<u64>,
+    code: PluginFailureCode,
+) -> PluginProtocolError {
+    let message = match &code {
+        PluginFailureCode::UnknownPlugin => format!("plugin {plugin_id} is not loaded"),
+        PluginFailureCode::AlreadyLoading => format!("plugin {plugin_id} is being loaded"),
+        PluginFailureCode::AlreadyLoaded => format!("plugin {plugin_id} is already loaded"),
+        PluginFailureCode::StaleHandle => format!(
+            "plugin {plugin_id} is loaded at generation {}, not {}",
+            state.generation().unwrap_or_default(),
+            requested_generation.unwrap_or_default()
+        ),
+        other => format!("plugin {plugin_id} was refused as {other:?}"),
+    };
+    PluginProtocolError::new(code, message)
+}
+
 impl InProcessPluginBackend {
     /// Run one registration a loaded plugin made.
     ///
@@ -213,23 +255,11 @@ impl PluginExecutionBackend for InProcessPluginBackend {
             // see "not loaded" and start a second load of the same plugin.
             {
                 let mut loaded = self.loaded();
-                match loaded.get(&request.plugin_id) {
-                    Some(Entry::Loading) => {
-                        return Err(PluginProtocolError::new(
-                            PluginFailureCode::AlreadyLoading,
-                            format!("plugin {} is being loaded", request.plugin_id),
-                        ));
-                    }
-                    Some(Entry::Loaded(_)) => {
-                        return Err(PluginProtocolError::new(
-                            PluginFailureCode::AlreadyLoaded,
-                            format!("plugin {} is already loaded", request.plugin_id),
-                        ));
-                    }
-                    None => {
-                        loaded.insert(request.plugin_id.clone(), Entry::Loading);
-                    }
+                let state = lifecycle_of(loaded.get(&request.plugin_id));
+                if let Err(code) = state.admit_load() {
+                    return Err(lifecycle_refusal(state, &request.plugin_id, None, code));
                 }
+                loaded.insert(request.plugin_id.clone(), Entry::Loading);
             }
 
             // The approval travels with the load rather than being checked
@@ -316,36 +346,17 @@ impl PluginExecutionBackend for InProcessPluginBackend {
     ) -> PluginExecutionFuture<'a, ()> {
         Box::pin(async move {
             let mut loaded = self.loaded();
-            match loaded.get(&request.handle.plugin_id) {
-                Some(Entry::Loading) => {
-                    return Err(PluginProtocolError::new(
-                        PluginFailureCode::AlreadyLoading,
-                        format!("plugin {} is being loaded", request.handle.plugin_id),
-                    ));
-                }
-                Some(Entry::Loaded(entry)) => {
-                    if entry.handle.generation != request.handle.generation {
-                        // The plugin exists, but this handle is from before a
-                        // reload. It must not be able to unload the instance
-                        // that replaced it, and the caller needs to know that is
-                        // what happened rather than that nothing was there.
-                        return Err(PluginProtocolError::new(
-                            PluginFailureCode::StaleHandle,
-                            format!(
-                                "plugin {} is loaded at generation {}, not {}",
-                                request.handle.plugin_id,
-                                entry.handle.generation,
-                                request.handle.generation
-                            ),
-                        ));
-                    }
-                }
-                None => {
-                    return Err(PluginProtocolError::new(
-                        PluginFailureCode::UnknownPlugin,
-                        format!("plugin {} is not loaded", request.handle.plugin_id),
-                    ));
-                }
+            let state = lifecycle_of(loaded.get(&request.handle.plugin_id));
+            // A handle from before a reload must not be able to unload the
+            // instance that replaced it, and the caller needs to know that is
+            // what happened rather than that nothing was there.
+            if let Err(code) = state.admit_generation(request.handle.generation) {
+                return Err(lifecycle_refusal(
+                    state,
+                    &request.handle.plugin_id,
+                    Some(request.handle.generation),
+                    code,
+                ));
             }
             // Dropping the entry drops the activation, which deregisters the
             // plugin kinds and unloads the library.
@@ -362,26 +373,27 @@ impl PluginExecutionBackend for InProcessPluginBackend {
         Box::pin(async move {
             match request.handle {
                 None => Ok(self.descriptors()),
-                Some(handle) => match self.loaded().get(&handle.plugin_id) {
-                    Some(Entry::Loaded(entry)) if entry.handle.generation == handle.generation => {
-                        Ok(vec![entry.describe()])
+                Some(handle) => {
+                    let loaded = self.loaded();
+                    let state = lifecycle_of(loaded.get(&handle.plugin_id));
+                    match state.admit_generation(handle.generation) {
+                        Err(code) => Err(lifecycle_refusal(
+                            state,
+                            &handle.plugin_id,
+                            Some(handle.generation),
+                            code,
+                        )),
+                        Ok(()) => Ok(vec![
+                            loaded
+                                .get(&handle.plugin_id)
+                                .and_then(|entry| match entry {
+                                    Entry::Loaded(loaded) => Some(loaded.describe()),
+                                    Entry::Loading => None,
+                                })
+                                .expect("an admitted handle names a loaded instance"),
+                        ]),
                     }
-                    Some(Entry::Loaded(entry)) => Err(PluginProtocolError::new(
-                        PluginFailureCode::StaleHandle,
-                        format!(
-                            "plugin {} is loaded at generation {}, not {}",
-                            handle.plugin_id, entry.handle.generation, handle.generation
-                        ),
-                    )),
-                    Some(Entry::Loading) => Err(PluginProtocolError::new(
-                        PluginFailureCode::AlreadyLoading,
-                        format!("plugin {} is being loaded", handle.plugin_id),
-                    )),
-                    None => Err(PluginProtocolError::new(
-                        PluginFailureCode::UnknownPlugin,
-                        format!("plugin {} is not loaded", handle.plugin_id),
-                    )),
-                },
+                }
             }
         })
     }
