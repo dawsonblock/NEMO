@@ -271,15 +271,26 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     let manager = std::sync::Arc::new(nemo_relay::plugin::execution::PluginManager::new(
         std::sync::Arc::new(backend),
     ));
-    let context = nemo_relay_plugin_host::proxy::ProxyContext::new(manager, 5_000, binding)
-        .expect("a budget to run in");
+    let context = nemo_relay_plugin_host::proxy::ProxyContext::new(manager, binding, 5_000);
     let proxies =
         nemo_relay_plugin_host::proxy::install(context, descriptor, loaded.handle.clone())
             .expect("the kernel can proxy a tool request intercept");
 
-    let rewritten = nemo_relay::api::tool::tool_request_intercepts(
-        "example_tool",
-        serde_json::json!({"input": true}),
+    // The chain runs under the trusted budget the runtime would publish for the
+    // action: without it the proxy refuses, because a registration reached
+    // outside a managed action has no deadline to inherit.
+    let rewritten = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_request_intercepts(
+                "example_tool",
+                serde_json::json!({"input": true}),
+            )
+            .await
+        },
     )
     .await
     .expect("the chain should reach the child");

@@ -5,6 +5,7 @@
 
 pub mod callbacks;
 mod continuation_context;
+pub mod execution_budget;
 pub mod global;
 pub mod scope_stack;
 pub mod state;
@@ -23,6 +24,10 @@ pub use callbacks::{
 pub use continuation_context::MiddlewareContinuationContext;
 #[cfg(test)]
 pub(crate) use continuation_context::MiddlewareContinuationLease;
+pub use execution_budget::{
+    ExecutionBudget, current_execution_budget, now_unix_ms as budget_now_unix_ms,
+    with_execution_budget,
+};
 pub use global::global_context;
 pub use scope_stack::{
     IdentitySource, PropagationContext, RuntimeIdentity, ScopeStack, ScopeStackHandle,

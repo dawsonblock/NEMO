@@ -24,43 +24,39 @@ use nemo_relay_plugin_protocol::{
     PluginProtocolError, PluginRegistrationDescriptor, PluginRegistrationOperation, PluginSuccess,
 };
 
-/// What a proxy needs to invoke a registration safely.
+/// What a proxy needs in order to invoke a registration safely.
 ///
-/// The manager rather than the backend, because the manager is where the
-/// central controls live: protocol and binding validation, request-identity
-/// uniqueness, the trusted deadline. A proxy that called the backend directly
-/// would be a second, weaker path into the same process boundary.
+/// The manager rather than the backend, because the manager is where the central
+/// controls live: protocol and binding validation, request-identity uniqueness,
+/// the trusted deadline. A proxy that called the backend directly would be a
+/// second, weaker path into the same process boundary.
+///
+/// There is deliberately no budget here. A budget belongs to an invocation, not
+/// to a registration: a proxy installed once and used two hours later has no
+/// idea what the action can still afford, so it reads the trusted budget the
+/// runtime publishes while a managed call runs, and refuses when there is none.
 #[derive(Clone)]
 pub struct ProxyContext {
     manager: Arc<PluginManager>,
-    /// The budget the caller's trusted deadline leaves, in milliseconds.
-    ///
-    /// Supplied rather than invented: a proxy that chose its own budget would
-    /// be a place where a plugin can outlive the work it was asked to do. Zero
-    /// is refused at installation, because a registration that may not run is
-    /// not a registration to install.
-    budget_millis: u64,
     runtime_binding_digest: String,
+    /// The most a remote registration may be given, whatever it inherited.
+    ///
+    /// A cap, not a budget: it can only shorten what the runtime published.
+    local_cap_millis: u64,
 }
 
 impl ProxyContext {
     /// Build the context a proxy runs under.
     pub fn new(
         manager: Arc<PluginManager>,
-        budget_millis: u64,
         runtime_binding_digest: impl Into<String>,
-    ) -> Result<Self, PluginProtocolError> {
-        if budget_millis == 0 {
-            return Err(PluginProtocolError::new(
-                PluginFailureCode::DeadlineExceeded,
-                "no budget remains for a proxied registration to run in",
-            ));
-        }
-        Ok(Self {
+        local_cap_millis: u64,
+    ) -> Self {
+        Self {
             manager,
-            budget_millis,
             runtime_binding_digest: runtime_binding_digest.into(),
-        })
+            local_cap_millis,
+        }
     }
 }
 
@@ -157,13 +153,13 @@ fn install_tool_request_intercept(
             // The payload shape is the class's, not the wire's: the host reads
             // the tool name and the arguments out of one object.
             let payload = serde_json::json!({ "tool": tool, "args": args });
+            let execution = context.execution_context()?;
             let request = PluginInvokeRequest {
                 handle,
                 registration_id: registration_id.clone(),
                 arguments: payload.to_string(),
-                budget_millis: context.budget_millis,
+                budget_millis: execution.remaining_budget_millis,
             };
-            let execution = context.execution_context();
             let outcome = context
                 .manager
                 .invoke(request, execution)
@@ -226,23 +222,30 @@ fn install_tool_request_intercept(
 impl ProxyContext {
     /// What a proxy tells the manager about the operation it is making.
     ///
-    /// The binding is the session's, not the proxy's invention: the host checks
-    /// it against the session it established, and a proxy that sent none is
-    /// refused — which is how that requirement was found. The deadline is the
-    /// caller's budget, so no layer below the caller can enlarge it.
-    fn execution_context(&self) -> PluginExecutionContext {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(0);
-        PluginExecutionContext {
+    /// The budget is the one the runtime published for the action being
+    /// executed, narrowed by this proxy's cap. A proxy that finds none refuses:
+    /// a registration reached outside a managed action has no deadline to
+    /// inherit, and choosing one would be the invention this path exists to
+    /// avoid. The binding is the session's, not the proxy's invention, because
+    /// the host checks it against the session it established.
+    fn execution_context(&self) -> Result<PluginExecutionContext, nemo_relay::error::FlowError> {
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
+        let inherited = nemo_relay::api::runtime::current_execution_budget().ok_or_else(|| {
+            nemo_relay::error::FlowError::InvalidArgument(
+                "a remote plugin registration was reached outside a managed action, so it has \
+                 no trusted budget to run under"
+                    .to_string(),
+            )
+        })?;
+        let narrowed = inherited.narrowed_to(self.local_cap_millis, now);
+        Ok(PluginExecutionContext {
             operation_request_id: nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
             protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
             runtime_binding_digest: self.runtime_binding_digest.clone(),
-            deadline_unix_ms: now.saturating_add(self.budget_millis),
-            remaining_budget_millis: self.budget_millis,
+            deadline_unix_ms: narrowed.deadline_unix_ms.unwrap_or(now),
+            remaining_budget_millis: narrowed.remaining_budget_millis,
             max_response_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
-        }
+        })
     }
 }
 
@@ -274,6 +277,60 @@ mod tests {
     /// into them take turns: two suites sharing one registry would each observe
     /// the other's proxies.
     static PROXY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Run a chain as the runtime would: under the trusted budget for the action.
+    async fn run_under_budget<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
+        nemo_relay::api::runtime::with_execution_budget(
+            nemo_relay::api::runtime::ExecutionBudget::new(now + 30_000, 30_000),
+            future,
+        )
+        .await
+    }
+
+    /// Outside a managed action there is no budget to inherit, and a proxy that
+    /// invented one would let a registration outlive the work that asked for it.
+    #[tokio::test]
+    async fn a_proxy_reached_outside_a_managed_action_refuses_rather_than_inventing_a_deadline() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let backend = Arc::new(RecordingProxyBackend::default());
+        let context = ProxyContext::new(
+            Arc::new(PluginManager::new(
+                backend.clone() as Arc<dyn PluginExecutionBackend>
+            )),
+            "test-binding",
+            5_000,
+        );
+        let installed = install(
+            context,
+            &descriptor(PluginRegistrationOperation::ToolRequestIntercept),
+            PluginHandle {
+                plugin_id: "example".into(),
+                generation: 1,
+            },
+        )
+        .expect("the one class this kernel proxies");
+
+        let error = nemo_relay::api::tool::tool_request_intercepts(
+            "example_tool",
+            serde_json::json!({"input": true}),
+        )
+        .await
+        .expect_err("no trusted budget is in scope");
+
+        assert!(
+            error.to_string().contains("trusted budget"),
+            "the refusal says why: {error}"
+        );
+        assert!(
+            backend.invocations.lock().expect("the record").is_empty(),
+            "nothing may reach the plugin without a budget to run under"
+        );
+        drop(installed);
+    }
 
     /// A backend that records what it was asked to run.
     #[derive(Default)]
@@ -388,10 +445,9 @@ mod tests {
             Arc::new(PluginManager::new(
                 backend.clone() as Arc<dyn PluginExecutionBackend>
             )),
-            5_000,
             "test-binding",
-        )
-        .expect("a budget to run in");
+            5_000,
+        );
         let installed = install(
             context,
             &descriptor(PluginRegistrationOperation::ToolRequestIntercept),
@@ -408,10 +464,10 @@ mod tests {
 
         // The kernel's own chain reaches the plugin's registration through the
         // proxy, and what the backend answered is what the chain returns.
-        let rewritten = nemo_relay::api::tool::tool_request_intercepts(
+        let rewritten = run_under_budget(nemo_relay::api::tool::tool_request_intercepts(
             "example_tool",
             serde_json::json!({"input": true}),
-        )
+        ))
         .await
         .expect("the chain");
         assert_eq!(rewritten["rewritten"], true, "{rewritten}");
@@ -429,10 +485,10 @@ mod tests {
         // Dropping the proxies takes them out of the chain: a registration whose
         // plugin is no longer loaded must not be left behind to fail later.
         drop(installed);
-        let after = nemo_relay::api::tool::tool_request_intercepts(
+        let after = run_under_budget(nemo_relay::api::tool::tool_request_intercepts(
             "example_tool",
             serde_json::json!({"input": true}),
-        )
+        ))
         .await
         .expect("the chain");
         assert_eq!(after["rewritten"], serde_json::Value::Null, "{after}");
@@ -452,10 +508,9 @@ mod tests {
             Arc::new(PluginManager::new(
                 backend.clone() as Arc<dyn PluginExecutionBackend>
             )),
-            5_000,
             "test-binding",
-        )
-        .expect("a budget to run in");
+            5_000,
+        );
         let installed = install(
             context,
             &descriptor(PluginRegistrationOperation::ToolRequestIntercept),
@@ -466,10 +521,10 @@ mod tests {
         )
         .expect("the one class this kernel proxies");
 
-        let error = nemo_relay::api::tool::tool_request_intercepts(
+        let error = run_under_budget(nemo_relay::api::tool::tool_request_intercepts(
             "example_tool",
             serde_json::json!({"input": true}),
-        )
+        ))
         .await
         .expect_err("the backend failed after it was entered");
 
@@ -547,10 +602,9 @@ mod tests {
             Arc::new(PluginManager::new(
                 backend as Arc<dyn PluginExecutionBackend>,
             )),
-            5_000,
             "test-binding",
-        )
-        .expect("a budget to run in");
+            5_000,
+        );
         let error = install(
             context,
             &descriptor(PluginRegistrationOperation::LlmStreamExecutionIntercept),
