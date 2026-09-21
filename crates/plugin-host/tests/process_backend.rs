@@ -268,13 +268,14 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     // The kernel installs the proxy, then makes a real call through its own
     // chain: the chain runs in this process, the registration runs in the child.
     let binding = backend.runtime_binding_digest().to_owned();
-    let proxies = nemo_relay_plugin_host::proxy::install(
+    let manager = std::sync::Arc::new(nemo_relay::plugin::execution::PluginManager::new(
         std::sync::Arc::new(backend),
-        descriptor,
-        loaded.handle.clone(),
-        &binding,
-    )
-    .expect("the kernel can proxy a tool request intercept");
+    ));
+    let context = nemo_relay_plugin_host::proxy::ProxyContext::new(manager, 5_000, binding)
+        .expect("a budget to run in");
+    let proxies =
+        nemo_relay_plugin_host::proxy::install(context, descriptor, loaded.handle.clone())
+            .expect("the kernel can proxy a tool request intercept");
 
     let rewritten = nemo_relay::api::tool::tool_request_intercepts(
         "example_tool",

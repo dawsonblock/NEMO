@@ -1818,6 +1818,13 @@ fn status_from_flow_error(err: FlowError) -> NemoRelayStatus {
         FlowError::ResourceExhausted { .. } => NemoRelayStatus::Backpressured,
         // Admission timeout is retryable backpressure at the native boundary.
         FlowError::Timeout { .. } => NemoRelayStatus::Backpressured,
+        // A registration that failed keeps its reason: the dispatch state and
+        // the certainty belong to whoever decides about effects, and a status
+        // code at the ABI boundary is not a place to keep them.
+        FlowError::PluginInvocation { failure, .. } => {
+            set_native_last_error(failure.message);
+            NemoRelayStatus::Internal
+        }
         FlowError::Upstream(_) | FlowError::Internal(_) | FlowError::CallbackException { .. } => {
             NemoRelayStatus::Internal
         }

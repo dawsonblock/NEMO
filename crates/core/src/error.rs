@@ -142,6 +142,29 @@ pub enum FlowError {
     #[error("{0}")]
     Upstream(UpstreamFailure),
 
+    /// A registration a loaded plugin made failed when the runtime invoked it.
+    ///
+    /// The dispatch state and the certainty travel with the failure rather than
+    /// being rendered into a message: a caller deciding whether an effect may
+    /// have happened cannot read that off a string, and "the plugin may have
+    /// dispatched" is not the same fact as "the plugin failed".
+    #[error("plugin registration '{registration}' failed: {}",
+        match certainty {
+            nemo_relay_plugin_protocol::OutcomeCertainty::Unknown =>
+                "the plugin may have dispatched; the outcome is unknown",
+            _ => "the plugin reported a failure",
+        })]
+    PluginInvocation {
+        /// The registration that was invoked.
+        registration: String,
+        /// Why it failed, as the plugin described it.
+        failure: nemo_relay_plugin_protocol::PluginFailure,
+        /// Whether the plugin may have reached an external system.
+        dispatch: nemo_relay_plugin_protocol::DispatchState,
+        /// What the runtime can prove about the outcome.
+        certainty: nemo_relay_plugin_protocol::OutcomeCertainty,
+    },
+
     /// An internal runtime error (e.g., lock poisoning).
     #[error("internal error: {0}")]
     Internal(String),
@@ -185,6 +208,7 @@ impl FlowError {
                 UpstreamFailureClass::InvalidRequest => "invalid_request",
                 UpstreamFailureClass::Other => "upstream_error",
             },
+            Self::PluginInvocation { .. } => "plugin_invocation",
             Self::Internal(_) | Self::CallbackException { .. } => "internal_error",
         }
     }

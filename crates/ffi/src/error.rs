@@ -126,6 +126,11 @@ impl From<&FlowError> for NemoRelayStatus {
             // Admission timeouts are bounded overload, not runtime defects.
             // Preserve the retryable capacity signal across the stable ABI.
             FlowError::Timeout { .. } => NemoRelayStatus::ResourceExhausted,
+            // A registration a plugin made failed while the runtime invoked it.
+            // The dispatch state and certainty stay in the message rather than
+            // becoming a status: a binding caller deciding about effects reads
+            // them from the runtime error, not from the ABI status.
+            FlowError::PluginInvocation { .. } => NemoRelayStatus::Internal,
             FlowError::Upstream(_)
             | FlowError::Internal(_)
             | FlowError::CallbackException { .. } => NemoRelayStatus::Internal,

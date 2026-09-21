@@ -189,6 +189,22 @@ impl PluginManager {
         self.backend.inspect(request, context).await
     }
 
+    /// Run one registration a loaded plugin made.
+    ///
+    /// The same central controls every lifecycle operation receives: the
+    /// operation is validated against the session's contract, its identity is
+    /// reserved so two live operations cannot share one, and the backend is
+    /// reached only through here. That is what makes a kernel-side proxy a
+    /// caller of the manager rather than a second path into the boundary.
+    pub async fn invoke(
+        &self,
+        request: PluginInvokeRequest,
+        context: PluginExecutionContext,
+    ) -> Result<PluginExecutionOutcome, PluginProtocolError> {
+        let _in_flight = self.begin(&context)?;
+        self.backend.invoke(request, context).await
+    }
+
     /// Report backend health.
     pub async fn health(
         &self,
