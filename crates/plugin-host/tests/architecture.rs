@@ -18,6 +18,12 @@
 //! crate that loads a library would be invisible until somebody noticed. The
 //! dependency checks close the other half — a crate can reach the loader without
 //! naming it, by depending on the crate that owns it.
+//!
+//! The same reasoning covers time. A budget belongs to an invocation and comes
+//! from the runtime, so a duration written into the plugin-execution path is a
+//! deadline somebody chose there — the shape the audit found as a `30_000`
+//! constant. That check is source-level because the mistake is legible there: a
+//! number in these files reads as policy whether or not it reaches a caller.
 
 use std::path::{Path, PathBuf};
 
@@ -156,6 +162,157 @@ fn code_lines(source: &str) -> impl Iterator<Item = &str> {
     source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
+}
+
+/// Paths that decide what an invocation may be given, and the fixed durations
+/// that would be a deadline chosen locally in each.
+///
+/// The token list is empty where a fixed duration is transport mechanics rather
+/// than policy — how long to wait for a socket to appear, how long to sleep
+/// between checks — and non-empty where *any* fixed duration in the file would
+/// be a budget nobody configured.
+const BUDGET_DECIDING_PATHS: &[(&str, &[&str])] = &[
+    (
+        "plugin-host:proxy.rs",
+        &["Duration::from_secs", "Duration::from_millis"],
+    ),
+    (
+        "core:plugin/execution.rs",
+        &["Duration::from_secs", "Duration::from_millis"],
+    ),
+    ("plugin-host:supervisor.rs", &[]),
+];
+
+/// Constants whose name alone says they are a budget chosen in the wrong place.
+const BUDGET_CONSTANT_TOKENS: &[&str] =
+    &["PROXY_BUDGET", "DEFAULT_PLUGIN_TIMEOUT", "DEFAULT_BUDGET"];
+
+/// The lines of a file that are not behind `#[cfg(test)]`.
+///
+/// A test fixture may state any duration it likes, so a test module is skipped —
+/// but only the block is skipped, not everything after the first marker, because
+/// production code below a conditional helper is still production code and a
+/// scan that stopped at the first marker would not see it.
+fn production_lines(source: &str) -> Vec<(usize, &str)> {
+    let mut lines = Vec::new();
+    let mut skipping: Option<i32> = None;
+    for (index, line) in source.lines().enumerate() {
+        match skipping {
+            Some(depth) => {
+                let mut next = depth;
+                for character in line.chars() {
+                    match character {
+                        '{' => next += 1,
+                        '}' => next -= 1,
+                        _ => {}
+                    }
+                }
+                skipping = (next > 0).then_some(next);
+            }
+            None => {
+                if line.trim() == "#[cfg(test)]" {
+                    skipping = Some(0);
+                    continue;
+                }
+                lines.push((index + 1, line));
+            }
+        }
+    }
+    lines
+}
+
+/// A number written in thousands, which in these files is a duration somebody
+/// picked: `30_000`, `5_000`, `1_500`. Returns the literal as written.
+fn thousand_grouped_literal(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'_' {
+            continue;
+        }
+        let before = &bytes[..index];
+        let after = &bytes[index + 1..];
+        let digits_before = before.last().is_some_and(u8::is_ascii_digit);
+        let digits_after = after.len() >= 3 && after[..3].iter().all(u8::is_ascii_digit);
+        if !(digits_before && digits_after) {
+            continue;
+        }
+        let start = before
+            .iter()
+            .rposition(|byte| !byte.is_ascii_digit())
+            .map_or(0, |position| position + 1);
+        let end = index
+            + 1
+            + after
+                .iter()
+                .position(|byte| !byte.is_ascii_digit())
+                .unwrap_or(after.len());
+        return Some(&line[start..end]);
+    }
+    None
+}
+
+#[test]
+fn no_plugin_execution_path_chooses_its_own_budget() {
+    let workspace = workspace_root();
+    let mut offenders = Vec::new();
+
+    for member in workspace_members(&workspace) {
+        let crate_name = member
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let src = member.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut sources = Vec::new();
+        rust_sources(&src, &mut sources);
+
+        for (path, source) in sources {
+            let relative = path
+                .split(&format!("{crate_name}/src/"))
+                .nth(1)
+                .unwrap_or(&path)
+                .to_owned();
+            let qualified = format!("{crate_name}:{relative}");
+            let Some((_, duration_tokens)) = BUDGET_DECIDING_PATHS
+                .iter()
+                .find(|(path, _)| *path == qualified)
+            else {
+                continue;
+            };
+
+            for (number, line) in production_lines(&source) {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if let Some(literal) = thousand_grouped_literal(line) {
+                    offenders.push(format!(
+                        "{qualified}:{number} states the duration {literal} locally: {}",
+                        line.trim()
+                    ));
+                }
+                for token in *duration_tokens {
+                    if line.contains(token) {
+                        offenders.push(format!(
+                            "{qualified}:{number} builds a duration locally with {token}"
+                        ));
+                    }
+                }
+                for token in BUDGET_CONSTANT_TOKENS {
+                    if line.contains(token) {
+                        offenders.push(format!("{qualified}:{number} names {token}"));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a plugin-execution path must take its budget from the runtime rather than \
+         choose one: {offenders:#?}"
+    );
 }
 
 #[test]

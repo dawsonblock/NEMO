@@ -139,6 +139,10 @@ name = "middleware_integration"
 path = "tests/integration/middleware_tests.rs"
 
 [[test]]
+name = "managed_budget_integration"
+path = "tests/integration/managed_budget_tests.rs"
+
+[[test]]
 name = "pipeline_integration"
 path = "tests/integration/pipeline_tests.rs"
 

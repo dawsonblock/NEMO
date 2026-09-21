@@ -507,6 +507,13 @@ Still open, in the order they need closing:
    memory, file and child limits, platform sandboxing and destination network
    policy are not applied yet, and capabilities do not declare the profile they
    need.
+5. **A production composition that states the managed caps.** The runtime now
+   publishes a trusted budget on the real managed paths, and resolves it from
+   the smallest of the inherited deadline, the durable lease expiry and the
+   configured cap. Nothing composes a production plugin path yet, so nothing
+   requires a production deployment to state those caps: an unstated cap
+   publishes no budget, which a registration across the boundary refuses — fail
+   closed, but silent until the composition that owns the decision exists.
 
 After invocation, the cutover milestones are what move the metric: production
 selects the process backend and refuses the in-process one, the bindings stop
@@ -566,6 +573,22 @@ holds the supervisor that starts it and the backend that reaches it.
   budget that passes mid-operation kills the process instead of asking a plugin
   to honour a cancellation token. A kill is reported as `DeadlineExceeded`, not
   as a crash.
+- **Where that budget comes from.** A managed call publishes the smallest of
+  three sources — the deadline its parent published, the durable action lease's
+  *expiry*, and `now` plus the runtime's configured cap for that kind of call —
+  and refuses to start when a source that exists has already passed. A lease
+  contributes an expiry rather than a duration, because `now + 30` computed at a
+  later layer is a lease silently extended, and a callback that started under one
+  expiry keeps it even if another task renews the lease behind it. A call with
+  none of the three publishes nothing: work that stays in process is unaffected,
+  and a registration across the boundary refuses, since a deadline chosen inside
+  the plugin path is the invention the trusted budget exists to prevent. Two
+  gaps are named rather than hidden: nothing in the tree *states* the caps yet
+  (item 5 below), and the streaming LLM path does not publish a budget, which is
+  safe only because no remotely supported registration class is reachable from
+  it. The kernel's own `kernel_deadline_unix_ms` still hard-codes 29 seconds for
+  an action's deadline; that constant is the same shape of finding and moves when
+  runtime policy owns the action budget rather than the per-call cap alone.
 - **Failure vocabulary.** A transport failure is reported as `HostCrashed` when
   the child has exited and as `Unavailable` when it is still running. The two
   call for different responses — one is a process that ended, the other is a

@@ -13,7 +13,8 @@ use crate::api::runtime::subscriber_dispatcher::{
     register_pending_publication,
 };
 use crate::api::runtime::{
-    EventSubscriberFn, ScopeStackHandle, ToolExecutionNextFn, with_active_event_uuid,
+    EventSubscriberFn, ManagedBudget, ManagedCall, ScopeStackHandle, ToolExecutionNextFn,
+    resolve_managed_call_budget, with_active_event_uuid, with_execution_budget,
 };
 use crate::api::scope::event;
 use crate::api::scope::{EmitMarkEventParams, ScopeHandle, metadata_with_log_severity};
@@ -766,6 +767,22 @@ impl Drop for ManagedToolCompletion {
 /// When execution fails after the start event has been emitted, the runtime
 /// still emits a tool-end event without an output payload.
 pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<ToolExecutionResult> {
+    ensure_runtime_owner()?;
+    // The budget is resolved before anything runs, so a call that inherited an
+    // expired deadline — or that is running under a lease which has already
+    // lapsed — is refused rather than started on time the runtime has spent.
+    // What it resolves to covers the whole managed call, including the intercept
+    // chains, because that is where a remote registration is reached.
+    match resolve_managed_call_budget(ManagedCall::Tool)? {
+        ManagedBudget::Bounded(budget) => {
+            with_execution_budget(budget, tool_call_execute_managed(params)).await
+        }
+        ManagedBudget::Unbounded => tool_call_execute_managed(params).await,
+    }
+}
+
+/// The body of a managed tool call, under whatever budget the boundary resolved.
+async fn tool_call_execute_managed(params: ToolCallExecuteParams) -> Result<ToolExecutionResult> {
     let ToolCallExecuteParams {
         name,
         args,
@@ -776,7 +793,6 @@ pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<ToolExec
         metadata,
         tool_call_id,
     } = params;
-    ensure_runtime_owner()?;
     {
         let (entries, subscribers, parent_uuid, guardrail_metadata) = {
             let scope_stack = current_scope_stack();

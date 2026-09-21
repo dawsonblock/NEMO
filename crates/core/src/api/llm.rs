@@ -28,8 +28,9 @@ use crate::api::runtime::subscriber_dispatcher::{
 };
 use crate::api::runtime::{
     EventSubscriberFn, LlmCollectorFn, LlmExecutionNextFn, LlmFinalizerFn, LlmJsonStream,
-    LlmSanitizeRequestContext, LlmSanitizeResponseContext, LlmStreamExecutionNextFn,
-    MiddlewareContinuationContext, with_active_event_uuid,
+    LlmSanitizeRequestContext, LlmSanitizeResponseContext, LlmStreamExecutionNextFn, ManagedBudget,
+    ManagedCall, MiddlewareContinuationContext, resolve_managed_call_budget,
+    with_active_event_uuid, with_execution_budget,
 };
 use crate::api::runtime::{ScopeStackHandle, capture_traceparent, current_scope_stack};
 use crate::api::scope::event;
@@ -1601,6 +1602,20 @@ impl Drop for ManagedLlmCompletion {
 /// Response codecs enrich observability output only and do not change the
 /// value returned to the caller.
 pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
+    ensure_runtime_owner()?;
+    // Resolved before anything runs and published for the whole call: a managed
+    // LLM call reaches remote registrations through the same intercept chains a
+    // tool call does, and both need the same trusted deadline underneath them.
+    match resolve_managed_call_budget(ManagedCall::Llm)? {
+        ManagedBudget::Bounded(budget) => {
+            with_execution_budget(budget, llm_call_execute_managed(params)).await
+        }
+        ManagedBudget::Unbounded => llm_call_execute_managed(params).await,
+    }
+}
+
+/// The body of a managed LLM call, under whatever budget the boundary resolved.
+async fn llm_call_execute_managed(params: LlmCallExecuteParams) -> Result<Json> {
     let LlmCallExecuteParams {
         name,
         request,
@@ -1613,7 +1628,6 @@ pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
         codec,
         response_codec,
     } = params;
-    ensure_runtime_owner()?;
     {
         let (entries, subscribers, parent_uuid, guardrail_metadata) = {
             let scope_stack = current_scope_stack();
