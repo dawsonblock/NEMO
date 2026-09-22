@@ -26,6 +26,12 @@ pub const REWRITE_MARKER: &str = "native_intercept";
 /// Marker the LLM rewrite adds.
 pub const LLM_MARKER: &str = "native_llm_intercept";
 
+/// Marker a sanitized request payload carries.
+pub const SANITIZE_REQUEST_MARKER: &str = "native_tool_request_sanitize";
+
+/// Marker a sanitized response payload carries.
+pub const SANITIZE_RESPONSE_MARKER: &str = "native_tool_response_sanitize";
+
 struct InterceptPlugin;
 
 impl NativePlugin for InterceptPlugin {
@@ -38,6 +44,30 @@ impl NativePlugin for InterceptPlugin {
     }
 
     fn register(&mut self, config: &Map<String, Json>, ctx: &mut PluginContext<'_>) -> Result<()> {
+        // The two sanitize directions. They change what an event publishes and
+        // never what the tool does, which is the invariant a test can see from
+        // outside: the call's own result comes back untouched while the copy the
+        // event carries is the sanitized one.
+        ctx.register_tool_sanitize_request_guardrail(
+            "fixture_intercept_sanitize_request",
+            0,
+            |_name, value| async move {
+                Ok(serde_json::json!({
+                    "value": value,
+                    SANITIZE_REQUEST_MARKER: true,
+                }))
+            },
+        )?;
+        ctx.register_tool_sanitize_response_guardrail(
+            "fixture_intercept_sanitize_response",
+            0,
+            |_name, value| async move {
+                Ok(serde_json::json!({
+                    "value": value,
+                    SANITIZE_RESPONSE_MARKER: true,
+                }))
+            },
+        )?;
         // An observer, which is the third class a kernel can serve. What it saw
         // is written where the caller can read it, because a subscriber in
         // another process has no other way to witness that an event arrived: its

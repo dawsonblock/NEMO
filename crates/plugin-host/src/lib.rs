@@ -484,7 +484,7 @@ impl ProcessLoadedPlugins {
     pub async fn load<I, J>(
         config: PluginHostSupervisorConfig,
         registration_cap_millis: u64,
-        observer_budget_millis: u64,
+        observability_budget_millis: u64,
         specs: I,
         components: J,
     ) -> Result<Self, PluginProtocolError>
@@ -555,7 +555,7 @@ impl ProcessLoadedPlugins {
         // call that raised it.
         let context = crate::proxy::ProxyContext::new(manager, binding, registration_cap_millis)
             .with_operation_scopes(backend.operation_scopes())
-            .with_observer_budget(observer_budget_millis);
+            .with_observability_budget(observability_budget_millis);
         let mut proxies = Vec::new();
         for descriptor in &descriptors {
             let handle = handles

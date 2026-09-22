@@ -164,7 +164,12 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
     assert!(after.is_empty(), "{after:#?}");
 }
 
-#[tokio::test]
+// A multi-threaded runtime, because this fixture registers the sanitize
+// guardrails too: a sanitizer is answered by the runtime that owns the
+// connection, and on a single-threaded runtime the thread that would answer is
+// the thread that is waiting. Installing one is refused there rather than left
+// as a hang — see `a_sanitize_proxy_is_refused_on_a_single_threaded_runtime`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     use nemo_relay_plugin_protocol::{PluginActivateRequest, PluginComponentConfiguration};
 
@@ -334,7 +339,7 @@ async fn the_kernel_serves_its_socket_and_refuses_a_caller_without_the_credentia
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_composition_installs_a_plugin_from_another_process_into_this_chain() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
     use nemo_relay_plugin_protocol::PluginComponentConfiguration;
@@ -360,7 +365,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         host_config(),
         5_000,
         // How long an observer's delivery may take. Stated rather than
-        // defaulted: a runtime with no observer budget has no remote observers.
+        // defaulted: a runtime with no observability budget has no remote observers.
         5_000,
         [("fixture_intercept".to_string(), fixture.artifact())],
         [PluginComponentConfiguration {
@@ -378,7 +383,9 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         vec![
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
-            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite"
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_request",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_response"
         ],
         "every registration the plugin made is proxied here, in the classes this kernel serves"
     );
@@ -498,6 +505,67 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     )
     .await
     .expect("a managed tool call the observer was watching");
+
+    // A sanitize guardrail in another process changes what observers see and not
+    // what the tool did. This is the boundary regression for the hang it used to
+    // be: the guardrail's own runner returns in process, and here the same
+    // guardrail is reached over the boundary — so a failure here is the boundary
+    // and nothing else.
+    let published: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording = std::sync::Arc::clone(&published);
+    nemo_relay::api::subscriber::register_subscriber(
+        "process-backend-sanitized-payloads",
+        std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+            if event.name() == "sanitized_tool" {
+                recording.lock().unwrap().push(serde_json::json!({
+                    "has_data": event.data().is_some(),
+                    "data": event.data().cloned(),
+                }));
+            }
+        }),
+    )
+    .expect("a subscriber");
+    let result = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("sanitized_tool")
+                    .args(serde_json::json!({"input": true}))
+                    .func(std::sync::Arc::new(|_args| {
+                        Box::pin(async { Ok(serde_json::json!({"secret": "value"}).into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed tool call whose payload is sanitized elsewhere");
+    assert_eq!(
+        result.result,
+        serde_json::json!({"secret": "value"}),
+        "the sanitizer must not change what the tool returned"
+    );
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+    let published = published.lock().unwrap().clone();
+    assert!(
+        published.iter().any(|event| {
+            event["has_data"] == serde_json::json!(true)
+                && event["data"]
+                    .get("native_tool_response_sanitize")
+                    .and_then(|marker| marker.as_bool())
+                    .unwrap_or(false)
+                && event["data"].to_string().contains("secret")
+        }),
+        "the published copy should carry the sanitizer's work: {published:#?}"
+    );
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-sanitized-payloads")
+        .expect("a deregistration");
 
     // Dropping the composition takes the registration out of the chain and ends
     // the host: a plugin's callback may not outlive the runtime that installed it.

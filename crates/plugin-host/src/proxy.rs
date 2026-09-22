@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::operation_scopes::OperationScopes;
 use nemo_relay::api::llm::LlmRequest;
-use nemo_relay::api::runtime::{LlmRequestInterceptFn, ToolInterceptFn};
+use nemo_relay::api::runtime::{LlmRequestInterceptFn, ToolInterceptFn, ToolSanitizeFn};
 use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
@@ -59,10 +59,40 @@ pub struct ProxyContext {
     /// delivery, so it neither inherits the action's budget nor is allowed to
     /// extend it. Absent means this runtime wants no remote observers, which is
     /// refused rather than defaulted.
-    observer_budget_millis: Option<u64>,
+    observability_budget_millis: Option<u64>,
 }
 
 impl ProxyContext {
+    /// The context for work this runtime asks of a plugin beside a call.
+    ///
+    /// Built from the stated observability budget rather than from the task-local
+    /// one: the dispatcher does not run in the calling task, so a proxy that read
+    /// the call's budget here would read nothing and refuse every sanitizer.
+    fn passive_execution_context(
+        &self,
+        operation_request_id: String,
+    ) -> Result<PluginExecutionContext, nemo_relay::error::FlowError> {
+        let Some(budget_millis) = self
+            .observability_budget_millis
+            .filter(|millis| *millis > 0)
+        else {
+            return Err(nemo_relay::error::FlowError::InvalidArgument(
+                "this runtime states no budget for work beside a call, so it cannot ask a \
+                 plugin to do any"
+                    .to_string(),
+            ));
+        };
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
+        Ok(PluginExecutionContext {
+            operation_request_id,
+            protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+            runtime_binding_digest: self.runtime_binding_digest.clone(),
+            deadline_unix_ms: now.saturating_add(budget_millis),
+            remaining_budget_millis: budget_millis,
+            max_response_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        })
+    }
+
     /// Build the context a proxy runs under.
     pub fn new(
         manager: Arc<PluginManager>,
@@ -74,13 +104,13 @@ impl ProxyContext {
             runtime_binding_digest: runtime_binding_digest.into(),
             local_cap_millis,
             operation_scopes: None,
-            observer_budget_millis: None,
+            observability_budget_millis: None,
         }
     }
 
     /// State how long an observer's delivery may take.
-    pub fn with_observer_budget(mut self, millis: u64) -> Self {
-        self.observer_budget_millis = Some(millis);
+    pub fn with_observability_budget(mut self, millis: u64) -> Self {
+        self.observability_budget_millis = Some(millis);
         self
     }
 
@@ -104,6 +134,8 @@ pub struct RegistrationProxies {
     tool_request_intercepts: Vec<String>,
     llm_request_intercepts: Vec<String>,
     subscribers: Vec<String>,
+    tool_sanitize_request: Vec<String>,
+    tool_sanitize_response: Vec<String>,
     /// One delivery task per observer registration, ended with this value.
     deliveries: Vec<std::sync::Arc<crate::observer::ObserverDelivery>>,
 }
@@ -115,6 +147,8 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("tool_request_intercepts", &self.tool_request_intercepts)
             .field("llm_request_intercepts", &self.llm_request_intercepts)
             .field("subscribers", &self.subscribers)
+            .field("tool_sanitize_request", &self.tool_sanitize_request)
+            .field("tool_sanitize_response", &self.tool_sanitize_response)
             .finish()
     }
 }
@@ -126,6 +160,8 @@ impl RegistrationProxies {
             .iter()
             .chain(self.llm_request_intercepts.iter())
             .chain(self.subscribers.iter())
+            .chain(self.tool_sanitize_request.iter())
+            .chain(self.tool_sanitize_response.iter())
             .map(String::as_str)
             .collect()
     }
@@ -142,6 +178,15 @@ impl Drop for RegistrationProxies {
         for registration in &self.subscribers {
             let _ = nemo_relay::api::subscriber::deregister_subscriber(registration);
         }
+        for registration in &self.tool_sanitize_request {
+            let _ =
+                nemo_relay::api::registry::deregister_tool_sanitize_request_guardrail(registration);
+        }
+        for registration in &self.tool_sanitize_response {
+            let _ = nemo_relay::api::registry::deregister_tool_sanitize_response_guardrail(
+                registration,
+            );
+        }
     }
 }
 
@@ -155,11 +200,25 @@ pub fn install(
         tool_request_intercepts: Vec::new(),
         llm_request_intercepts: Vec::new(),
         subscribers: Vec::new(),
+        tool_sanitize_request: Vec::new(),
+        tool_sanitize_response: Vec::new(),
         deliveries: Vec::new(),
     };
 
     for registration in &descriptor.registrations {
         match registration.operation {
+            PluginRegistrationOperation::ToolSanitizeRequestGuardrail => {
+                install_tool_sanitize(&context, registration, &handle, false)?;
+                installed
+                    .tool_sanitize_request
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::ToolSanitizeResponseGuardrail => {
+                install_tool_sanitize(&context, registration, &handle, true)?;
+                installed
+                    .tool_sanitize_response
+                    .push(registration.registration_id.clone());
+            }
             PluginRegistrationOperation::Subscriber => {
                 installed
                     .deliveries
@@ -422,6 +481,162 @@ fn install_llm_request_intercept(
     })
 }
 
+/// Run plugin work on the runtime that owns this session's connection.
+///
+/// The dispatcher drives sanitizers on a runtime of its own, and a connection
+/// belongs to the runtime that made it: awaiting the call from the dispatcher's
+/// runtime is a wait nothing can end except the budget, which is exactly what
+/// the first version of this proxy did — every invocation took its whole budget
+/// and the events still arrived, with their observability fields cleared.
+///
+/// So the work runs where the connection lives and the answer is carried back.
+/// If that runtime is gone, the guardrail has not answered and the chain's
+/// fail-closed rule applies to a copy that was never sanitized.
+async fn on_session_runtime<T>(
+    runtime: tokio::runtime::Handle,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, nemo_relay::error::FlowError>
+where
+    T: Send + 'static,
+{
+    let (answered, received) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let _ = answered.send(work.await);
+    });
+    received.await.map_err(|_| {
+        nemo_relay::error::FlowError::Internal(
+            "the runtime that owns this plugin session stopped before the guardrail answered"
+                .to_string(),
+        )
+    })
+}
+
+/// Install the proxy for one tool sanitize guardrail.
+///
+/// A sanitize guardrail changes what observers see and never what the tool does,
+/// which is what makes this proxy safe to have at all: it is handed the copy of
+/// the payload an event would carry, and its answer is used for that event. A
+/// refusal — including the host reporting that the guardrail omitted the payload
+/// — is returned as an error, because that is how the kernel's chain learns to
+/// publish nothing rather than publish unsanitized.
+fn install_tool_sanitize(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+    response_direction: bool,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    // Captured here, where the caller's runtime is current, because the callback
+    // below runs on the dispatcher's.
+    let session_runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "a sanitize proxy needs the runtime that owns the session to answer on".to_string(),
+        )
+    })?;
+    // A sanitizer is invoked from the dispatcher, and the caller's own task is
+    // waiting for that invocation: on a single-threaded runtime the thread that
+    // would answer is the thread that is waiting, so the wait could only end at
+    // the budget. Refused rather than left as a hang, and named as what it is —
+    // this needs an independent runtime for off-path work, not a longer budget.
+    if session_runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is a sanitize guardrail and this runtime is single-threaded, so the \
+                 dispatcher's wait for it could never be answered; remote sanitizers need a \
+                 multi-threaded runtime (or an independent runtime for off-path work)",
+                registration.registration_id
+            ),
+        ));
+    }
+
+    let callable: ToolSanitizeFn = Arc::new(move |tool: String, value: serde_json::Value| {
+        let context = context.clone();
+        let handle = handle.clone();
+        let registration_id = registration_id.clone();
+        let session_runtime = session_runtime.clone();
+        Box::pin(async move {
+            let answered = on_session_runtime(session_runtime, async move {
+                let payload = serde_json::json!({ "tool": tool, "value": value }).to_string();
+                let execution = context.passive_execution_context(
+                    nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
+                )?;
+                let request = PluginInvokeRequest {
+                    handle,
+                    registration_id: registration_id.clone(),
+                    arguments: payload,
+                    budget_millis: execution.remaining_budget_millis,
+                };
+                let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                    scopes.enter(
+                        &execution.operation_request_id,
+                        nemo_relay::api::runtime::current_scope_stack(),
+                    )
+                });
+                let outcome =
+                    context
+                        .manager
+                        .invoke(request, execution)
+                        .await
+                        .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        })?;
+                match outcome.result {
+                    Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
+                        .map_err(|error| {
+                            nemo_relay::error::FlowError::Internal(format!(
+                                "a proxied guardrail answered with something that is not JSON: \
+                                 {error}"
+                            ))
+                        }),
+                    Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                        "a proxied guardrail answered with {}",
+                        other_name(&other)
+                    ))),
+                    Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id,
+                        dispatch: outcome.dispatch,
+                        certainty: outcome.certainty,
+                        failure,
+                    }),
+                }
+            })
+            .await;
+            answered?
+        })
+    });
+
+    let installed = if response_direction {
+        nemo_relay::api::registry::register_tool_sanitize_response_guardrail(
+            &registration.registration_id,
+            priority,
+            callable,
+        )
+    } else {
+        nemo_relay::api::registry::register_tool_sanitize_request_guardrail(
+            &registration.registration_id,
+            priority,
+            callable,
+        )
+    };
+    installed.map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
 /// Install the proxy for one event subscriber.
 ///
 /// The kernel keeps its own subscriber list — one proxy per registration — and
@@ -434,13 +649,16 @@ fn install_subscriber(
     registration: &PluginRegistrationDescriptor,
     handle: &PluginHandle,
 ) -> Result<std::sync::Arc<crate::observer::ObserverDelivery>, PluginProtocolError> {
-    let Some(budget_millis) = context.observer_budget_millis.filter(|millis| *millis > 0) else {
+    let Some(budget_millis) = context
+        .observability_budget_millis
+        .filter(|millis| *millis > 0)
+    else {
         // No stated limit means no remote observers, rather than a limit this
         // layer chose for the runtime.
         return Err(PluginProtocolError::new(
             PluginFailureCode::Rejected,
             format!(
-                "'{}' is a subscriber and this runtime states no observer budget, so it cannot \
+                "'{}' is a subscriber and this runtime states no observability budget, so it cannot \
                  be delivered to",
                 registration.registration_id
             ),
@@ -534,6 +752,39 @@ mod tests {
         .await
     }
 
+    /// A sanitizer's wait is answered by the runtime that owns the connection, and
+    /// on a single-threaded runtime that thread is the one already waiting. The
+    /// refusal is the point: a hang that ends at the budget is a worse answer
+    /// than a refusal that says why.
+    #[tokio::test]
+    async fn a_sanitize_proxy_is_refused_on_a_single_threaded_runtime() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let backend = Arc::new(RecordingProxyBackend::default());
+        let context = ProxyContext::new(
+            Arc::new(PluginManager::new(
+                backend as Arc<dyn PluginExecutionBackend>,
+            )),
+            "test-binding",
+            5_000,
+        )
+        .with_observability_budget(5_000);
+
+        let error = install(
+            context,
+            &descriptor(PluginRegistrationOperation::ToolSanitizeResponseGuardrail),
+            PluginHandle {
+                plugin_id: "example".into(),
+                generation: 1,
+            },
+        )
+        .expect_err("a sanitize proxy on a single-threaded runtime");
+        assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+        assert!(
+            error.failure.message.contains("single-threaded"),
+            "{error:?}"
+        );
+    }
+
     /// An observer's delivery is not part of the action whose event it sees, so
     /// it does not inherit that action's budget. A runtime that states none
     /// cannot have remote observers: the alternative is a number this layer
@@ -558,10 +809,10 @@ mod tests {
                 generation: 1,
             },
         )
-        .expect_err("a subscriber with no observer budget");
+        .expect_err("a subscriber with no observability budget");
         assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
         assert!(
-            error.failure.message.contains("observer budget"),
+            error.failure.message.contains("observability budget"),
             "{error:?}"
         );
     }

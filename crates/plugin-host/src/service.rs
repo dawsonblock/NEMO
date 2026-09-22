@@ -296,6 +296,18 @@ impl PluginHostService {
                         Err(error) => Ok(refusal(error.to_string())),
                     }
                 }
+                // The two tool sanitize directions. What crosses is the payload
+                // an event would carry, and what comes back is the copy the event
+                // should publish: a sanitizer changes what observers see and
+                // never what the tool does. A refusal — including the chain
+                // omitting the payload — is reported as one, so the kernel omits
+                // it the same way it would in process.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolSanitizeRequestGuardrail => {
+                    sanitized_tool_payload(&request, false).await
+                }
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolSanitizeResponseGuardrail => {
+                    sanitized_tool_payload(&request, true).await
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.
@@ -872,6 +884,58 @@ impl PluginHostService {
                 .unwrap_or(0),
         )?;
         Ok(envelope.context)
+    }
+}
+
+/// Run one tool sanitize guardrail over the payload a tool call would publish.
+///
+/// The payload is the class's own shape — the tool's name and the JSON an event
+/// would carry — and the answer is either the sanitized copy or a refusal, which
+/// is how the chain's "omit the payload" reaches the kernel.
+async fn sanitized_tool_payload(
+    request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
+    response_direction: bool,
+) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
+    let payload: serde_json::Value = serde_json::from_str(&request.arguments)
+        .map_err(|error| refused(format!("a tool sanitize payload must be JSON: {error}")))?;
+    let tool = payload
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| refused("a tool sanitize payload names no tool"))?
+        .to_string();
+    let value = payload
+        .get("value")
+        .cloned()
+        .ok_or_else(|| refused("a tool sanitize payload carries no value"))?;
+    let sanitized = if response_direction {
+        nemo_relay::api::tool::invoke_tool_sanitize_response_registration(
+            &request.registration_id,
+            &tool,
+            value,
+        )
+        .await
+    } else {
+        nemo_relay::api::tool::invoke_tool_sanitize_request_registration(
+            &request.registration_id,
+            &tool,
+            value,
+        )
+        .await
+    };
+    match sanitized {
+        Ok(Some(sanitized)) => Ok(success(serde_json::to_string(&sanitized).map_err(
+            |error| {
+                refused(format!(
+                    "the sanitized payload could not be serialized: {error}"
+                ))
+            },
+        )?)),
+        // A payload that could not be sanitized is not published unsanitized: the
+        // chain omits it, and a refusal is what tells the kernel to do the same.
+        Ok(None) => Ok(refusal(
+            "the guardrail omitted the payload rather than publishing it unsanitized",
+        )),
+        Err(error) => Ok(refusal(error.to_string())),
     }
 }
 

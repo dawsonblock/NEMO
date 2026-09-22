@@ -864,7 +864,14 @@ sanitizers on a private runtime of its own, while the connection's tasks make
 progress on the runtime that composed it, so the wait can only end at the budget.
 Observers do not have this problem because their delivery runs on a task of that
 second runtime. The fix is to make an off-path invocation's transport belong to
-the runtime that drives it, not to move the wait.
+the runtime that drives it, not to move the wait: the work runs on the session's
+runtime and the answer is carried back. That is now in place and the boundary
+regression passes — but only on a multi-threaded runtime, because on a
+single-threaded one the thread that would answer the sanitizer is the thread that
+is waiting for it. Installing a sanitize proxy on a single-threaded runtime is
+therefore refused rather than left as a hang that ends at the budget, and the
+named follow-up is an independent runtime for off-path work, which would remove
+the limitation instead of documenting it.
 
 Nothing in this matrix changes the ordering that moves the metric: coverage, then
 the cutover, then the loader leaving, which is what finally drops the 621.
