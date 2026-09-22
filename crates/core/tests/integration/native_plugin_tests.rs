@@ -208,6 +208,65 @@ impl Drop for NativePluginTestCleanup {
     }
 }
 
+/// The tool sanitize runner terminates and returns the sanitized copy, with no
+/// process boundary anywhere: the fixture is loaded into this process and the
+/// exact registration is invoked through the same entry point the host calls.
+///
+/// This is the causal experiment. The same fixture's sanitizers already run
+/// through the runtime's own chain — the events below assert their markers today
+/// — so a hang here would be the runner or the callback plumbing, while a hang
+/// only over the boundary is the boundary. The answer decides which layer to fix
+/// rather than which layer to guess at.
+#[tokio::test]
+async fn the_tool_sanitize_runner_returns_the_sanitized_copy_in_process() {
+    use nemo_relay::api::registry::list_runtime_registrations;
+
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture);
+
+    // Held for the test's duration: dropping it unloads the library, and the
+    // runner below needs the guardrail it registered.
+    let _activation = load_native_plugins([NativePluginLoadSpec {
+        plugin_id: "fixture_native".into(),
+        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
+        approved_identity: None,
+    }])
+    .expect("native plugin should load");
+    let mut cleanup = NativePluginTestCleanup::new();
+
+    let mut plugin_config = PluginConfig::default();
+    plugin_config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(plugin_config)
+        .await
+        .expect("native plugin should initialize");
+    cleanup.mark_plugin_configuration_active();
+
+    let registration = list_runtime_registrations(None)
+        .expect("the registrations this process holds")
+        .into_iter()
+        .map(|identity| identity.effective_name)
+        .find(|name| name.ends_with("fixture_tool_sanitize_request"))
+        .expect("the fixture's tool request sanitize guardrail");
+
+    let sanitized = nemo_relay::api::tool::invoke_tool_sanitize_request_registration(
+        &registration,
+        "native-fixture-tool",
+        serde_json::json!({"input": true}),
+    )
+    .await
+    .expect("the runner must return rather than wait")
+    .expect("the guardrail produced a payload");
+    assert_eq!(
+        sanitized["native_plugin_tool_sanitize_request"], true,
+        "the runner returned the guardrail's copy: {sanitized}"
+    );
+}
+
 #[tokio::test]
 async fn sdk_cdylib_registers_tool_request_intercept() {
     let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;

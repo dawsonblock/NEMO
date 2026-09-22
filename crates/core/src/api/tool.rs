@@ -945,6 +945,83 @@ async fn tool_call_execute_managed(params: ToolCallExecuteParams) -> Result<Tool
     }
 }
 
+/// Run exactly one tool request sanitize guardrail, named by its registration.
+///
+/// A sanitize guardrail changes what observers see and never what the runtime
+/// does: the chain it belongs to rewrites the copy of the payload that goes into
+/// events, and the callback's arguments and result are untouched. That is why a
+/// host can run one of these without being trusted with the call — and why the
+/// answer here is the sanitized *copy* rather than a call to make.
+///
+/// `None` means the chain omitted the observability payload, which is what a
+/// failing sanitizer produces: a payload that could not be sanitized is not
+/// published unsanitized. A caller reports that as a refusal so the runtime
+/// omits the payload the same way it would in process.
+pub async fn invoke_tool_sanitize_request_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+) -> Result<Option<Json>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.tool_sanitize_request_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_sanitize_request_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool request sanitize guardrail is registered as '{registration}'"
+        )));
+    };
+    Ok(NemoRelayContextState::tool_sanitize_request_snapshot_chain(name, args, &[entry]).await)
+}
+
+/// Run exactly one tool response sanitize guardrail, named by its registration.
+///
+/// The response direction of [`invoke_tool_sanitize_request_registration`], with
+/// the same rule: what comes back is the sanitized copy for the event, and `None`
+/// is a payload that could not be sanitized and is therefore omitted.
+pub async fn invoke_tool_sanitize_response_registration(
+    registration: &str,
+    name: &str,
+    result: Json,
+) -> Result<Option<Json>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.tool_sanitize_response_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_sanitize_response_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool response sanitize guardrail is registered as '{registration}'"
+        )));
+    };
+    Ok(NemoRelayContextState::tool_sanitize_response_snapshot_chain(name, result, &[entry]).await)
+}
+
 /// Run only the tool request-intercept chain.
 ///
 /// This applies the currently active global and scope-local request intercepts
