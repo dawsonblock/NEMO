@@ -791,7 +791,10 @@ record exists: harmless must not mean silent.
 **An observer is bounded by a budget the runtime states.** It does not inherit the
 action's budget, because nothing about that action depends on the delivery, and it
 is not given a default, because a limit nobody chose is the thing this branch has
-refused at every other layer. A runtime with no stated observer budget cannot have
+refused at every other layer. That budget is a *separate policy* from the managed
+action budget — the work it bounds is work beside a call, not the call — and it
+should be named as one (`plugin_observability_budget` beside
+`managed_action_budget`) rather than folded into the action's. A runtime with no stated observer budget cannot have
 remote observers: installation is refused rather than served with an invented
 limit. A process test pins that refusal.
 
@@ -824,7 +827,10 @@ per unit of added complexity* rather than protocol completeness.
 | event metadata injector | event | no | no | 4 | that same decision |
 | mark sanitize guardrail | event | no | no | 9 | that same decision |
 | scope sanitize start/end guardrail | event | no | no | 6 + 6 | that same decision |
-| tool/LLM sanitize request/response guardrail | event | no | no | 6 + 6 + 6 + 6 | that same decision |
+| tool sanitize request/response guardrail | `(name, Json) -> Json` | no (hangs) | no (hangs) | 6 + 6 | an off-path transport: see below |
+| mark / scope sanitize guardrail | `(Arc<Event>, EventSanitizeFields) -> EventSanitizeFields` | no | no | 9 + 6 + 6 | the same, plus one field shape |
+| LLM sanitize request/response guardrail | codec-bearing context | no | no | 6 + 6 | codec identity on the wire |
+| event metadata injector | metadata map | no | no | 4 | the same as observers |
 | tool execution intercept | continuation | no | no | 11 | the duplex session: it wraps the call, so the child has to call back |
 | LLM execution intercept, stream intercept, continuations, completions, pull streams | continuation | no | no | 6 + 6 | the duplex session |
 
@@ -839,14 +845,26 @@ kernel's subscribers, so a remote guardrail is exactly as observable as an
 in-process one. What the child emits for its own copy of the call goes to a
 runtime with no subscribers, which is where the duplicate belongs.
 
-**The largest win is one decision, not one class.** Nine families and about
-seventy registration sites in this repository are event-shaped: something the
-runtime already holds is shown to a plugin, and the plugin may transform it. They
-differ in which fields they may change, not in what has to cross, so one vocabulary
-decision — what an event is on the wire, and what a remote observer's failure
-means — unlocks all nine at once. That is a better return than a fourth and fifth
-unary class taken one at a time, and it is the decision to take after the
-conditional guardrails.
+**The largest win is one decision, not one class — for observers.** The families
+that *watch* share one shape: something the runtime already holds is shown to a
+plugin, which answers with nothing or with metadata, and `PluginObservedEvent`
+carries it. The families that *transform* do not share one shape, and an earlier
+revision of this table said they did. There are four, and they are now listed
+above: `(name, Json) -> Json`, `(Arc<Event>, EventSanitizeFields) ->
+EventSanitizeFields`, a codec-bearing context, and a metadata map. That matters
+because it says not to build one generic "sanitize" wire operation: each shape
+would have to carry its own vocabulary anyway.
+
+**A sanitizer's own wait belongs to the runtime that drives it.** The tool
+sanitize pair was wired and hung: each invocation waited its whole budget (5s →
+16s, 60s → 181s), the events arrived with their observability fields cleared, and
+the guardrail itself is fine — invoked through its exact-registration runner in
+process it returns in 0.03 s. What is left is the transport: the dispatcher runs
+sanitizers on a private runtime of its own, while the connection's tasks make
+progress on the runtime that composed it, so the wait can only end at the budget.
+Observers do not have this problem because their delivery runs on a task of that
+second runtime. The fix is to make an off-path invocation's transport belong to
+the runtime that drives it, not to move the wait.
 
 Nothing in this matrix changes the ordering that moves the metric: coverage, then
 the cutover, then the loader leaving, which is what finally drops the 621.
