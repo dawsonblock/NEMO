@@ -770,6 +770,60 @@ holds the supervisor that starts it and the backend that reaches it.
   which is a signature rather than a load — and the token list no longer treats
   it as one.
 
+### The off-path client needs an attach, and the host does not have one yet
+
+The verification the transport-affinity work depends on, done before building any
+second connection, and it has a security-relevant answer.
+
+**The host's session state records no transport.** `HostSession` is `New`,
+`Active { session_id, supported_registration_operations }` or `Closed`, and every
+request is authorised by `established(session_id)` plus the context checks. The
+credential is checked in exactly one place: `handshake`, which is also the only
+thing that can move `New → Active`. So the model today is "one session, one
+connection, and the connection is the one that handshook" — not because the state
+machine enforces it, but because nothing has ever opened a second one.
+
+That has a consequence for the off-path client, and it is not the one the plan
+assumed. A second connection to the same socket can already serve the live
+session **without presenting the credential**: it never has to handshake, because
+`invoke` only asks whether the session exists and whether the context matches it.
+Today that is difficult to exploit — the session identity is a fresh UUID and the
+socket lives in a directory only this user can read — but it means the credential
+has stopped being the thing that authorises a transport, and a second connection
+is exactly the change that would turn that from hard to notice into easy to
+forget.
+
+**So the off-path client is not the next commit on its own; the attach is.** The
+operation it needs is not the handshake, and must not be:
+
+| | handshake | attach |
+|---|---|---|
+| proves | the session credential, the runtime binding, the protocol version | the same three, **and** the session it is attaching to |
+| may create a session | yes | never |
+| may renegotiate limits or capabilities | yes, it establishes them | never; it inherits the session's |
+| may change registration state | n/a | never |
+| results in | `New → Active` | an additional transport for the session that is already `Active` |
+
+An attach that created a second session, reloaded plugins, or accepted a weaker
+capability set would solve runtime affinity by weakening the session model, which
+is the trade this branch has refused everywhere else. The negotiated properties —
+frame limit, protocol version, read capabilities, supported registration classes,
+runtime binding — stay properties of the session; a second transport is a second
+transport.
+
+What remains, in order, once the attach exists: a connection descriptor the
+supervisor can hand out (endpoint, credential, session identity, negotiated
+limits), an off-path client created lazily *on the off-path runtime* and cached
+there, off-path calls routed through it rather than through the primary client,
+and a broken off-path connection discarded and failed per family — reconnect and
+reattach only while the session is alive, never to a session the host has
+invalidated. The acceptance criteria are the ones already named: a
+single-threaded caller with a remote sanitizer, a remote subscriber on the same
+runtime, the primary client stalled while an off-path operation still completes,
+an off-path connection killed with the primary call unaffected, and a reattached
+connection that sees the same session, the same registrations and the same
+generation.
+
 ### Observers cross, and the failure rule is what makes them safe to cross
 
 Subscribers are the most-registered family in this repository (27 sites), and they
