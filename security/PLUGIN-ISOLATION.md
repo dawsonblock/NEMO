@@ -863,15 +863,25 @@ process it returns in 0.03 s. What is left is the transport: the dispatcher runs
 sanitizers on a private runtime of its own, while the connection's tasks make
 progress on the runtime that composed it, so the wait can only end at the budget.
 Observers do not have this problem because their delivery runs on a task of that
-second runtime. The fix is to make an off-path invocation's transport belong to
-the runtime that drives it, not to move the wait: the work runs on the session's
-runtime and the answer is carried back. That is now in place and the boundary
-regression passes — but only on a multi-threaded runtime, because on a
-single-threaded one the thread that would answer the sanitizer is the thread that
-is waiting for it. Installing a sanitize proxy on a single-threaded runtime is
-therefore refused rather than left as a hang that ends at the budget, and the
-named follow-up is an independent runtime for off-path work, which would remove
-the limitation instead of documenting it.
+second runtime. The composition now owns a runtime for off-path work
+(`OffPathPluginExecutor`), with a stated budget and a stated in-flight bound, and
+the sanitize proxy submits to it rather than awaiting the call on whichever
+runtime the dispatcher happened to be using. That buys three things that are
+tested: the bound refuses work it cannot hold instead of growing a queue nobody
+chose, a stopped executor fails pending operations cleanly rather than leaving
+them to expire, and the runtime is a composition resource — one per host, shared
+by every off-path family, ended in the background so teardown cannot block on a
+plugin.
+
+It does **not** yet remove the single-threaded restriction, and the reason is
+narrower than the first one: the *connection* is still the composition's, and its
+tasks live on the runtime that opened it. On a single-threaded caller that runtime
+is blocked waiting for the sanitizer, so the reply has no thread to arrive on — the
+work moved, the transport did not. Installing a sanitize proxy there is refused
+with that reason rather than degraded silently, and the next step is an off-path
+*client*: a second connection to the same host, opened on the off-path runtime, so
+the transport belongs to the runtime that awaits it. The host accepts it because
+the credential is checked at handshake and the session on every request.
 
 Nothing in this matrix changes the ordering that moves the metric: coverage, then
 the cutover, then the loader leaving, which is what finally drops the 621.

@@ -164,11 +164,11 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
     assert!(after.is_empty(), "{after:#?}");
 }
 
-// A multi-threaded runtime, because this fixture registers the sanitize
-// guardrails too: a sanitizer is answered by the runtime that owns the
-// connection, and on a single-threaded runtime the thread that would answer is
-// the thread that is waiting. Installing one is refused there rather than left
-// as a hang — see `a_sanitize_proxy_is_refused_on_a_single_threaded_runtime`.
+// Multi-threaded, because the fixture registers the sanitize guardrails: their
+// work runs on the composition's off-path runtime, but the connection is still
+// the composition's, and on a single-threaded caller that runtime is blocked
+// waiting for the answer. Installing one there is refused rather than left as a
+// hang — see `a_sanitize_proxy_is_refused_on_a_single_threaded_runtime`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     use nemo_relay_plugin_protocol::{PluginActivateRequest, PluginComponentConfiguration};
@@ -231,7 +231,20 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     let manager = std::sync::Arc::new(nemo_relay::plugin::execution::PluginManager::new(
         std::sync::Arc::new(backend),
     ));
-    let context = nemo_relay_plugin_host::proxy::ProxyContext::new(manager, binding, 5_000);
+    // The off-path runtime this composition would own, because the fixture
+    // registers the sanitize classes too.
+    let off_path = std::sync::Arc::new(
+        nemo_relay_plugin_host::off_path::OffPathPluginExecutor::start(
+            &nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+                budget_millis: 5_000,
+                max_in_flight: 8,
+            },
+        )
+        .expect("an off-path runtime"),
+    );
+    let context = nemo_relay_plugin_host::proxy::ProxyContext::new(manager, binding, 5_000)
+        .with_observability_budget(5_000)
+        .with_off_path_executor(off_path);
     let proxies =
         nemo_relay_plugin_host::proxy::install(context, descriptor, loaded.handle.clone())
             .expect("the kernel can proxy a tool request intercept");
@@ -339,6 +352,7 @@ async fn the_kernel_serves_its_socket_and_refuses_a_caller_without_the_credentia
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }
 
+// Multi-threaded for the same reason as the tool-call test above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_composition_installs_a_plugin_from_another_process_into_this_chain() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
@@ -364,9 +378,12 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     let loaded = ProcessLoadedPlugins::load(
         host_config(),
         5_000,
-        // How long an observer's delivery may take. Stated rather than
-        // defaulted: a runtime with no observability budget has no remote observers.
-        5_000,
+        // How long off-path work may take and how much of it may be in flight,
+        // stated rather than defaulted.
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
         [("fixture_intercept".to_string(), fixture.artifact())],
         [PluginComponentConfiguration {
             kind: "fixture_intercept".into(),
@@ -596,7 +613,10 @@ async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
     let error = match ProcessLoadedPlugins::load(
         host_config(),
         0,
-        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
         [("fixture_intercept".to_string(), fixture.artifact())],
         Vec::new(),
     )

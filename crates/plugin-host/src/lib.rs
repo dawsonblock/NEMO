@@ -424,6 +424,8 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 pub mod conformance;
 /// Delivering this runtime's events to observers in another process.
 pub mod observer;
+/// The runtime that work beside a call runs on.
+pub mod off_path;
 /// Which scope stack each in-flight operation belongs to.
 pub mod operation_scopes;
 /// The kernel-side proxies for a plugin's registrations.
@@ -470,6 +472,12 @@ pub struct LoadedPlugins {
 /// cannot outlive the runtime that installed them.
 pub struct ProcessLoadedPlugins {
     backend: Arc<ProcessPluginBackend>,
+    /// Held so it outlives the proxies that submit to it.
+    ///
+    /// Read for one reason: the composition reports it, and a caller tearing the
+    /// composition down should be able to see that off-path work is a resource
+    /// this owns rather than a task nobody can stop.
+    off_path: Arc<crate::off_path::OffPathPluginExecutor>,
     proxies: Vec<crate::proxy::RegistrationProxies>,
     handles: Vec<PluginHandle>,
 }
@@ -484,7 +492,7 @@ impl ProcessLoadedPlugins {
     pub async fn load<I, J>(
         config: PluginHostSupervisorConfig,
         registration_cap_millis: u64,
-        observability_budget_millis: u64,
+        observability: crate::off_path::ObservabilityPolicy,
         specs: I,
         components: J,
     ) -> Result<Self, PluginProtocolError>
@@ -496,11 +504,18 @@ impl ProcessLoadedPlugins {
         // afford, and this is the second limit on top of that. Zero would mean
         // "no time at all", which nobody means, so it is refused rather than
         // treated as a default.
+        observability.validate()?;
         if registration_cap_millis == 0 {
             return Err(refused(
                 "a registration cap of zero milliseconds would refuse every invocation",
             ));
         }
+        // The off-path runtime belongs to this composition and outlives every
+        // proxy installed from it: work done beside a call must be answerable by
+        // a thread the caller is not holding.
+        let off_path = Arc::new(crate::off_path::OffPathPluginExecutor::start(
+            &observability,
+        )?);
         let backend = Arc::new(ProcessPluginBackend::launch(config).await?);
         let binding = backend.runtime_binding_digest().to_owned();
         let manager = Arc::new(PluginManager::new(
@@ -555,7 +570,8 @@ impl ProcessLoadedPlugins {
         // call that raised it.
         let context = crate::proxy::ProxyContext::new(manager, binding, registration_cap_millis)
             .with_operation_scopes(backend.operation_scopes())
-            .with_observability_budget(observability_budget_millis);
+            .with_observability_budget(observability.budget_millis)
+            .with_off_path_executor(Arc::clone(&off_path));
         let mut proxies = Vec::new();
         for descriptor in &descriptors {
             let handle = handles
@@ -575,6 +591,7 @@ impl ProcessLoadedPlugins {
             backend,
             proxies,
             handles,
+            off_path,
         })
     }
 
@@ -599,6 +616,11 @@ impl ProcessLoadedPlugins {
     /// The backend holding the loaded plugins.
     pub fn backend(&self) -> &Arc<ProcessPluginBackend> {
         &self.backend
+    }
+
+    /// The runtime work beside a call runs on.
+    pub fn off_path(&self) -> &Arc<crate::off_path::OffPathPluginExecutor> {
+        &self.off_path
     }
 }
 
