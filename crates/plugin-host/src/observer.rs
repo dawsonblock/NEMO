@@ -31,7 +31,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nemo_relay::api::scope::EmitMarkEventParams;
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_VERSION, PluginExecutionContext, PluginFailureCode, PluginHandle,
@@ -52,7 +51,7 @@ pub(crate) const OBSERVER_QUEUE_CAPACITY: usize = 256;
 /// A name rather than a log line: a failure to deliver an event to an observer is
 /// something a subscriber of this runtime can react to, and the runtime's own
 /// stream is where it belongs.
-pub const OBSERVER_FAILURE_MARK: &str = "nemo.plugin.observer.failed";
+pub use crate::off_path::OBSERVER_FAILURE_MARK;
 
 /// One observer's delivery task, ended when its registration is removed.
 pub(crate) struct ObserverDelivery {
@@ -191,15 +190,7 @@ async fn deliver(
 
 /// Record one observer failure in this runtime's own stream.
 fn record_failure(registration: &str, reason: &str) {
-    let _ = nemo_relay::api::scope::event(
-        EmitMarkEventParams::builder()
-            .name(OBSERVER_FAILURE_MARK)
-            .data_opt(Some(serde_json::json!({
-                "registration": registration,
-                "reason": reason,
-            })))
-            .build(),
-    );
+    crate::off_path::record_failure(OBSERVER_FAILURE_MARK, registration, reason);
 }
 
 /// The name of a success a subscriber cannot have sent.

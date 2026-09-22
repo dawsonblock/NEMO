@@ -70,6 +70,37 @@ fn refused(message: &str) -> PluginProtocolError {
     PluginProtocolError::new(PluginFailureCode::Rejected, message.to_string())
 }
 
+/// The mark this runtime emits when an observer's delivery failed.
+pub const OBSERVER_FAILURE_MARK: &str = "nemo.plugin.observer.failed";
+
+/// The mark this runtime emits when a sanitize guardrail failed.
+///
+/// The chain clears the observability fields when a sanitizer fails, which is the
+/// fail-closed direction — and also why a failure used to be invisible: the event
+/// arrived without a payload and only a log line said why. A class whose whole
+/// purpose is deciding what other people may see should say when it could not
+/// decide.
+pub const SANITIZE_FAILURE_MARK: &str = "nemo.plugin.sanitize.failed";
+
+/// Record one off-path failure in this runtime's own stream.
+///
+/// One function rather than one per family: the mark names the family, and the
+/// shape — a registration and a reason — is the same fact either way. A failure
+/// that cannot be recorded is dropped rather than propagated, because the caller
+/// is already reporting it and an observer of the record must not change what the
+/// caller sees.
+pub(crate) fn record_failure(mark: &str, registration: &str, reason: &str) {
+    let _ = nemo_relay::api::scope::event(
+        nemo_relay::api::scope::EmitMarkEventParams::builder()
+            .name(mark)
+            .data_opt(Some(serde_json::json!({
+                "registration": registration,
+                "reason": reason,
+            })))
+            .build(),
+    );
+}
+
 /// The runtime off-path plugin work runs on.
 ///
 /// Owned by the composition that started the host, so every off-path family

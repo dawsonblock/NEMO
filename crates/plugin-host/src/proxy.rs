@@ -555,7 +555,8 @@ fn install_tool_sanitize(
         let registration_id = registration_id.clone();
         let off_path = Arc::clone(&off_path);
         Box::pin(async move {
-            let Some(answer) = off_path.submit(async move {
+            let recording = registration_id.clone();
+            let submitted = off_path.submit(async move {
                 let payload = serde_json::json!({ "tool": tool, "value": value }).to_string();
                 let execution = context.passive_execution_context(
                     nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
@@ -602,16 +603,39 @@ fn install_tool_sanitize(
                         failure,
                     }),
                 }
-            }) else {
+            });
+            let Some(answer) = submitted else {
                 // Saturation fails closed for this family: a payload that could
                 // not be sanitized is not published unsanitized, and the call it
                 // belongs to is never made to wait for the sanitizer.
-                return Err(nemo_relay::error::FlowError::ResourceExhausted {
+                let error = nemo_relay::error::FlowError::ResourceExhausted {
                     resource: "plugin_observability_in_flight",
                     limit: 0,
-                });
+                };
+                crate::off_path::record_failure(
+                    crate::off_path::SANITIZE_FAILURE_MARK,
+                    &recording,
+                    &error.to_string(),
+                );
+                return Err(error);
             };
-            crate::off_path::OffPathPluginExecutor::answer(answer).await?
+            match crate::off_path::OffPathPluginExecutor::answer(answer)
+                .await
+                .and_then(|inner| inner)
+            {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    // The chain will clear the observability fields, which is the
+                    // fail-closed answer; the record is what keeps a sanitizer
+                    // that could not decide from being invisible.
+                    crate::off_path::record_failure(
+                        crate::off_path::SANITIZE_FAILURE_MARK,
+                        &recording,
+                        &error.to_string(),
+                    );
+                    Err(error)
+                }
+            }
         })
     });
 

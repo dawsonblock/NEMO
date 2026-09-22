@@ -401,11 +401,35 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_never",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_request",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_response"
         ],
         "every registration the plugin made is proxied here, in the classes this kernel serves"
     );
+
+    // Off-path failures are recorded in this runtime's own stream, so this
+    // subscriber is what turns "the payload was withheld" into a fact the test
+    // can read.
+    let failures: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let failures = std::sync::Arc::clone(&failures);
+        nemo_relay::api::subscriber::register_subscriber(
+            "process-backend-off-path-failures",
+            std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+                if event.name() == nemo_relay_plugin_host::observer::OBSERVER_FAILURE_MARK
+                    || event.name() == nemo_relay_plugin_host::off_path::SANITIZE_FAILURE_MARK
+                {
+                    failures.lock().unwrap().push(serde_json::json!({
+                        "mark": event.name(),
+                        "data": event.data().cloned(),
+                    }));
+                }
+            }),
+        )
+        .expect("a subscriber");
+    }
 
     // An observer in the other process sees this runtime's events: its own
     // runtime's subscribers are not this runtime's, so the witness is a file the
@@ -582,6 +606,30 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         "the published copy should carry the sanitizer's work: {published:#?}"
     );
     nemo_relay::api::subscriber::deregister_subscriber("process-backend-sanitized-payloads")
+        .expect("a deregistration");
+
+    // A guardrail that refused to sanitize is recorded, not merely logged: the
+    // chain clears the observability fields, so the record is the only thing that
+    // says the payload was withheld rather than never produced.
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+    let recorded = failures.lock().unwrap().clone();
+    assert!(
+        recorded.iter().any(|failure| {
+            failure["mark"] == serde_json::json!(nemo_relay_plugin_host::off_path::SANITIZE_FAILURE_MARK)
+                && failure["data"]["registration"]
+                    .as_str()
+                    .is_some_and(|registration| registration.ends_with("fixture_intercept_sanitize_never"))
+                // What the record can say: the guardrail omitted the payload
+                // rather than publishing it unsanitized. The guardrail's own
+                // words stay in the child, because the chain replaces an omitted
+                // payload with an omission rather than an error to carry.
+                && failure["data"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("omitted the payload"))
+        }),
+        "a sanitizer that could not answer should be recorded: {recorded:#?}"
+    );
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-off-path-failures")
         .expect("a deregistration");
 
     // Dropping the composition takes the registration out of the chain and ends

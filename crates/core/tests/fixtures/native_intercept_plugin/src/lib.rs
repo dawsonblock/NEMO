@@ -68,6 +68,16 @@ impl NativePlugin for InterceptPlugin {
                 }))
             },
         )?;
+        // A guardrail that refuses to sanitize. It runs after the one above (a
+        // later priority) so the sanitized copy is published first and this
+        // failure is what a record of a sanitizer failure has to carry: a payload
+        // nobody could sanitize is not published unsanitized, and the reason
+        // would otherwise be a log line.
+        ctx.register_tool_sanitize_request_guardrail(
+            "fixture_intercept_sanitize_never",
+            10,
+            |_name, _value| async move { Err("the fixture refuses to sanitize".into()) },
+        )?;
         // An observer, which is the third class a kernel can serve. What it saw
         // is written where the caller can read it, because a subscriber in
         // another process has no other way to witness that an event arrived: its
