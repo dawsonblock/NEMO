@@ -52,6 +52,14 @@ pub struct ProxyContext {
     /// Optional because a kernel that forwards nothing has no use for it, and a
     /// proxy without one simply leaves the registry alone.
     operation_scopes: Option<Arc<OperationScopes>>,
+    /// How long an observer's delivery may take, when the runtime states one.
+    ///
+    /// Separate from the registration cap because an observer is not part of the
+    /// action whose event it sees: nothing about that action depends on the
+    /// delivery, so it neither inherits the action's budget nor is allowed to
+    /// extend it. Absent means this runtime wants no remote observers, which is
+    /// refused rather than defaulted.
+    observer_budget_millis: Option<u64>,
 }
 
 impl ProxyContext {
@@ -66,7 +74,14 @@ impl ProxyContext {
             runtime_binding_digest: runtime_binding_digest.into(),
             local_cap_millis,
             operation_scopes: None,
+            observer_budget_millis: None,
         }
+    }
+
+    /// State how long an observer's delivery may take.
+    pub fn with_observer_budget(mut self, millis: u64) -> Self {
+        self.observer_budget_millis = Some(millis);
+        self
     }
 
     /// Register in-flight operations in `scopes`.
@@ -88,6 +103,9 @@ impl ProxyContext {
 pub struct RegistrationProxies {
     tool_request_intercepts: Vec<String>,
     llm_request_intercepts: Vec<String>,
+    subscribers: Vec<String>,
+    /// One delivery task per observer registration, ended with this value.
+    deliveries: Vec<std::sync::Arc<crate::observer::ObserverDelivery>>,
 }
 
 impl std::fmt::Debug for RegistrationProxies {
@@ -96,6 +114,7 @@ impl std::fmt::Debug for RegistrationProxies {
             .debug_struct("RegistrationProxies")
             .field("tool_request_intercepts", &self.tool_request_intercepts)
             .field("llm_request_intercepts", &self.llm_request_intercepts)
+            .field("subscribers", &self.subscribers)
             .finish()
     }
 }
@@ -106,6 +125,7 @@ impl RegistrationProxies {
         self.tool_request_intercepts
             .iter()
             .chain(self.llm_request_intercepts.iter())
+            .chain(self.subscribers.iter())
             .map(String::as_str)
             .collect()
     }
@@ -119,6 +139,9 @@ impl Drop for RegistrationProxies {
         for registration in &self.llm_request_intercepts {
             let _ = nemo_relay::api::registry::deregister_llm_request_intercept(registration);
         }
+        for registration in &self.subscribers {
+            let _ = nemo_relay::api::subscriber::deregister_subscriber(registration);
+        }
     }
 }
 
@@ -131,10 +154,20 @@ pub fn install(
     let mut installed = RegistrationProxies {
         tool_request_intercepts: Vec::new(),
         llm_request_intercepts: Vec::new(),
+        subscribers: Vec::new(),
+        deliveries: Vec::new(),
     };
 
     for registration in &descriptor.registrations {
         match registration.operation {
+            PluginRegistrationOperation::Subscriber => {
+                installed
+                    .deliveries
+                    .push(install_subscriber(&context, registration, &handle)?);
+                installed
+                    .subscribers
+                    .push(registration.registration_id.clone());
+            }
             PluginRegistrationOperation::ToolRequestIntercept => {
                 install_tool_request_intercept(&context, registration, &handle)?;
                 installed
@@ -389,6 +422,76 @@ fn install_llm_request_intercept(
     })
 }
 
+/// Install the proxy for one event subscriber.
+///
+/// The kernel keeps its own subscriber list — one proxy per registration — and
+/// the host runs exactly the registration this proxy stands for, which is the
+/// same separation the intercept classes use. What differs is what happens when
+/// it fails: see [`crate::observer`], where the rule is that an observer's
+/// failure is recorded and stops there.
+fn install_subscriber(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<std::sync::Arc<crate::observer::ObserverDelivery>, PluginProtocolError> {
+    let Some(budget_millis) = context.observer_budget_millis.filter(|millis| *millis > 0) else {
+        // No stated limit means no remote observers, rather than a limit this
+        // layer chose for the runtime.
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is a subscriber and this runtime states no observer budget, so it cannot \
+                 be delivered to",
+                registration.registration_id
+            ),
+        ));
+    };
+    let registration_id = registration.registration_id.clone();
+    let delivery = std::sync::Arc::new(crate::observer::ObserverDelivery::start(
+        Arc::clone(&context.manager),
+        context.runtime_binding_digest.clone(),
+        handle.clone(),
+        registration_id.clone(),
+        budget_millis,
+        context.operation_scopes.clone(),
+    )?);
+
+    let offering = std::sync::Arc::clone(&delivery);
+    let callable: nemo_relay::api::runtime::EventSubscriberFn =
+        Arc::new(move |event: &nemo_relay::api::event::Event| {
+            // An observer is not told about its own delivery failures. The
+            // failure is reported as an event, and delivering that event to the
+            // observer that caused it would ask it to fail again — an observer
+            // that fails on every event would otherwise never stop being told.
+            if event.name() == crate::observer::OBSERVER_FAILURE_MARK
+                && event
+                    .data()
+                    .and_then(|data| data.get("registration"))
+                    .and_then(|registration| registration.as_str())
+                    == Some(registration_id.as_str())
+            {
+                return;
+            }
+            offering.offer(
+                nemo_relay_plugin_protocol::PluginObservedEvent {
+                    event: event.clone(),
+                },
+                &registration_id,
+            );
+        });
+    nemo_relay::api::subscriber::register_subscriber(&registration.registration_id, callable)
+        .map_err(|error| {
+            PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!(
+                    "the proxy for '{}' could not be installed: {error}",
+                    registration.registration_id
+                ),
+            )
+        })?;
+    Ok(delivery)
+}
+
 /// The name of a success a proxy cannot turn into arguments.
 fn other_name(success: &PluginSuccess) -> &'static str {
     match success {
@@ -429,6 +532,38 @@ mod tests {
             future,
         )
         .await
+    }
+
+    /// An observer's delivery is not part of the action whose event it sees, so
+    /// it does not inherit that action's budget. A runtime that states none
+    /// cannot have remote observers: the alternative is a number this layer
+    /// chose for the runtime.
+    #[tokio::test]
+    async fn a_subscriber_cannot_be_proxied_without_a_stated_observer_budget() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let backend = Arc::new(RecordingProxyBackend::default());
+        let context = ProxyContext::new(
+            Arc::new(PluginManager::new(
+                backend as Arc<dyn PluginExecutionBackend>,
+            )),
+            "test-binding",
+            5_000,
+        );
+
+        let error = install(
+            context,
+            &descriptor(PluginRegistrationOperation::Subscriber),
+            PluginHandle {
+                plugin_id: "example".into(),
+                generation: 1,
+            },
+        )
+        .expect_err("a subscriber with no observer budget");
+        assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+        assert!(
+            error.failure.message.contains("observer budget"),
+            "{error:?}"
+        );
     }
 
     /// Outside a managed action there is no budget to inherit, and a proxy that

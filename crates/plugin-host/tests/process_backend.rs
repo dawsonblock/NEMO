@@ -349,13 +349,23 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         support::intercept_fixture(),
         "nemo_relay_native_intercept_fixture",
     );
+    let observed_path = std::env::temp_dir()
+        .join(format!(
+            "nemo-observer-{}.log",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ))
+        .to_string_lossy()
+        .into_owned();
     let loaded = ProcessLoadedPlugins::load(
         host_config(),
+        5_000,
+        // How long an observer's delivery may take. Stated rather than
+        // defaulted: a runtime with no observer budget has no remote observers.
         5_000,
         [("fixture_intercept".to_string(), fixture.artifact())],
         [PluginComponentConfiguration {
             kind: "fixture_intercept".into(),
-            config_json: "{}".into(),
+            config_json: serde_json::json!({ "observer_log": observed_path }).to_string(),
         }],
     )
     .await
@@ -367,10 +377,51 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         registrations,
         vec![
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite"
         ],
         "every registration the plugin made is proxied here, in the classes this kernel serves"
     );
+
+    // An observer in the other process sees this runtime's events: its own
+    // runtime's subscribers are not this runtime's, so the witness is a file the
+    // child writes and this process reads.
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("example_tool")
+                    .args(serde_json::json!({"input": true}))
+                    .func(std::sync::Arc::new(|args| {
+                        Box::pin(async move { Ok(args.into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed tool call the observer was watching");
+
+    // Delivery is asynchronous, so this waits for the witness rather than
+    // assuming an order between two independent paths.
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen = std::fs::read_to_string(&observed_path).unwrap_or_default();
+        if seen.lines().any(|line| line == "example_tool") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen.lines().any(|line| line == "example_tool"),
+        "the observer in the other process should have seen the call it was watching: {seen:?}"
+    );
+    let _ = std::fs::remove_file(&observed_path);
 
     // The second class reaches the child the same way, under the same trusted
     // budget the first does: the proxy refuses an invocation with nothing to
@@ -424,6 +475,30 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     .expect("the chain should reach the child");
     assert_eq!(rewritten["native_intercept"], true, "{rewritten}");
 
+    // A managed tool call is what emits the scope events an observer is shown:
+    // the intercept chain above runs before any event exists, so the observer has
+    // to be given a call rather than a rewrite.
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("example_tool")
+                    .args(serde_json::json!({"input": true}))
+                    .func(std::sync::Arc::new(|args| {
+                        Box::pin(async move { Ok(args.into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed tool call the observer was watching");
+
     // Dropping the composition takes the registration out of the chain and ends
     // the host: a plugin's callback may not outlive the runtime that installed it.
     drop(loaded);
@@ -453,6 +528,7 @@ async fn a_composition_refuses_a_cap_that_would_refuse_every_invocation() {
     let error = match ProcessLoadedPlugins::load(
         host_config(),
         0,
+        5_000,
         [("fixture_intercept".to_string(), fixture.artifact())],
         Vec::new(),
     )

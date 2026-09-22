@@ -276,6 +276,26 @@ impl PluginHostService {
                         Err(error) => refusal(error.to_string()),
                     })
                 }
+                // The first observer class. A subscriber answers with nothing:
+                // it watched, and what it does with what it saw is its own
+                // business. Its failure is reported as a refusal so the kernel
+                // can record it, and never as an outcome that changes the work
+                // it was watching.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::Subscriber => {
+                    let observed: nemo_relay_plugin_protocol::PluginObservedEvent =
+                        serde_json::from_str(&request.arguments).map_err(|error| {
+                            refused(format!(
+                                "a subscriber payload must be an observed event: {error}"
+                            ))
+                        })?;
+                    match nemo_relay::api::subscriber::invoke_subscriber_registration(
+                        &request.registration_id,
+                        &observed.event,
+                    ) {
+                        Ok(()) => Ok(success(String::new())),
+                        Err(error) => Ok(refusal(error.to_string())),
+                    }
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.

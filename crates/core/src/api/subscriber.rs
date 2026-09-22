@@ -8,6 +8,42 @@ use crate::api::runtime::global_context;
 use crate::api::shared::ensure_runtime_owner;
 use crate::error::{FlowError, Result};
 
+/// Run exactly one event subscriber, named by its registration.
+///
+/// The runtime's own dispatch runs every subscriber for an event, which is what
+/// the runtime needs and what a host cannot use: a host holds one plugin's
+/// registrations and has to run *that* subscriber when the kernel asks, or the
+/// kernel's subscriber list — which holds one proxy per registration — would run
+/// the plugin's whole set once per proxy.
+///
+/// A subscriber that panics is reported as an error rather than unwinding into
+/// the caller, for the same reason the runtime's dispatcher catches it: an
+/// observer that fails may not take down the work it was watching.
+///
+/// # Errors
+/// `NotFound` when nothing is registered under that name, which is what a caller
+/// needs to refuse the delivery rather than appearing to have delivered it.
+pub fn invoke_subscriber_registration(
+    registration: &str,
+    event: &crate::api::event::Event,
+) -> Result<()> {
+    ensure_runtime_owner()?;
+    let subscriber = {
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?;
+        state.event_subscribers.get(registration).cloned()
+    };
+    let Some(subscriber) = subscriber else {
+        return Err(FlowError::NotFound(format!(
+            "no event subscriber is registered as '{registration}'"
+        )));
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subscriber(event)))
+        .map_err(|_| FlowError::Internal(format!("subscriber '{registration}' panicked")))
+}
+
 /// Register a global lifecycle event subscriber.
 ///
 /// The subscriber is added to the process-wide registry and receives every

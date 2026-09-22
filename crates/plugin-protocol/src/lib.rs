@@ -570,6 +570,20 @@ pub struct PluginInspectRequest {
     pub handle: Option<PluginHandle>,
 }
 
+/// One event, on its way to a plugin that observes it.
+///
+/// The event crosses whole rather than as a summary: a subscriber decides what a
+/// runtime event means, and a summary would be this side's guess at which fields
+/// that takes. It is the runtime's own event type, in its canonical form, so a
+/// subscriber in another process sees exactly what a subscriber in this one sees
+/// — and a field added to the event does not need a second definition here to
+/// reach it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginObservedEvent {
+    /// The event, in ATOF form.
+    pub event: nemo_relay_types::api::event::Event,
+}
+
 /// What a side of the boundary knows about one plugin identifier.
 ///
 /// This is the lifecycle as a value rather than as a convention inside one

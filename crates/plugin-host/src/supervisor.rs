@@ -384,6 +384,7 @@ impl ProcessPluginBackend {
         vec![
             nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmRequestIntercept,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::Subscriber,
         ]
     }
 

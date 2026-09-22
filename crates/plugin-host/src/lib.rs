@@ -422,6 +422,8 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 }
 
 pub mod conformance;
+/// Delivering this runtime's events to observers in another process.
+pub mod observer;
 /// Which scope stack each in-flight operation belongs to.
 pub mod operation_scopes;
 /// The kernel-side proxies for a plugin's registrations.
@@ -482,6 +484,7 @@ impl ProcessLoadedPlugins {
     pub async fn load<I, J>(
         config: PluginHostSupervisorConfig,
         registration_cap_millis: u64,
+        observer_budget_millis: u64,
         specs: I,
         components: J,
     ) -> Result<Self, PluginProtocolError>
@@ -550,12 +553,9 @@ impl ProcessLoadedPlugins {
         // backend can serve. The manager is the only path to the backend, and
         // the operation scopes are what attach a mark the plugin raises to the
         // call that raised it.
-        let context = crate::proxy::ProxyContext::new(
-            manager,
-            binding,
-            nemo_relay_plugin_protocol::MAX_FRAME_BYTES as u64,
-        )
-        .with_operation_scopes(backend.operation_scopes());
+        let context = crate::proxy::ProxyContext::new(manager, binding, registration_cap_millis)
+            .with_operation_scopes(backend.operation_scopes())
+            .with_observer_budget(observer_budget_millis);
         let mut proxies = Vec::new();
         for descriptor in &descriptors {
             let handle = handles

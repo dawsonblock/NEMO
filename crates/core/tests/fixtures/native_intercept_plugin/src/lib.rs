@@ -37,7 +37,24 @@ impl NativePlugin for InterceptPlugin {
         Vec::new()
     }
 
-    fn register(&mut self, _config: &Map<String, Json>, ctx: &mut PluginContext<'_>) -> Result<()> {
+    fn register(&mut self, config: &Map<String, Json>, ctx: &mut PluginContext<'_>) -> Result<()> {
+        // An observer, which is the third class a kernel can serve. What it saw
+        // is written where the caller can read it, because a subscriber in
+        // another process has no other way to witness that an event arrived: its
+        // own runtime's subscribers are not the caller's.
+        if let Some(log) = config.get("observer_log").and_then(|value| value.as_str()) {
+            let log = log.to_string();
+            ctx.register_subscriber("fixture_intercept_observer", move |event| {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                {
+                    let _ = writeln!(file, "{}", event.name());
+                }
+            })?;
+        }
         ctx.register_llm_request_intercept(
             "fixture_intercept_llm_rewrite",
             0,

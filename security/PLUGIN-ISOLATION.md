@@ -770,6 +770,43 @@ holds the supervisor that starts it and the backend that reaches it.
   which is a signature rather than a load — and the token list no longer treats
   it as one.
 
+### Observers cross, and the failure rule is what makes them safe to cross
+
+Subscribers are the most-registered family in this repository (27 sites), and they
+are now servable: the kernel's own subscriber list holds one proxy per
+registration, the host runs exactly the registration the kernel named, and the
+event crosses whole — the runtime's own event type in its canonical form, so a
+field added to an event does not need a second definition to reach a subscriber
+in another process.
+
+Three rules make a remote observer safe, and all three are about what an observer
+is rather than about the transport.
+
+**An observer is never fatal.** A delivery that fails is recorded as a mark in
+this runtime's stream and stops there. This is not a new rule — the in-process
+dispatcher already catches a panicking subscriber and logs it — but it is the
+reason a remote observer cannot break the work it is watching, and the reason the
+record exists: harmless must not mean silent.
+
+**An observer is bounded by a budget the runtime states.** It does not inherit the
+action's budget, because nothing about that action depends on the delivery, and it
+is not given a default, because a limit nobody chose is the thing this branch has
+refused at every other layer. A runtime with no stated observer budget cannot have
+remote observers: installation is refused rather than served with an invented
+limit. A process test pins that refusal.
+
+**A full queue drops, loudly.** Delivery is queued and performed by a task of its
+own: the runtime's dispatch calls subscribers on the thread that serves every
+observer, so a proxy that waited on an RPC there would make one plugin's latency
+everyone's. A queue that overflows records the drop once per saturation rather
+than per event, so the record cannot become the flood it reports, and an observer
+is never told about its own delivery failures — that would ask it to fail again.
+
+What the kernel still owns is unchanged: which events exist, which registrations
+see them, and the ordering the runtime gives them. The witness in the process test
+is a file the child writes, because a subscriber in another process has no other
+way to show the caller what it saw.
+
 ## Cutover matrix
 
 Which registration families can cross today, and what the ones that cannot need.
