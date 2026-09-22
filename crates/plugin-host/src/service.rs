@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 
 use nemo_relay::plugin::execution::PluginExecutionBackend;
 use nemo_relay_plugin_proto::convert::{
-    activate_outcome_to_wire, activate_request_from_wire, cancel_outcome_to_wire,
-    execution_outcome_to_wire, handshake_outcome_to_wire, handshake_request_from_wire,
-    health_outcome_to_wire, inspect_outcome_to_wire, inspect_request_from_wire,
-    invoke_request_from_wire, load_outcome_to_wire, load_request_from_wire,
-    operation_envelope_from_wire, session_close_outcome_to_wire, unload_outcome_to_wire,
-    unload_request_from_wire,
+    activate_outcome_to_wire, activate_request_from_wire, attach_outcome_to_wire,
+    attach_request_from_wire, cancel_outcome_to_wire, execution_outcome_to_wire,
+    handshake_outcome_to_wire, handshake_request_from_wire, health_outcome_to_wire,
+    inspect_outcome_to_wire, inspect_request_from_wire, invoke_request_from_wire,
+    load_outcome_to_wire, load_request_from_wire, operation_envelope_from_wire,
+    session_close_outcome_to_wire, unload_outcome_to_wire, unload_request_from_wire,
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
@@ -68,7 +68,10 @@ enum HostSession {
     New,
     /// Serving a session.
     Active {
-        session_id: String,
+        /// What the handshake established. Held whole because an attach hands it
+        /// back rather than recomputing it: the parameters an attach reports are
+        /// the session's, not the attaching caller's.
+        identity: nemo_relay_plugin_protocol::PluginSessionIdentity,
         /// Registration classes the kernel can install a proxy for.
         supported_registration_operations: Vec<PluginRegistrationOperation>,
     },
@@ -328,10 +331,7 @@ impl PluginHostService {
             .lock()
             .map_err(|error| refused(format!("the session lock was poisoned: {error}")))?;
         match &*session {
-            HostSession::Active {
-                session_id: established,
-                ..
-            } if established == session_id => Ok(()),
+            HostSession::Active { identity, .. } if identity.session_id == session_id => Ok(()),
             HostSession::Active { .. } => Err(refused(
                 "this request names a session this host did not establish",
             )),
@@ -482,7 +482,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
             Ok(mut session) => match &*session {
                 HostSession::New => {
                     *session = HostSession::Active {
-                        session_id,
+                        identity: identity.clone(),
                         supported_registration_operations: request
                             .supported_registration_operations
                             .clone(),
@@ -513,6 +513,95 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         }
         Ok(Response::new(handshake_outcome_to_wire(
             LifecycleOutcome::Completed(identity),
+        )))
+    }
+
+    async fn attach(
+        &self,
+        request: Request<v1::AttachRequest>,
+    ) -> Result<Response<v1::AttachOutcome>, Status> {
+        let refused_attach = |failure: nemo_relay_plugin_protocol::PluginFailure| {
+            Response::new(attach_outcome_to_wire(LifecycleOutcome::Failed(failure)))
+        };
+        let request = match attach_request_from_wire(&request.into_inner()) {
+            Ok(request) => request,
+            Err(error) => return Ok(refused_attach(error.failure)),
+        };
+        // The credential first, as at handshake: an attach that could be made
+        // without it would make the socket path the authorisation, and a second
+        // transport is not a lesser one.
+        if request.session_credential != self.config.session_credential {
+            return Ok(refused_attach(
+                refused("the session credential is not the one this host was started with").failure,
+            ));
+        }
+        if let Err(error) = check_protocol_version(request.protocol_version) {
+            return Ok(refused_attach(error.failure));
+        }
+        if request.runtime_binding_digest != self.config.runtime_binding_digest {
+            return Ok(refused_attach(
+                refused("the runtime binding is not the one this host was started with").failure,
+            ));
+        }
+
+        // Then the session, because an attach joins one rather than making one.
+        // Everything it answers comes from the state the handshake established:
+        // a caller that could supply a frame limit, a registration set or a
+        // capability set could supply weaker ones.
+        let attached = {
+            let session = match self.session.lock() {
+                Ok(session) => session,
+                Err(error) => {
+                    return Ok(refused_attach(
+                        refused(format!("the session lock was poisoned: {error}")).failure,
+                    ));
+                }
+            };
+            match &*session {
+                HostSession::Active {
+                    identity,
+                    supported_registration_operations,
+                } => {
+                    if request.session_id != identity.session_id {
+                        return Ok(refused_attach(
+                            refused("this host did not establish that session").failure,
+                        ));
+                    }
+                    if request.protocol_version != identity.protocol_version {
+                        return Ok(refused_attach(
+                            refused(
+                                "the attaching client speaks a protocol version this session \
+                                 did not establish",
+                            )
+                            .failure,
+                        ));
+                    }
+                    nemo_relay_plugin_protocol::PluginAttachedSession {
+                        session_id: identity.session_id.clone(),
+                        negotiated_frame_limit: identity.maximum_frame_bytes,
+                        supported_registration_operations: supported_registration_operations
+                            .clone(),
+                        accepted_read_capabilities: identity.accepted_read_capabilities.clone(),
+                        runtime_binding_digest: self.config.runtime_binding_digest.clone(),
+                    }
+                }
+                HostSession::New => {
+                    return Ok(refused_attach(
+                        refused("this host has no session to attach to").failure,
+                    ));
+                }
+                HostSession::Closed => {
+                    return Ok(refused_attach(
+                        refused(
+                            "this host has already served its session and will not serve another",
+                        )
+                        .failure,
+                    ));
+                }
+            }
+        };
+        Ok(Response::new(attach_outcome_to_wire(
+            LifecycleOutcome::Completed(attached),
         )))
     }
 
@@ -1006,6 +1095,226 @@ mod tests {
             .into_result()
             .expect("an established session")
             .session_id
+    }
+
+    /// The attach request helper: the three facts a handshake proves plus the
+    /// session being joined.
+    fn attach_request(config: &PluginHostConfig, session_id: &str) -> v1::AttachRequest {
+        v1::AttachRequest {
+            session_id: session_id.to_owned(),
+            session_credential: config.session_credential.clone(),
+            runtime_binding_digest: config.runtime_binding_digest.clone(),
+            protocol_version: u32::from(PROTOCOL_VERSION),
+        }
+    }
+
+    /// Attach and read what it joined, or read the refusal.
+    async fn attach(
+        service: &PluginHostService,
+        request: v1::AttachRequest,
+    ) -> nemo_relay_plugin_protocol::LifecycleOutcome<
+        nemo_relay_plugin_protocol::PluginAttachedSession,
+    > {
+        let outcome = service
+            .attach(Request::new(request))
+            .await
+            .expect("a served attach")
+            .into_inner();
+        nemo_relay_plugin_proto::convert::attach_outcome_from_wire(&outcome)
+            .expect("a converted attach")
+    }
+
+    #[tokio::test]
+    async fn an_attach_joins_the_established_session_and_creates_nothing() {
+        let (service, config) = service();
+        let session_id = establish(&service, &config).await;
+        let before = service
+            .inspect(Request::new(v1::InspectRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                handle: None,
+            }))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+
+        let joined = match attach(&service, attach_request(&config, &session_id)).await {
+            nemo_relay_plugin_protocol::LifecycleOutcome::Completed(joined) => joined,
+            nemo_relay_plugin_protocol::LifecycleOutcome::Failed(failure) => {
+                panic!("an attach to the established session: {failure:?}")
+            }
+        };
+        assert_eq!(joined.session_id, session_id, "the same session");
+        assert_eq!(
+            joined.negotiated_frame_limit, config.maximum_frame_bytes,
+            "the frame limit the session negotiated, not one the caller offered"
+        );
+        assert_eq!(
+            joined.accepted_read_capabilities,
+            vec![PluginHostReadCapability::RuntimeDiagnostics],
+            "the capabilities the session accepted"
+        );
+        assert_eq!(joined.runtime_binding_digest, config.runtime_binding_digest);
+        assert_eq!(
+            joined.supported_registration_operations,
+            vec![nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept],
+            "the classes the session can serve"
+        );
+
+        // Attaching twice is two transports for one session, not two sessions.
+        let again = match attach(&service, attach_request(&config, &session_id)).await {
+            nemo_relay_plugin_protocol::LifecycleOutcome::Completed(joined) => joined,
+            nemo_relay_plugin_protocol::LifecycleOutcome::Failed(failure) => {
+                panic!("a second attach to the same session: {failure:?}")
+            }
+        };
+        assert_eq!(again.session_id, session_id);
+
+        // And the session is still the handshake's: a second handshake is refused
+        // exactly as it was before an attach existed.
+        let refused = service
+            .handshake(Request::new(handshake_request(&config)))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        assert!(
+            !matches!(
+                handshake_outcome_from_wire(&refused).expect("a converted handshake"),
+                nemo_relay_plugin_protocol::LifecycleOutcome::Completed(_)
+            ),
+            "an attach must not make room for a second session"
+        );
+
+        // Nothing about the loaded set changed, because nothing was loaded.
+        let after = service
+            .inspect(Request::new(v1::InspectRequest {
+                session_id,
+                context: Some(context()),
+                handle: None,
+            }))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let before_loaded =
+            match nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&before)
+                .expect("a converted inspection")
+                .into_result()
+            {
+                Ok(descriptors) => descriptors.len(),
+                Err(failure) => panic!("the session should serve an inspection: {failure:?}"),
+            };
+        let after_loaded = match nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&after)
+            .expect("a converted inspection")
+            .into_result()
+        {
+            Ok(descriptors) => descriptors.len(),
+            Err(failure) => panic!("the session should still serve an inspection: {failure:?}"),
+        };
+        assert_eq!(
+            after_loaded, before_loaded,
+            "an attach changes no plugin state"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_that_does_not_prove_the_session_is_refused() {
+        let (service, config) = service();
+        let session_id = establish(&service, &config).await;
+
+        let refusal = |outcome: nemo_relay_plugin_protocol::LifecycleOutcome<
+            nemo_relay_plugin_protocol::PluginAttachedSession,
+        >| match outcome {
+            nemo_relay_plugin_protocol::LifecycleOutcome::Failed(failure) => failure,
+            nemo_relay_plugin_protocol::LifecycleOutcome::Completed(joined) => {
+                panic!("this attach should have been refused: {joined:?}")
+            }
+        };
+
+        let wrong_credential = v1::AttachRequest {
+            session_credential: "another-credential".into(),
+            ..attach_request(&config, &session_id)
+        };
+        assert!(
+            refusal(attach(&service, wrong_credential).await)
+                .message
+                .contains("credential")
+        );
+
+        let wrong_session = attach_request(&config, "another-session");
+        assert!(
+            refusal(attach(&service, wrong_session).await)
+                .message
+                .contains("did not establish")
+        );
+
+        let wrong_binding = v1::AttachRequest {
+            runtime_binding_digest: "another-binding".into(),
+            ..attach_request(&config, &session_id)
+        };
+        assert!(
+            refusal(attach(&service, wrong_binding).await)
+                .message
+                .contains("runtime binding")
+        );
+
+        let wrong_protocol = v1::AttachRequest {
+            protocol_version: u32::from(PROTOCOL_VERSION) + 1,
+            ..attach_request(&config, &session_id)
+        };
+        assert!(
+            refusal(attach(&service, wrong_protocol).await)
+                .message
+                .contains("protocol version")
+        );
+
+        // And a request that names nothing is refused as an envelope rather than
+        // judged as a session.
+        let unnamed = v1::AttachRequest {
+            session_id: String::new(),
+            ..attach_request(&config, &session_id)
+        };
+        assert!(
+            refusal(attach(&service, unnamed).await)
+                .message
+                .contains("naming no session")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_before_a_session_or_after_it_closed_is_refused() {
+        let (service, config) = service();
+
+        // Before: there is nothing to join. A host that attached here would be
+        // inventing a session for a caller that never established one.
+        let early = attach(&service, attach_request(&config, "any-session")).await;
+        assert!(matches!(
+            early,
+            nemo_relay_plugin_protocol::LifecycleOutcome::Failed(ref failure)
+                if failure.message.contains("no session to attach to")
+        ));
+
+        let session_id = establish(&service, &config).await;
+        let closed = service
+            .session_close(Request::new(v1::SessionCloseRequest {
+                session_id: session_id.clone(),
+            }))
+            .await
+            .expect("a served close")
+            .into_inner();
+        assert!(matches!(
+            nemo_relay_plugin_proto::convert::session_close_outcome_from_wire(&closed)
+                .expect("a converted close"),
+            nemo_relay_plugin_protocol::LifecycleOutcome::Completed(_)
+        ));
+
+        // After: a closed session is not joined, for the same reason a handshake
+        // cannot start another one.
+        let late = attach(&service, attach_request(&config, &session_id)).await;
+        assert!(matches!(
+            late,
+            nemo_relay_plugin_protocol::LifecycleOutcome::Failed(ref failure)
+                if failure.message.contains("already served its session")
+        ));
     }
 
     #[tokio::test]

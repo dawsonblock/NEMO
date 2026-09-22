@@ -247,6 +247,55 @@ message HandshakeResponse {
   repeated HostReadCapability accepted_read_capabilities = 7;
 }
 
+// Attach a second transport to a session this host has already established.
+//
+// A handshake creates a session; an attach joins one. The distinction exists
+// because the kernel's off-path work — the callbacks it runs beside a call rather
+// than on the call's own path — needs a transport whose tasks live on the runtime
+// that drives it, and a second transport must not be a second session: a plugin
+// already loaded, activated and proxied belongs to the session that did that, and
+// an attach that created another session, reloaded plugins or renegotiated
+// capabilities would solve a runtime-affinity problem by weakening the session
+// model.
+//
+// So an attach proves the same three facts a handshake does, plus the session it
+// is joining, and it returns the parameters that session already fixed rather
+// than any the caller offers. This message carries no frame limit, no feature
+// list and no read capabilities: a caller that could state those could state
+// weaker ones.
+message AttachRequest {
+  // The session being joined. A session this host did not establish is refused
+  // rather than created.
+  string session_id = 1;
+  // The credential this host was started with, checked here as it is at
+  // handshake: knowing where the socket is must not be enough to be a transport.
+  string session_credential = 2;
+  // Digest of the runtime identity the session is bound to.
+  string runtime_binding_digest = 3;
+  // Protocol version of the attaching client.
+  uint32 protocol_version = 4;
+}
+
+// The session parameters an attach joins.
+//
+// Every field is what the session already established. The attaching client
+// checks them against what it was told rather than using them to negotiate
+// anything: its only decision is whether this is the session it meant.
+message AttachedSession {
+  string session_id = 1;
+  uint32 negotiated_frame_limit = 2;
+  repeated PluginRegistrationOperation supported_registration_operations = 3;
+  repeated HostReadCapability accepted_read_capabilities = 4;
+  string runtime_binding_digest = 5;
+}
+
+message AttachOutcome {
+  oneof result {
+    AttachedSession attached = 1;
+    PluginFailure failure = 2;
+  }
+}
+
 // Kernel-held state a plugin host may be allowed to read.
 //
 // These exist because a less-trusted process asking for them is a decision
@@ -819,6 +868,8 @@ message HealthOutcome {
 
 service PluginHost {
   rpc Handshake(HandshakeRequest) returns (HandshakeOutcome);
+  // Join an established session with another transport. It creates no session.
+  rpc Attach(AttachRequest) returns (AttachOutcome);
   rpc Load(LoadRequest) returns (LoadOutcome);
   rpc Unload(UnloadRequest) returns (UnloadOutcome);
   rpc Inspect(InspectRequest) returns (InspectOutcome);

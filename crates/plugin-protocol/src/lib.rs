@@ -570,6 +570,43 @@ pub struct PluginInspectRequest {
     pub handle: Option<PluginHandle>,
 }
 
+/// A request to join a session this host has already established.
+///
+/// The same three facts a handshake proves — the credential, the runtime binding
+/// and the protocol version — plus the session being joined. It carries no frame
+/// limit, no feature list and no read capabilities: those belong to the session,
+/// and a caller that could state them could state weaker ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAttachRequest {
+    /// The session being joined.
+    pub session_id: String,
+    /// The credential this host was started with.
+    pub session_credential: String,
+    /// Digest of the runtime identity the session is bound to.
+    pub runtime_binding_digest: String,
+    /// Protocol version of the attaching client.
+    pub protocol_version: u16,
+}
+
+/// The parameters of the session an attach joined.
+///
+/// Every field is what the session already fixed. An attaching client checks them
+/// against what it was told rather than using them to negotiate anything: its
+/// only decision is whether this is the session it meant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAttachedSession {
+    /// The session that was joined.
+    pub session_id: String,
+    /// Frame limit the session negotiated.
+    pub negotiated_frame_limit: u32,
+    /// Registration classes the session can serve.
+    pub supported_registration_operations: Vec<PluginRegistrationOperation>,
+    /// Kernel-held state this session accepted.
+    pub accepted_read_capabilities: Vec<PluginHostReadCapability>,
+    /// Digest of the runtime identity the session is bound to.
+    pub runtime_binding_digest: String,
+}
+
 /// One event, on its way to a plugin that observes it.
 ///
 /// The event crosses whole rather than as a summary: a subscriber decides what a

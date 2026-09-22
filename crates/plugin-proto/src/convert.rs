@@ -16,21 +16,21 @@
 
 use nemo_relay_plugin_protocol::{
     DataSchema, DispatchState, LifecycleOutcome, LogSeverity, MAX_FRAME_BYTES, OutcomeCertainty,
-    PluginActivateRequest, PluginArtifactIdentity, PluginCapability, PluginCapabilityKind,
-    PluginChunkDecision, PluginCodecOperation, PluginCompletionCancelled, PluginCompletionOutcome,
-    PluginCompletionSettlement, PluginComponentConfiguration, PluginContinuationChunk,
-    PluginContinuationDisposition, PluginContinuationRequest, PluginDescriptor,
-    PluginExecutionContext, PluginExecutionOutcome, PluginExecutionShape, PluginFailure,
-    PluginFailureCode, PluginHandle, PluginHandshakeRequest, PluginHostCallOutcome,
-    PluginHostHealth, PluginHostReadCapability, PluginInspectRequest, PluginInvokeRequest,
-    PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse, PluginMarkEmit,
-    PluginOperationEnvelope, PluginOutputCredit, PluginProtocolError, PluginRegistrationDescriptor,
-    PluginRegistrationOperation, PluginRegistrationOrdering, PluginResolveCodecRequest,
-    PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest, PluginSessionIdentity,
-    PluginSessionMessage, PluginSessionPayload, PluginStreamChunk, PluginStreamChunkKind,
-    PluginStreamControl, PluginStreamEnd, PluginStreamFailed, PluginStreamItem,
-    PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened, PluginStreamPullRequest,
-    PluginSuccess, PluginUnloadRequest, registration_shape,
+    PluginActivateRequest, PluginArtifactIdentity, PluginAttachRequest, PluginAttachedSession,
+    PluginCapability, PluginCapabilityKind, PluginChunkDecision, PluginCodecOperation,
+    PluginCompletionCancelled, PluginCompletionOutcome, PluginCompletionSettlement,
+    PluginComponentConfiguration, PluginContinuationChunk, PluginContinuationDisposition,
+    PluginContinuationRequest, PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome,
+    PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginHandshakeRequest,
+    PluginHostCallOutcome, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
+    PluginInvokeRequest, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
+    PluginMarkEmit, PluginOperationEnvelope, PluginOutputCredit, PluginProtocolError,
+    PluginRegistrationDescriptor, PluginRegistrationOperation, PluginRegistrationOrdering,
+    PluginResolveCodecRequest, PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest,
+    PluginSessionIdentity, PluginSessionMessage, PluginSessionPayload, PluginStreamChunk,
+    PluginStreamChunkKind, PluginStreamControl, PluginStreamEnd, PluginStreamFailed,
+    PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened,
+    PluginStreamPullRequest, PluginSuccess, PluginUnloadRequest, registration_shape,
 };
 
 use crate::v1;
@@ -1587,6 +1587,123 @@ pub fn mark_request_to_wire(mark: &PluginMarkEmit, session_id: &str) -> v1::Emit
     }
 }
 
+/// Validate a frame limit a session negotiated.
+fn frame_limit_from_wire(limit: u32) -> Result<u32, PluginProtocolError> {
+    if limit == 0 {
+        return Err(malformed("a session with a zero frame limit"));
+    }
+    if limit > MAX_FRAME_BYTES {
+        return Err(malformed(format!(
+            "a session frame limit of {limit} exceeds the maximum {MAX_FRAME_BYTES}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// Validate an attach request.
+///
+/// The fields it carries are the ones an attach proves, so a request missing any
+/// of them is refused as an envelope rather than judged as a session: a caller
+/// that named no session could not be joining one, and one that named no
+/// credential could not be a transport this host should trust.
+pub fn attach_request_from_wire(
+    wire: &v1::AttachRequest,
+) -> Result<PluginAttachRequest, PluginProtocolError> {
+    if wire.session_id.trim().is_empty() {
+        return Err(malformed("an attach naming no session"));
+    }
+    if wire.session_credential.trim().is_empty() {
+        return Err(malformed("an attach with no session credential"));
+    }
+    if wire.runtime_binding_digest.trim().is_empty() {
+        return Err(malformed("an attach naming no runtime binding"));
+    }
+    Ok(PluginAttachRequest {
+        session_id: wire.session_id.trim().to_owned(),
+        session_credential: wire.session_credential.clone(),
+        runtime_binding_digest: wire.runtime_binding_digest.clone(),
+        protocol_version: u16::try_from(wire.protocol_version).map_err(|_| {
+            malformed("an attach whose protocol version is not a version this schema can carry")
+        })?,
+    })
+}
+
+/// Read what an attach joined.
+pub fn attached_session_from_wire(
+    wire: &v1::AttachedSession,
+) -> Result<PluginAttachedSession, PluginProtocolError> {
+    let mut supported_registration_operations = Vec::new();
+    for operation in &wire.supported_registration_operations {
+        supported_registration_operations.push(registration_operation_from_wire(*operation)?);
+    }
+    let mut accepted_read_capabilities = Vec::new();
+    for capability in &wire.accepted_read_capabilities {
+        accepted_read_capabilities.push(read_capability_from_wire(*capability)?);
+    }
+    Ok(PluginAttachedSession {
+        session_id: required_text(&wire.session_id, "an attached session with no identity")?,
+        negotiated_frame_limit: frame_limit_from_wire(wire.negotiated_frame_limit)?,
+        supported_registration_operations,
+        accepted_read_capabilities,
+        runtime_binding_digest: required_text(
+            &wire.runtime_binding_digest,
+            "an attached session with no runtime binding",
+        )?,
+    })
+}
+
+/// Read an attach outcome.
+pub fn attach_outcome_from_wire(
+    wire: &v1::AttachOutcome,
+) -> Result<LifecycleOutcome<PluginAttachedSession>, PluginProtocolError> {
+    match wire.result.as_ref() {
+        Some(v1::attach_outcome::Result::Attached(attached)) => Ok(LifecycleOutcome::Completed(
+            attached_session_from_wire(attached)?,
+        )),
+        Some(v1::attach_outcome::Result::Failure(failure)) => {
+            Ok(LifecycleOutcome::Failed(failure_from_wire(failure)?))
+        }
+        None => Err(malformed(
+            "an attach outcome that is neither an answer nor a failure",
+        )),
+    }
+}
+
+/// Encode what an attach joined.
+pub fn attached_session_to_wire(session: &PluginAttachedSession) -> v1::AttachedSession {
+    v1::AttachedSession {
+        session_id: session.session_id.clone(),
+        negotiated_frame_limit: session.negotiated_frame_limit,
+        supported_registration_operations: session
+            .supported_registration_operations
+            .iter()
+            .map(|operation| registration_operation_to_wire(*operation))
+            .collect(),
+        accepted_read_capabilities: session
+            .accepted_read_capabilities
+            .iter()
+            .map(|capability| read_capability_to_wire(*capability))
+            .collect(),
+        runtime_binding_digest: session.runtime_binding_digest.clone(),
+    }
+}
+
+/// Encode an attach outcome.
+pub fn attach_outcome_to_wire(
+    outcome: LifecycleOutcome<PluginAttachedSession>,
+) -> v1::AttachOutcome {
+    v1::AttachOutcome {
+        result: Some(match outcome {
+            LifecycleOutcome::Completed(session) => {
+                v1::attach_outcome::Result::Attached(attached_session_to_wire(&session))
+            }
+            LifecycleOutcome::Failed(failure) => {
+                v1::attach_outcome::Result::Failure(failure_to_wire(&failure))
+            }
+        }),
+    }
+}
+
 /// Validate a mark.
 ///
 /// The optional fields stay optional, and a present-but-empty one is refused
@@ -2486,6 +2603,79 @@ mod tests {
             .expect("the invocation that asked");
         assert_eq!(answered.dispatch, DispatchState::DispatchAttempted);
         assert_eq!(answered.certainty, OutcomeCertainty::Unknown);
+    }
+
+    #[test]
+    fn an_attach_that_proves_nothing_is_refused() {
+        // An attach proves the same facts a handshake does plus the session it
+        // joins, so a request missing any of them is refused as an envelope
+        // rather than judged as a session.
+        let complete = v1::AttachRequest {
+            session_id: "session-1".into(),
+            session_credential: "credential".into(),
+            runtime_binding_digest: "binding".into(),
+            protocol_version: 1,
+        };
+        assert!(attach_request_from_wire(&complete).is_ok());
+
+        for incomplete in [
+            v1::AttachRequest {
+                session_id: "  ".into(),
+                ..complete.clone()
+            },
+            v1::AttachRequest {
+                session_credential: String::new(),
+                ..complete.clone()
+            },
+            v1::AttachRequest {
+                runtime_binding_digest: String::new(),
+                ..complete.clone()
+            },
+        ] {
+            assert!(
+                attach_request_from_wire(&incomplete).is_err(),
+                "an attach that proves nothing is not an attach: {incomplete:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attached_session_with_no_identity_is_refused() {
+        let session = v1::AttachedSession {
+            session_id: "session-1".into(),
+            negotiated_frame_limit: 1024,
+            supported_registration_operations: vec![],
+            accepted_read_capabilities: vec![],
+            runtime_binding_digest: "binding".into(),
+        };
+        assert!(attached_session_from_wire(&session).is_ok());
+
+        assert!(
+            attached_session_from_wire(&v1::AttachedSession {
+                session_id: String::new(),
+                ..session.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            attached_session_from_wire(&v1::AttachedSession {
+                negotiated_frame_limit: 0,
+                ..session.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            attached_session_from_wire(&v1::AttachedSession {
+                runtime_binding_digest: String::new(),
+                ..session
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_attach_outcome_with_neither_arm_is_malformed() {
+        assert!(attach_outcome_from_wire(&v1::AttachOutcome { result: None }).is_err());
     }
 
     #[test]

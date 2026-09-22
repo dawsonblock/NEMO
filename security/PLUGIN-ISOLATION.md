@@ -811,6 +811,28 @@ frame limit, protocol version, read capabilities, supported registration classes
 runtime binding — stay properties of the session; a second transport is a second
 transport.
 
+**The attach is implemented** (`rpc Attach`), and it validates against the
+*established* session rather than against anything the caller supplies: the
+session identity is stored whole in `Active`, and the answer reports those
+parameters rather than recomputing them. The tests are mostly negative, because
+that is where the contract lives: a wrong credential, a session this host did not
+establish, a different runtime binding, a different protocol version, and a request
+naming nothing are each refused; attaching before a session exists, or after it
+closed, is refused for the same reasons a second handshake is. The positive case
+proves the absence of a side effect rather than a stream of them — two attaches
+return the same session identity, a second *handshake* is still refused (so an
+attach creates no room for a second session), and the loaded set is unchanged.
+
+**One limitation is recorded rather than hidden.** Attach authenticates the
+client, but a Tonic service cannot track which connection a later request arrived
+on, so later session-bound operations are still authorised by the session identity
+and the context, not by the transport. A peer that can open the socket and knows
+the session identity can therefore skip the attach. Closing that needs a
+transport token minted by the attach and required in the metadata of every
+session-bound request — a change to the primary client too, since the primary
+transport would have to attach before it could issue anything. It is named here
+as the follow-up rather than left as an implication of "attach exists".
+
 What remains, in order, once the attach exists: a connection descriptor the
 supervisor can hand out (endpoint, credential, session identity, negotiated
 limits), an off-path client created lazily *on the off-path runtime* and cached

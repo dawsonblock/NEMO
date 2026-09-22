@@ -33,6 +33,8 @@ fn vectors_path() -> PathBuf {
 /// somebody made rather than something that happened. Closing this list is part
 /// of the ABI-closure work.
 const PENDING_VECTORS: &[&str] = &[
+    "AttachOutcome",
+    "AttachRequest",
     "CancelOperationRequest",
     "EmitMarkRequest",
     "EmitMarkResponse",
