@@ -1144,6 +1144,27 @@ session installs nothing) and it is worth doing before the CLI is written, so th
 command is thin plumbing over an honest report rather than a tool that cannot answer
 its own question.
 
+**Discovery is implemented, and running it found something.** `ActivateRequest` now
+carries `discovery`: a serving session refuses a plugin whole when it registers a
+class the session cannot serve — right for production, useless for inspection — and
+an inspecting session reports every descriptor, unsupported classes included, so the
+blockers are visible as what they are. Nothing is installed either way (the host
+reports and the kernel decides, and proxy installation refuses a class the backend
+does not support), so the flag changes what is *reported* and nothing else. The test
+proves both halves against the same plugin in the same host: serving refuses,
+inspecting reports, and the report contains an operation this kernel cannot serve.
+
+Running it turned up a defect in the repository's own fixture: `fixture_native`
+registers one injector name twice, and the *conversion* refuses a duplicate
+registration at the same attachment point
+(`a registration named …fixture_event_metadata_injector twice at the same attachment
+point`). That has a consequence worth stating: the sixteen-surface fixture cannot be
+activated *over the boundary* at all today, so it was never a valid coverage
+measurement — the 10/16 above comes from reading its source. Fixing the fixture, or
+deciding what a duplicate registration *means* (two injectors under one name is
+either a plugin bug or a contract the conversion is too strict about), is a
+prerequisite for measuring it properly.
+
 **What NEMO already produces.** Activation is the authoritative source, and the
 boundary already surfaces it: `ProcessPluginBackend::activate` returns one
 `PluginDescriptor` per activated plugin, each carrying the registrations the plugin

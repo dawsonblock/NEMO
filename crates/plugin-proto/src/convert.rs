@@ -1202,7 +1202,10 @@ pub fn activate_request_from_wire(
             )?,
         });
     }
-    Ok(PluginActivateRequest { components })
+    Ok(PluginActivateRequest {
+        components,
+        discovery: wire.discovery,
+    })
 }
 
 /// Build the wire form of an activation request.
@@ -1222,6 +1225,7 @@ pub fn activate_request_to_wire(
                 config_json: component.config_json.clone(),
             })
             .collect(),
+        discovery: request.discovery,
     }
 }
 
@@ -2465,6 +2469,7 @@ mod tests {
             session_id: "session-1".into(),
             context: None,
             components: Vec::new(),
+            discovery: false,
         })
         .expect_err("an activation with no components");
         assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
@@ -2486,6 +2491,7 @@ mod tests {
                     session_id: "session-1".into(),
                     context: None,
                     components: vec![component],
+                    discovery: false,
                 })
                 .is_err()
             );
@@ -2498,6 +2504,7 @@ mod tests {
                 kind: "example".into(),
                 config_json: r#"{"model":"example"}"#.into(),
             }],
+            discovery: false,
         })
         .expect("an activation");
         assert_eq!(request.components.len(), 1);

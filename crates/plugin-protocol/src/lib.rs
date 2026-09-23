@@ -750,6 +750,22 @@ pub struct PluginComponentConfiguration {
 pub struct PluginActivateRequest {
     /// Components to activate.
     pub components: Vec<PluginComponentConfiguration>,
+    /// Whether this session is inspecting rather than serving.
+    ///
+    /// Activation runs a plugin's register callbacks, and a serving session
+    /// refuses a plugin *whole* when it registers a class that session cannot
+    /// serve — because a load reporting success while a callback disappears is
+    /// worse than a refused load. Inspection wants the opposite: it exists to find
+    /// the classes this kernel cannot serve, so it reports every descriptor,
+    /// unsupported ones included, and installs nothing.
+    ///
+    /// The flag cannot widen what a session may do: the host installs no proxies
+    /// either way — it reports what the plugin registered, and the kernel decides
+    /// what to install from that — and proxy installation refuses a class the
+    /// backend does not support. So a discovery request changes what is *reported*
+    /// and nothing else.
+    #[serde(default)]
+    pub discovery: bool,
 }
 
 /// Liveness and resource state of the host.

@@ -803,6 +803,17 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 )
                 .await?;
 
+            // An inspecting session reports what a plugin registered, unsupported
+            // classes included, because those are what it is looking for. A
+            // serving session refuses instead, and the reason is the same in both
+            // directions: one wants to know what it cannot serve, the other must
+            // not appear to serve it. Nothing is installed either way — the host
+            // reports and the kernel decides — so the flag changes what is
+            // reported and nothing else.
+            if activation.discovery {
+                return Ok(descriptors);
+            }
+
             // A plugin that registered something this session cannot serve is
             // refused here — after activation, where registrations first exist,
             // rather than at load, where they do not yet.
@@ -1848,6 +1859,7 @@ mod tests {
                     kind: "fixture_native".into(),
                     config_json: "{}".into(),
                 }],
+                discovery: false,
             }))
             .await
             .expect("a served activation")
@@ -1873,6 +1885,103 @@ mod tests {
 
     /// A session that can serve nothing, so activation of a real plugin must
     /// fail closed on whatever it registers.
+    /// A discovery session reports what a serving one refuses — and the same
+    /// plugin, in the same host, tells both stories truthfully.
+    #[tokio::test]
+    async fn a_discovery_activation_reports_what_a_serving_one_refuses() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((_, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the discovery case");
+            return;
+        };
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let session_id = establish(&service, &config).await;
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                .expect("the fixture's identity");
+        service
+            .load(Request::new(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact: artifact.clone(),
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load");
+
+        let activate = |discovery: bool| {
+            service.activate(Request::new(v1::ActivateRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+                discovery,
+            }))
+        };
+
+        // Serving: this session cannot proxy everything the fixture registers, so
+        // activation is refused whole rather than half-served.
+        let serving = activate(false)
+            .await
+            .expect("a served activation")
+            .into_inner();
+        let serving = nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&serving)
+            .expect("converted");
+        assert!(
+            serving.into_result().is_err(),
+            "a serving session refuses what it cannot serve"
+        );
+
+        // Inspecting: the same plugin, reported in full, so the classes this
+        // kernel cannot serve are visible as what they are. Read from the wire
+        // rather than through the conversion, because this fixture registers one
+        // injector name twice and the conversion refuses a duplicate registration
+        // — a real finding of its own, and one that means the sixteen-surface
+        // fixture cannot be activated *over the boundary* until it is fixed. The
+        // report is what this test is about, and it is visible before conversion.
+        let discovery = activate(true)
+            .await
+            .expect("a served activation")
+            .into_inner();
+        let Some(v1::activate_outcome::Result::Activated(response)) = discovery.result else {
+            panic!("a discovery session reports rather than refuses: {discovery:?}");
+        };
+        let serveable: Vec<i32> = crate::ProcessPluginBackend::supported_registration_operations()
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+            })
+            .collect();
+        let reported: Vec<i32> = response
+            .descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .map(|registration| registration.operation)
+            .collect();
+        assert!(
+            !reported.is_empty(),
+            "the report is the plugin's actual registrations"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|operation| !serveable.contains(operation)),
+            "including the ones this kernel cannot serve, which is the point: \
+             otherwise a plugin could never be measured as blocked — reported {reported:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_activation_that_registers_what_this_session_cannot_serve_is_refused_whole() {
         let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
@@ -1914,6 +2023,7 @@ mod tests {
 
         let outcome = service
             .activate(Request::new(v1::ActivateRequest {
+                discovery: false,
                 session_id,
                 context: Some(context()),
                 components: vec![v1::ComponentConfiguration {
@@ -2028,6 +2138,7 @@ mod tests {
             .activate(Request::new(v1::ActivateRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
+                discovery: false,
                 components: vec![v1::ComponentConfiguration {
                     kind: "fixture_native".into(),
                     config_json: "{}".into(),

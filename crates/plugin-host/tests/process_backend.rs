@@ -210,6 +210,8 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     let descriptors = backend
         .activate(
             PluginActivateRequest {
+                // A serving composition, as production is.
+                discovery: false,
                 components: vec![PluginComponentConfiguration {
                     kind: "fixture_intercept".into(),
                     config_json: "{}".into(),

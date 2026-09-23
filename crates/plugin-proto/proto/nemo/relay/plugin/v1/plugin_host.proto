@@ -360,18 +360,29 @@ message ComponentConfiguration {
   string config_json = 2;
 }
 
+// Ask a session to run a plugin's register callbacks.
+//
+// `discovery` says this session is inspecting rather than serving: a serving
+// session refuses a plugin that registered a class it cannot serve, because a load
+// reporting success while a callback disappears is worse than a refused load, and
+// an inspecting one reports every registration so the classes this kernel cannot
+// serve are visible as what they are — the blockers.
 message ActivateRequest {
   string session_id = 1;
   PluginExecutionContext context = 2;
   repeated ComponentConfiguration components = 3;
+  // Whether this session is inspecting rather than serving. See the comment
+  // above this message: it changes what is reported, not what may be installed.
+  bool discovery = 4;
 }
 
 // What the host holds once the components are activated.
 //
 // The descriptors are the point: they carry the registrations the plugin made,
-// which is what the kernel needs to install a proxy per registration. A plugin
-// that registered something this session cannot serve is refused here rather
-// than reported as activated.
+// which is what the kernel needs to install a proxy per registration. A serving
+// session refuses a plugin that registered something it cannot serve, rather than
+// reporting it as activated; an inspecting session reports them all, because the
+// unsupported ones are what it is looking for.
 message ActivateResponse {
   repeated PluginDescriptor descriptors = 1;
 }

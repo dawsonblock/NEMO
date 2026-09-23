@@ -566,7 +566,13 @@ impl ProcessLoadedPlugins {
         } else {
             backend
                 .activate(
-                    nemo_relay_plugin_protocol::PluginActivateRequest { components },
+                    nemo_relay_plugin_protocol::PluginActivateRequest {
+                        components,
+                        // A composition serves: it wants the classes it can proxy,
+                        // and a plugin registering anything else is refused whole
+                        // rather than half-served.
+                        discovery: false,
+                    },
                     lifecycle_context(&binding, "activate"),
                 )
                 .await?

@@ -435,6 +435,9 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             "ActivateRequest",
             v1::ActivateRequest {
                 session_id: "session-1".into(),
+                // Vectored as a serving activation: discovery is an inspection
+                // affordance, and the vector records the shape production sends.
+                discovery: false,
                 context: Some(context("operation-7")),
                 components: vec![v1::ComponentConfiguration {
                     kind: "example".into(),
