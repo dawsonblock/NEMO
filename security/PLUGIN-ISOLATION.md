@@ -1057,6 +1057,22 @@ repository ships, because they are the plugins it actually has.
 | remotely supported | the eleven that are not sanitizers-of-marks-or-scopes, execution intercepts or stream intercepts |
 | remaining blockers | mark sanitize, scope-start sanitize, scope-end sanitize, tool execution intercept, LLM execution intercept, LLM stream execution intercept |
 
+`examples/rust-native-plugin` — the plugin a reader is pointed at first:
+
+| | |
+|---|---|
+| registered classes | metadata injector, tool + LLM request intercepts, subscriber, mark and scope-start/end sanitizers, tool and LLM sanitize request/response, tool + LLM conditional, LLM execution intercept, LLM stream execution intercept |
+| remotely supported | the same eleven that are not mark/scope sanitizers, execution intercepts or stream intercepts |
+| remaining blockers | mark sanitize, scope-start sanitize, scope-end sanitize, LLM execution intercept, LLM stream execution intercept |
+
+That is the number worth watching, and it is five rather than six: the example
+registers the mark and scope sanitizer families that the next increment covers plus
+two execution intercepts, and it registers *no* tool execution intercept. The
+distinction matters because the execution-intercept count is what decides whether
+duplex is on the path for a given plugin: this one needs the LLM execution and
+stream intercepts, so it is not servable without duplex work — whereas a plugin that
+registers only the first four categories is servable today.
+
 So the answer to "which real plugin is closest to 100%" is the first one, and it is
 already there — which is worth stating plainly, because it means the *coverage*
 argument for the next class is not about that fixture. The argument is that a real
