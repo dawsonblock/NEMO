@@ -68,6 +68,17 @@ impl NativePlugin for InterceptPlugin {
                 }))
             },
         )?;
+        // An additive observer: it answers with metadata to insert, and nothing
+        // it returns can change the call that produced the event.
+        ctx.register_event_metadata_injector(
+            "fixture_intercept_metadata",
+            0,
+            |_event| async move {
+                let mut additions = std::collections::BTreeMap::new();
+                additions.insert("native_injected".to_string(), Json::Bool(true));
+                Ok(additions)
+            },
+        )?;
         // A decision, which is the class that can stop a call: this one allows
         // everything except the tool named below, so a test can see both halves
         // of the decision cross the boundary.

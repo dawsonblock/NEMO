@@ -649,6 +649,22 @@ holds the supervisor that starts it and the backend that reaches it.
   host's `invoke` is lost at that hop, and the mark lands in the child's own
   runtime exactly as before. Every seam below that hop is tested; the gap is the
   hop itself.
+- **An additive observer crosses, with the family's failure rule.** Metadata
+  injectors are servable: the kernel sends the event its dispatcher is about to
+  publish, the child answers with the keys it wants added, and the kernel inserts
+  them into that copy. Nothing an injector returns can reach the call that produced
+  the event, which is the same guarantee the sanitizers carry and the reason the
+  class is safe to run elsewhere. Its failure rule is the opposite of a sanitizer's
+  and comes from the in-process chain rather than from here: **an injector that
+  cannot answer preserves the event and continues without injection** — a
+  sanitizer withholds a payload it could not sanitize, an injector adds nothing it
+  could not compute — so a failure is recorded (`nemo.plugin.metadata.failed`)
+  rather than made fatal, because an additive hook must not become a way to stop a
+  runtime from publishing. The answer is also checked at the boundary: metadata is
+  a JSON object, and anything else is refused rather than coerced into one. The
+  test proves three things at once — the tool's own result is unchanged, the
+  published copy carries the child's key, and the whole thing runs on a
+  single-threaded caller.
 - **A decision crosses, and that is its own kind of class.** Tool conditional
   guardrails are servable: the kernel sends the tool and its arguments, the child
   runs exactly the named registration, and the answer is the decision — a reason
@@ -991,7 +1007,7 @@ per unit of added complexity* rather than protocol completeness.
 | tool sanitize request/response guardrail | `(name, Json) -> Json` | no (hangs) | no (hangs) | 6 + 6 | an off-path transport: see below |
 | mark / scope sanitize guardrail | `(Arc<Event>, EventSanitizeFields) -> EventSanitizeFields` | no | no | 9 + 6 + 6 | the same, plus one field shape |
 | LLM sanitize request/response guardrail | codec-bearing context | no | no | 6 + 6 | codec identity on the wire |
-| event metadata injector | metadata map | no | no | 4 | the same as observers |
+| event metadata injector | event → metadata map | yes | yes | 4 | — |
 | tool execution intercept | continuation | no | no | 11 | the duplex session: it wraps the call, so the child has to call back |
 | LLM execution intercept, stream intercept, continuations, completions, pull streams | continuation | no | no | 6 + 6 | the duplex session |
 

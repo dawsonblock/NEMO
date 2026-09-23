@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::api::runtime::EventSubscriberFn;
+use crate::api::runtime::NemoRelayContextState;
 use crate::api::runtime::current_scope_stack;
 use crate::api::runtime::flush_subscribers as flush_runtime_subscribers;
 use crate::api::runtime::global_context;
 use crate::api::shared::ensure_runtime_owner;
 use crate::error::{FlowError, Result};
+use crate::json::Json;
+use std::sync::Arc;
 
 /// Run exactly one event subscriber, named by its registration.
 ///
@@ -42,6 +45,57 @@ pub fn invoke_subscriber_registration(
     };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subscriber(event)))
         .map_err(|_| FlowError::Internal(format!("subscriber '{registration}' panicked")))
+}
+
+/// Run exactly one event metadata injector, named by its registration.
+///
+/// An injector is *additive*: it answers with the metadata keys it wants added,
+/// and the runtime inserts them. Its failure rule follows from that — the runtime's
+/// own injector chain says so in a comment, and it is worth repeating here because
+/// it is the opposite of the sanitizer's: **an injector that cannot answer
+/// preserves the event and continues without injection**. A sanitizer withholds a
+/// payload it could not sanitize; an injector adds nothing it could not compute.
+///
+/// # Errors
+/// `NotFound` when nothing is registered under that name, which is what a caller
+/// needs to refuse the delivery rather than appear to have injected nothing.
+pub async fn invoke_event_metadata_injector_registration(
+    registration: &str,
+    event: &crate::api::event::Event,
+) -> Result<std::collections::BTreeMap<String, Json>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.event_metadata_injectors);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?;
+        NemoRelayContextState::event_metadata_injector_entries(
+            &state.event_metadata_injectors,
+            &scope_local_refs,
+        )
+        .into_iter()
+        .find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no event metadata injector is registered as '{registration}'"
+        )));
+    };
+    let payload = Arc::new(event.clone());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (entry.payload)(Arc::clone(&payload))
+    })) {
+        Ok(future) => future.await,
+        Err(_) => Err(FlowError::Internal(format!(
+            "metadata injector '{registration}' panicked"
+        ))),
+    }
 }
 
 /// Register a global lifecycle event subscriber.

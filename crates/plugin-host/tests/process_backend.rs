@@ -455,6 +455,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_conditional",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_conditional",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_metadata",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_never",
@@ -755,6 +756,61 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         ),
         "the decision reaches the caller on the LLM chain too: {refusal:?}"
     );
+
+    // An injector adds, and only adds: the tool's own result is what it was, and
+    // the copy this runtime publishes carries the key the child contributed.
+    let injected: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording = std::sync::Arc::clone(&injected);
+    nemo_relay::api::subscriber::register_subscriber(
+        "process-backend-injected-metadata",
+        std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+            if event.name() == "injected_tool"
+                && let Some(metadata) = event.metadata()
+            {
+                recording.lock().unwrap().push(metadata.clone());
+            }
+        }),
+    )
+    .expect("a subscriber");
+    let result = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("injected_tool")
+                    .args(serde_json::json!({"input": true}))
+                    .func(std::sync::Arc::new(|_args| {
+                        Box::pin(async { Ok(serde_json::json!({"kept": true}).into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed tool call whose events are annotated elsewhere");
+    assert_eq!(
+        result.result,
+        serde_json::json!({"kept": true}),
+        "an injector must not change what the tool returned"
+    );
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+    let injected = injected.lock().unwrap().clone();
+    assert!(
+        injected.iter().any(|metadata| {
+            metadata
+                .get("native_injected")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        }),
+        "the copy this runtime published should carry the child's addition: {injected:#?}"
+    );
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-injected-metadata")
+        .expect("a deregistration");
 
     // Dropping the composition takes the registration out of the chain and ends
     // the host: a plugin's callback may not outlive the runtime that installed it.

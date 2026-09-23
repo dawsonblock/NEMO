@@ -150,6 +150,7 @@ pub struct RegistrationProxies {
     tool_request_intercepts: Vec<String>,
     llm_request_intercepts: Vec<String>,
     subscribers: Vec<String>,
+    metadata_injectors: Vec<String>,
     tool_sanitize_request: Vec<String>,
     tool_conditional: Vec<String>,
     llm_conditional: Vec<String>,
@@ -165,6 +166,7 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("tool_request_intercepts", &self.tool_request_intercepts)
             .field("llm_request_intercepts", &self.llm_request_intercepts)
             .field("subscribers", &self.subscribers)
+            .field("metadata_injectors", &self.metadata_injectors)
             .field("tool_sanitize_request", &self.tool_sanitize_request)
             .field("tool_conditional", &self.tool_conditional)
             .field("llm_conditional", &self.llm_conditional)
@@ -180,6 +182,7 @@ impl RegistrationProxies {
             .iter()
             .chain(self.llm_request_intercepts.iter())
             .chain(self.subscribers.iter())
+            .chain(self.metadata_injectors.iter())
             .chain(self.tool_sanitize_request.iter())
             .chain(self.tool_conditional.iter())
             .chain(self.llm_conditional.iter())
@@ -196,6 +199,9 @@ impl Drop for RegistrationProxies {
         }
         for registration in &self.llm_request_intercepts {
             let _ = nemo_relay::api::registry::deregister_llm_request_intercept(registration);
+        }
+        for registration in &self.metadata_injectors {
+            let _ = nemo_relay::api::registry::deregister_event_metadata_injector(registration);
         }
         for registration in &self.subscribers {
             let _ = nemo_relay::api::subscriber::deregister_subscriber(registration);
@@ -232,6 +238,7 @@ pub fn install(
         tool_request_intercepts: Vec::new(),
         llm_request_intercepts: Vec::new(),
         subscribers: Vec::new(),
+        metadata_injectors: Vec::new(),
         tool_sanitize_request: Vec::new(),
         tool_conditional: Vec::new(),
         llm_conditional: Vec::new(),
@@ -263,6 +270,12 @@ pub fn install(
                 install_tool_sanitize(&context, registration, &handle, true)?;
                 installed
                     .tool_sanitize_response
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::EventMetadataInjector => {
+                install_metadata_injector(&context, registration, &handle)?;
+                installed
+                    .metadata_injectors
                     .push(registration.registration_id.clone());
             }
             PluginRegistrationOperation::Subscriber => {
@@ -836,6 +849,157 @@ fn install_tool_sanitize(
         )
     };
     installed.map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// Install the proxy for one event metadata injector.
+///
+/// An injector adds: it answers with the keys it wants added, and the kernel
+/// inserts them into the copy of the event its dispatcher is about to publish.
+/// Nothing it returns reaches the call that produced the event, which is the same
+/// guarantee the sanitizers carry and the reason this class is safe to run
+/// elsewhere.
+///
+/// Failure follows the family's own rule rather than a new one: an injector that
+/// cannot answer preserves the event and continues without injection, so this
+/// records the failure — an additive hook must not become a way to stop a runtime
+/// from publishing — and lets the chain proceed with nothing added.
+fn install_metadata_injector(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    let off_path = context.off_path.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is a metadata injector and this runtime started no runtime for work beside \
+                 a call, so its answer could never arrive",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::EventMetadataInjectorFn = Arc::new(
+        move |event: std::sync::Arc<nemo_relay::api::event::Event>| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let off_path = Arc::clone(&off_path);
+            Box::pin(async move {
+                let observed = nemo_relay_plugin_protocol::PluginObservedEvent {
+                    event: (*event).clone(),
+                };
+                let recording = registration_id.clone();
+                let payload = serde_json::to_string(&observed).map_err(|error| {
+                    nemo_relay::error::FlowError::Internal(format!(
+                        "an observed event could not be serialized: {error}"
+                    ))
+                })?;
+                let delivery = Arc::clone(&off_path);
+                let submitted = off_path.submit(async move {
+                    let execution = context.passive_execution_context(
+                        nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
+                    )?;
+                    let request = PluginInvokeRequest {
+                        handle,
+                        registration_id: registration_id.clone(),
+                        arguments: payload,
+                        budget_millis: execution.remaining_budget_millis,
+                    };
+                    let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                        scopes.enter(
+                            &execution.operation_request_id,
+                            nemo_relay::api::runtime::current_scope_stack(),
+                        )
+                    });
+                    let outcome = delivery.invoke(request, execution).await.map_err(|error| {
+                        nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        }
+                    })?;
+                    match outcome.result {
+                        Ok(PluginSuccess::Invoked(response)) => {
+                            let additions: serde_json::Value =
+                                serde_json::from_str(&response.output).map_err(|error| {
+                                    nemo_relay::error::FlowError::Internal(format!(
+                                        "a proxied injector answered with something that is not \
+                                         metadata: {error}"
+                                    ))
+                                })?;
+                            // The boundary the family needs: metadata is an
+                            // object, and anything else is refused rather than
+                            // coerced into one.
+                            let Some(object) = additions.as_object() else {
+                                return Err(nemo_relay::error::FlowError::InvalidArgument(
+                                    "an injector's answer must be a JSON object of metadata".into(),
+                                ));
+                            };
+                            Ok(object
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect::<std::collections::BTreeMap<_, _>>())
+                        }
+                        Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                            "a proxied injector answered with {}",
+                            other_name(&other)
+                        ))),
+                        Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id,
+                            dispatch: outcome.dispatch,
+                            certainty: outcome.certainty,
+                            failure,
+                        }),
+                    }
+                });
+                let Some(answer) = submitted else {
+                    // Saturation is the family's rule too: nothing is added, and
+                    // the event is published as it was.
+                    crate::off_path::record_failure(
+                        crate::off_path::METADATA_FAILURE_MARK,
+                        &recording,
+                        "the off-path runtime is at its in-flight limit",
+                    );
+                    return Ok(std::collections::BTreeMap::new());
+                };
+                match crate::off_path::OffPathPluginExecutor::answer(answer)
+                    .await
+                    .and_then(|inner| inner)
+                {
+                    Ok(additions) => Ok(additions),
+                    Err(error) => {
+                        crate::off_path::record_failure(
+                            crate::off_path::METADATA_FAILURE_MARK,
+                            &recording,
+                            &error.to_string(),
+                        );
+                        Err(error)
+                    }
+                }
+            })
+        },
+    );
+
+    nemo_relay::api::registry::register_event_metadata_injector(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
         PluginProtocolError::new(
             PluginFailureCode::Rejected,
             format!(

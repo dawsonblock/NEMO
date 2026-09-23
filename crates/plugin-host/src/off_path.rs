@@ -85,6 +85,13 @@ pub const OBSERVER_FAILURE_MARK: &str = "nemo.plugin.observer.failed";
 /// decide.
 pub const SANITIZE_FAILURE_MARK: &str = "nemo.plugin.sanitize.failed";
 
+/// The mark this runtime emits when a metadata injector failed.
+///
+/// An injector's failure is invisible by construction — it adds nothing and the
+/// event proceeds — so without a record a hook that never worked and a hook that
+/// had nothing to add would look the same.
+pub const METADATA_FAILURE_MARK: &str = "nemo.plugin.metadata.failed";
+
 /// Record one off-path failure in this runtime's own stream.
 ///
 /// One function rather than one per family: the mark names the family, and the

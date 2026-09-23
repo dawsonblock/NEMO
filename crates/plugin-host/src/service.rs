@@ -366,6 +366,33 @@ impl PluginHostService {
                         Err(error) => Ok(refusal(error.to_string())),
                     }
                 }
+                // The additive observer class. Its answer is the metadata it
+                // wants added, and the kernel inserts it; a failure here means
+                // nothing is added, which is what an injector's failure means in
+                // process too.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::EventMetadataInjector => {
+                    let observed: nemo_relay_plugin_protocol::PluginObservedEvent =
+                        serde_json::from_str(&request.arguments).map_err(|error| {
+                            refused(format!(
+                                "a metadata injector payload must be an observed event: {error}"
+                            ))
+                        })?;
+                    match nemo_relay::api::subscriber::invoke_event_metadata_injector_registration(
+                        &request.registration_id,
+                        &observed.event,
+                    )
+                    .await
+                    {
+                        Ok(additions) => Ok(success(
+                            serde_json::to_string(&additions).map_err(|error| {
+                                refused(format!(
+                                    "the injected metadata could not be serialized: {error}"
+                                ))
+                            })?,
+                        )),
+                        Err(error) => Ok(refusal(error.to_string())),
+                    }
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.
