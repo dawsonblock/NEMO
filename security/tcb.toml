@@ -241,7 +241,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 11
 max_transitive_packages = 239
-max_source_lines = 7937
+max_source_lines = 8196
 max_unsafe_occurrences = 1
 direct_dependency_digest = "e574bc35ea7d5125d68be653e523a40e40b76504458db28a90b94ccdfc786f0f"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

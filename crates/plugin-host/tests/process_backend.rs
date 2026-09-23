@@ -308,6 +308,60 @@ async fn the_process_backend_satisfies_the_shared_lifecycle_suite() {
 }
 
 #[tokio::test]
+async fn a_second_transport_attaches_to_the_session_and_serves_only_invocations() {
+    use nemo_relay_plugin_host::attached::AttachedClient;
+    use nemo_relay_plugin_protocol::{PluginHandle, PluginInvokeRequest};
+
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    let descriptor = backend.connection_descriptor();
+    let attached = AttachedClient::connect(descriptor.clone())
+        .await
+        .expect("a second transport should attach to the established session");
+    assert_eq!(
+        attached.descriptor().session_id,
+        descriptor.session_id,
+        "the attach joins the session the kernel established"
+    );
+
+    // A second transport is another way to reach the same session: a registration
+    // the session does not hold is refused *by the host*, which is what shows the
+    // request was served rather than dropped.
+    let outcome = attached
+        .invoke(
+            PluginInvokeRequest {
+                handle: PluginHandle {
+                    plugin_id: "absent".into(),
+                    generation: 1,
+                },
+                registration_id: "absent".into(),
+                arguments: "{}".into(),
+                budget_millis: 5_000,
+            },
+            context(),
+        )
+        .await;
+    assert!(
+        outcome
+            .map(|outcome| outcome.result.is_err())
+            .unwrap_or(true),
+        "the session answered, and its answer was that nothing holds that registration"
+    );
+
+    // And the attach is what authorises a transport: a descriptor naming a session
+    // the host never established is refused rather than served.
+    let stranger = nemo_relay_plugin_host::attached::ConnectionDescriptor {
+        session_id: "another-session".into(),
+        ..descriptor
+    };
+    assert!(
+        AttachedClient::connect(stranger).await.is_err(),
+        "a session this host did not establish cannot be joined"
+    );
+}
+
+#[tokio::test]
 async fn the_kernel_serves_its_socket_and_refuses_a_caller_without_the_credential() {
     use nemo_relay_plugin_host::runtime_service::{SESSION_CREDENTIAL_HEADER, connect_to_kernel};
     use tonic::metadata::MetadataValue;

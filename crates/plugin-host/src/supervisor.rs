@@ -113,6 +113,12 @@ pub struct PluginHostSupervisor {
     /// up when the host forwards a mark a plugin raised during it.
     operation_scopes: Arc<OperationScopes>,
     session: PluginSessionIdentity,
+    /// Kept for a second transport: the host checks the credential at attach as
+    /// it does at handshake, so a descriptor has to carry it.
+    session_credential: String,
+    /// Kept for the same reason, and because the session's identity does not
+    /// carry it: the binding is a property of the runtime, not of the handshake.
+    runtime_binding_digest: String,
     client: PluginHostClient<Channel>,
 }
 
@@ -260,6 +266,8 @@ impl PluginHostSupervisor {
             runtime_server,
             operation_scopes,
             session,
+            session_credential: credential,
+            runtime_binding_digest: config.runtime_binding_digest.clone(),
             client,
         })
     }
@@ -277,6 +285,17 @@ impl PluginHostSupervisor {
     /// it.
     pub fn kernel_endpoint(&self) -> &Path {
         &self.kernel_endpoint
+    }
+
+    /// Everything a second transport needs to attach to this session.
+    pub fn connection_descriptor(&self) -> crate::attached::ConnectionDescriptor {
+        crate::attached::ConnectionDescriptor {
+            endpoint: self.socket_dir.join("s"),
+            session_credential: self.session_credential.clone(),
+            runtime_binding_digest: self.runtime_binding_digest.clone(),
+            session_id: self.session.session_id.clone(),
+            maximum_frame_bytes: self.session.maximum_frame_bytes,
+        }
     }
 
     /// The registry that says which scope an in-flight operation belongs to.
@@ -460,6 +479,11 @@ impl ProcessPluginBackend {
     /// The registry that says which scope an in-flight operation belongs to.
     pub fn operation_scopes(&self) -> Arc<OperationScopes> {
         self.supervisor.operation_scopes()
+    }
+
+    /// Everything a second transport needs to attach to this session.
+    pub fn connection_descriptor(&self) -> crate::attached::ConnectionDescriptor {
+        self.supervisor.connection_descriptor()
     }
 
     /// End the host process.

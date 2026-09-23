@@ -421,6 +421,8 @@ impl PluginExecutionBackend for InProcessPluginBackend {
     }
 }
 
+/// A second transport attached to a session the kernel established.
+pub mod attached;
 pub mod conformance;
 /// Delivering this runtime's events to observers in another process.
 pub mod observer;
