@@ -781,6 +781,75 @@ holds the supervisor that starts it and the backend that reaches it.
   which is a signature rather than a load — and the token list no longer treats
   it as one.
 
+### The off-path client: the plan, including the two bugs I hit
+
+The attach is in. This is what comes next, written down because I attempted it
+twice and reverted twice, and both failures were mine rather than the design's.
+
+**What it is for.** Subscribers, sanitizers, metadata injectors and mark/scope
+sanitizers are all invoked by the *dispatcher*, off the call's own task. On a
+single-threaded caller runtime the thread that would answer them is the thread
+waiting for them, so they are refused there today (`install_tool_sanitize`) and
+work only on a multi-threaded caller. A transport whose tasks live on the off-path
+runtime removes the restriction for every one of those families at once, which is
+why it is worth more than another class.
+
+**The shape.**
+
+- `attached.rs`: `ConnectionDescriptor { endpoint, session_credential,
+  runtime_binding_digest, session_id, maximum_frame_bytes }`, and
+  `AttachedClient::connect(descriptor)` which connects **and constructs the Tonic
+  client on the runtime that calls it**, then `Attach`, then checks the joined
+  session's `session_id`, `negotiated_frame_limit` and `runtime_binding_digest`
+  against the descriptor. Its `invoke` checks the deadline before sending and reads
+  the answer with `invocation_answer_from_wire`, and it returns
+  `PluginInvocationError` — phases preserved. Do **not** route it through
+  `PluginExecutionBackend` to keep the "manager is the only path" rule: that trait
+  returns `PluginProtocolError`, which flattens the phase into text, which is the
+  exact regression an earlier commit removed.
+- `off_path.rs`: the executor gains `descriptor: Option<ConnectionDescriptor>` and
+  `attached: Mutex<Option<Arc<AttachedClient>>>`; `attach_to(descriptor)`;
+  `attached()` submits the connect *on the executor runtime* and caches the result;
+  `invoke()` delegates to the client.
+- `supervisor.rs`: `connection_descriptor()`. Store the credential and binding at
+  spawn — `PluginSessionIdentity` does **not** carry the binding, so it cannot be
+  read from the session.
+- Composition: launch the backend **first**, then
+  `OffPathPluginExecutor::start(&policy)?.attach_to(backend.connection_descriptor())`.
+- Routing: sanitize proxies and observer deliveries go through `off_path.invoke`.
+  The observer's drain loop must be spawned with `spawn_long_lived` on the off-path
+  runtime.
+- Remove the single-threaded refusal in `install_tool_sanitize`.
+
+**Bug one.** `invoke_request_to_wire(request, session_id, context)` takes the
+*session* id in its second argument. I passed `context.operation_request_id`, and
+the host refused with "this request names a session this host did not establish" —
+the check working, and a reminder that the wire's session field and the context's
+operation field are easy to confuse.
+
+**Bug two.** Routing the wiring up but leaving the observer's drain loop on
+`Handle::current()` at install time looks correct and silently delivers nothing: on
+a single-threaded caller the loop's runtime never runs. Moving the loop to the
+off-path runtime is what made the observer witness pass.
+
+**Acceptance.** Flip `the_composition_installs_a_plugin_from_another_process_into_this_chain`
+and `a_real_tool_call_reaches_a_registration_inside_the_child` back to
+`#[tokio::test]` (current-thread) and require: the tool executes, the event copy is
+sanitized, the tool result is unchanged, and nothing times out. Then: an
+unavailable off-path transport makes a sanitizer fail closed *and* record
+`nemo.plugin.sanitize.failed` with the reason, while the primary call still
+completes.
+
+**What stopped me, and what to read first.** With the client in place and the
+observer path working single-threaded, the *sanitize* invocation still timed out —
+each attempt paying its whole passive budget — while the observer's call over the
+same transport and the same child succeeded. I could not tell whether that was the
+budget, the dispatcher's private runtime interacting with the submitted work, or
+the attach being re-attempted per call, because a sanitizer failure was invisible.
+It no longer is: that record now exists, so the next attempt should run the
+composition test, read `nemo.plugin.sanitize.failed`, and start from what it says
+rather than from this paragraph.
+
 ### The off-path client needs an attach, and the host does not have one yet
 
 The verification the transport-affinity work depends on, done before building any
