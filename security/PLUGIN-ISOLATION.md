@@ -797,6 +797,44 @@ holds the supervisor that starts it and the backend that reaches it.
   which is a signature rather than a load — and the token list no longer treats
   it as one.
 
+### Mark and scope sanitizers: the projection design
+
+The next class, written down because its first question is not the one the other
+sanitizers asked. A payload sanitizer crosses as `(name, Json) -> Json`; these three
+families — mark sanitize, scope-start sanitize, scope-end sanitize — are
+`(Arc<Event>, EventSanitizeFields) -> EventSanitizeFields`, and the obvious
+implementation, serialising the event, is the wrong one: it would ship the runtime's
+whole internal event to a plugin because that is convenient for the host.
+
+**What crosses is a projection.** The immutable identity a sanitizer decides on —
+the event's name, whether it is a scope or a mark, and the scope phase when it is a
+scope — plus the mutable observability fields it may change (`data`,
+`category_profile`, `metadata`). Nothing else: not the uuid, not the timestamps, not
+the propagation root. A sanitizer that needs more than that is asking for capability
+it has not been given, and that should be a decision rather than a default.
+
+**How the host runs it, and why that is the whole design.** The runtime's sanitizer
+chain runs on an `Event`, not on fields, so the host *synthesises* an event from the
+projection — name, kind, scope phase, fields — runs the chain with one entry against
+it, and returns the fields. That is honest under the projection contract precisely
+because the projection is what the sanitizer was promised: the synthetic event is
+what it was told it would see, and the sanitized fields are the only thing that
+crosses back. If the host instead serialised the real event, the projection would be
+decoration, and the class would be carrying the whole runtime object over the
+boundary for the sake of convenience.
+
+**Failure is the sanitizer rule, not the injector's.** A sanitizer that fails or
+cannot answer clears the mutable observability fields, so the event is still
+published with no payload: a payload that could not be sanitized is not published
+unsanitized. `nemo.plugin.sanitize.failed` already exists for this family and names
+the registration and the reason, which is why the class arrives with its diagnostics
+rather than needing them built.
+
+**One shape, three registries.** The three families differ only in which registry a
+registration lives in and how the runtime collects them; the payload, the answer,
+the failure rule and the projection are identical, so this should be one installer
+and one host branch parameterised by class rather than three copies.
+
 ### The off-path client: the plan, including the two bugs I hit
 
 The attach is in. This is what comes next, written down because I attempted it
