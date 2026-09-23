@@ -29,8 +29,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nemo_relay_plugin_protocol::{PluginFailureCode, PluginProtocolError};
-use tokio::sync::{Semaphore, oneshot};
+use nemo_relay_plugin_protocol::{
+    PluginExecutionContext, PluginExecutionOutcome, PluginFailureCode, PluginInvocationError,
+    PluginInvokeRequest, PluginProtocolError,
+};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 
 /// How much a runtime asks of plugins *beside* the calls it makes.
 ///
@@ -120,6 +123,12 @@ pub struct OffPathPluginExecutor {
     runtime: Option<tokio::runtime::Runtime>,
     in_flight: Arc<Semaphore>,
     running: Arc<AtomicUsize>,
+    /// The session this runtime attaches its own transport to, when it has one.
+    descriptor: Option<crate::attached::ConnectionDescriptor>,
+    /// The attached transport, created on this runtime the first time it is
+    /// needed: creating it elsewhere and moving it here would keep its tasks
+    /// where it was made, which is the bug this exists to remove.
+    attached: Mutex<Option<Arc<crate::attached::AttachedClient>>>,
 }
 
 impl Drop for OffPathPluginExecutor {
@@ -159,6 +168,8 @@ impl OffPathPluginExecutor {
             runtime: Some(runtime),
             in_flight: Arc::new(Semaphore::new(policy.max_in_flight)),
             running: Arc::new(AtomicUsize::new(0)),
+            descriptor: None,
+            attached: Mutex::new(None),
         })
     }
 
@@ -193,8 +204,11 @@ impl OffPathPluginExecutor {
     /// For the loop that drains one observer's queue: the loop is not an
     /// operation, and the operations it performs take permits as they go. Holding
     /// one for the loop would spend the bound on idleness.
-    pub fn spawn_long_lived(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.handle.spawn(work);
+    pub fn spawn_long_lived(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::AbortHandle {
+        self.handle.spawn(work).abort_handle()
     }
 
     /// Wait for an operation to answer, or say that this executor stopped first.
@@ -208,6 +222,67 @@ impl OffPathPluginExecutor {
                     .to_string(),
             )
         })
+    }
+
+    /// Attach to the session this runtime's off-path work belongs to.
+    pub fn attach_to(mut self, descriptor: crate::attached::ConnectionDescriptor) -> Self {
+        self.descriptor = Some(descriptor);
+        self
+    }
+
+    /// The attached transport, connecting and attaching it on this runtime if this
+    /// is the first off-path call.
+    async fn attached(&self) -> Result<Arc<crate::attached::AttachedClient>, String> {
+        let mut cached = self.attached.lock().await;
+        if let Some(client) = cached.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        let Some(descriptor) = self.descriptor.clone() else {
+            return Err(
+                "this runtime has no session transport beside the call's, so it cannot ask a \
+                 plugin to do work off the call's path"
+                    .to_string(),
+            );
+        };
+        // Submitted here rather than connected here, so both the connection and the
+        // client are created *on this runtime*.
+        let Some(received) =
+            self.submit(async move { crate::attached::AttachedClient::connect(descriptor).await })
+        else {
+            return Err(
+                "this runtime is at its in-flight limit, so it cannot open its transport"
+                    .to_string(),
+            );
+        };
+        let client = match received.await {
+            Ok(Ok(client)) => Arc::new(client),
+            Ok(Err(error)) => return Err(error.failure.message),
+            Err(_) => return Err("this runtime stopped before its transport attached".to_string()),
+        };
+        *cached = Some(Arc::clone(&client));
+        Ok(client)
+    }
+
+    /// Invoke one registration over this runtime's attached transport.
+    ///
+    /// The uncertainty a caller needs survives: an error after the transport was
+    /// entered is reported as entered, not as a definite non-dispatch.
+    pub async fn invoke(
+        &self,
+        request: PluginInvokeRequest,
+        context: PluginExecutionContext,
+    ) -> Result<PluginExecutionOutcome, PluginInvocationError> {
+        let client = self
+            .attached()
+            .await
+            .map_err(|message| PluginInvocationError {
+                failure: nemo_relay_plugin_protocol::PluginFailure {
+                    code: PluginFailureCode::Unavailable,
+                    message,
+                },
+                phase: nemo_relay_plugin_protocol::PluginInvocationPhase::RefusedBeforeBackend,
+            })?;
+        client.invoke(request, context).await
     }
 
     /// How many operations are running now.

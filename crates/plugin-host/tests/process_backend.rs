@@ -164,12 +164,11 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
     assert!(after.is_empty(), "{after:#?}");
 }
 
-// Multi-threaded, because the fixture registers the sanitize guardrails: their
-// work runs on the composition's off-path runtime, but the connection is still
-// the composition's, and on a single-threaded caller that runtime is blocked
-// waiting for the answer. Installing one there is refused rather than left as a
-// hang — see `a_sanitize_proxy_is_refused_on_a_single_threaded_runtime`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Single-threaded, deliberately: an off-path callback's answer arrives over the
+// composition's own transport, created on the off-path runtime, so the caller's
+// topology must not decide whether a plugin can answer. This test hung on exactly
+// this runtime before that transport existed.
+#[tokio::test]
 async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     use nemo_relay_plugin_protocol::{PluginActivateRequest, PluginComponentConfiguration};
 
@@ -406,8 +405,9 @@ async fn the_kernel_serves_its_socket_and_refuses_a_caller_without_the_credentia
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }
 
-// Multi-threaded for the same reason as the tool-call test above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Single-threaded for the same reason: the composition test carries the sanitize
+// invariant, and that invariant must not depend on the caller's thread count.
+#[tokio::test]
 async fn the_composition_installs_a_plugin_from_another_process_into_this_chain() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
     use nemo_relay_plugin_protocol::PluginComponentConfiguration;

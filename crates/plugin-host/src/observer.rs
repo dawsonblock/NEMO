@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
-    MAX_FRAME_BYTES, PROTOCOL_VERSION, PluginExecutionContext, PluginFailureCode, PluginHandle,
-    PluginInvokeRequest, PluginObservedEvent, PluginProtocolError, PluginSuccess, Uuid,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION, PluginExecutionContext, PluginHandle, PluginInvokeRequest,
+    PluginObservedEvent, PluginProtocolError, PluginSuccess, Uuid,
 };
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -59,7 +59,10 @@ pub(crate) struct ObserverDelivery {
     /// Whether the queue is already known to be full, so one saturation is
     /// recorded once.
     saturated: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    /// A handle rather than the task: the loop belongs to the off-path runtime,
+    /// and dropping this observer must end it without waiting for that runtime to
+    /// be polled by the caller.
+    task: tokio::task::AbortHandle,
 }
 
 impl Drop for ObserverDelivery {
@@ -77,6 +80,7 @@ impl ObserverDelivery {
     /// queue and nobody to drain it, which is a refusal rather than a silent
     /// backlog.
     pub(crate) fn start(
+        off_path: Arc<crate::off_path::OffPathPluginExecutor>,
         manager: Arc<PluginManager>,
         runtime_binding_digest: String,
         handle: PluginHandle,
@@ -84,17 +88,16 @@ impl ObserverDelivery {
         budget_millis: u64,
         operation_scopes: Option<Arc<OperationScopes>>,
     ) -> Result<Self, PluginProtocolError> {
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            PluginProtocolError::new(
-                PluginFailureCode::Rejected,
-                "an observer proxy needs a runtime to deliver on".to_string(),
-            )
-        })?;
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<PluginObservedEvent>(OBSERVER_QUEUE_CAPACITY);
-        let task = runtime.spawn(async move {
+        // The loop runs on the off-path runtime, not on whichever runtime
+        // installed the proxy: the caller's runtime is the one usually waiting for
+        // the call this event belongs to.
+        let delivery_runtime = Arc::clone(&off_path);
+        let task = off_path.spawn_long_lived(async move {
             while let Some(observed) = receiver.recv().await {
                 let reason = deliver(
+                    &delivery_runtime,
                     &manager,
                     &runtime_binding_digest,
                     &handle,
@@ -141,7 +144,8 @@ impl ObserverDelivery {
 /// Deliver one event to one observer, or say why it could not be delivered.
 #[allow(clippy::too_many_arguments)]
 async fn deliver(
-    manager: &Arc<PluginManager>,
+    off_path: &Arc<crate::off_path::OffPathPluginExecutor>,
+    _manager: &Arc<PluginManager>,
     runtime_binding_digest: &str,
     handle: &PluginHandle,
     registration_id: &str,
@@ -176,7 +180,9 @@ async fn deliver(
         arguments,
         budget_millis,
     };
-    let outcome = manager
+    // The attached transport, so an observer's answer does not depend on the
+    // caller's topology either.
+    let outcome = off_path
         .invoke(request, context)
         .await
         .map_err(|error| error.failure.message)?;

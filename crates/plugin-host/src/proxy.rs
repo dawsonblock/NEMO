@@ -732,26 +732,6 @@ fn install_tool_sanitize(
             ),
         )
     })?;
-    // The off-path runtime runs the work, but the *connection* is still the
-    // composition's, and its tasks live on the runtime that opened it. On a
-    // single-threaded caller that runtime is blocked waiting for this callback,
-    // so nothing would drive the reply and the wait would end at the budget.
-    // Refused until an off-path client exists, rather than degraded silently.
-    if tokio::runtime::Handle::try_current()
-        .map(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread)
-        .unwrap_or(false)
-    {
-        return Err(PluginProtocolError::new(
-            PluginFailureCode::Rejected,
-            format!(
-                "'{}' is a sanitize guardrail and this caller's runtime is single-threaded: its \
-                 connection belongs to the thread that would be waiting, so remote sanitizers \
-                 need an off-path client (or a multi-threaded caller runtime) until that lands",
-                registration.registration_id
-            ),
-        ));
-    }
-
     let callable: ToolSanitizeFn = Arc::new(move |tool: String, value: serde_json::Value| {
         let context = context.clone();
         let handle = handle.clone();
@@ -759,7 +739,7 @@ fn install_tool_sanitize(
         let off_path = Arc::clone(&off_path);
         Box::pin(async move {
             let recording = registration_id.clone();
-            let submitted = off_path.submit(async move {
+            let submitted = Arc::clone(&off_path).submit(async move {
                 let payload = serde_json::json!({ "tool": tool, "value": value }).to_string();
                 let execution = context.passive_execution_context(
                     nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
@@ -776,17 +756,17 @@ fn install_tool_sanitize(
                         nemo_relay::api::runtime::current_scope_stack(),
                     )
                 });
-                let outcome =
-                    context
-                        .manager
-                        .invoke(request, execution)
-                        .await
-                        .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
-                            registration: registration_id.clone(),
-                            dispatch: error.dispatch(),
-                            certainty: error.certainty(),
-                            failure: error.failure,
-                        })?;
+                // The off-path transport, never the primary one: this callback
+                // runs beside the call, and the connection it uses is the one
+                // whose tasks live on the runtime that awaits it.
+                let outcome = off_path.invoke(request, execution).await.map_err(|error| {
+                    nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id.clone(),
+                        dispatch: error.dispatch(),
+                        certainty: error.certainty(),
+                        failure: error.failure,
+                    }
+                })?;
                 match outcome.result {
                     Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
                         .map_err(|error| {
@@ -894,7 +874,18 @@ fn install_subscriber(
         ));
     };
     let registration_id = registration.registration_id.clone();
+    let off_path = context.off_path.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is a subscriber and this runtime started no runtime for work beside a \
+                 call, so its events would have nowhere to be answered from",
+                registration.registration_id
+            ),
+        )
+    })?;
     let delivery = std::sync::Arc::new(crate::observer::ObserverDelivery::start(
+        Arc::clone(&off_path),
         Arc::clone(&context.manager),
         context.runtime_binding_digest.clone(),
         handle.clone(),
@@ -981,12 +972,17 @@ mod tests {
         .await
     }
 
-    /// Two reasons a sanitize proxy cannot be installed here: no off-path runtime
-    /// was started, or this caller's runtime is single-threaded and its connection
-    /// belongs to the thread that would be waiting. Either way the answer could
-    /// not arrive, so the refusal is the honest outcome.
+    /// A sanitize proxy needs the runtime that can answer it.
+    ///
+    /// The callback runs on the dispatcher, off the call's task, so its answer
+    /// arrives over the composition's attached transport. A composition that
+    /// started no off-path runtime has nowhere for that answer to come from, and
+    /// the refusal is the honest outcome: the alternative is a wait that ends at
+    /// the budget. The caller's own thread count stopped mattering when the
+    /// transport moved to the off-path runtime, which is why this test no longer
+    /// has a second reason.
     #[tokio::test]
-    async fn a_sanitize_proxy_needs_an_off_path_runtime_and_a_caller_that_can_wait() {
+    async fn a_sanitize_proxy_needs_an_off_path_runtime() {
         let _guard = PROXY_TEST_LOCK.lock().await;
         let backend = Arc::new(RecordingProxyBackend::default());
         let context = ProxyContext::new(
@@ -1010,41 +1006,7 @@ mod tests {
         assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
         assert!(
             error.failure.message.contains("runtime for work"),
-            "the first reason a sanitizer cannot be served here: {error:?}"
-        );
-
-        // With an off-path runtime but a single-threaded caller, the connection
-        // is still the caller's, so the refusal moves to that reason.
-        let executor = std::sync::Arc::new(
-            crate::off_path::OffPathPluginExecutor::start(&crate::off_path::ObservabilityPolicy {
-                budget_millis: 5_000,
-                max_in_flight: 2,
-            })
-            .expect("an off-path runtime"),
-        );
-        let backend = Arc::new(RecordingProxyBackend::default());
-        let context = ProxyContext::new(
-            Arc::new(PluginManager::new(
-                backend as Arc<dyn PluginExecutionBackend>,
-            )),
-            "test-binding",
-            5_000,
-        )
-        .with_observability_budget(5_000)
-        .with_off_path_executor(executor);
-        let error = install(
-            context,
-            &descriptor(PluginRegistrationOperation::ToolSanitizeResponseGuardrail),
-            PluginHandle {
-                plugin_id: "example".into(),
-                generation: 1,
-            },
-        )
-        .expect_err("a sanitize proxy whose caller cannot wait");
-        assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
-        assert!(
-            error.failure.message.contains("single-threaded"),
-            "the second reason: {error:?}"
+            "the reason a sanitizer cannot be served here: {error:?}"
         );
     }
 

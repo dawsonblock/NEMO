@@ -840,15 +840,20 @@ unavailable off-path transport makes a sanitizer fail closed *and* record
 `nemo.plugin.sanitize.failed` with the reason, while the primary call still
 completes.
 
-**What stopped me, and what to read first.** With the client in place and the
-observer path working single-threaded, the *sanitize* invocation still timed out —
-each attempt paying its whole passive budget — while the observer's call over the
-same transport and the same child succeeded. I could not tell whether that was the
-budget, the dispatcher's private runtime interacting with the submitted work, or
-the attach being re-attempted per call, because a sanitizer failure was invisible.
-It no longer is: that record now exists, so the next attempt should run the
-composition test, read `nemo.plugin.sanitize.failed`, and start from what it says
-rather than from this paragraph.
+**Landed.** The client is in: `OffPathPluginExecutor::attach_to(descriptor)` and a
+lazy `attached()` that submits the connect *on the off-path runtime* and caches
+the transport, with sanitize proxies and observer deliveries routed through
+`off_path.invoke`. The acceptance passes — both process-boundary tests run on a
+current-thread runtime, the event copy is sanitized, the tool result is unchanged,
+and nothing times out. The single-threaded refusal is gone, because the reason for
+it is.
+
+The sanitize timeout that defeated two attempts was exactly what the plan
+predicted it would be: the *work* had moved to the off-path runtime while the
+*connection* stayed on the caller's, so the reply had no thread to arrive on. The
+transport primitive landed on its own first (`feat(plugin): land the transport a
+second connection needs`), and the rerouting that followed it was then a small
+change rather than a third attempt at both.
 
 ### The off-path client needs an attach, and the host does not have one yet
 

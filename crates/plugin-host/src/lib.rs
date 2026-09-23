@@ -515,10 +515,16 @@ impl ProcessLoadedPlugins {
         // The off-path runtime belongs to this composition and outlives every
         // proxy installed from it: work done beside a call must be answerable by
         // a thread the caller is not holding.
-        let off_path = Arc::new(crate::off_path::OffPathPluginExecutor::start(
-            &observability,
-        )?);
         let backend = Arc::new(ProcessPluginBackend::launch(config).await?);
+        // The off-path runtime belongs to this composition and outlives every
+        // proxy installed from it. It attaches a transport of its own, created on
+        // that runtime: work done beside a call must be answerable by a thread the
+        // caller is not holding, and by a connection whose tasks live where the
+        // work runs.
+        let off_path = Arc::new(
+            crate::off_path::OffPathPluginExecutor::start(&observability)?
+                .attach_to(backend.connection_descriptor()),
+        );
         let binding = backend.runtime_binding_digest().to_owned();
         let manager = Arc::new(PluginManager::new(
             Arc::clone(&backend) as Arc<dyn PluginExecutionBackend>
