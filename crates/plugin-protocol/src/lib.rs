@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use nemo_relay_types::api::event::{DataSchema, LogSeverity};
+pub use nemo_relay_types::api::event::{DataSchema, EventSanitizeFields, LogSeverity};
 pub use nemo_relay_types::api::scope::ScopeType;
 pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
 pub use uuid::Uuid;
@@ -605,6 +605,48 @@ pub struct PluginAttachedSession {
     pub accepted_read_capabilities: Vec<PluginHostReadCapability>,
     /// Digest of the runtime identity the session is bound to.
     pub runtime_binding_digest: String,
+}
+
+/// Which sanitizer a projection is for.
+///
+/// Closed on purpose: three families share one shape, and a class outside this set
+/// has no runner to invoke it, so it is refused at conversion rather than carried
+/// and rejected later by a match arm somebody forgot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginEventSanitizeClass {
+    /// Sanitizes the mutable fields of a mark.
+    Mark,
+    /// Sanitizes the mutable fields of a scope-start event.
+    ScopeStart,
+    /// Sanitizes the mutable fields of a scope-end event.
+    ScopeEnd,
+}
+
+/// What a sanitizer is shown, and the whole of what it is shown.
+///
+/// This is a projection, not the event. The runtime's own sanitizer callbacks
+/// receive an `Event`, and passing that across the boundary because the in-process
+/// API happens to have one would ship the runtime's internal representation to a
+/// plugin for the host's convenience: the uuid, the timestamps, the propagation
+/// root, and every field `Event` grows later.
+///
+/// What crosses instead is the identity a sanitizer decides on — its name, and the
+/// scope phase when it is a scope event — plus the mutable observability fields it
+/// is allowed to change. The approved field set is enforced by a test rather than
+/// by this comment: a field added to `Event` does not reach a plugin until somebody
+/// deliberately adds it here, and a field added *here* fails that test until
+/// somebody deliberately approves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginEventSanitizeCall {
+    /// Which sanitizer family this is for.
+    pub class: PluginEventSanitizeClass,
+    /// The event's name.
+    pub name: String,
+    /// The scope lifecycle phase, for a scope event.
+    pub scope_category: Option<String>,
+    /// The mutable observability fields the sanitizer may change.
+    pub fields: EventSanitizeFields,
 }
 
 /// One event, on its way to a plugin that observes it.
@@ -1337,6 +1379,74 @@ pub fn check_deadline(deadline_unix_ms: u64) -> Result<(), PluginProtocolError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fields a sanitizer is allowed to see: the projection's own fields and
+    /// the mutable fields inside it. One list, because both are disclosure.
+    const APPROVED_SANITIZER_FIELDS: &[&str] = &[
+        "class",
+        "name",
+        "scope_category",
+        "fields",
+        "data",
+        "category_profile",
+        "metadata",
+    ];
+
+    /// Every key the projection serialises, at either level.
+    fn serialized_projection_keys() -> std::collections::BTreeSet<String> {
+        let call = PluginEventSanitizeCall {
+            class: PluginEventSanitizeClass::Mark,
+            name: "example.mark".into(),
+            scope_category: Some("start".into()),
+            fields: EventSanitizeFields {
+                data: Some(serde_json::json!({"k": 1})),
+                category_profile: Some(nemo_relay_types::api::event::CategoryProfile {
+                    subtype: Some("example".into()),
+                    ..Default::default()
+                }),
+                metadata: Some(serde_json::json!({"k": 2})),
+            },
+        };
+        let serialized = serde_json::to_value(&call).expect("a serializable projection");
+        let mut keys = std::collections::BTreeSet::new();
+        let object = serialized.as_object().expect("a projection is an object");
+        for (key, value) in object {
+            keys.insert(key.clone());
+            if key == "fields"
+                && let Some(fields) = value.as_object()
+            {
+                for field in fields.keys() {
+                    keys.insert(field.clone());
+                }
+            }
+        }
+        keys
+    }
+
+    /// The capability boundary, enforced rather than described.
+    ///
+    /// The property is not "the projection serialises". It is that the set of
+    /// fields a plugin can see equals the set somebody approved. A field added to
+    /// the runtime's `Event` changes nothing here — which is the point, because
+    /// disclosure should be a decision — and a field added to *this* projection
+    /// fails until it is approved in the same change. Verified by adding a field
+    /// name to this list and watching the test refuse it.
+    #[test]
+    fn the_sanitizer_projection_discloses_exactly_its_approved_fields() {
+        let approved: std::collections::BTreeSet<String> = APPROVED_SANITIZER_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect();
+        let serialized = serialized_projection_keys();
+        let unexpected: Vec<&String> = serialized.difference(&approved).collect();
+        let missing: Vec<&String> = approved.difference(&serialized).collect();
+        assert!(
+            unexpected.is_empty() && missing.is_empty(),
+            "the projection must disclose exactly the approved fields: unexpected {unexpected:?}, \
+             missing {missing:?}. Adding a field to a plugin's view is a capability decision, so \
+             it takes an edit to this list as well as to the type."
+        );
+    }
 
     #[test]
     fn the_lifecycle_refuses_a_load_from_anything_but_absent() {
