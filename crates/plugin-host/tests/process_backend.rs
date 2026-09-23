@@ -812,9 +812,35 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     nemo_relay::api::subscriber::deregister_subscriber("process-backend-injected-metadata")
         .expect("a deregistration");
 
-    // Dropping the composition takes the registration out of the chain and ends
-    // the host: a plugin's callback may not outlive the runtime that installed it.
+    // The composition was still holding the child, so end it deliberately and
+    // watch the whole plugin leave together.
+    let process_id = loaded.backend().process_id();
+    assert!(process_id.is_some(), "the plugin lived in another process");
+
+    // Dropping the composition takes every registration out of this process's
+    // chains and ends the host: a complete plugin — all nine registrations this
+    // fixture makes, none of them left behind — may not outlive the runtime that
+    // installed it.
+    let handles = loaded.handles().to_vec();
+    let registrations: Vec<String> = loaded
+        .registrations()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    // A weak reference, not a clone: a clone would outlive the composition and
+    // keep the child alive, which is the thing this part is checking.
+    let backend = std::sync::Arc::downgrade(loaded.backend());
     drop(loaded);
+
+    assert_eq!(
+        registrations.len(),
+        9,
+        "this is the complete-plugin regression: every registration the fixture makes was served"
+    );
+    assert!(
+        !handles.is_empty(),
+        "the plugin was loaded by the session that was dropped"
+    );
     let after = nemo_relay::api::tool::tool_request_intercepts(
         "example_tool",
         serde_json::json!({"input": true}),
@@ -824,7 +850,24 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     assert_eq!(
         after["native_intercept"],
         serde_json::Value::Null,
-        "{after}"
+        "the tool rewrite left with the composition: {after}"
+    );
+    assert!(
+        nemo_relay::api::tool::tool_request_intercepts("example_tool", serde_json::json!({}))
+            .await
+            .is_ok(),
+        "and the chain itself is still this runtime's, not the plugin's"
+    );
+    // The composition held the only handle to the child, so releasing it is what
+    // ends the host — the kill is `Drop`'s, and the child cannot be left holding a
+    // socket nobody will read.
+    assert!(
+        backend.upgrade().is_none(),
+        "the composition was the last holder of the host it started"
+    );
+    assert!(
+        process_id.is_some(),
+        "and it was a real process, not a handle this process kept"
     );
 }
 

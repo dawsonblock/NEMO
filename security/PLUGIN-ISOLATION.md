@@ -1071,6 +1071,42 @@ of its registration sets contains no execution or stream intercept, it is servab
 without duplex work, and it should become the first cutover candidate rather than
 waiting for the last class.
 
+## Two cutovers, and why duplex may not be on the path
+
+The coverage calculation above makes a distinction the earlier plan did not draw.
+
+**Functional cutover** is one consumer using `ProcessLoadedPlugins` for one plugin
+known to be fully remotely supported. **Global cutover** is every supported
+production plugin doing so, with no production consumer needing the in-process
+fallback. The second is the one that lets the loader leave the kernel's dependency
+graph — but nothing about the first requires waiting for it.
+
+The complete-plugin regression is what makes the first one available: a plugin — the
+nine-registration fixture — lives entirely behind the process composition. The test
+now proves the whole shape rather than one class of it: every registration it makes
+is served, the chain it installed here is this runtime's own, dropping the
+composition takes every registration with it and releases the last handle to the
+child, and the work never needed an in-process load.
+
+**So duplex is not automatically next.** Execution intercepts, LLM stream
+intercepts and the session families are the most complicated remaining protocol
+work, and they are on the critical path only if a plugin somebody actually needs
+registers one of them. The cheaper question comes first: take a real plugin's
+registration set, subtract the removable classes, and look at what is left.
+
+- If the remainder is empty, that plugin is servable **now** and should become the
+  first functional-cutover candidate rather than waiting for the last class.
+- If the remainder is execution or stream intercepts, then — and only then — duplex
+  is what stands between that plugin and the cutover, and the work is justified by
+  a named plugin rather than by ABI completeness.
+
+Alongside that, a second metric becomes worth tracking per plugin: the share of its
+registrations reachable **only** through the process host. Once one plugin reaches
+all of them, the tests for that plugin can assert that its production composition
+does not touch `load_native_plugins`, `PluginHostActivation` or the in-process
+backend at all — which is how the loader extraction becomes incremental instead of
+one final migration.
+
 ## Cutover matrix
 
 Which registration families can cross today, and what the ones that cannot need.
