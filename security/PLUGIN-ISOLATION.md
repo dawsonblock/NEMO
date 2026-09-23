@@ -1112,6 +1112,38 @@ discovered dynamic plugin's canonical identity, manifest and lifecycle state. It
 does *not* report registrations today, and the reason is structural rather than an
 omission: registrations exist only after activation, and inspect does not activate.
 
+**The assumed path for the tool does not work as sketched, and that is a finding.**
+The natural design — start a host, load, activate, print the descriptors — cannot
+report blockers, because activation *refuses the plugin whole* when it registers a
+class the session cannot serve (`an_activation_that_registers_what_this_session_cannot_serve_is_refused_whole`).
+That refusal is right for production: a load reporting success while a callback
+disappears is worse than a refused load. It is wrong for inspection, whose whole
+purpose is to find the classes this kernel *cannot* serve.
+
+So the tool needs one of two things, and the choice is a protocol decision rather
+than an implementation detail:
+
+1. **A discovery activation.** The activate request would carry a flag saying this
+   session is inspecting rather than serving: the child runs the register callbacks
+   and reports every descriptor, including classes this kernel has no proxy for, and
+   the session installs nothing. The report is then the measurement the coverage
+   subtraction wants, with the unsupported classes named as the blockers — which is
+   exactly the test the tool is supposed to satisfy ("unsupported registration
+   appears as a blocker, not silently omitted"). The flag must not be usable to
+   install anything: a discovery session has no proxies, so the only thing it can
+   change is what it reports.
+2. **Report the refusal.** Cheaper, and honest but weaker: activation against a
+   serving session fails and names one unsupported class, so the tool can say "not
+   fully servable, blocked by X" and re-run with that class offered until it
+   activates — a search rather than a report, and it only works for classes the
+   kernel can learn to offer, which is circular.
+
+The first is the design that matches the requirement. It is a small protocol change
+(one field on the activate request, one branch in the host, a test that a discovery
+session installs nothing) and it is worth doing before the CLI is written, so the
+command is thin plumbing over an honest report rather than a tool that cannot answer
+its own question.
+
 **What NEMO already produces.** Activation is the authoritative source, and the
 boundary already surfaces it: `ProcessPluginBackend::activate` returns one
 `PluginDescriptor` per activated plugin, each carrying the registrations the plugin
