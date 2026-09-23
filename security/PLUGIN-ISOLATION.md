@@ -1087,6 +1087,46 @@ of its registration sets contains no execution or stream intercept, it is servab
 without duplex work, and it should become the first cutover candidate rather than
 waiting for the last class.
 
+## Getting a plugin's registration set
+
+The coverage subtraction needs one input per plugin: which surfaces it registers.
+The 16 the ABI exposes are the ones the table above lists, and the answer belongs to
+the binary rather than to a hand-written file — a manifest that can drift from what
+the plugin actually registers is a second source of truth, which is the thing this
+whole milestone exists to avoid.
+
+Three ways to get it, in increasing order of how much they are worth trusting.
+
+**Source.** For a plugin whose source you have, the registration calls are the
+answer:
+
+```bash
+rg -n 'register_(tool|llm|scope|mark|event)_[a-z_]*|register_subscriber' path/to/plugin
+```
+
+That is fast and it is also the weakest answer, because it reads intent rather than
+behaviour: a registration behind a configuration branch may never run.
+
+**What the CLI knows.** `nemo-relay plugins inspect <id> --json` reports a
+discovered dynamic plugin's canonical identity, manifest and lifecycle state. It
+does *not* report registrations today, and the reason is structural rather than an
+omission: registrations exist only after activation, and inspect does not activate.
+
+**What NEMO already produces.** Activation is the authoritative source, and the
+boundary already surfaces it: `ProcessPluginBackend::activate` returns one
+`PluginDescriptor` per activated plugin, each carrying the registrations the plugin
+made — identity, class and ordering — because the kernel needs exactly that to
+install a proxy per registration. So the tool the coverage work wants is thin:
+activate the plugin in a host and print the descriptors. That would give
+
+```json
+{"plugin": "my_plugin", "registrations": ["tool_request_intercept", "subscriber"]}
+```
+
+from what the binary really registered, in a child process, with no in-process load
+— which is also a useful thing for a deployment to be able to run. Until that tool
+exists, the coverage table above is built from source and says so.
+
 ## Two cutovers, and why duplex may not be on the path
 
 The coverage calculation above makes a distinction the earlier plan did not draw.
