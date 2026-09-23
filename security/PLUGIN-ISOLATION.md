@@ -909,7 +909,7 @@ per unit of added complexity* rather than protocol completeness.
 | tool request intercept | yes | yes | yes | 7 | — |
 | LLM request intercept | yes | yes | yes | 7 | — |
 | tool conditional guardrail | `(name, Json) -> Option<String>` | yes | yes | 6 | — |
-| LLM conditional guardrail | shape known | no | no | 6 | the same |
+| LLM conditional guardrail | `(LlmRequest) -> Option<String>` | yes | yes | 6 | — |
 | subscriber | event | no | no | 27 | one shared decision: what an event is on the wire, and what a remote observer's failure means |
 | event metadata injector | event | no | no | 4 | that same decision |
 | mark sanitize guardrail | event | no | no | 9 | that same decision |

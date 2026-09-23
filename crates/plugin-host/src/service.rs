@@ -344,6 +344,28 @@ impl PluginHostService {
                         Err(error) => Ok(refusal(error.to_string())),
                     }
                 }
+                // The LLM decision, over the request the chain holds.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmConditionalExecutionGuardrail => {
+                    let request_json: serde_json::Value = serde_json::from_str(&request.arguments)
+                        .map_err(|error| {
+                            refused(format!(
+                                "an LLM conditional payload must be JSON: {error}"
+                            ))
+                        })?;
+                    match nemo_relay::api::llm::invoke_llm_conditional_execution_registration(
+                        &request.registration_id,
+                        request_json,
+                    )
+                    .await
+                    {
+                        Ok(decision) => Ok(success(
+                            serde_json::to_string(&decision).map_err(|error| {
+                                refused(format!("the decision could not be serialized: {error}"))
+                            })?,
+                        )),
+                        Err(error) => Ok(refusal(error.to_string())),
+                    }
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.

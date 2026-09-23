@@ -399,6 +399,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         registrations,
         vec![
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_conditional",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_conditional",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite",
@@ -662,6 +663,43 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
                 if reason.contains("refuses this tool")
         ),
         "the decision reaches the caller: {refusal:?}"
+    );
+
+    // The LLM half of the decision, over the request rather than the arguments.
+    let refusal = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::llm::llm_call_execute(
+                nemo_relay::api::llm::LlmCallExecuteParams::builder()
+                    .name("rejected-model")
+                    .request(nemo_relay::api::llm::LlmRequest {
+                        headers: serde_json::Map::new(),
+                        content: serde_json::json!({"model": "rejected-model"}),
+                    })
+                    .func(std::sync::Arc::new(|request| {
+                        Box::pin(async move {
+                            Ok(nemo_relay::json::Json::Object(
+                                request.content.as_object().cloned().unwrap_or_default(),
+                            ))
+                        })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect_err("a model the guardrail refused");
+    assert!(
+        matches!(
+            refusal,
+            nemo_relay::error::FlowError::GuardrailRejected(ref reason)
+                if reason.contains("refuses this model")
+        ),
+        "the decision reaches the caller on the LLM chain too: {refusal:?}"
     );
 
     // Dropping the composition takes the registration out of the chain and ends

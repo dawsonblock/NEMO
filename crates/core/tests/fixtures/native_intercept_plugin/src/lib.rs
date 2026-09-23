@@ -82,6 +82,23 @@ impl NativePlugin for InterceptPlugin {
                 }
             },
         )?;
+        // The LLM half of the same decision.
+        ctx.register_llm_conditional_execution_guardrail(
+            "fixture_intercept_llm_conditional",
+            0,
+            |request| async move {
+                if request
+                    .content
+                    .get("model")
+                    .and_then(|model| model.as_str())
+                    == Some("rejected-model")
+                {
+                    Ok(Some("the fixture refuses this model".to_string()))
+                } else {
+                    Ok(None)
+                }
+            },
+        )?;
         // A guardrail that refuses to sanitize. It runs after the one above (a
         // later priority) so the sanitized copy is published first and this
         // failure is what a record of a sanitizer failure has to carry: a payload

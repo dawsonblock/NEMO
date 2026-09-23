@@ -2165,6 +2165,57 @@ pub async fn invoke_llm_request_intercept_registration(
     .await
 }
 
+/// Run exactly one LLM conditional-execution guardrail, named by its registration.
+///
+/// The decision direction of the LLM chain, and the same rule as the tool one:
+/// the host runs *that* registration, because the kernel's chain already holds one
+/// proxy per registration and running the plugin's whole set once per proxy would
+/// ask the same question several times and take the strictest answer.
+///
+/// `Some(reason)` refuses the call, `None` allows it. The guardrail's scope events
+/// belong to the chain that holds the proxy, in the process that owns the
+/// subscribers, so nothing about them has to cross.
+pub async fn invoke_llm_conditional_execution_registration(
+    registration: &str,
+    request: Json,
+) -> Result<Option<String>> {
+    ensure_runtime_owner()?;
+    let request: LlmRequest = serde_json::from_value(request).map_err(|error| {
+        FlowError::InvalidArgument(format!(
+            "an LLM conditional payload must be a request: {error}"
+        ))
+    })?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_conditional_execution_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_conditional_execution_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no LLM conditional-execution guardrail is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::llm_conditional_execution_snapshot_chain(
+        &request,
+        &[entry],
+        &[],
+        None,
+        None,
+    )
+    .await
+}
+
 /// Run only the LLM conditional-execution guardrail chain.
 ///
 /// This evaluates whether an LLM call should be allowed to proceed without

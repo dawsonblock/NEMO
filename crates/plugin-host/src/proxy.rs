@@ -152,6 +152,7 @@ pub struct RegistrationProxies {
     subscribers: Vec<String>,
     tool_sanitize_request: Vec<String>,
     tool_conditional: Vec<String>,
+    llm_conditional: Vec<String>,
     tool_sanitize_response: Vec<String>,
     /// One delivery task per observer registration, ended with this value.
     deliveries: Vec<std::sync::Arc<crate::observer::ObserverDelivery>>,
@@ -166,6 +167,7 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("subscribers", &self.subscribers)
             .field("tool_sanitize_request", &self.tool_sanitize_request)
             .field("tool_conditional", &self.tool_conditional)
+            .field("llm_conditional", &self.llm_conditional)
             .field("tool_sanitize_response", &self.tool_sanitize_response)
             .finish()
     }
@@ -180,6 +182,7 @@ impl RegistrationProxies {
             .chain(self.subscribers.iter())
             .chain(self.tool_sanitize_request.iter())
             .chain(self.tool_conditional.iter())
+            .chain(self.llm_conditional.iter())
             .chain(self.tool_sanitize_response.iter())
             .map(String::as_str)
             .collect()
@@ -196,6 +199,11 @@ impl Drop for RegistrationProxies {
         }
         for registration in &self.subscribers {
             let _ = nemo_relay::api::subscriber::deregister_subscriber(registration);
+        }
+        for registration in &self.llm_conditional {
+            let _ = nemo_relay::api::registry::deregister_llm_conditional_execution_guardrail(
+                registration,
+            );
         }
         for registration in &self.tool_conditional {
             let _ = nemo_relay::api::registry::deregister_tool_conditional_execution_guardrail(
@@ -226,12 +234,19 @@ pub fn install(
         subscribers: Vec::new(),
         tool_sanitize_request: Vec::new(),
         tool_conditional: Vec::new(),
+        llm_conditional: Vec::new(),
         tool_sanitize_response: Vec::new(),
         deliveries: Vec::new(),
     };
 
     for registration in &descriptor.registrations {
         match registration.operation {
+            PluginRegistrationOperation::LlmConditionalExecutionGuardrail => {
+                install_llm_conditional(&context, registration, &handle)?;
+                installed
+                    .llm_conditional
+                    .push(registration.registration_id.clone());
+            }
             PluginRegistrationOperation::ToolConditionalExecutionGuardrail => {
                 install_tool_conditional(&context, registration, &handle)?;
                 installed
@@ -583,6 +598,93 @@ fn install_tool_conditional(
         });
 
     nemo_relay::api::registry::register_tool_conditional_execution_guardrail(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// Install the proxy for one LLM conditional-execution guardrail.
+///
+/// The tool decision's twin, over the request instead of the arguments: the child
+/// answers with a reason to refuse or nothing to allow, and the kernel's chain
+/// reports the refusal and emits the guardrail's scope events around this proxy.
+fn install_llm_conditional(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+
+    let callable: nemo_relay::api::runtime::LlmConditionalFn =
+        Arc::new(move |request: LlmRequest| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            Box::pin(async move {
+                let payload = serde_json::to_string(&request).map_err(|error| {
+                    nemo_relay::error::FlowError::Internal(format!(
+                        "an LLM conditional request could not be serialized: {error}"
+                    ))
+                })?;
+                let execution = context.execution_context()?;
+                let invocation = PluginInvokeRequest {
+                    handle,
+                    registration_id: registration_id.clone(),
+                    arguments: payload,
+                    budget_millis: execution.remaining_budget_millis,
+                };
+                let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                    scopes.enter(
+                        &execution.operation_request_id,
+                        nemo_relay::api::runtime::current_scope_stack(),
+                    )
+                });
+                let outcome = context
+                    .manager
+                    .invoke(invocation, execution)
+                    .await
+                    .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id.clone(),
+                        dispatch: error.dispatch(),
+                        certainty: error.certainty(),
+                        failure: error.failure,
+                    })?;
+                match outcome.result {
+                    Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
+                        .map_err(|error| {
+                            nemo_relay::error::FlowError::Internal(format!(
+                                "a proxied guardrail answered with something that is not a \
+                                 decision: {error}"
+                            ))
+                        }),
+                    Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                        "a proxied guardrail answered with {}",
+                        other_name(&other)
+                    ))),
+                    Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id,
+                        dispatch: outcome.dispatch,
+                        certainty: outcome.certainty,
+                        failure,
+                    }),
+                }
+            })
+        });
+
+    nemo_relay::api::registry::register_llm_conditional_execution_guardrail(
         &registration.registration_id,
         priority,
         callable,
