@@ -835,6 +835,15 @@ registration lives in and how the runtime collects them; the payload, the answer
 the failure rule and the projection are identical, so this should be one installer
 and one host branch parameterised by class rather than three copies.
 
+**The projection needs a test that fails when the event grows.** The property here
+is not "serialisation works" — it is that *the fields on the wire are exactly the
+sanitizer-visible fields somebody approved*. Without a test, an internal field added
+to `Event` later would appear to native plugins automatically, which is disclosure
+by accident rather than by decision. So the increment includes a test that fails if
+the projection stops matching its approved field list, in the same spirit as the
+conversion-coverage manifest: adding a field to the projection is then an edit
+somebody makes on purpose, and adding one to `Event` is not enough to leak it.
+
 ### The off-path client: the plan, including the two bugs I hit
 
 The attach is in. This is what comes next, written down because I attempted it
@@ -1024,6 +1033,43 @@ What the kernel still owns is unchanged: which events exist, which registrations
 see them, and the ordering the runtime gives them. The witness in the process test
 is a file the child writes, because a subscriber in another process has no other
 way to show the caller what it saw.
+
+## Coverage, which is the metric now
+
+The useful question stopped being "how many registration classes are supported" and
+became "which real plugin is closest to being fully servable by
+`ProcessLoadedPlugins`". This is that calculation for the two fixtures the
+repository ships, because they are the plugins it actually has.
+
+`fixture_intercept` — the one the process tests drive end to end:
+
+| | |
+|---|---|
+| registered classes | 9 (tool + LLM request intercept, subscriber, tool request/response sanitize, tool + LLM conditional, metadata injector, and the refusing guardrail) |
+| remotely supported | 9 |
+| remaining blockers | **0** — it is fully servable today |
+
+`fixture_native` — the sixteen-surface fixture the in-process tests use:
+
+| | |
+|---|---|
+| registered classes | tool + LLM request intercepts, subscriber, metadata injector, mark and scope-start/end sanitizers, tool and LLM request/response sanitizers, tool + LLM conditional, tool execution intercept, LLM execution intercept, LLM stream execution intercept |
+| remotely supported | the eleven that are not sanitizers-of-marks-or-scopes, execution intercepts or stream intercepts |
+| remaining blockers | mark sanitize, scope-start sanitize, scope-end sanitize, tool execution intercept, LLM execution intercept, LLM stream execution intercept |
+
+So the answer to "which real plugin is closest to 100%" is the first one, and it is
+already there — which is worth stating plainly, because it means the *coverage*
+argument for the next class is not about that fixture. The argument is that a real
+deployed plugin is much likelier to look like the second: mark and scope sanitizers
+are among the most-registered families in this repository (9 + 6 + 6 sites), and
+execution and stream intercepts are the duplex work.
+
+That reframes the next two increments honestly. Mark and scope sanitizers are worth
+doing because they are common, not because they unblock a fixture. And the duplex
+question should be answered by the same calculation against a *real* plugin — if one
+of its registration sets contains no execution or stream intercept, it is servable
+without duplex work, and it should become the first cutover candidate rather than
+waiting for the last class.
 
 ## Cutover matrix
 
