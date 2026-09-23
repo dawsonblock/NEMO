@@ -398,6 +398,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     assert_eq!(
         registrations,
         vec![
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_conditional",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite",
@@ -631,6 +632,37 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     );
     nemo_relay::api::subscriber::deregister_subscriber("process-backend-off-path-failures")
         .expect("a deregistration");
+
+    // A decision crosses too, and it takes effect: the guardrail in the other
+    // process refuses this tool, and the call is refused here with its reason.
+    let refusal = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("rejected_tool")
+                    .args(serde_json::json!({"input": true}))
+                    .func(std::sync::Arc::new(|args| {
+                        Box::pin(async move { Ok(args.into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect_err("a tool the guardrail refused");
+    assert!(
+        matches!(
+            refusal,
+            nemo_relay::error::FlowError::GuardrailRejected(ref reason)
+                if reason.contains("refuses this tool")
+        ),
+        "the decision reaches the caller: {refusal:?}"
+    );
 
     // Dropping the composition takes the registration out of the chain and ends
     // the host: a plugin's callback may not outlive the runtime that installed it.

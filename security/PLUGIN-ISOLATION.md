@@ -649,6 +649,17 @@ holds the supervisor that starts it and the backend that reaches it.
   host's `invoke` is lost at that hop, and the mark lands in the child's own
   runtime exactly as before. Every seam below that hop is tested; the gap is the
   hop itself.
+- **A decision crosses, and that is its own kind of class.** Tool conditional
+  guardrails are servable: the kernel sends the tool and its arguments, the child
+  runs exactly the named registration, and the answer is the decision — a reason
+  to refuse or nothing to allow. The kernel's own chain reports that as a
+  rejection, and the guardrail's scope events are emitted by that chain around the
+  *proxy* entry with the kernel's subscribers, so a remote guardrail looks exactly
+  like an in-process one in the event stream. The test proves both halves: the
+  call proceeds for a tool the fixture allows, and one the fixture refuses comes
+  back as `GuardrailRejected` carrying the reason the child gave. That is the third
+  behavioural category to cross — rewrites, observations, and now decisions — and
+  it is the first class where the child's answer can stop the call.
 - **A second class crosses: LLM request intercepts.** The same shape as the tool
   class, one level up. The kernel sends the invocation its own chain holds — the
   request *and* the annotation a codec produced, because a callback may rewrite
@@ -897,7 +908,7 @@ per unit of added complexity* rather than protocol completeness.
 |---|---|---|---|---|---|
 | tool request intercept | yes | yes | yes | 7 | — |
 | LLM request intercept | yes | yes | yes | 7 | — |
-| tool conditional guardrail | shape known | no | no | 6 | the exact-registration entry point; its lifecycle events need nothing new |
+| tool conditional guardrail | `(name, Json) -> Option<String>` | yes | yes | 6 | — |
 | LLM conditional guardrail | shape known | no | no | 6 | the same |
 | subscriber | event | no | no | 27 | one shared decision: what an event is on the wire, and what a remote observer's failure means |
 | event metadata injector | event | no | no | 4 | that same decision |

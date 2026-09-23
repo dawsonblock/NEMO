@@ -311,6 +311,39 @@ impl PluginHostService {
                 nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolSanitizeResponseGuardrail => {
                     sanitized_tool_payload(&request, true).await
                 }
+                // The first decision class. A conditional guardrail can refuse
+                // the call, so what crosses is its decision: a reason the kernel
+                // reports as a rejection, or nothing at all for permission.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolConditionalExecutionGuardrail => {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&request.arguments).map_err(|error| {
+                            refused(format!(
+                                "a conditional guardrail payload must be JSON: {error}"
+                            ))
+                        })?;
+                    let tool = payload
+                        .get("tool")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| refused("a conditional guardrail payload names no tool"))?
+                        .to_string();
+                    let args = payload.get("args").cloned().ok_or_else(|| {
+                        refused("a conditional guardrail payload carries no arguments")
+                    })?;
+                    match nemo_relay::api::tool::invoke_tool_conditional_execution_registration(
+                        &request.registration_id,
+                        &tool,
+                        args,
+                    )
+                    .await
+                    {
+                        Ok(decision) => Ok(success(
+                            serde_json::to_string(&decision).map_err(|error| {
+                                refused(format!("the decision could not be serialized: {error}"))
+                            })?,
+                        )),
+                        Err(error) => Ok(refusal(error.to_string())),
+                    }
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.

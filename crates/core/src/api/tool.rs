@@ -1022,6 +1022,56 @@ pub async fn invoke_tool_sanitize_response_registration(
     Ok(NemoRelayContextState::tool_sanitize_response_snapshot_chain(name, result, &[entry]).await)
 }
 
+/// Run exactly one tool conditional-execution guardrail, named by its registration.
+///
+/// The chain entry point runs every guardrail for a name, which is what a tool
+/// call needs and what a host cannot use: a host holding one plugin's
+/// registrations has to run *that* guardrail when the kernel asks, or the kernel's
+/// chain — which holds one proxy per registration — would run the plugin's whole
+/// set once per proxy.
+///
+/// The answer is the decision and nothing else: `Some(reason)` refuses the call,
+/// `None` allows it. The guardrail's own scope events are emitted by the chain
+/// that holds the proxy, in the process that owns the subscribers, so a remote
+/// guardrail is observable exactly as an in-process one is.
+pub async fn invoke_tool_conditional_execution_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+) -> Result<Option<String>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.tool_conditional_execution_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_conditional_execution_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool conditional-execution guardrail is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::tool_conditional_execution_snapshot_chain(
+        name,
+        &args,
+        &[entry],
+        &[],
+        None,
+        None,
+    )
+    .await
+}
+
 /// Run only the tool request-intercept chain.
 ///
 /// This applies the currently active global and scope-local request intercepts

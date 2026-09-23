@@ -68,6 +68,20 @@ impl NativePlugin for InterceptPlugin {
                 }))
             },
         )?;
+        // A decision, which is the class that can stop a call: this one allows
+        // everything except the tool named below, so a test can see both halves
+        // of the decision cross the boundary.
+        ctx.register_tool_conditional_execution_guardrail(
+            "fixture_intercept_conditional",
+            0,
+            |name, _args| async move {
+                if name == "rejected_tool" {
+                    Ok(Some("the fixture refuses this tool".to_string()))
+                } else {
+                    Ok(None)
+                }
+            },
+        )?;
         // A guardrail that refuses to sanitize. It runs after the one above (a
         // later priority) so the sanitized copy is published first and this
         // failure is what a record of a sanitizer failure has to carry: a payload
