@@ -310,10 +310,20 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # test counts the polls a producer is asked for — and the rest is the measurement
 # and the prose that says which reading of "initial credit" this is. No dependency
 # moved and no `unsafe` did.
+#
+# Budget raise (deadlines and transport disappearance): the deadline is three more
+# waits in the actor — the open, the demand, and a pull whose producer is still
+# working — plus the state that holds a stream's ending for the pull that has not
+# been made yet, and half the growth is the four states' tests. The other half is
+# the host's end of the session learning what it had been assuming: a session that
+# ends fails the streams it was serving rather than closing them, with the calls
+# still waiting woken and the calls that follow refused, and two tests that require
+# the producer of a producing stream and of a stream nobody asked about to be gone
+# when their session is. No dependency moved and no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 16328
+max_source_lines = 16913
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

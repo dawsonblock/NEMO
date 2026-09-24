@@ -18,6 +18,12 @@
 //! output. Two reasons: a `poll_next` cannot await, and — more importantly — the
 //! consumer dropping the stream has to reach the kernel as a cancellation rather
 //! than as a host that stopped asking without saying so.
+//!
+//! Nothing on this side ends a stream except the kernel saying so. A session that
+//! ends — the kernel dying, the transport breaking, a message the kernel refuses —
+//! is a session that stopped serving the streams it was serving, and every one of
+//! them fails with that rather than ending as if it had finished: a consumer must
+//! not read "the kernel went away" as "the stream was complete".
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -55,6 +61,13 @@ pub struct SessionChannel {
     /// produce the same call identity — which is how an answer ends up applied to
     /// the wrong call.
     calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the session's answers have stopped.
+    ///
+    /// A session that has ended has ended for every call made after it, and a call
+    /// that waits for an answer that cannot come is a call that hangs. This is what
+    /// makes the end visible to the calls that follow it, so a stream stops with a
+    /// failure instead of waiting for a kernel that is no longer there.
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for SessionChannel {
@@ -83,6 +96,7 @@ impl KernelCallbacks {
                 >,
             >,
         > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut request = tonic::Request::new(ReceiverStream::new(messages));
         request
@@ -105,13 +119,18 @@ impl KernelCallbacks {
         // holding that signal open.
         let cancelling = outbound.downgrade();
         let session = session_id.to_owned();
+        let ending = std::sync::Arc::clone(&ended);
         tokio::spawn(async move {
+            // Every way out of this loop is the session's answers having stopped —
+            // the transport broke, or the kernel sent something this side cannot
+            // read. None of them leaves a call that is waiting for an answer in a
+            // state where an answer can still arrive.
             while let Some(answer) = answers_in.next().await {
-                let Ok(answer) = answer else { return };
+                let Ok(answer) = answer else { break };
                 let Ok(answer) =
                     nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
                 else {
-                    return;
+                    break;
                 };
                 // The stream an answer names, when the answer is one that
                 // creates a stream: an answer nobody receives has to leave
@@ -130,8 +149,8 @@ impl KernelCallbacks {
                     }
                     // Answers to calls this side did not make are not this side's
                     // to route; a session that sent one is answered by ending the
-                    // channel, which the loop does by returning.
-                    _ => return,
+                    // channel.
+                    _ => break,
                 };
                 let waiting = routing
                     .lock()
@@ -172,6 +191,17 @@ impl KernelCallbacks {
                         .await;
                 }
             }
+
+            // The session's answers have stopped. Every call still waiting for one
+            // is waiting for a session that is no longer there: dropping their
+            // senders is how they learn it, and the flag is how the calls that
+            // follow learn it without waiting at all. A stream that stopped because
+            // its session did is not a stream that finished.
+            ending.store(true, std::sync::atomic::Ordering::SeqCst);
+            routing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         });
 
         Ok(SessionChannel {
@@ -179,6 +209,7 @@ impl KernelCallbacks {
             answers,
             session_id: session_id.to_owned(),
             calls: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ended,
         })
     }
 }
@@ -251,6 +282,9 @@ impl SessionChannel {
         &self,
         host_call_id: &str,
     ) -> Result<tokio::sync::oneshot::Receiver<PluginSessionPayload>, String> {
+        if self.ended.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the session has ended".to_string());
+        }
         let (sender, answer) = tokio::sync::oneshot::channel();
         let replaced = self
             .answers
@@ -274,8 +308,17 @@ impl SessionChannel {
         // The same counter every other stream on this channel mints from.
         let calls = std::sync::Arc::clone(&self.calls);
         let address = stream_id.clone();
+        let ended = std::sync::Arc::clone(&self.ended);
         let pulling = tokio::spawn(async move {
             loop {
+                if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = items
+                        .send(Err(nemo_relay::error::FlowError::Internal(
+                            "the session ended before the stream did".into(),
+                        )))
+                        .await;
+                    return;
+                }
                 let host_call_id = format!(
                     "{session_id}-{}",
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -285,6 +328,22 @@ impl SessionChannel {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(host_call_id.clone(), sender);
+                if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    // The session could have ended between the check above and this
+                    // registration, and a sender left in a map nobody reads is a
+                    // pull that waits forever. The registration is taken back and
+                    // the stream is told, rather than hung, that its session ended.
+                    answers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&host_call_id);
+                    let _ = items
+                        .send(Err(nemo_relay::error::FlowError::Internal(
+                            "the session ended before the stream did".into(),
+                        )))
+                        .await;
+                    return;
+                }
                 let sent = outbound
                     .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
                         &PluginSessionMessage {
@@ -297,11 +356,28 @@ impl SessionChannel {
                     ))
                     .await;
                 if sent.is_err() {
+                    // The session's side of the channel is gone, and this stream did
+                    // not end: a consumer that reads it to a clean end would take a
+                    // stream that stopped for one that finished.
+                    let _ = items
+                        .send(Err(nemo_relay::error::FlowError::Internal(
+                            "the session ended before the stream did".into(),
+                        )))
+                        .await;
                     return;
                 }
                 let answered = match answer.await {
                     Ok(answered) => answered,
-                    Err(_) => return,
+                    // The call this pull made was dropped, which is the session
+                    // being gone rather than the stream being over.
+                    Err(_) => {
+                        let _ = items
+                            .send(Err(nemo_relay::error::FlowError::Internal(
+                                "the session ended before the stream did".into(),
+                            )))
+                            .await;
+                        return;
+                    }
                 };
                 let item = match answered {
                     PluginSessionPayload::StreamItem(item) => {
@@ -321,7 +397,17 @@ impl SessionChannel {
                             .await;
                         return;
                     }
-                    _ => return,
+                    // An answer of a shape a pull cannot take: the two sides no
+                    // longer agree about this stream, which the consumer reads as
+                    // the failure it is rather than as an end that never came.
+                    other => {
+                        let _ = items
+                            .send(Err(nemo_relay::error::FlowError::Internal(format!(
+                                "the kernel answered a pull with {other:?}"
+                            ))))
+                            .await;
+                        return;
+                    }
                 };
                 // A consumer that stopped reading is a consumer that stopped
                 // wanting the stream, and the kernel has to be told: nothing else
@@ -428,9 +514,16 @@ mod tests {
     /// A kernel serving one session channel, with one stream parked for one
     /// operation, reachable over a real socket.
     async fn serve_kernel(chunks: Vec<Result<serde_json::Value, String>>) -> std::path::PathBuf {
-        use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
+        serve_kernel_until(chunks).await.0
+    }
 
-        let continuations = std::sync::Arc::new(crate::continuations::Continuations::new());
+    /// The same kernel, with the task serving it returned.
+    ///
+    /// A test that ends the kernel needs the handle: a session that dies mid-stream
+    /// is the case the consumer must not read as a stream that finished.
+    async fn serve_kernel_until(
+        chunks: Vec<Result<serde_json::Value, String>>,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
         let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
             std::sync::Arc::new(move |_request| {
                 let chunks = chunks.clone();
@@ -444,6 +537,16 @@ mod tests {
                     ))
                 })
             });
+        serve_kernel_with_producer(stream).await
+    }
+
+    /// The same kernel, serving a producer the test builds.
+    async fn serve_kernel_with_producer(
+        stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
+        use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
+
+        let continuations = std::sync::Arc::new(crate::continuations::Continuations::new());
         // Parked for as long as the channel test runs: the guard is leaked on
         // purpose, because the kernel's session outlives this helper.
         std::mem::forget(continuations.hold_llm_stream("operation-1", "registration-1", stream));
@@ -467,13 +570,13 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("a socket directory");
         let endpoint = directory.join("k");
         let listener = tokio::net::UnixListener::bind(&endpoint).expect("a kernel socket");
-        tokio::spawn(async move {
+        let serving = tokio::spawn(async move {
             let _ = Server::builder()
                 .add_service(RelayRuntimeServer::new(service))
                 .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
                 .await;
         });
-        endpoint
+        (endpoint, serving)
     }
 
     async fn callbacks(endpoint: &std::path::Path) -> KernelCallbacks {
@@ -653,6 +756,96 @@ mod tests {
             stopped.is_ok(),
             "the kernel dropped the producer the consumer walked away from"
         );
+    }
+
+    /// A session that ends mid-stream is a failure, not an end.
+    ///
+    /// Nothing in this channel can end a stream except the kernel saying so. A
+    /// consumer that read a stream to a clean end after its session ended would take
+    /// a stream that stopped for one that finished, which is the distinction the
+    /// terminal frame makes on the wire and this makes on this side. The session
+    /// here ends because the kernel refuses a message — the same session end a
+    /// kernel that died produces, and the one the socket reports as a broken stream
+    /// — while a stream is mid-flight.
+    #[tokio::test]
+    async fn a_session_that_ends_mid_stream_fails_the_stream() {
+        use nemo_relay_plugin_protocol::{PluginStreamControl, PluginStreamPullRequest};
+
+        // A producer that produces one frame and then blocks, so the stream cannot
+        // finish before its session does.
+        let one_then_blocked: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
+            std::sync::Arc::new(|_request| {
+                Box::pin(async move {
+                    Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                        tokio_stream::iter(vec![Ok::<
+                            serde_json::Value,
+                            nemo_relay::error::FlowError,
+                        >(
+                            serde_json::json!({"chunk": 1})
+                        )])
+                        .chain(tokio_stream::pending()),
+                    ))
+                })
+            });
+        let endpoint = serve_kernel_with_producer(one_then_blocked).await.0;
+        let callbacks = callbacks(&endpoint).await;
+        let channel = callbacks
+            .open_session(SESSION_ID)
+            .await
+            .expect("an open channel");
+        let request = LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        };
+        let mut stream = channel
+            .open_stream("operation-1", &request)
+            .await
+            .expect("a stream");
+        assert_eq!(
+            stream.next().await.expect("a chunk").expect("a chunk"),
+            serde_json::json!({"chunk": 1})
+        );
+        // The next pull is answered by nothing: the producer is blocked, so the
+        // stream is mid-flight when the session ends.
+        channel
+            .outbound
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &PluginSessionMessage {
+                    session_id: SESSION_ID.into(),
+                    message: PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                        host_call_id: "pull-1".into(),
+                        stream_id: "operation-1-1".into(),
+                    }),
+                },
+            ))
+            .await
+            .expect("a sent pull");
+
+        // The kernel refuses a message, which ends the session it was serving.
+        channel
+            .outbound
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &PluginSessionMessage {
+                    session_id: SESSION_ID.into(),
+                    message: PluginSessionPayload::StreamCancel(PluginStreamControl {
+                        host_call_id: "cancel-unknown".into(),
+                        stream_id: "stream-never-opened".into(),
+                    }),
+                },
+            ))
+            .await
+            .expect("a sent cancel");
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the consumer is told something");
+        match next {
+            Some(Err(failure)) => assert!(
+                failure.to_string().contains("session ended"),
+                "the failure says the session ended rather than the stream: {failure}"
+            ),
+            other => panic!("a stream whose session ended fails rather than ending: {other:?}"),
+        }
     }
 
     /// An open nobody is waiting for is cancelled rather than left producing.

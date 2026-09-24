@@ -335,12 +335,42 @@ start — a stream the plugin has not asked about has no credit and is not polle
 and a terminal frame does not spend a credit because it is what the pull that
 asked for it was for.
 
+The deadline is the operation's, not the consumer's: it is taken from the budget
+the chain position was parked under, so a stream cannot outlive the call whose
+chain it wraps. It is enforced in the three places a stream can be waiting — the
+open, the demand, and a pull whose producer is still working — and it settles the
+actor before it drops the producer, which is the order the two have to happen in:
+what ended the stream is held for the next pull when nothing was outstanding,
+because a stream's frames are answers to demand and the ending is one of them.
+`a_deadline_before_the_first_frame_ends_the_stream`,
+`a_deadline_while_a_pull_is_pending_answers_the_pull`,
+`a_deadline_between_frames_ends_the_stream` and
+`a_deadline_while_the_open_is_blocked_refuses_the_open` are the four states; the
+first waits for the producer to be dropped before it asks for anything, so it is
+the call's deadline being enforced rather than the consumer's.
+
+Transport disappearance was the last thing the terminal frame was standing in for
+without saying so. The host's end of the session used to read a broken session as
+the end of the stream it was pulling: the pulling task's channel closed and the
+consumer saw a clean end, which is exactly the "silently means successful EOF" the
+terminal frame exists to prevent. Now every way that task can exit without the
+kernel saying the stream ended — the session's side of the channel going away, a
+call being dropped because the session ended, an answer of a shape a pull cannot
+take — fails the stream with "the session ended before the stream did". The
+reader, on its own exit, marks the channel ended and drops the calls still waiting
+for answers, so the calls that follow learn it too instead of waiting for a kernel
+that is no longer there, and a call that registers in the window between the two
+finds its own registration taken back rather than left in a map nobody reads.
+`a_session_that_ends_mid_stream_fails_the_stream` ends a session under a
+mid-flight stream and requires the consumer to be told, and
+`a_session_that_ends_drops_every_producer` requires both a producing stream and a
+stream that was never asked for anything to lose their producers when the session
+goes — at the driver level, where the actors are.
+
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **Stream deadlines**, before the first frame, while a pull is pending, between
-   frames, and while the downstream work behind the stream is blocked.
-2. **Qualification**: host death and kernel death in every phase, marks before,
+1. **Qualification**: host death and kernel death in every phase, marks before,
    during and after streaming, and the terminal-frame rule pinned as a test, since
    it holds only while one stream has one producer. The class stays unlisted until
    those land, so a plugin registering it is refused whole rather than half-served.

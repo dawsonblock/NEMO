@@ -71,12 +71,20 @@
 //!    frame, byte and frame-count ceilings before they cross, and a frame that
 //!    would cross one is not sent — the stream is over instead, and so is the work
 //!    behind it.
+//! 11. **A stream may not outlive the call it belongs to.** The deadline is the
+//!    operation's, taken from the budget the chain position was parked under, and
+//!    it is enforced whether or not anyone is asking: an idle stream is over when
+//!    its call's time is up and its producer goes with it, an open still blocked at
+//!    the deadline never becomes a stream, and a pull whose producer is still
+//!    working at the deadline is answered with the deadline rather than with a
+//!    frame. What ended the stream is held for the next pull when nothing was
+//!    outstanding — a stream's frames are answers to demand, and the ending is one
+//!    of them.
 //!
-//! What the streaming increment still owes: stream deadlines, and the
-//! qualification matrix — deadlines before the first frame, during a pending pull
-//! and between frames, host death in each phase, marks during streaming, and the
-//! terminal-frame rule pinned as a test. The class is not served until those land,
-//! so nothing depends on the actor's shape yet.
+//! What the streaming increment still owes is the qualification matrix: host and
+//! kernel death in each phase, marks during streaming, and the terminal-frame rule
+//! pinned as a test of its own. The class is not served until those land, so
+//! nothing depends on the actor's shape yet.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -180,6 +188,8 @@ enum Lifecycle {
 enum Produced {
     /// The stream was settled instead of producing: the actor stops.
     Settled,
+    /// The call's deadline passed while the producer was still working.
+    Expired,
     /// The producer answered, with an item, a failure, or the end.
     Next(Option<Result<nemo_relay::json::Json, nemo_relay::error::FlowError>>),
 }
@@ -427,6 +437,8 @@ impl SessionDriver {
             lifecycle: Lifecycle::Opening,
             active_pull: None,
             next_pull_id: 1,
+            deadline: None,
+            outcome: None,
             credit: 0,
             spent_bytes: 0,
             spent_frames: 0,
@@ -485,6 +497,39 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "the stream's producer panicked".to_string())
 }
 
+/// A future that completes when a deadline passes, if there is one.
+///
+/// Taken as a value rather than read from the actor so that the wait can be raced
+/// against the producer the actor is holding: both are what the select needs, and
+/// neither borrows the other.
+async fn expires(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        // No deadline is not a deadline that never passes: it is nothing to wait
+        // for, so this never completes.
+        None => std::future::pending().await,
+    }
+}
+
+/// The failure that says a stream ran out of the call's time.
+fn deadline_failure(message: &str) -> PluginFailure {
+    PluginFailure {
+        code: PluginFailureCode::DeadlineExceeded,
+        message: message.to_string(),
+    }
+}
+
+/// When a budget's deadline lands, in this task's own clock.
+///
+/// A budget carries an absolute deadline in Unix milliseconds because it travels;
+/// a task waits on its own clock, so the two are reconciled once, here, where the
+/// stream takes the call's deadline for its own.
+fn deadline_of(budget: &nemo_relay::api::runtime::ExecutionBudget) -> Option<tokio::time::Instant> {
+    let deadline = budget.deadline_unix_ms?;
+    let remaining = deadline.saturating_sub(nemo_relay::api::runtime::budget_now_unix_ms());
+    Some(tokio::time::Instant::now() + std::time::Duration::from_millis(remaining))
+}
+
 /// One stream, owned by the task that produces it.
 ///
 /// Everything a stream needs to be produced lives here and nowhere else: the
@@ -516,6 +561,22 @@ struct StreamActor {
     active_pull: Option<ActivePull>,
     /// The identity the next pull this actor produces for will have.
     next_pull_id: u64,
+    /// When this stream must be over, if the operation it belongs to has a
+    /// deadline.
+    ///
+    /// Taken from the budget the chain position was parked under, which is the
+    /// call's: a stream is part of the call whose chain it wraps, so it may not
+    /// outlive the call's deadline. A deadline already past is one the stream is
+    /// over before it produces anything.
+    deadline: Option<tokio::time::Instant>,
+    /// What ended this stream, when it ended with something the plugin has not been
+    /// told yet.
+    ///
+    /// A deadline can pass while nothing is outstanding, and there is no frame to
+    /// attach the ending to: the next pull is what the plugin learns on, so the
+    /// failure is held rather than sent unsolicited. Nothing is produced behind it
+    /// — the producer is already gone.
+    outcome: Option<PluginFailure>,
     /// How many frames the consumer has asked for and not been answered.
     ///
     /// This is the whole of this stream's demand accounting. A pull grants one
@@ -672,27 +733,70 @@ impl StreamActor {
             // by its consumer's appetite rather than by its producer's — and a
             // stream whose consumer has stopped asking waits here rather than
             // running ahead of it.
-            if self.credit == 0 {
+            if let Some(outcome) = self.outcome.clone() {
+                // The stream is over and the plugin has not been told. The pull it
+                // makes now is what it is told on: the failure is the answer to
+                // that demand rather than a message nobody asked for.
                 let Some(pull) = self.pulls.recv().await else {
+                    return;
+                };
+                self.grant(pull);
+                let granted = self.active_pull.take().expect("a granted pull");
+                self.fail(granted, outcome);
+                return;
+            }
+            if self.credit == 0 {
+                let deadline = self.deadline;
+                let pull = tokio::select! {
+                    biased;
+                    // The call's deadline does not wait for demand: a stream whose
+                    // operation has run out of time is over whether or not its
+                    // consumer is still asking, and the producer goes with it.
+                    () = expires(deadline) => {
+                        self.expire();
+                        continue;
+                    }
+                    pull = self.pulls.recv() => pull,
+                };
+                let Some(pull) = pull else {
                     // The session let this stream go without saying so — the handle
                     // closing is the same instruction as a cancellation, and the one
                     // that cannot be lost behind a queue.
                     return;
                 };
-                self.active_pull = Some(ActivePull {
-                    pull_id: self.next_pull_id,
-                    host_call_id: pull.host_call_id,
-                });
-                self.next_pull_id += 1;
-                // One pull is one frame's worth of demand, and the session's
-                // record refuses a second pull while one is outstanding: the
-                // grant is one, so N is one.
-                self.credit = 1;
+                self.grant(pull);
             }
             if !self.produce().await {
                 return;
             }
         }
+    }
+
+    /// Take one pull's worth of demand.
+    ///
+    /// One pull is one frame's worth, and the session's record refuses a second
+    /// pull while one is outstanding: the grant is one, so N is one.
+    fn grant(&mut self, pull: PluginStreamPullRequest) {
+        self.active_pull = Some(ActivePull {
+            pull_id: self.next_pull_id,
+            host_call_id: pull.host_call_id,
+        });
+        self.next_pull_id += 1;
+        self.credit = 1;
+    }
+
+    /// Settle a stream whose deadline passed while nothing was outstanding.
+    ///
+    /// The producer is dropped — the call's time is up, so the work behind the
+    /// stream is over — and what ended the stream is held for the next pull, which
+    /// is the message the plugin will read it in. Nothing is sent unsolicited: a
+    /// stream's frames are answers to demand, and the ending is one of them.
+    fn expire(&mut self) {
+        self.producer = None;
+        self.lifecycle = Lifecycle::Terminal;
+        self.outcome = Some(deadline_failure(
+            "the operation's deadline passed before the stream produced what was asked for",
+        ));
     }
 
     /// Call the chain the plugin is wrapping and take the stream it answers with.
@@ -713,6 +817,9 @@ impl StreamActor {
                     self.request.operation_request_id
                 ))
             })?;
+        // The call's deadline, taken before the chain is called: an open that
+        // blocks past it never becomes a stream.
+        self.deadline = parked.budget.as_ref().and_then(deadline_of);
         let ParkedChain::LlmStream(next) = parked.chain else {
             return Err(refusal(format!(
                 "operation '{}' holds a {} position, which has no downstream stream",
@@ -731,10 +838,18 @@ impl StreamActor {
                 ))
             })?;
 
+        let deadline = self.deadline;
         let opened = tokio::select! {
             biased;
             _ = self.pulls.recv() => Err(refusal(
                 "the session ended before the stream opened".to_string(),
+            )),
+            // The chain is downstream work, and it is the call's deadline that
+            // bounds it: an open still blocked when the call's time is up never
+            // becomes a stream.
+            () = expires(deadline) => Err(deadline_failure(
+                "the operation's deadline passed while the chain that opens this \
+                 stream was still blocked",
             )),
             opened = next(provider_request) => {
                 opened.map_err(|error| refusal(error.to_string()))
@@ -775,6 +890,7 @@ impl StreamActor {
     ///
     /// Answers whether the actor has more to serve.
     async fn produce(&mut self) -> bool {
+        let deadline = self.deadline;
         let Some(producer) = self.producer.as_mut() else {
             return false;
         };
@@ -796,12 +912,29 @@ impl StreamActor {
                          producing for a pull cannot be handed another"
                     ),
                 },
+                // The deadline bounds the work, so a producer that is still
+                // blocking when the call's time is up is a producer whose frame
+                // will never be the answer to this pull.
+                () = expires(deadline) => Produced::Expired,
                 item = producer.next() => Produced::Next(item),
             }
         };
 
         match produced {
             Produced::Settled => false,
+            Produced::Expired => {
+                let Some(active) = self.active_pull.take() else {
+                    return false;
+                };
+                self.fail(
+                    active,
+                    deadline_failure(
+                        "the operation's deadline passed while the downstream stream was \
+                         producing the frame this pull asked for",
+                    ),
+                );
+                false
+            }
             Produced::Next(Some(Ok(chunk))) => self.deliver(pull_id, PullResult::Data(chunk)),
             Produced::Next(Some(Err(error))) => self.deliver(
                 pull_id,
@@ -1048,6 +1181,64 @@ mod tests {
             self.park(operation, never(dropped));
         }
 
+        /// A producer whose first poll never resolves, with a sentinel of its own.
+        fn park_pending_watched(&self, operation: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.park(operation, never(Arc::clone(&dropped)));
+            dropped
+        }
+
+        /// A producer that produces `chunks` and then ends, with a sentinel of its
+        /// own.
+        fn park_watched(
+            &self,
+            operation: &str,
+            chunks: Vec<serde_json::Value>,
+        ) -> Arc<std::sync::atomic::AtomicBool> {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.park(operation, watched(chunks, Arc::clone(&dropped)));
+            dropped
+        }
+
+        /// Park a chain position under a budget whose deadline is `after` from now.
+        ///
+        /// The budget is the call's, and it is the call's deadline the stream
+        /// inherits: a stream is part of the call whose chain it wraps, so it may
+        /// not outlive it.
+        async fn park_until(
+            &self,
+            operation: &str,
+            producer: LlmStreamExecutionNextFn,
+            after: std::time::Duration,
+        ) {
+            let millis = u64::try_from(after.as_millis()).expect("a deadline in milliseconds");
+            let now = nemo_relay::api::runtime::budget_now_unix_ms();
+            let continuations = Arc::clone(&self.continuations);
+            let operation = operation.to_owned();
+            nemo_relay::api::runtime::with_execution_budget(
+                nemo_relay::api::runtime::ExecutionBudget::new(now + millis, millis),
+                async move {
+                    std::mem::forget(continuations.hold_llm_stream(
+                        &operation,
+                        "registration-1",
+                        producer,
+                    ));
+                },
+            )
+            .await;
+        }
+
+        /// Wait until a producer says it was dropped.
+        async fn await_dropped(&self) {
+            let dropped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !self.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(dropped.is_ok(), "the producer behind the stream is dropped");
+        }
+
         /// A producer that says how many times it was polled, and when it was
         /// dropped.
         fn park_counting(
@@ -1276,6 +1467,59 @@ mod tests {
         Arc::new(move |_request| {
             let dropped = Arc::clone(&dropped);
             Box::pin(async move { Ok(LlmJsonStream::new(Never(dropped))) })
+        })
+    }
+
+    /// A chain position whose stream produces `chunks` and then never resolves,
+    /// saying when it is dropped.
+    ///
+    /// The producer that runs out of work without running out of stream: a deadline
+    /// between frames is what this is here to be caught by.
+    fn then_pending(
+        chunks: Vec<serde_json::Value>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    ) -> LlmStreamExecutionNextFn {
+        /// A producer that produces what it has and then nothing.
+        struct ThenPending {
+            items: std::vec::IntoIter<serde_json::Value>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl tokio_stream::Stream for ThenPending {
+            type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                match self.items.next() {
+                    Some(chunk) => std::task::Poll::Ready(Some(Ok(chunk))),
+                    None => std::task::Poll::Pending,
+                }
+            }
+        }
+        impl Drop for ThenPending {
+            fn drop(&mut self) {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Arc::new(move |_request| {
+            let chunks = chunks.clone();
+            let dropped = Arc::clone(&dropped);
+            Box::pin(async move {
+                Ok(LlmJsonStream::new(ThenPending {
+                    items: chunks.into_iter(),
+                    dropped,
+                }))
+            })
+        })
+    }
+
+    /// A chain position that never answers with a stream.
+    fn hanging_chain() -> LlmStreamExecutionNextFn {
+        Arc::new(|_request| {
+            Box::pin(std::future::pending::<
+                nemo_relay::error::Result<LlmJsonStream>,
+            >())
         })
     }
 
@@ -1754,6 +1998,154 @@ mod tests {
         };
         assert_eq!(item.stream_id, second);
         assert_eq!(item.chunk_json, serde_json::json!({"chunk": 1}).to_string());
+    }
+
+    /// A session that ends takes every producer with it.
+    ///
+    /// One stream is parked in a pull and another is waiting to be asked for
+    /// anything at all. The session ending — whichever way it ends — is what stops
+    /// both, and the producers are the evidence rather than the absence of an
+    /// error: a session that ended is not one that left work behind, whatever the
+    /// work was doing when it did.
+    #[tokio::test]
+    async fn a_session_that_ends_drops_every_producer() {
+        let mut session = Session::new();
+        let producing = session.park_pending_watched("operation-1");
+        let waiting = session.park_watched("operation-2", vec![serde_json::json!({"chunk": 2})]);
+        let squeezed = session.opened("call-1", "operation-1").await;
+        session.opened("call-2", "operation-2").await;
+        // One stream is producing for a pull that will never be answered, and the
+        // other has not been asked for anything.
+        session.pull("call-3", &squeezed).expect("a pull");
+
+        drop(session);
+
+        for (stream, sentinel) in [
+            ("the producing stream", producing),
+            ("the waiting stream", waiting),
+        ] {
+            let dropped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !sentinel.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(
+                dropped.is_ok(),
+                "{stream} dropped its producer when the session ended"
+            );
+        }
+    }
+
+    /// A deadline before the first frame: the stream is over when the call's time
+    /// is up, whether or not its consumer has asked for anything.
+    ///
+    /// A deadline that only arrived at the next pull would be the consumer's
+    /// deadline rather than the call's, and the work behind the stream would be
+    /// held open by a consumer that had stopped asking.
+    #[tokio::test]
+    async fn a_deadline_before_the_first_frame_ends_the_stream() {
+        let mut session = Session::new();
+        session
+            .park_until(
+                "operation-1",
+                then_pending(Vec::new(), Arc::clone(&session.dropped)),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        let stream_id = session.opened("call-1", "operation-1").await;
+
+        // Nobody pulls, and the stream ends anyway: the producer goes with the
+        // call's time. Waiting for that drop is what makes this the state the test
+        // names rather than one the scheduler picked.
+        session.await_dropped().await;
+
+        // The pull that comes afterwards is answered with what ended the stream,
+        // so a consumer that asks late learns why rather than waiting for a frame
+        // that will never come.
+        let crossed = session.drive(&stream_id, 2).await;
+        let Some(PluginSessionPayload::StreamFailed(failed)) = crossed.first() else {
+            panic!("the deadline is the answer to the pull that follows it: {crossed:?}");
+        };
+        assert_eq!(failed.failure.code, PluginFailureCode::DeadlineExceeded);
+        session.actors_gone().await;
+    }
+
+    /// A deadline while a pull is pending: the pull is answered with the deadline
+    /// rather than waiting for a producer that may never produce.
+    #[tokio::test]
+    async fn a_deadline_while_a_pull_is_pending_answers_the_pull() {
+        let mut session = Session::new();
+        session
+            .park_until(
+                "operation-1",
+                never(Arc::clone(&session.dropped)),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        let stream_id = session.opened("call-1", "operation-1").await;
+
+        // The pull is made and the producer never answers it; the deadline is what
+        // the pull is answered with.
+        let crossed = session.drive(&stream_id, 2).await;
+        let Some(PluginSessionPayload::StreamFailed(failed)) = crossed.first() else {
+            panic!("a pull the deadline interrupts is answered with it: {crossed:?}");
+        };
+        assert_eq!(failed.failure.code, PluginFailureCode::DeadlineExceeded);
+        session.drained().await;
+    }
+
+    /// A deadline between frames: a stream that produced a frame and then blocked
+    /// is over when the call's time is up.
+    #[tokio::test]
+    async fn a_deadline_between_frames_ends_the_stream() {
+        let mut session = Session::new();
+        session
+            .park_until(
+                "operation-1",
+                then_pending(
+                    vec![serde_json::json!({"chunk": 1})],
+                    Arc::clone(&session.dropped),
+                ),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        let stream_id = session.opened("call-1", "operation-1").await;
+
+        let crossed = session.drive(&stream_id, 3).await;
+        assert!(
+            matches!(crossed.first(), Some(PluginSessionPayload::StreamItem(_))),
+            "the frame that crossed before the deadline is the frame the plugin got: \
+             {crossed:?}"
+        );
+        let Some(PluginSessionPayload::StreamFailed(failed)) = crossed.get(1) else {
+            panic!("the stream ends with the deadline rather than with silence: {crossed:?}");
+        };
+        assert_eq!(failed.failure.code, PluginFailureCode::DeadlineExceeded);
+        session.drained().await;
+    }
+
+    /// A deadline while the open is blocked: the stream never opens, and the plugin
+    /// is told why rather than waiting for a chain that may never answer.
+    #[tokio::test]
+    async fn a_deadline_while_the_open_is_blocked_refuses_the_open() {
+        let mut session = Session::new();
+        session
+            .park_until(
+                "operation-1",
+                hanging_chain(),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        session
+            .open("call-1", "operation-1")
+            .expect("an open request");
+
+        let PluginSessionPayload::StreamOpenFailed(failed) = session.answer().await else {
+            panic!("an open the deadline ended is refused rather than opened");
+        };
+        assert_eq!(failed.failure.code, PluginFailureCode::DeadlineExceeded);
+        session.actors_gone().await;
     }
 
     /// A stream nobody pulls is never polled.
