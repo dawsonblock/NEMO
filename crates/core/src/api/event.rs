@@ -147,6 +147,11 @@ async fn invoke_event_sanitize_registration(
     event: Event,
     kind: RuntimeRegistrationKind,
 ) -> crate::error::Result<EventSanitizeOutcome> {
+    // The same claim every other public entry point makes before it touches the
+    // runtime: this process is this binding's. A door that skipped it would be a way
+    // to run a registration from a second binding in one process, which is the thing
+    // the owner check exists to refuse.
+    crate::api::shared::ensure_runtime_owner()?;
     let scope_stack = crate::api::runtime::current_scope_stack();
     let locals = scope_stack
         .read()
@@ -181,14 +186,15 @@ async fn invoke_event_sanitize_registration(
         &local_refs,
         kind,
     );
-    let entry = entries
-        .into_iter()
-        .find(|entry| entry.name == registration)
-        .ok_or_else(|| {
-            crate::error::FlowError::NotFound(format!(
-                "no event sanitize guardrail of this class is registered as '{registration}'"
-            ))
-        })?;
+    let entry = crate::api::runtime::state::NemoRelayContextState::exact_event_sanitize_entry(
+        &entries,
+        registration,
+    )
+    .ok_or_else(|| {
+        crate::error::FlowError::NotFound(format!(
+            "no event sanitize guardrail of this class is registered as '{registration}'"
+        ))
+    })?;
     // One entry, and this door reports what it did rather than only the event it
     // left behind: the chain's failure rule is to clear the fields, and a caller
     // that has to account for the failure needs the reason beside them.

@@ -138,7 +138,14 @@ max_transitive_packages = 265
 # answer from looping on the record of its own failure. A single-entry runner sits
 # under both, so the chain's fail-closed clearing and the door's reporting are one
 # implementation. No dependency moved and no `unsafe` did.
-max_source_lines = 74377
+#
+# Raised once more for the Layer 1 repair: the exact-registration doors now make the
+# same process-ownership claim every other entry point makes, their selection of a name
+# held twice is a documented rule with a home rather than the order a merged vector
+# happened to be built in, and the environment names the owner check reads are visible
+# to the crate's tests so a suite cannot test a second spelling of them. No dependency
+# moved and no `unsafe` did.
+max_source_lines = 74410
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -171,7 +178,12 @@ max_transitive_packages = 24
 # synthetic event is built back from it, and the tests require that no event identity —
 # uuid, parent, timestamp — crosses in either direction. No dependency moved and no
 # `unsafe` did.
-max_source_lines = 1968
+#
+# Raised again for the disclosure list the ratchet compares against: the fields the
+# kernel keeps are written down as data, so a projection that grows a key fails a test
+# instead of passing silently, and the same list is asserted over every class. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 2016
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"

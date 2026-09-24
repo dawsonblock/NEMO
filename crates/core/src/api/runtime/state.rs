@@ -887,6 +887,30 @@ impl NemoRelayContextState {
             .collect()
     }
 
+    /// The entry a named exact-registration door runs.
+    ///
+    /// A name is unique *within* one registry — a second registration under a name a
+    /// registry already holds is refused when it is made — so two entries can share a
+    /// name only when one is process-global and the other is scope-local, and a merged
+    /// chain holds both. A door runs the entry the chain would run *first*, which is
+    /// what [`Self::event_sanitize_entries`] already ordered: ascending priority, and
+    /// on a tie the global registration before a scope-local one, because the merge
+    /// appends the globals first and sorts stably.
+    ///
+    /// That rule is stated and tested rather than left to whichever order a merged
+    /// vector happened to be built in: a caller names *one* registration and the
+    /// answer is a value, so which one it got has to be a decision rather than an
+    /// accident of iteration.
+    pub(crate) fn exact_event_sanitize_entry(
+        entries: &[Guardrail<EventSanitizeFn>],
+        registration: &str,
+    ) -> Option<Guardrail<EventSanitizeFn>> {
+        entries
+            .iter()
+            .find(|entry| entry.name == registration)
+            .cloned()
+    }
+
     /// Snapshot Event metadata injector entries in deterministic priority order.
     pub(crate) fn event_metadata_injector_entries(
         global: &SortedRegistry<EventMetadataInjector>,

@@ -1547,6 +1547,54 @@ mod tests {
         keys
     }
 
+    /// The fields the kernel keeps. Written as a list rather than as a comment because
+    /// the point of the projection is that disclosure is a decision: a field that
+    /// crosses the boundary has to be added to the approved set deliberately, and one
+    /// that is *not* on this list has to be shown not to cross.
+    const KERNEL_ONLY_FIELDS: &[&str] = &[
+        "uuid",
+        "timestamp",
+        "parent_uuid",
+        "propagation_root_uuid",
+        "atof_version",
+        "kind",
+        "category",
+        "data_schema",
+    ];
+
+    /// The runtime's own event shape does not cross, by key or by value.
+    ///
+    /// The serialized-value check is what catches a field smuggled inside another one;
+    /// the key check is what catches a field the projection grows.
+    #[test]
+    fn a_projection_carries_no_kernel_only_field() {
+        for class in [
+            PluginEventSanitizeClass::Mark,
+            PluginEventSanitizeClass::ScopeStart,
+            PluginEventSanitizeClass::ScopeEnd,
+        ] {
+            let call = PluginEventSanitizeCall {
+                class,
+                name: "example".into(),
+                scope_category: class.scope_category().map(|_| "start".to_string()),
+                fields: EventSanitizeFields::default(),
+            };
+            let serialized = serde_json::to_value(&call).expect("a serializable projection");
+            let keys: std::collections::BTreeSet<&str> = serialized
+                .as_object()
+                .expect("a projection is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            for kernel_only in KERNEL_ONLY_FIELDS {
+                assert!(
+                    !keys.contains(kernel_only),
+                    "{kernel_only} is the kernel's and crossed in this projection: {call:?}"
+                );
+            }
+        }
+    }
+
     /// The capability boundary, enforced rather than described.
     ///
     /// The property is not "the projection serialises". It is that the set of

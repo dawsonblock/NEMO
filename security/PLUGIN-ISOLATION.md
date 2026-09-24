@@ -1642,6 +1642,47 @@ is not a way to publish something a sanitizer should see: what a plugin emits is
 forwarded and published through the ordinary path, and a call to `runtime_mark` from a
 host process stays in that process, where the kernel has no subscribers.
 
+**The Layer 1 doors owed two things, and both are paid.** First, they never made the
+claim every other entry point makes: `ensure_runtime_owner()` was missing, so a process
+already owned by another binding could have reached the registries through a door. The
+check is one call in the shared helper now, which is also what fixes the three doors at
+once rather than three times, and it is tested by authoring the refused state directly —
+a published owner and a different current binding — and requiring the refusal before
+anything is resolved.
+
+Second, "run the registration named X" had no stated answer for a name held twice. It
+can only be held twice across registries, because one registry refuses a second
+registration under a name it already holds, so the pair is a process-global entry and a
+scope-local one. The rule is the chain's own precedence, written down and pinned: the
+door runs the entry the chain would run *first* — ascending priority, and on a tie the
+global registration, because the merge appends globals first and sorts stably. Three
+tests hold it: the lower priority wins, the tie goes to the global one, and a
+scope-local registration is reachable while its scope lives and is not found once that
+scope closes. The doors' remaining matrix is direct too: exact mark, exact scope-start,
+exact scope-end, siblings that did not run, a name only another class holds, and a
+failure that clears the fields and reports why.
+
+**What the projection costs a first-party sanitizer, measured.** The projection was
+chosen over shipping the event, and the price of that choice had to be checked rather
+than assumed: *do any sanitizers the repository ships read what it leaves behind?* They
+do, in one place. `nemo-relay-pii-redaction`'s event sanitizers read two fields the
+projection does not carry — `event.category()` to gate the scope sanitizers by their
+`sanitize_llm` / `sanitize_tool` configuration, and `event.data_schema()` to recognize a
+Relay metric mark and apply the metric-envelope sanitizer. Every other first-party
+sanitizer ignores the event and works on the fields alone.
+
+Nothing is broken by that today, and it must not be papered over either: the PII
+component is a *built-in* component, registered in the kernel's own process, so no
+projection is involved in what it does. It becomes a real gap the moment that component
+is hosted as a native plugin: a hosted sanitizer would be shown a synthetic event whose
+category is `custom` and whose data schema is absent, and the two branches would
+silently take their default paths. The disclosure ratchet is where the decision lands —
+adding `category` and `data_schema` to the projection means adding them to the approved
+list in the same change, which is the point of that test — and until then the honest
+statement is that process isolation narrows the sanitizer view to what
+`PluginEventSanitizeCall` declares, and a plugin that needs more is asking for
+capability the boundary has not granted.
+
 **Class coverage: 14 of 16.** The three that crossed together are the mark, scope-start
 and scope-end sanitizers: one shape, one projection, and one installer parameterised
 by class. What each needed was a kernel proxy, a host-side runner and a core door that
