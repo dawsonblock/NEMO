@@ -1168,6 +1168,41 @@ mod tests {
         );
     }
 
+    /// A cancellation between frames settles the stream and stops its producer.
+    ///
+    /// Nothing about the stream being mid-flight changes the answer: the frame
+    /// that crossed is the last one, the producer is dropped with whatever it was
+    /// holding, and the stream may not be pulled again.
+    #[tokio::test]
+    async fn a_cancellation_between_frames_stops_the_stream() {
+        let mut session = Session::new();
+        session.park_producing(
+            "operation-1",
+            vec![
+                serde_json::json!({"chunk": 1}),
+                serde_json::json!({"chunk": 2}),
+            ],
+        );
+        let stream_id = session.opened("call-1", "operation-1").await;
+        session.pull("call-2", &stream_id).expect("a pull");
+        assert!(matches!(
+            session.answer().await,
+            PluginSessionPayload::StreamItem(_)
+        ));
+
+        // The first frame crossed and the second never will: the cancellation
+        // arrives between them, with the producer holding one more.
+        session
+            .cancel("cancel-1", &stream_id)
+            .expect("a cancellation");
+        session.drained().await;
+        assert_eq!(session.driver.served_streams(), 0);
+        assert!(
+            session.pull("call-3", &stream_id).is_err(),
+            "a cancelled stream cannot be pulled"
+        );
+    }
+
     /// A cancellation for a stream that already ended is a no-op, and the session
     /// keeps serving after it.
     ///
