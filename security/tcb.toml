@@ -322,12 +322,20 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # when their session is. The last of it is the mirror of that rule on the kernel's
 # side of the frames: a host that answered and stopped used to be read as a host
 # that finished, which is what the terminal frame exists to distinguish, and the
-# three shapes of a frames stream are now one test. No dependency moved and no
+# three shapes of a frames stream are now one test.
+#
+# Budget raise (qualification): the streaming qualification work is mostly tests,
+# and it found one thing that cannot be fixed here — the mark window does not
+# follow an asynchronous callback onto the plugin's own task, so a streaming mark
+# never reaches the kernel. The raise is the fixture's mark, the ignored test that
+# records that finding with its measurement, the four shapes of a frames stream
+# (each now also requiring the held chain position to be given back), and the
+# repeated mixture of three streams ending three ways. No dependency moved and no
 # `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 17050
+max_source_lines = 17310
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

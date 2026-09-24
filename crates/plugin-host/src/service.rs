@@ -3518,6 +3518,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&manifest_dir);
     }
 
+    /// A mark a streaming callback raises reaches the host's forwarder.
+    ///
+    /// A streaming call has four positions a mark can be raised in — before the
+    /// plugin opens the downstream stream, while the downstream producer is
+    /// active, between the chunks it returns upstream, and after the last chunk
+    /// but before the terminal frame — and all four have to survive the boundary
+    /// with the call they belong to. The fixture raises the first of them today,
+    /// so this asserts the mechanism before the matrix that will compare
+    /// attribution across two concurrent streams.
+    ///
+    /// Ignored because it cannot pass yet, and the reason is recorded here rather
+    /// than in a commit message: the host opens the mark window around a *unary*
+    /// callback, where the callback body runs inside it, and a streaming
+    /// callback's body runs on the plugin's own executor task instead — outside
+    /// any window this process opens. The mark is therefore emitted into the host
+    /// process's own event stream and never reaches the kernel. This is measured
+    /// rather than assumed: with the window installed around the streaming
+    /// registration as well as around the callback, no `ForwardedStep::Mark` is
+    /// raised at all. The fix is the window following the plugin's task, which is
+    /// the same capture-and-restore the scope binding already does — work on the
+    /// plugin SDK's side of the ABI, and not part of this qualification pass.
+    #[ignore = "a streaming callback's mark does not reach the host's forwarder; see the doc comment"]
+    #[tokio::test]
+    async fn a_streaming_callback_s_mark_reaches_the_host_s_forwarder() {
+        use tokio_stream::StreamExt;
+
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the mark case");
+            return;
+        };
+        let ((service, session_id), mut marks) =
+            streaming_service_with_marks(&artifact, KernelProducer::watching(), true).await;
+        let mut frames = invoke_stream_frames(&service, &session_id).await;
+        // Reading the frames is what runs the callback and produces through it.
+        while let Some(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
+                .await
+                .expect("a frame or an end")
+        {
+            let frame = frame.expect("a frame");
+            if matches!(
+                frame.chunk,
+                Some(v1::stream_chunk::Chunk::End(_)) | Some(v1::stream_chunk::Chunk::Failure(_))
+            ) {
+                break;
+            }
+        }
+        drop(frames);
+
+        // What the callback raised, as the host recorded it for the kernel.
+        let mut seen = Vec::new();
+        while let Ok(Some(step)) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), marks.recv()).await
+        {
+            if let ForwardedStep::Mark { mark, .. } = step {
+                seen.push(mark);
+            }
+        }
+        let raised = seen
+            .iter()
+            .find(|mark| mark.name == "fixture.native.llm_stream.mark");
+        let raised = raised.unwrap_or_else(|| {
+            panic!("the mark the streaming callback raised crossed to the forwarder: {seen:?}")
+        });
+        assert_eq!(
+            raised.operation_request_id, "operation-stream",
+            "a mark belongs to the call whose callback raised it"
+        );
+        assert_eq!(
+            raised.data_json.as_deref().map(|data| {
+                serde_json::from_str::<serde_json::Value>(data)
+                    .expect("the mark's data is JSON")["position"]
+                    .clone()
+            }),
+            Some(serde_json::json!("before-downstream")),
+            "and the position it was raised in is the one the plugin named"
+        );
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
     /// Cancelling the outer consumer reaches the kernel's producer.
     ///
     /// The whole point of a boundary is that a caller who walks away takes the
@@ -3614,6 +3695,25 @@ mod tests {
         artifact: &str,
         producer: KernelProducer,
     ) -> (PluginHostService, String) {
+        streaming_service_with_marks(artifact, producer, false)
+            .await
+            .0
+    }
+
+    /// The same service, with the marks its callback raises readable as steps.
+    ///
+    /// A host only forwards a plugin's marks when it has somewhere to forward
+    /// them, which in production is the channel to the kernel: this is that
+    /// channel, so a test can see what crossed it.
+    async fn streaming_service_with_marks(
+        artifact: &str,
+        producer: KernelProducer,
+        forward_marks: bool,
+    ) -> (
+        (PluginHostService, String),
+        tokio::sync::mpsc::Receiver<ForwardedStep>,
+    ) {
+        let (mark_sender, mark_steps) = tokio::sync::mpsc::channel::<ForwardedStep>(64);
         let backend = Arc::new(crate::InProcessPluginBackend::new());
         let config = PluginHostConfig {
             protocol_version: PROTOCOL_VERSION,
@@ -3621,7 +3721,10 @@ mod tests {
             session_credential: "credential".into(),
             maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
         };
-        let service = PluginHostService::new(backend, config.clone());
+        let mut service = PluginHostService::new(backend, config.clone());
+        if forward_marks {
+            service = service.with_mark_forwarding(mark_sender);
+        }
         let mut handshake = handshake_request(&config);
         handshake.supported_registration_operations = EVERY_REGISTRATION_OPERATION
             .iter()
@@ -3695,7 +3798,7 @@ mod tests {
             .expect("a converted activation")
             .into_result()
             .expect("the session serves every class this fixture registers");
-        (service, session_id)
+        ((service, session_id), mark_steps)
     }
 
     /// Start the streaming invocation the cancellation cases drop.

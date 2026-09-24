@@ -380,11 +380,40 @@ says so (an end), and failed (the failure, then an end).
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **Qualification**: marks before, during and after streaming, and the remaining
-   host-death and kernel-death phases, which the terminal-frame and
-   transport-disappearance tests above are the first of. The class stays unlisted
-   until those land, so a plugin registering it is refused whole rather than
-   half-served.
+1. **The mark window does not follow a streaming callback.** This is the one thing
+   the qualification pass found that the class cannot be advertised without, and it
+   is measured rather than assumed. The host opens the mark window around a
+   *unary* callback, where the callback body runs inside it, and the plugin SDK
+   runs an asynchronous callback's body on the plugin's own executor task — outside
+   any window the host process opens. A mark a streaming callback raises is
+   therefore emitted into the host process's own event stream and never reaches the
+   kernel: with the window installed around the streaming registration as well as
+   around the callback, no `ForwardedStep::Mark` is raised at all, which is what
+   `a_streaming_callback_s_mark_reaches_the_host_s_forwarder` records — ignored,
+   with that reason, so the invariant is written down before the fix rather than
+   after it. The fix is the window following the plugin's task, which is the same
+   capture-and-restore the scope binding already does, and it is work on the plugin
+   SDK's side of the ABI rather than in the session. Until it lands, the four
+   positions a streaming mark can be raised in — before the plugin opens the
+   downstream stream, while the downstream producer is active, between the chunks
+   it returns upstream, and after the last chunk but before the terminal frame —
+   are not carried, and neither is the two-stream attribution matrix that would
+   show a mark cannot migrate to a neighbouring operation. A mark that cannot be
+   delivered is not a lost log line: the class stays unlisted, so a plugin
+   registering it is refused whole.
+2. **The rest of the qualification matrix**, which needs no new mechanism: the
+   cases are in the tree and the counts are asserted with them. Host death is
+   `a_session_that_ends_mid_stream_fails_the_stream` (a caller is told rather than
+   handed a clean end) and `a_session_that_ends_drops_every_producer` (a producing
+   stream and one nobody asked about both lose their producers); a session that
+   broke mid-stream, a host that stopped without the frame that ends the stream,
+   and a stream that failed are the four shapes of
+   `a_stream_of_frames_that_stops_without_a_terminal_frame_is_a_failure`, each of
+   which also requires the kernel's held chain position to be given back with the
+   stream; and `streams_that_end_every_way_at_once_leave_nothing_behind` runs the
+   mixture — a stream finishing, one cancelled with a pull outstanding, and one
+   released unpulled, over and over — requiring every producer to be dropped and
+   both counts to return to zero each round.
 
 **What keeps a host from outliving its kernel.** The supervisor kills the child when
 it drops, and that is not enough on its own: a reference to the composition can be

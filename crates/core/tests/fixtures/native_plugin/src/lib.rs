@@ -320,7 +320,18 @@ impl NativePlugin for FixtureNativePlugin {
         ctx.register_llm_stream_execution_intercept(
             "fixture_llm_stream_execution",
             0,
-            |_name, request, next| async move {
+            {
+                let runtime = runtime.clone();
+                move |_name, request, next| {
+                    let runtime = runtime.clone();
+                    async move {
+                        // A mark raised before the downstream stream is opened: the
+                        // first of the positions attribution has to survive.
+                        runtime.emit_mark(
+                            "fixture.native.llm_stream.mark",
+                            Some(&json!({"position": "before-downstream"})),
+                            None,
+                        )?;
                 let stream = next
                     .call(mark_llm_request(
                         request,
@@ -331,6 +342,8 @@ impl NativePlugin for FixtureNativePlugin {
                     chunk.map(|chunk| mark_json(chunk, "native_plugin_llm_stream_execution"))
                 }));
                 Ok(stream)
+                    }
+                }
             },
         )?;
 

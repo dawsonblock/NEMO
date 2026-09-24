@@ -81,10 +81,15 @@
 //!    outstanding — a stream's frames are answers to demand, and the ending is one
 //!    of them.
 //!
-//! What the streaming increment still owes is the qualification matrix: host and
-//! kernel death in each phase, marks during streaming, and the terminal-frame rule
-//! pinned as a test of its own. The class is not served until those land, so
-//! nothing depends on the actor's shape yet.
+//! What the streaming increment still owes is one mechanism and no more of this
+//! one: the mark window has to follow an asynchronous callback onto the plugin's
+//! own task before a streaming mark can reach the kernel, which is the plugin
+//! SDK's side of the ABI rather than this session's. Everything else the class
+//! owed is here and asserted — the deadline, the ceilings, the terminal rule, and
+//! the shutdown that drops every producer — and the mixture of them is run rather
+//! than argued in `streams_that_end_every_way_at_once_leave_nothing_behind`. The
+//! class is not served until the marks land, so nothing depends on the actor's
+//! shape yet.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -1228,6 +1233,17 @@ mod tests {
             .await;
         }
 
+        /// Wait until a producer's own sentinel says it was dropped.
+        async fn await_sentinel(&self, sentinel: &std::sync::atomic::AtomicBool, stream: &str) {
+            let dropped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !sentinel.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(dropped.is_ok(), "{stream} dropped its producer");
+        }
+
         /// Wait until a producer says it was dropped.
         async fn await_dropped(&self) {
             let dropped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1998,6 +2014,81 @@ mod tests {
         };
         assert_eq!(item.stream_id, second);
         assert_eq!(item.chunk_json, serde_json::json!({"chunk": 1}).to_string());
+    }
+
+    /// Streams that end every way at once, over and over, leave nothing behind.
+    ///
+    /// Every other test here pins one state, deliberately. This is for the races
+    /// they cannot see: an actor being cancelled while its neighbours are
+    /// producing, a release landing between another stream's frames, an open
+    /// arriving while a terminal is in flight. Repeating the mixture is what makes
+    /// a missing cleanup show up as a count that does not return to where it
+    /// started, rather than as one unlucky interleaving nobody ran.
+    #[tokio::test]
+    async fn streams_that_end_every_way_at_once_leave_nothing_behind() {
+        for round in 0..25 {
+            let mut session = Session::new();
+            let completing = session.park_watched(
+                "operation-1",
+                vec![
+                    serde_json::json!({"chunk": 1}),
+                    serde_json::json!({"chunk": 2}),
+                ],
+            );
+            let cancelled = session.park_pending_watched("operation-2");
+            let released =
+                session.park_watched("operation-3", vec![serde_json::json!({"chunk": 3})]);
+            let finishing = session.opened("call-1", "operation-1").await;
+            let never = session.opened("call-2", "operation-2").await;
+            let let_go = session.opened("call-3", "operation-3").await;
+            assert_eq!(
+                session.driver.actors_alive(),
+                3,
+                "round {round} is three streams, each with an actor of its own"
+            );
+
+            // Three ways of ending, interleaved: one stream produces and finishes,
+            // one is cancelled while its pull is outstanding, and one is let go
+            // without ever being pulled.
+            session.pull("call-4", &finishing).expect("a pull");
+            assert!(matches!(
+                session.answer().await,
+                PluginSessionPayload::StreamItem(_)
+            ));
+            session.pull("call-5", &never).expect("a pull");
+            session.cancel("cancel-1", &never).expect("a cancellation");
+            session.release("release-1", &let_go).expect("a release");
+
+            session.pull("call-6", &finishing).expect("a pull");
+            assert!(
+                matches!(session.answer().await, PluginSessionPayload::StreamItem(_)),
+                "round {round} produces the second chunk"
+            );
+            session.pull("call-7", &finishing).expect("a pull");
+            assert!(
+                matches!(session.answer().await, PluginSessionPayload::StreamEnd(_)),
+                "round {round} ends the stream it was producing"
+            );
+
+            for (stream, sentinel) in [
+                ("the stream that finished", &completing),
+                ("the stream that was cancelled", &cancelled),
+                ("the stream that was released", &released),
+            ] {
+                session.await_sentinel(sentinel, stream).await;
+            }
+            session.actors_gone().await;
+            assert_eq!(
+                session.driver.actors_alive(),
+                0,
+                "round {round} left an actor behind"
+            );
+            assert_eq!(
+                session.driver.served_streams(),
+                0,
+                "round {round} left a stream in the registry"
+            );
+        }
     }
 
     /// A session that ends takes every producer with it.
