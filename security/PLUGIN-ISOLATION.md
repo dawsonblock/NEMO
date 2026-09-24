@@ -1468,6 +1468,28 @@ replaces the other: a boundary that served sixteen classes nobody registers woul
 be complete and useless, and a fixture that happens to register only servable
 classes says nothing about the classes that do not cross.
 
+**The event sanitizer design is frozen; implement it, don't revisit it.** The
+composition, decided rather than discovered: event payload semantics from the
+metadata injector's path, sanitizer failure semantics and off-path execution from
+the tool pair. A `PluginObservedEvent` goes down with a kernel-owned class, a
+kernel-owned registration identity and the operation's identity; what comes back is
+`observed.event`, and the class, the identities and the observation envelope stay
+the kernel's — the plugin transforms the event and nothing else. Serializing the
+whole envelope back would let a shared wire type quietly widen what a plugin
+controls, so it does not.
+
+Identical serialization must not imply interchangeable capability. All three classes
+share the event representation, which makes class confusion *easier* rather than
+safer: a structurally valid answer for the wrong class is rejected, because the class
+is part of the capability rather than a field inside it.
+
+The Layer 2 gate, with the confidentiality property tested as itself rather than
+inferred from an error: inject an unmistakable sentinel into every observable field,
+force each failure path — refusal, plugin failure, malformed answer, wrong class,
+wrong registration, wrong operation, budget exceeded, host gone — and assert that no
+sentinel value can appear in anything subsequently publishable. "The proxy returned
+an error" is weaker than "the secret cannot be published".
+
 **Where Layer 2 of the event sanitizers starts, from the reconnaissance.** Two
 things the next session should not have to rediscover, both found by reading the one
 already-served class whose payload is an event:
