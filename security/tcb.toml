@@ -280,10 +280,24 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # drop, and a gate that holds the kernel inside an open so the consumer can leave
 # while it is in flight) and the session channel names the same window directly.
 # No dependency moved and no `unsafe` did.
+#
+# Budget raise (per-stream actors): the kernel's session stopped answering pulls
+# itself and started routing them to an actor per stream, so that no producer can
+# decide whether the session serves anything else. It is a rewrite of the file
+# this budget already paid for plus the actors that replace its loop, and the
+# evidence is the larger half: the interruptibility tests (a producer parked in
+# `poll_next` while another stream is served and the parked one is cancelled, at
+# the dispatcher and again over a real socket), the one-outstanding-pull refusal,
+# cross-stream isolation, a panicking producer that fails only its own stream,
+# the two ceilings, and the shutdown drain that ends the answer stream only once
+# every producer is gone. Both the dispatcher and the actors also carry the
+# written form of the invariants they rest on, which is where most of the growth
+# is. No dependency moved, no `unsafe` did, and the streaming class is still not
+# served.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 14392
+max_source_lines = 15632
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

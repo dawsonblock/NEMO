@@ -450,13 +450,34 @@ impl RelayRuntime for RelayRuntimeService {
         let (answers, outbound) = tokio::sync::mpsc::channel(SESSION_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
-            let mut driver =
-                crate::session_driver::SessionDriver::new(session_id.clone(), continuations);
+            // The writer: one task owns what reaches the plugin. Actors and the
+            // dispatcher hand it messages rather than writing to the transport
+            // themselves, so a host that has stopped reading its answers cannot
+            // hold up the reception of its own messages — and the transport's own
+            // buffer is still what paces a host that reads slowly.
+            let (writes, mut written) = tokio::sync::mpsc::unbounded_channel::<
+                nemo_relay_plugin_protocol::PluginSessionMessage,
+            >();
+            let writing = tokio::spawn(async move {
+                while let Some(message) = written.recv().await {
+                    let message =
+                        nemo_relay_plugin_proto::convert::session_message_to_wire(&message);
+                    if answers.send(message).await.is_err() {
+                        return;
+                    }
+                }
+            });
+
+            let mut driver = crate::session_driver::SessionDriver::new(
+                session_id.clone(),
+                continuations,
+                writes,
+            );
             while let Some(message) = inbound.next().await {
                 let Ok(message) = message else {
                     // The host's side of the channel broke; nothing is owed to a
                     // session that is no longer there.
-                    return;
+                    break;
                 };
                 let message =
                     match nemo_relay_plugin_proto::convert::session_message_from_wire(&message) {
@@ -466,32 +487,27 @@ impl RelayRuntime for RelayRuntimeService {
                             // cannot attribute to this session, and the two sides no
                             // longer agree about what the channel is: it ends rather
                             // than continuing with one side's picture of it.
-                            return;
+                            break;
                         }
                     };
                 if message.session_id != session_id {
-                    return;
+                    break;
                 }
-                match driver.handle(message).await {
-                    Ok(owed) => {
-                        for answer in owed {
-                            if answers
-                                .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
-                                    &answer,
-                                ))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                    // A refused message ends the channel: the state machine says
-                    // the session is no longer the one this host thinks it has,
-                    // and answering anyway would be guessing on its behalf.
-                    Err(_) => return,
+                // A refused message ends the channel: the state machine says the
+                // session is no longer the one this host thinks it has, and
+                // answering anyway would be guessing on its behalf.
+                if driver.handle(message).is_err() {
+                    break;
                 }
             }
+
+            // The session is over. Dropping the dispatcher closes every actor's
+            // commands, so every actor stops and drops its producer; the writer
+            // ends the response once the last of them has let go of it. Waiting
+            // for that is what makes a session's shutdown the producers' shutdown
+            // rather than a hope about scheduling.
+            drop(driver);
+            let _ = writing.await;
         });
 
         // The channel's answers are messages, not failures: a refusal the plugin
@@ -1148,6 +1164,284 @@ mod tests {
 
         drop(outbound);
         serving.abort();
+    }
+
+    /// A session keeps answering while a producer is parked.
+    ///
+    /// The driver's own tests prove the dispatcher routes rather than produces.
+    /// This is the same property through everything around it — the credential,
+    /// the conversion, the writer task and the transport — because a wait
+    /// anywhere on that path would be head-of-line blocking by another name.
+    #[tokio::test]
+    async fn a_session_channel_answers_while_a_producer_is_blocked() {
+        use nemo_relay_plugin_protocol::{
+            PluginSessionMessage, PluginSessionPayload, PluginStreamOpenRequest,
+            PluginStreamPullRequest,
+        };
+
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let parked: nemo_relay::api::runtime::LlmStreamExecutionNextFn = Arc::new(|_request| {
+            Box::pin(async move {
+                Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                    tokio_stream::pending(),
+                ))
+            })
+        });
+        let serving: nemo_relay::api::runtime::LlmStreamExecutionNextFn = Arc::new(|_request| {
+            Box::pin(async move {
+                Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                    tokio_stream::iter(vec![Ok(serde_json::json!({"chunk": 1}))]),
+                ))
+            })
+        });
+        let continuations = Arc::clone(&service.config.continuations);
+        let _parked = continuations.hold_llm_stream("operation-parked", "registration-1", parked);
+        let _serving =
+            continuations.hold_llm_stream("operation-serving", "registration-1", serving);
+        let (endpoint, serving_task) = serve_session_channel(service).await;
+
+        let mut client = connect_to_kernel(&endpoint, nemo_relay_plugin_protocol::MAX_FRAME_BYTES)
+            .await
+            .expect("a client");
+        let (outbound, inbound) = tokio::sync::mpsc::channel(8);
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(inbound));
+        request.metadata_mut().insert(
+            SESSION_CREDENTIAL_HEADER,
+            CREDENTIAL.parse().expect("a header value"),
+        );
+        let mut answers = client
+            .session(request)
+            .await
+            .expect("a served session channel")
+            .into_inner();
+
+        async fn send(
+            outbound: &tokio::sync::mpsc::Sender<nemo_relay_plugin_proto::v1::PluginSessionMessage>,
+            payload: PluginSessionPayload,
+        ) -> Result<
+            (),
+            tokio::sync::mpsc::error::SendError<nemo_relay_plugin_proto::v1::PluginSessionMessage>,
+        > {
+            let message = PluginSessionMessage {
+                session_id: SESSION_ID.into(),
+                message: payload,
+            };
+            outbound
+                .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                    &message,
+                ))
+                .await
+        }
+        let mut opened = Vec::new();
+        for (call, operation) in [
+            ("call-1", "operation-parked"),
+            ("call-2", "operation-serving"),
+        ] {
+            send(
+                &outbound,
+                PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
+                    host_call_id: call.into(),
+                    operation_request_id: operation.into(),
+                    request_json: serde_json::json!({"headers": {}, "content": {}}).to_string(),
+                }),
+            )
+            .await
+            .expect("a sent open");
+        }
+        for _ in 0..2 {
+            let answer = answers.next().await.expect("an answer").expect("a message");
+            let answer = nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
+                .expect("a converted answer");
+            let PluginSessionPayload::StreamOpened(opened_stream) = answer.message else {
+                panic!("the kernel opens both streams: {answer:?}");
+            };
+            opened.push(opened_stream);
+        }
+        let parked = opened
+            .iter()
+            .find(|stream| stream.host_call_id == "call-1")
+            .expect("the parked stream")
+            .stream_id
+            .clone();
+        let serving = opened
+            .iter()
+            .find(|stream| stream.host_call_id == "call-2")
+            .expect("the serving stream")
+            .stream_id
+            .clone();
+
+        // The parked pull is routed and its producer parks: nothing answers it,
+        // because nothing has been produced.
+        send(
+            &outbound,
+            PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                host_call_id: "pull-parked".into(),
+                stream_id: parked.clone(),
+            }),
+        )
+        .await
+        .expect("a sent pull");
+
+        // The stream beside it is served while that pull is outstanding, which is
+        // what a blocked producer must not be able to cost.
+        send(
+            &outbound,
+            PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                host_call_id: "pull-serving".into(),
+                stream_id: serving.clone(),
+            }),
+        )
+        .await
+        .expect("a sent pull");
+        let answer = answers.next().await.expect("an answer").expect("a message");
+        let answer = nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
+            .expect("a converted answer");
+        let PluginSessionPayload::StreamItem(item) = answer.message else {
+            panic!("the stream that can produce answers: {answer:?}");
+        };
+        assert_eq!(item.stream_id, serving);
+
+        // The cancellation of the parked stream is served without the producer
+        // yielding, and the session keeps serving messages afterwards: the open
+        // after it is answered.
+        send(
+            &outbound,
+            PluginSessionPayload::StreamCancel(nemo_relay_plugin_protocol::PluginStreamControl {
+                host_call_id: "cancel-parked".into(),
+                stream_id: parked,
+            }),
+        )
+        .await
+        .expect("a sent cancel");
+        send(
+            &outbound,
+            PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
+                host_call_id: "call-3".into(),
+                operation_request_id: "operation-parked".into(),
+                request_json: serde_json::json!({"headers": {}, "content": {}}).to_string(),
+            }),
+        )
+        .await
+        .expect("a sent open");
+        let answer = answers.next().await.expect("an answer").expect("a message");
+        let answer = nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
+            .expect("a converted answer");
+        assert!(
+            matches!(answer.message, PluginSessionPayload::StreamOpened(_)),
+            "the session serves the next open after a cancellation: {answer:?}"
+        );
+
+        drop(outbound);
+        serving_task.abort();
+    }
+
+    /// A session that ends takes the producers it was serving with it.
+    ///
+    /// The host's end of the channel closing is how a session ends. What has to
+    /// follow is the work: every actor stops, every producer is dropped, and the
+    /// answer stream ends because there is nothing left to say it with — which is
+    /// also why an answer stream that has ended is the observable proof that the
+    /// producers are gone.
+    #[tokio::test]
+    async fn a_session_that_ends_drops_the_producers_it_was_serving() {
+        use nemo_relay_plugin_protocol::{
+            PluginSessionMessage, PluginSessionPayload, PluginStreamOpenRequest,
+            PluginStreamPullRequest,
+        };
+
+        /// A producer that never produces and says when it is gone.
+        struct Watched(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl tokio_stream::Stream for Watched {
+            type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for Watched {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn = {
+            let dropped = Arc::clone(&dropped);
+            Arc::new(move |_request| {
+                let dropped = Arc::clone(&dropped);
+                Box::pin(async move {
+                    Ok(nemo_relay::api::runtime::LlmJsonStream::new(Watched(
+                        dropped,
+                    )))
+                })
+            })
+        };
+        let continuations = Arc::clone(&service.config.continuations);
+        let _held = continuations.hold_llm_stream("operation-1", "registration-1", stream);
+        let (endpoint, serving_task) = serve_session_channel(service).await;
+
+        let mut client = connect_to_kernel(&endpoint, nemo_relay_plugin_protocol::MAX_FRAME_BYTES)
+            .await
+            .expect("a client");
+        let (outbound, inbound) = tokio::sync::mpsc::channel(8);
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(inbound));
+        request.metadata_mut().insert(
+            SESSION_CREDENTIAL_HEADER,
+            CREDENTIAL.parse().expect("a header value"),
+        );
+        let mut answers = client
+            .session(request)
+            .await
+            .expect("a served session channel")
+            .into_inner();
+
+        let message = |payload| PluginSessionMessage {
+            session_id: SESSION_ID.into(),
+            message: payload,
+        };
+        outbound
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &message(PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
+                    host_call_id: "call-1".into(),
+                    operation_request_id: "operation-1".into(),
+                    request_json: serde_json::json!({"headers": {}, "content": {}}).to_string(),
+                })),
+            ))
+            .await
+            .expect("a sent open");
+        let answer = answers.next().await.expect("an answer").expect("a message");
+        let answer = nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
+            .expect("a converted answer");
+        let PluginSessionPayload::StreamOpened(opened) = answer.message else {
+            panic!("the kernel opens the stream: {answer:?}");
+        };
+        outbound
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &message(PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                    host_call_id: "pull-1".into(),
+                    stream_id: opened.stream_id,
+                })),
+            ))
+            .await
+            .expect("a sent pull");
+
+        // The host lets go of its end while the kernel is parked in the
+        // producer.
+        drop(outbound);
+        assert!(
+            answers.next().await.is_none(),
+            "the session's answers end when the session does"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the producer the session was serving is dropped with it"
+        );
+        serving_task.abort();
     }
 
     /// A session channel without the credential is refused at the door, like

@@ -278,25 +278,41 @@ the downstream stream the kernel is producing for that operation, the chunks it
 marked on the way back, and the terminal frame — both halves of the boundary,
 end to end.
 
+The kernel's side is no longer a loop that answers pulls itself. A pull is work,
+and work that one stream's producer can park is work the session must not be
+waiting on: `SessionDriver::handle` is not an `async fn` at all — it validates a
+message against the session's record and routes it — and every stream is owned by
+an actor of its own, which owns the producer, the stream's lifecycle, the pull it
+is producing for and the identity of the next one. What the actor produces reaches
+the plugin through the session's writer rather than through the dispatcher, so a
+producer parked in `poll_next` cannot delay another stream's pull, the
+cancellation of its own stream, or the arrival of anything else. Cancellation is
+actor-owned and does not require cooperation: the actor is racing its poll against
+its pulls closing, `biased`, so a cancellation that arrived while the producer was
+also ready is the one that decides — the poll future is dropped and then the
+producer. The pull identity a result is recorded against is checked rather than
+assumed, and the session records a result only for the pull it is still waiting
+for, so a result that arrives after a cancellation settled the pull is discarded
+as stale rather than answered or refused. Actors are bounded (streams per session,
+opens in flight), a producer's panic fails its stream and not the session, and a
+session that ends drops every producer before its answer stream ends:
+`a_session_channel_answers_while_a_producer_is_blocked`,
+`a_parked_producer_holds_up_neither_the_session_nor_its_cancellation`, and
+`a_session_that_ends_drops_the_producers_it_was_serving` are the evidence, with
+the one-pull rule, cross-stream isolation and the panic case beside them.
+
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **Interruptible outstanding pulls.** The kernel's driver answers one message at a
-   time, so a cancellation arriving while it is producing waits for the pull it
-   interrupted. The fix is the split the driver's own docs describe: reception stays
-   serialized, production moves to a bounded task with a cancellation token, and one
-   active pull per stream remains the rule.
-2. **Explicit credit**, scoped to the stream, starting at one.
-3. **Three budgets** — frame, cumulative bytes, and frame count — with every encoded
+1. **Explicit credit**, scoped to the stream, starting at one.
+2. **Three budgets** — frame, cumulative bytes, and frame count — with every encoded
    frame counted, terminal frames included.
-4. **Qualification**: deadlines before the first frame, during a pending pull and
-   between frames; host death before the first frame and mid-stream; marks before,
-   during and after streaming; and the terminal-frame rule pinned as a test, since it
-   holds only while one stream has one producer. One limitation is written down rather than
-implied: the kernel's driver reads and answers one message at a time, so a
-cancellation that arrives while it is producing is answered after the pull it
-interrupted. The class stays unlisted until those land, so a plugin registering it is
-refused whole rather than half-served.
+3. **Stream deadlines**, before the first frame, while a pull is pending, between
+   frames, and while the downstream work behind the stream is blocked.
+4. **Qualification**: host death and kernel death in every phase, marks before,
+   during and after streaming, and the terminal-frame rule pinned as a test, since
+   it holds only while one stream has one producer. The class stays unlisted until
+   those land, so a plugin registering it is refused whole rather than half-served.
 
 **What keeps a host from outliving its kernel.** The supervisor kills the child when
 it drops, and that is not enough on its own: a reference to the composition can be
@@ -370,11 +386,12 @@ fails the mark rather than growing the host's heap.
    streaming intercept needs the duplex session instead of a unary resume, and both
    halves of it exist — the kernel's driver, the host's channel, and the upstream
    direction where a callback's returned stream crosses back. What remains is
-   pulls that a cancellation can interrupt, credit, the three budget
-   limits, and the deadline/crash/mark qualification. Cancellation that reaches the
-   producer behind a dropped consumer used to be on that list and is not any more:
-   it holds for every state a consumer can leave in, including the open that is
-   still in flight. The other
+   credit, the three budget limits, stream deadlines, and the qualification
+   matrix. Two things used to be on that list and are not any more: cancellation
+   that reaches the producer behind a dropped consumer (it holds for every state a
+   consumer can leave in, including the open that is still in flight) and
+   interruptible pulls (a pull is routed to an actor, so no producer can hold up
+   the session or its own cancellation). The other
    five classes need shapes of their own plus a core entry point that runs exactly
    one registration of that class.
 

@@ -132,6 +132,15 @@ impl PluginSessionState {
             && self.output_credit.is_empty()
     }
 
+    /// How many opens this session owes an answer to.
+    ///
+    /// An open runs the chain the plugin is wrapping, so this is work the
+    /// session has begun and not yet resolved: the number a session bound on
+    /// concurrent opens is a bound on.
+    pub fn pending_opens(&self) -> usize {
+        self.pending_opens.len()
+    }
+
     /// Record that the kernel expects a completion.
     ///
     /// The kernel creates the identity, so a settlement can only ever name one
@@ -535,6 +544,38 @@ impl PluginSessionState {
         }
     }
 
+    /// Record that the kernel produced a result for a pull, if the stream is
+    /// still waiting for that pull.
+    ///
+    /// `send_item` and its terminal siblings answer whether a result *fits*: a
+    /// chunk for a call that never pulled is a message the session refuses, and
+    /// refusing it ends the channel. This answers the other question a producer
+    /// asks — whether the pull it was producing for is still the one the stream
+    /// is waiting for — and the answer is not a refusal either way.
+    ///
+    /// The difference matters because of cancellation. A cancellation settles
+    /// the pull it interrupted, so a producer that was finishing at that exact
+    /// moment hands back a result for a pull the session has already closed.
+    /// That result is *stale* rather than wrong: it belongs to a call nobody is
+    /// waiting for any more, and discarding it is what lets a cancelled stream
+    /// be cancelled without the session treating its last frame as a peer
+    /// misbehaving. `false` says the stream is not waiting for that pull — which
+    /// is also what a released or already-ended stream answers, for the same
+    /// reason.
+    pub fn settle_pull(&mut self, stream_id: &str, host_call_id: &str, terminal: bool) -> bool {
+        let waiting = self
+            .streams
+            .get(stream_id)
+            .and_then(|stream| stream.outstanding_pull.as_deref())
+            == Some(host_call_id);
+        if !waiting {
+            return false;
+        }
+        // The stream is waiting for this call, which is exactly the case
+        // `answer_pull` accepts, so the record cannot be the one it refuses.
+        self.answer_pull(stream_id, host_call_id, terminal).is_ok()
+    }
+
     /// Forget everything belonging to an operation that has finished.
     ///
     /// A session outlives the operations that use it, so without this the state
@@ -674,6 +715,84 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    /// A result for a pull a cancellation settled is stale, not a violation.
+    ///
+    /// The producer that was finishing when the cancellation arrived has a
+    /// result for a call the session has already closed. It belongs to nobody,
+    /// and the difference between discarding it and refusing it is the
+    /// difference between a cancellation and a broken channel.
+    #[test]
+    fn a_result_for_a_pull_a_cancellation_settled_is_stale() {
+        let mut session = session_with_stream();
+        pull(&mut session, "pull-1");
+        session
+            .receive_cancel(&PluginStreamControl {
+                host_call_id: "cancel-1".into(),
+                stream_id: "stream-1".into(),
+            })
+            .expect("a cancellation");
+
+        assert!(
+            !session.settle_pull("stream-1", "pull-1", false),
+            "the pull the cancellation settled is not one the stream is waiting for"
+        );
+        // Refusing it was the old reading, and it is the one that would end a
+        // session over a cancellation that worked.
+        assert!(
+            session
+                .send_item(&PluginStreamItem {
+                    host_call_id: "pull-1".into(),
+                    stream_id: "stream-1".into(),
+                    chunk_json: r#"{"delta":"late"}"#.into(),
+                })
+                .is_err(),
+            "the record itself still refuses an answer to a settled pull"
+        );
+    }
+
+    /// A result for a pull nothing is waiting for is stale: the same rule a
+    /// released stream and an ended one answer with, and for the same reason.
+    #[test]
+    fn a_result_for_a_pull_of_a_released_stream_is_stale() {
+        let mut session = session_with_stream();
+        pull(&mut session, "pull-1");
+        session
+            .receive_release(&PluginStreamControl {
+                host_call_id: "release-1".into(),
+                stream_id: "stream-1".into(),
+            })
+            .expect("a release");
+
+        assert!(!session.settle_pull("stream-1", "pull-1", false));
+        // And a result for a pull that was never made is stale too: there is no
+        // pull outstanding to answer, whichever way it happened.
+        assert!(!session.settle_pull("stream-1", "pull-2", true));
+    }
+
+    /// The count an open bound is a bound on.
+    #[test]
+    fn an_open_in_flight_is_counted_until_it_is_answered() {
+        let mut session = PluginSessionState::new("session-1");
+        assert_eq!(session.pending_opens(), 0);
+
+        session
+            .receive_open_request(&PluginStreamOpenRequest {
+                host_call_id: "open-1".into(),
+                operation_request_id: "operation-1".into(),
+                request_json: r#"{"model":"example"}"#.into(),
+            })
+            .expect("an open request");
+        assert_eq!(session.pending_opens(), 1);
+
+        session
+            .send_opened(&PluginStreamOpened {
+                host_call_id: "open-1".into(),
+                stream_id: "stream-1".into(),
+            })
+            .expect("an opened stream");
+        assert_eq!(session.pending_opens(), 0);
     }
 
     #[test]
