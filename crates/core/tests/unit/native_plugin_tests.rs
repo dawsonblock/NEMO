@@ -1770,6 +1770,83 @@ fn assert_native_json_output_and_host_api() {
     );
 }
 
+/// The negotiation a plugin's entry goes through.
+///
+/// Every already-built plugin depends on this order: the current table first, then
+/// each frozen one, newest first. A plugin that only knows one version must be handed
+/// that version rather than a newer one it refuses — and one this host cannot speak to
+/// at all must be refused rather than handed a table it cannot read.
+#[test]
+fn the_entry_negotiation_offers_the_newest_version_a_plugin_accepts() {
+    for (plugin_max, expected) in [
+        (NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION),
+        (
+            NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
+            NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
+        ),
+        (
+            nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
+            nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
+        ),
+        (
+            NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,
+            NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,
+        ),
+    ] {
+        let mut plugin = NemoRelayNativePluginV1::default();
+        let status = negotiate_plugin_entry(entry_accepting_up_to(plugin_max), &mut plugin);
+        assert_eq!(
+            status,
+            NemoRelayStatus::Ok,
+            "a plugin built for v{plugin_max} is served"
+        );
+        assert_eq!(
+            OFFERED.lock().unwrap().last().copied(),
+            Some(expected),
+            "and the table it accepted is the newest one it knows"
+        );
+    }
+
+    let mut plugin = NemoRelayNativePluginV1::default();
+    let refused = negotiate_plugin_entry(entry_accepting_up_to(1), &mut plugin);
+    assert_eq!(
+        refused,
+        NemoRelayStatus::InvalidArg,
+        "a plugin sharing no version with this host is refused rather than handed one it cannot read"
+    );
+    assert_eq!(
+        OFFERED.lock().unwrap().len(),
+        4,
+        "every table this host can offer was offered before refusing"
+    );
+}
+
+/// The versions a fake plugin's entry was offered, in order.
+static OFFERED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// A plugin whose supported range ends at `max`, as an entry the loader can call.
+fn entry_accepting_up_to(max: u32) -> NemoRelayNativePluginEntry {
+    /// The version the fake plugin being called accepts up to.
+    static MAX: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+    unsafe extern "C" fn entry(
+        host: *const NemoRelayNativeHostApiV1,
+        _plugin: *mut NemoRelayNativePluginV1,
+    ) -> NemoRelayStatus {
+        let offered = unsafe { (*host).abi_version };
+        OFFERED.lock().unwrap().push(offered);
+        if offered <= *MAX.lock().unwrap() {
+            NemoRelayStatus::Ok
+        } else {
+            NemoRelayStatus::InvalidArg
+        }
+    }
+
+    OFFERED.lock().unwrap().clear();
+    *MAX.lock().unwrap() = max;
+    entry
+}
+
 #[test]
 fn native_async_next_abi_runs_tool_llm_and_stream_continuations() {
     let runtime = tokio::runtime::Builder::new_current_thread()

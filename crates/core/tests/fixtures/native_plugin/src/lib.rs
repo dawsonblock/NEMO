@@ -476,9 +476,6 @@ impl NativePlugin for FixtureNativePlugin {
                             .and_then(Json::as_str)
                             .unwrap_or("plain")
                             .to_owned();
-                        if shape == "panic-in-callback" {
-                            panic!("the streaming callback panicked before it answered");
-                        }
                         // The first of the four positions a streaming mark can be
                         // raised in: before the downstream stream is opened.
                         let stream_name = request
@@ -540,6 +537,12 @@ impl NativePlugin for FixtureNativePlugin {
                                 }),
                             );
                             return Ok(stream);
+                        }
+                        if shape == "panic-in-callback" {
+                            // A panic in the callback's own future, after the mark
+                            // it raised: the mark belongs to the call, and the call
+                            // fails rather than answering.
+                            panic!("the streaming callback panicked before it answered");
                         }
                         let stream = next
                             .call(mark_llm_request(

@@ -11,7 +11,7 @@ in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
 surface, and `just tcb-report` prints the number this milestone is judged on:
 
 ```
-kernel-process unsafe tokens: 645
+kernel-process unsafe tokens: 648
 ```
 
 `just tcb-report` checks that figure against the measurement rather than

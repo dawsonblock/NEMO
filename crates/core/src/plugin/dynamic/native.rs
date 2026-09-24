@@ -817,21 +817,7 @@ fn load_one_native_plugin(
                     library_path.display()
                 ))
             })?;
-        let mut status = entry(native_host_api(), &mut plugin);
-        // Older SDKs reject newer tables. Negotiate from the current table through
-        // separately frozen v4, v3 and v2 tables so their struct sizes and function
-        // pointers do not change as the current ABI grows.
-        for table in [
-            native_host_api_v4(),
-            native_host_api_v3(),
-            native_host_api_v2(),
-        ] {
-            if status != NemoRelayStatus::InvalidArg {
-                break;
-            }
-            drop_native_plugin_descriptor(&mut plugin);
-            status = entry(table, &mut plugin);
-        }
+        let status = negotiate_plugin_entry(*entry, &mut plugin);
         if status != NemoRelayStatus::Ok {
             drop_native_plugin_descriptor(&mut plugin);
             return Err(PluginError::RegistrationFailed(format!(
@@ -1398,6 +1384,36 @@ fn native_host_api() -> *const NemoRelayNativeHostApiV1 {
 fn native_host_api_v4() -> *const NemoRelayNativeHostApiV1 {
     static HOST_API: OnceLock<NemoRelayNativeHostApiV4> = OnceLock::new();
     &HOST_API.get_or_init(build_frozen_host_api_v4).v3.v1 as *const NemoRelayNativeHostApiV1
+}
+
+/// Call a plugin's entry, offering every table this host can speak.
+///
+/// A plugin built against an older SDK refuses a table whose version it does not
+/// know — its own supported range ends before this host's version — and that refusal
+/// says nothing about what the two could have agreed on. The negotiation therefore
+/// offers the current table first and then each frozen older one, newest first, so
+/// what a plugin is handed is the newest version it was built for.
+///
+/// The order is the whole of the rule, which is why it is a function with a test of
+/// its own rather than a loop inside the loader: getting it wrong is silent, and it
+/// is how every already-built plugin would stop loading at once.
+fn negotiate_plugin_entry(
+    entry: NemoRelayNativePluginEntry,
+    plugin: &mut NemoRelayNativePluginV1,
+) -> NemoRelayStatus {
+    let mut status = unsafe { entry(native_host_api(), plugin) };
+    for table in [
+        native_host_api_v4(),
+        native_host_api_v3(),
+        native_host_api_v2(),
+    ] {
+        if status != NemoRelayStatus::InvalidArg {
+            break;
+        }
+        drop_native_plugin_descriptor(plugin);
+        status = unsafe { entry(table, plugin) };
+    }
+    status
 }
 
 fn build_frozen_host_api_v4() -> NemoRelayNativeHostApiV4 {

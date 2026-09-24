@@ -3889,6 +3889,236 @@ mod tests {
         seen.lock().unwrap().clone()
     }
 
+    /// A panic in a streaming callback fails the call and not the session.
+    ///
+    /// The mark the callback raised before it panicked still belongs to the call —
+    /// the window was open when it was raised — and the call itself fails: a plugin
+    /// that panics must not answer, and must not take the session with it, so the
+    /// next invocation on the same session is served.
+    #[tokio::test]
+    async fn a_callback_that_panics_fails_the_call_and_not_the_session() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the panic case");
+            return;
+        };
+        let ((service, session_id), steps) =
+            streaming_service_with_marks(&artifact, KernelProducer::watching(), true).await;
+        let _marks = CollectedMarks::start(steps);
+
+        let mut frames = invoke_stream_frames(
+            &service,
+            &session_id,
+            "operation-stream",
+            serde_json::json!({"model": "fixture-model", "fixture_stream_shape": "panic-in-callback"}),
+        )
+        .await;
+        let crossed = drain_frames(&mut frames).await;
+        assert!(
+            crossed
+                .iter()
+                .any(|frame| matches!(frame, v1::stream_chunk::Chunk::Failure(_))),
+            "a callback that panicked answers with a failure: {crossed:?}"
+        );
+        assert!(
+            !crossed
+                .iter()
+                .take(crossed.len().saturating_sub(1))
+                .any(|frame| matches!(frame, v1::stream_chunk::Chunk::End(true))),
+            "and never with a clean end before it: {crossed:?}"
+        );
+
+        // The session survives: the same host serves a second invocation, which is
+        // the part a panic in one plugin's callback must not decide.
+        drop(frames);
+        let mut again = invoke_stream_frames(
+            &service,
+            &session_id,
+            "operation-stream",
+            serde_json::json!({"model": "fixture-model"}),
+        )
+        .await;
+        let crossed = drain_frames(&mut again).await;
+        assert!(
+            crossed
+                .iter()
+                .any(|frame| matches!(frame, v1::stream_chunk::Chunk::End(true))),
+            "the session serves the invocation that follows: {crossed:?}"
+        );
+        let _ = manifest_dir;
+    }
+
+    /// A returned stream that panics while being polled fails its call.
+    ///
+    /// The other place plugin code runs: after the callback has answered, while the
+    /// stream it handed back is being read. The ownership lifetimes differ — the
+    /// callback's future is gone by then — and the outcome has to be the same: a
+    /// failure rather than a stream that stops as if it had finished.
+    #[tokio::test]
+    async fn a_stream_that_panics_while_being_polled_fails_the_call() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the panic case");
+            return;
+        };
+        let ((service, session_id), steps) =
+            streaming_service_with_marks(&artifact, KernelProducer::watching(), true).await;
+        let _marks = CollectedMarks::start(steps);
+
+        let mut frames = invoke_stream_frames(
+            &service,
+            &session_id,
+            "operation-stream",
+            serde_json::json!({"model": "fixture-model", "fixture_stream_shape": "panic-in-stream"}),
+        )
+        .await;
+        let crossed = drain_frames(&mut frames).await;
+        assert!(
+            crossed
+                .iter()
+                .any(|frame| matches!(frame, v1::stream_chunk::Chunk::Failure(_))),
+            "a stream that panicked answers with a failure: {crossed:?}"
+        );
+        let _ = manifest_dir;
+    }
+
+    /// Two continuations of one callback stay attributed to the call they belong to.
+    ///
+    /// An intercept may run the rest of its chain more than once, and each run is a
+    /// call of its own: the plugin opens the downstream stream twice, raises a mark
+    /// for each, and both marks belong to the operation whose callback raised them
+    /// — the continuation is an identity of the *call*, not of the mark's owner.
+    #[tokio::test]
+    async fn two_continuations_of_one_callback_stay_attributed_to_their_call() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the continuation case");
+            return;
+        };
+        let ((service, session_id), steps) =
+            streaming_service_with_marks(&artifact, KernelProducer::watching(), true).await;
+        let marks = CollectedMarks::start(steps);
+
+        let mut frames = invoke_stream_frames(
+            &service,
+            &session_id,
+            "operation-stream",
+            serde_json::json!({
+                "model": "fixture-model",
+                "fixture_stream_shape": "two-continuations",
+            }),
+        )
+        .await;
+        let crossed = drain_frames(&mut frames).await;
+        // Both continuations produced, and both marks belong to the one operation.
+        let data = crossed
+            .iter()
+            .filter(|frame| matches!(frame, v1::stream_chunk::Chunk::Data(_)))
+            .count();
+        assert_eq!(
+            data, 4,
+            "both continuations ran, each producing the producer's two chunks: {crossed:?}"
+        );
+        let marks = marks.marks();
+        let mut positions: Vec<&str> = marks
+            .iter()
+            .filter(|(_, _, position)| position.ends_with("continuation"))
+            .map(|(operation, _, position)| {
+                assert_eq!(
+                    operation, "operation-stream",
+                    "a continuation's mark belongs to the call, not to the continuation"
+                );
+                position.as_str()
+            })
+            .collect();
+        positions.sort();
+        assert_eq!(
+            positions,
+            ["first-continuation", "second-continuation"],
+            "each continuation's mark arrived once: {marks:?}"
+        );
+        let _ = manifest_dir;
+    }
+
+    /// The supervisor's half of the mark path, running while a call does its work.
+    ///
+    /// A call's marks are delivered before the frame that ends it, so a test that
+    /// reads the frames without forwarding them is a test whose call never ends: the
+    /// collector stands in for the host's own forwarding loop.
+    struct CollectedMarks {
+        marks: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        forwarding: tokio::task::JoinHandle<()>,
+    }
+
+    impl CollectedMarks {
+        fn start(mut steps: tokio::sync::mpsc::Receiver<ForwardedStep>) -> Self {
+            let marks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recording = Arc::clone(&marks);
+            let forwarding = tokio::spawn(async move {
+                while let Some(step) = steps.recv().await {
+                    match step {
+                        ForwardedStep::Mark { mark, .. } => {
+                            let data: serde_json::Value = mark
+                                .data_json
+                                .as_deref()
+                                .and_then(|data| serde_json::from_str(data).ok())
+                                .unwrap_or(serde_json::Value::Null);
+                            recording.lock().unwrap().push((
+                                mark.operation_request_id.clone(),
+                                data["stream"].as_str().unwrap_or_default().to_owned(),
+                                data["position"].as_str().unwrap_or_default().to_owned(),
+                            ));
+                        }
+                        ForwardedStep::Flush { done } => {
+                            let _ = done.send(Ok(()));
+                        }
+                    }
+                }
+            });
+            Self { marks, forwarding }
+        }
+
+        /// What was forwarded so far.
+        ///
+        /// Complete once the call's frames have reached their end, because the end
+        /// waits for the marks ahead of it.
+        fn marks(&self) -> Vec<(String, String, String)> {
+            self.marks.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for CollectedMarks {
+        fn drop(&mut self) {
+            self.forwarding.abort();
+        }
+    }
+
+    /// Every frame a streaming invocation produced, up to the one that ends it.
+    async fn drain_frames(
+        frames: &mut <PluginHostService as v1::plugin_host_server::PluginHost>::InvokeStreamStream,
+    ) -> Vec<v1::stream_chunk::Chunk> {
+        use tokio_stream::StreamExt;
+
+        let mut crossed = Vec::new();
+        while let Some(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
+                .await
+                .expect("a frame or an end")
+        {
+            let frame = frame.expect("a frame");
+            let Some(chunk) = frame.chunk else { continue };
+            let terminal = matches!(
+                chunk,
+                v1::stream_chunk::Chunk::End(_) | v1::stream_chunk::Chunk::Failure(_)
+            );
+            crossed.push(chunk);
+            if terminal {
+                break;
+            }
+        }
+        crossed
+    }
+
     /// A mark belongs to the operation whose callback raised it, in whatever order
     /// the two streams reach their marks.
     ///
@@ -4397,6 +4627,57 @@ mod tests {
         };
         let outcome: LifecycleOutcome<()> = LifecycleOutcome::from_result(Err(failure));
         assert!(matches!(outcome, LifecycleOutcome::Failed(_)));
+    }
+
+    /// A window that has been closed refuses the marks of whatever still holds it.
+    ///
+    /// This is capability non-reuse rather than cleanup: a plugin task that outlives
+    /// its call still holds that call's window, and the operation identity the window
+    /// carries is one the kernel has already settled. Attributing a late mark
+    /// through it would attribute the mark to whatever holds that identity now, so
+    /// the window refuses instead — and nothing reaches the channel the kernel is
+    /// served from.
+    #[tokio::test]
+    async fn a_closed_window_refuses_a_late_mark() {
+        use nemo_relay::plugin::execution::{ForwardedMark, MarkForwarder};
+
+        let (sender, mut steps) = tokio::sync::mpsc::channel(4);
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = ForwardingSink {
+            sender,
+            session_id: "session-1".into(),
+            operation_request_id: "operation-1".into(),
+            closed: std::sync::Arc::clone(&closed),
+            host_calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let mark = ForwardedMark {
+            name: "example.mark".into(),
+            parent: None,
+            data_json: None,
+            metadata_json: None,
+            data_schema: None,
+            severity: None,
+            timestamp_unix_micros: None,
+        };
+
+        // While the call is running, the window takes marks.
+        sink.forward(&mark).expect("a mark of a running call");
+        assert!(
+            steps.try_recv().is_ok(),
+            "and it reaches the channel the kernel is served from"
+        );
+
+        // Once the call is over the same window refuses the same mark: the work
+        // that still holds it is work nobody is waiting for.
+        closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = sink
+            .forward(&mark)
+            .expect_err("a late mark is refused rather than attributed");
+        assert!(
+            refused.to_string().contains("has ended"),
+            "the refusal says the call the window belonged to is over: {refused}"
+        );
+        assert!(steps.try_recv().is_err(), "and nothing crossed for it");
     }
 
     /// A plugin's telemetry is bounded, and the bound is what refuses it.

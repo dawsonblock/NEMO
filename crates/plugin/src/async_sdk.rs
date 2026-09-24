@@ -228,16 +228,37 @@ impl MarkWindow {
             }))
         })
     }
-
-    /// Puts back whatever was installed before this window's work was polled.
-    fn restore(previous: Option<InstalledWindow>) {
-        let _ = CURRENT_MARK_WINDOW.try_with(|current| current.set(previous));
-    }
 }
 
 impl Drop for MarkWindow {
     fn drop(&mut self) {
         unsafe { (self.host.release_mark_window)(self.window) };
+    }
+}
+
+/// Puts the previous window back when the poll it was installed for ends.
+///
+/// A guard rather than a call after the poll, for the reason the scope binding's is
+/// one: a poll can unwind, and a window left installed on a worker thread is a
+/// window the *next* task scheduled there would raise its marks through — a mark
+/// attributed to an operation whose work this task is not running.
+struct MarkWindowRestore {
+    previous: Option<InstalledWindow>,
+}
+
+impl MarkWindowRestore {
+    /// Installs `window` for the poll this guard is held across.
+    fn install(window: Option<&Arc<MarkWindow>>) -> Self {
+        Self {
+            previous: window.and_then(|window| window.install()),
+        }
+    }
+}
+
+impl Drop for MarkWindowRestore {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = CURRENT_MARK_WINDOW.try_with(|current| current.set(previous));
     }
 }
 
@@ -899,9 +920,9 @@ where
             Err(error) => return Poll::Ready(Err(error)),
         };
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
-        let installed = this.window.as_ref().and_then(|window| window.install());
+        let _window = MarkWindowRestore::install(this.window.as_ref());
         let result = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx);
-        MarkWindow::restore(installed);
+        drop(_window);
         match restore.restore() {
             Ok(()) => result,
             Err(error) => Poll::Ready(Err(error)),
@@ -944,9 +965,9 @@ where
             Err(error) => return Poll::Ready(Some(Err(error))),
         };
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
-        let installed = this.window.as_ref().and_then(|window| window.install());
+        let _window = MarkWindowRestore::install(this.window.as_ref());
         let result = unsafe { Pin::new_unchecked(&mut this.stream) }.poll_next(cx);
-        MarkWindow::restore(installed);
+        drop(_window);
         match restore.restore() {
             Ok(()) => result,
             Err(error) => Poll::Ready(Some(Err(error))),
@@ -1786,4 +1807,82 @@ fn status_message(
 ) -> String {
     let _ = host;
     format!("{operation} failed: {status:?}")
+}
+
+#[cfg(test)]
+mod mark_window_tests {
+    use super::*;
+
+    unsafe extern "C" fn unused_emit(
+        _window: *const NemoRelayNativeMarkWindow,
+        _name: *const NemoRelayNativeString,
+        _parent: *const NemoRelayNativeScopeHandle,
+        _data_json: *const NemoRelayNativeString,
+        _metadata_json: *const NemoRelayNativeString,
+        _data_schema_json: *const NemoRelayNativeString,
+        _severity: *const NemoRelayNativeString,
+        _timestamp_unix_micros: *const i64,
+    ) -> NemoRelayStatus {
+        NemoRelayStatus::InvalidArg
+    }
+
+    fn installed(window: usize) -> InstalledWindow {
+        InstalledWindow {
+            window: window as *const NemoRelayNativeMarkWindow,
+            emit: unused_emit,
+        }
+    }
+
+    fn installed_window() -> Option<usize> {
+        installed_mark_window().map(|window| window.window as usize)
+    }
+
+    /// What one poll installs is taken back when it ends, innermost first.
+    ///
+    /// The SDK installs a window for one poll at a time, and one poll's work can run
+    /// inside another's. What that has to mean: a mark raised by the inner work
+    /// belongs to the inner window, and when it ends the outer one is *back* rather
+    /// than gone.
+    #[test]
+    fn an_inner_window_leaves_the_outer_one_installed() {
+        let outer = CURRENT_MARK_WINDOW.with(|current| current.replace(Some(installed(1))));
+        assert_eq!(installed_window(), Some(1));
+
+        let inner = CURRENT_MARK_WINDOW.with(|current| current.replace(Some(installed(2))));
+        assert_eq!(
+            installed_window(),
+            Some(2),
+            "the innermost window is the one a mark raised now belongs to"
+        );
+
+        CURRENT_MARK_WINDOW.with(|current| current.set(inner));
+        assert_eq!(installed_window(), Some(1), "the outer window is back");
+
+        CURRENT_MARK_WINDOW.with(|current| current.set(outer));
+        assert!(
+            installed_window().is_none(),
+            "and the outermost leaves nothing installed"
+        );
+    }
+
+    /// A poll that unwinds leaves no window behind.
+    ///
+    /// This is why the installation is a guard: a panic inside plugin code must not
+    /// leave a worker thread holding a window, because the next task scheduled there
+    /// would raise its marks through it — attributed to an operation whose work it
+    /// is not running.
+    #[test]
+    fn a_poll_that_unwinds_leaves_no_window_installed() {
+        let unwound = std::panic::catch_unwind(|| {
+            let _window = MarkWindowRestore::install(None);
+            let _installed =
+                CURRENT_MARK_WINDOW.with(|current| current.replace(Some(installed(3))));
+            panic!("plugin code panicked inside its own poll");
+        });
+        assert!(unwound.is_err(), "the panic reached the caller");
+        assert!(
+            installed_window().is_none(),
+            "and the window it had installed is not left on this thread"
+        );
+    }
 }
