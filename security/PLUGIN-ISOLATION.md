@@ -250,16 +250,24 @@ covered by its tests (sequences, terminals, unknown streams), and the driver's o
 tests cover the open/pull/end paths; the rest are the reason the class is not
 listed.
 
-What it does not include yet, and what the streaming increment still owes: the
-host's side of the channel (its client and the adapter that turns a plugin's pulls
-into messages), the proxy that parks a stream position, the upstream direction
-where the plugin's returned stream crosses back, and the qualification streaming
-needs — ordering, backpressure, half-close, cancellation while a pull is
-outstanding, host death mid-stream. One limitation is written down rather than
-implied: the driver reads and answers one message at a time, so a cancellation that
-arrives while the kernel is producing is answered after the pull it interrupted. The
-class stays unlisted until those land, so a plugin registering it is refused whole
-rather than half-served.
+Both ends of the channel now exist. `crates/plugin-host/src/session_channel.rs` is
+the host's: a callback asks the kernel for the downstream stream of one operation
+and gets a value it can poll, one task per stream does the pulling so a `poll_next`
+never has to await, and the consumer dropping the stream reaches the kernel as a
+cancellation rather than as a host that stopped asking without saying so.
+`a_dropped_stream_cancels_the_kernel_s_producer` proves that from the kernel's side —
+the producer is dropped — and `two_streams_on_one_channel_do_not_swap_answers`
+proves answers are routed by the call that asked rather than by stream.
+
+What it does not include yet, and what the streaming increment still owes: the proxy
+that parks a stream position and drives `InvokeStream`, the upstream direction where
+the plugin's *returned* stream crosses back, credit, and the rest of the acceptance
+gate above — deadlines, host death mid-stream, per-frame and cumulative budgets, and
+mark attribution during streaming. One limitation is written down rather than
+implied: the kernel's driver reads and answers one message at a time, so a
+cancellation that arrives while it is producing is answered after the pull it
+interrupted. The class stays unlisted until those land, so a plugin registering it is
+refused whole rather than half-served.
 
 **What keeps a host from outliving its kernel.** The supervisor kills the child when
 it drops, and that is not enough on its own: a reference to the composition can be

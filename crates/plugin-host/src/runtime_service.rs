@@ -119,6 +119,16 @@ impl KernelCallbacks {
         Ok(Self { client, credential })
     }
 
+    /// The client these calls travel on.
+    pub(crate) fn client(&self) -> &RelayRuntimeClient<Channel> {
+        &self.client
+    }
+
+    /// The credential every call has to carry.
+    pub(crate) fn credential(&self) -> &MetadataValue<Ascii> {
+        &self.credential
+    }
+
     /// Ask the kernel to run the rest of a chain this host is holding a position in.
     ///
     /// # Errors
