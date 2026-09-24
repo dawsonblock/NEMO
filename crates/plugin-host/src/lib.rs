@@ -425,6 +425,7 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 pub mod attached;
 /// The capability a session's transports have to present.
 pub mod capability;
+pub mod codec_capability;
 pub mod confidentiality;
 pub mod conformance;
 /// The continuations a kernel holds for the plugins that asked for them.

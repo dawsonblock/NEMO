@@ -212,6 +212,16 @@ pub(crate) fn merge_execution_intercept_callables<F: Clone>(
 /// callable does not know which name it was registered under. A caller that has
 /// to run *one* named registration — the dynamic-plugin boundary, whose
 /// registrations were made in another process — needs the entry.
+pub(crate) fn exact_guardrail_entry<T: Clone>(
+    entries: &[crate::api::registry::RegistryRecord<T>],
+    registration: &str,
+) -> Option<crate::api::registry::RegistryRecord<T>> {
+    entries
+        .iter()
+        .find(|entry| entry.name == registration)
+        .cloned()
+}
+
 pub(crate) fn merge_execution_intercept_entries<'a, F>(
     global: &'a SortedRegistry<ExecutionIntercept<F>>,
     scope_locals: &'a [&'a SortedRegistry<ExecutionIntercept<F>>],

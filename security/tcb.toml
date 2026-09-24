@@ -145,7 +145,12 @@ max_transitive_packages = 265
 # happened to be built in, and the environment names the owner check reads are visible
 # to the crate's tests so a suite cannot test a second spelling of them. No dependency
 # moved and no `unsafe` did.
-max_source_lines = 74410
+# Raised for the exact-registration doors of the LLM sanitize pair and the single-entry
+# runners under them: one entry per direction, sharing the name-selection rule with the
+# event doors rather than restating it, and reporting a sanitizer that did not answer so
+# a host running the registration for another process can account for the omission. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 74590
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -189,7 +194,10 @@ max_transitive_packages = 24
 # three classes, the refusal of a scope projection that states no category, and the
 # proof that an answer has nowhere to put either one. No dependency moved and no
 # `unsafe` did.
-max_source_lines = 2223
+# Raised for the codec reference: an opaque, bounded, shape-validated name for a
+# capability the runtime issued, with the direction it authorizes and the tests that pin
+# what is refused. No dependency moved and no `unsafe` did.
+max_source_lines = 2362
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -413,7 +421,11 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 19621
+# Raised for the codec capability record: references bound to an invocation, a
+# direction and a codec, with a guard whose drop is the revocation, and the refusal
+# matrix that keeps one call's capability from being another's. No dependency moved and
+# no `unsafe` did.
+max_source_lines = 20128
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

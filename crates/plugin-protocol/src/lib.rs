@@ -28,6 +28,7 @@ pub use nemo_relay_types::api::event::{
     DataSchema, EventCategory, EventSanitizeFields, LogSeverity,
 };
 pub use nemo_relay_types::api::scope::ScopeType;
+pub use nemo_relay_types::codec::identity::{BuiltinLlmCodec, LlmCodecIdentity};
 pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
 pub use uuid::Uuid;
 
@@ -794,6 +795,102 @@ impl PluginEventSanitizeCall {
                 category_profile,
             )),
         })
+    }
+}
+
+/// Which direction of codec work a capability authorizes.
+///
+/// The two directions are different traits on this side — a request codec decodes and
+/// encodes, a response codec decodes only — so a capability for one is not a weaker
+/// capability for the other. Naming the direction in the capability is what makes that
+/// checkable rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodecDirection {
+    /// The codec that reads the request an LLM call is about to make.
+    Request,
+    /// The codec that reads the response an LLM call returned.
+    Response,
+}
+
+/// The prefix every capability reference carries.
+pub const CODEC_REFERENCE_PREFIX: &str = "codec-";
+
+/// The most bytes a capability reference may carry.
+///
+/// A bound rather than a promise about the peer: a reference travels into the
+/// runtime's own state, so its length is this side's decision even though its
+/// authority is never derived from its shape.
+pub const MAX_CODEC_REFERENCE_BYTES: usize = 96;
+
+/// An opaque reference to one invocation's codec capability.
+///
+/// The reference is not the capability. It names something the kernel issued for one
+/// operation and one direction; the authority is the kernel's record of having issued
+/// it, and a reference this side never issued is a string with no meaning. So the shape
+/// is validated for boundedness and nothing else — a peer that guesses a well-formed
+/// reference has guessed a name, not a permission — and every use is checked against
+/// the record that produced it.
+///
+/// The codec itself never crosses. What a plugin gets is the reference, and what the
+/// runtime does with it — decoding or encoding with the codec object it already holds —
+/// happens on the side that holds the object. That is why a capability can be
+/// invocation-scoped at all: nothing about it outlives the operation it was issued for
+/// except the string, and the string is worthless on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CodecRef(String);
+
+impl CodecRef {
+    /// Issue a fresh reference.
+    ///
+    /// Unguessable because it is a time-ordered UUID rather than a counter: a peer that
+    /// sees one reference learns nothing about the next, which matters because a
+    /// reference travels to a process this side does not control.
+    pub fn issue() -> Self {
+        Self(format!(
+            "{CODEC_REFERENCE_PREFIX}{}",
+            Uuid::now_v7().simple()
+        ))
+    }
+
+    /// Accept a reference from the wire.
+    ///
+    /// # Errors
+    /// Refuses a value that is empty, longer than [`MAX_CODEC_REFERENCE_BYTES`], missing
+    /// the prefix, or carrying anything but ASCII alphanumerics after it. The refusal is
+    /// about shape: a well-formed reference this side never issued is refused later, by
+    /// the record.
+    pub fn from_opaque(value: impl Into<String>) -> std::result::Result<Self, PluginProtocolError> {
+        let value = value.into();
+        let Some(suffix) = value.strip_prefix(CODEC_REFERENCE_PREFIX) else {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "a codec reference must carry the reference prefix",
+            ));
+        };
+        if value.len() > MAX_CODEC_REFERENCE_BYTES {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!("a codec reference may carry at most {MAX_CODEC_REFERENCE_BYTES} bytes"),
+            ));
+        }
+        if suffix.is_empty()
+            || !suffix
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "a codec reference names nothing this side can look up",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// The reference as it travels.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -2219,5 +2316,47 @@ mod tests {
             rebuilt.data_schema().is_none(),
             "and cannot invent one either"
         );
+    }
+
+    /// A reference is issued, travels as a string, and comes back as itself.
+    #[test]
+    fn a_codec_reference_round_trips_through_the_wire() {
+        let issued = CodecRef::issue();
+        let carried = serde_json::to_string(&issued).expect("a serializable reference");
+        assert_eq!(
+            carried,
+            format!("\"{}\"", issued.as_str()),
+            "the reference is its own string on the wire"
+        );
+        let decoded: CodecRef = serde_json::from_str(&carried).expect("a decodable reference");
+        assert_eq!(decoded, issued);
+        assert_eq!(
+            CodecRef::from_opaque(issued.as_str().to_string()).expect("a shaped reference"),
+            issued
+        );
+
+        // Two issues are two references: a peer that has seen one learns nothing about
+        // the next.
+        assert_ne!(CodecRef::issue().as_str(), CodecRef::issue().as_str());
+    }
+
+    /// Shape is validated and bounded; authority is not in the shape.
+    #[test]
+    fn a_codec_reference_that_is_not_shaped_like_one_is_refused() {
+        for refused in [
+            String::new(),
+            "codec-".to_string(),
+            "capability-1".to_string(),
+            "codec-../escape".to_string(),
+            format!("codec-{}", "a".repeat(MAX_CODEC_REFERENCE_BYTES)),
+        ] {
+            assert!(
+                CodecRef::from_opaque(refused.clone()).is_err(),
+                "{refused} is not a reference this side will carry"
+            );
+        }
+        // A well-formed reference is accepted even though nothing issued it: the shape
+        // says what it is, and the record says whether it means anything.
+        assert!(CodecRef::from_opaque("codec-0123456789abcdef").is_ok());
     }
 }

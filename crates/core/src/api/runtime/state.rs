@@ -52,8 +52,9 @@ use crate::api::tool::{
 use crate::codec::request::AnnotatedLlmRequest;
 use crate::codec::response::AnnotatedLlmResponse;
 use crate::context::registries::{
-    merge_event_metadata_injector_entries, merge_execution_intercept_callables,
-    merge_execution_intercept_entries, merge_guardrail_entries, merge_intercept_entries,
+    exact_guardrail_entry, merge_event_metadata_injector_entries,
+    merge_execution_intercept_callables, merge_execution_intercept_entries,
+    merge_guardrail_entries, merge_intercept_entries,
 };
 use crate::error::FlowError;
 use crate::json::{Json, merge_json};
@@ -905,10 +906,7 @@ impl NemoRelayContextState {
         entries: &[Guardrail<EventSanitizeFn>],
         registration: &str,
     ) -> Option<Guardrail<EventSanitizeFn>> {
-        entries
-            .iter()
-            .find(|entry| entry.name == registration)
-            .cloned()
+        exact_guardrail_entry(entries, registration)
     }
 
     /// Snapshot Event metadata injector entries in deterministic priority order.
@@ -1574,36 +1572,54 @@ impl NemoRelayContextState {
         let mut value = Some(request);
         for entry in entries {
             if let Some(current) = value.take() {
-                let callback = Arc::clone(&entry.payload);
-                let callback_value = current.clone();
-                let callback_context = context.clone();
-                match AssertUnwindSafe(
-                    async move { callback(callback_value, callback_context).await },
-                )
-                .catch_unwind()
-                .await
-                {
-                    Ok(Ok(next)) => value = next,
-                    Ok(Err(_error)) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_request_sanitizer_failed",
-                            sanitizer = entry.name.as_str();
-                            "LLM request sanitizer failed; omitting the observability payload"
-                        );
-                    }
-                    Err(_) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_request_sanitizer_panicked",
-                            sanitizer = entry.name.as_str();
-                            "LLM request sanitizer panicked; omitting the observability payload"
-                        );
-                    }
-                }
+                let (next, _failure) =
+                    Self::llm_sanitize_request_one(current, context.clone(), entry).await;
+                value = next;
             }
         }
         value
+    }
+
+    /// Sanitize one LLM request with one registration, reporting when it did not answer.
+    ///
+    /// The family's rule is omission, and it is unchanged: a payload nobody could
+    /// sanitize is not published, and the entries after a failure have nothing left to
+    /// decide about because there is no payload to hand them. The reason travels beside
+    /// the answer for the caller that has to account for the failure — a host running the
+    /// registration for another process, whose log line is not this one.
+    pub(crate) async fn llm_sanitize_request_one(
+        request: LlmRequest,
+        context: LlmSanitizeRequestContext,
+        entry: &Guardrail<LlmSanitizeRequestFn>,
+    ) -> (Option<LlmRequest>, Option<String>) {
+        let callback = Arc::clone(&entry.payload);
+        match AssertUnwindSafe(async move { callback(request, context).await })
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(next)) => (next, None),
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_request_sanitizer_failed",
+                    sanitizer = entry.name.as_str();
+                    "LLM request sanitizer failed; omitting the observability payload: {error}"
+                );
+                (None, Some(error.to_string()))
+            }
+            Err(_) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_request_sanitizer_panicked",
+                    sanitizer = entry.name.as_str();
+                    "LLM request sanitizer panicked; omitting the observability payload"
+                );
+                (
+                    None,
+                    Some("the LLM request sanitizer panicked rather than answering".to_string()),
+                )
+            }
+        }
     }
 
     /// Snapshot LLM response sanitizers in priority order.
@@ -1646,36 +1662,52 @@ impl NemoRelayContextState {
         let mut value = Some(response);
         for entry in entries {
             if let Some(current) = value.take() {
-                let callback = Arc::clone(&entry.payload);
-                let callback_value = current.clone();
-                let callback_context = context.clone();
-                match AssertUnwindSafe(
-                    async move { callback(callback_value, callback_context).await },
-                )
-                .catch_unwind()
-                .await
-                {
-                    Ok(Ok(next)) => value = next,
-                    Ok(Err(_error)) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_response_sanitizer_failed",
-                            sanitizer = entry.name.as_str();
-                            "LLM response sanitizer failed; omitting the observability payload"
-                        );
-                    }
-                    Err(_) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_response_sanitizer_panicked",
-                            sanitizer = entry.name.as_str();
-                            "LLM response sanitizer panicked; omitting the observability payload"
-                        );
-                    }
-                }
+                let (next, _failure) =
+                    Self::llm_sanitize_response_one(current, context.clone(), entry).await;
+                value = next;
             }
         }
         value
+    }
+
+    /// Sanitize one LLM response with one registration, reporting when it did not answer.
+    ///
+    /// The response direction of [`Self::llm_sanitize_request_one`], with the same rule:
+    /// an answer nobody could sanitize is omitted rather than published, and the reason
+    /// is reported to whoever has to account for it.
+    pub(crate) async fn llm_sanitize_response_one(
+        response: Json,
+        context: LlmSanitizeResponseContext,
+        entry: &Guardrail<LlmSanitizeResponseFn>,
+    ) -> (Option<Json>, Option<String>) {
+        let callback = Arc::clone(&entry.payload);
+        match AssertUnwindSafe(async move { callback(response, context).await })
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(next)) => (next, None),
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_response_sanitizer_failed",
+                    sanitizer = entry.name.as_str();
+                    "LLM response sanitizer failed; omitting the observability payload: {error}"
+                );
+                (None, Some(error.to_string()))
+            }
+            Err(_) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_response_sanitizer_panicked",
+                    sanitizer = entry.name.as_str();
+                    "LLM response sanitizer panicked; omitting the observability payload"
+                );
+                (
+                    None,
+                    Some("the LLM response sanitizer panicked rather than answering".to_string()),
+                )
+            }
+        }
     }
 
     /// Snapshot LLM conditional-execution guardrails in priority order.

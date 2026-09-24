@@ -2386,6 +2386,144 @@ pub async fn llm_conditional_execution(request: &LlmRequest) -> Result<()> {
     Ok(())
 }
 
+/// What one exact LLM request sanitize registration did.
+///
+/// The request is the one to publish — the sanitizer's answer, or nothing when it did
+/// not answer — and `failure` is the sanitizer's own words in that second case. The
+/// family's rule is omission, so "no request" is an answer rather than a lost one; what
+/// the failure adds is the ability to say why, which the caller needs when it is running
+/// the registration on another process's behalf.
+#[derive(Debug, Clone)]
+pub struct LlmRequestSanitizeOutcome {
+    /// The request as it should be published, or nothing when it was omitted.
+    pub request: Option<LlmRequest>,
+    /// Why the sanitizer did not answer, when it did not.
+    pub failure: Option<String>,
+}
+
+impl From<(Option<LlmRequest>, Option<String>)> for LlmRequestSanitizeOutcome {
+    fn from((request, failure): (Option<LlmRequest>, Option<String>)) -> Self {
+        Self { request, failure }
+    }
+}
+
+/// What one exact LLM response sanitize registration did.
+///
+/// The response direction of [`LlmRequestSanitizeOutcome`], with the same rule.
+#[derive(Debug, Clone)]
+pub struct LlmResponseSanitizeOutcome {
+    /// The response as it should be published, or nothing when it was omitted.
+    pub response: Option<Json>,
+    /// Why the sanitizer did not answer, when it did not.
+    pub failure: Option<String>,
+}
+
+impl From<(Option<Json>, Option<String>)> for LlmResponseSanitizeOutcome {
+    fn from((response, failure): (Option<Json>, Option<String>)) -> Self {
+        Self { response, failure }
+    }
+}
+
+/// Run exactly one LLM request sanitize guardrail, named by its registration.
+///
+/// The same door the event sanitizers have, for the same reason: a host running a
+/// plugin's registration has to run *that* registration when the kernel asks, not the
+/// family. The registration is chosen here, by an identity the kernel owns — a plugin
+/// registers under names, the chain holds one proxy per registration, and this runs
+/// exactly the one the proxy names.
+///
+/// The context is the caller's because the codec it may carry belongs to the call:
+/// a host cannot construct one for itself, which is what the codec capability protocol
+/// is for.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when this process holds no registration of this class
+/// under that name.
+pub async fn invoke_llm_sanitize_request_registration(
+    registration: &str,
+    request: LlmRequest,
+    context: LlmSanitizeRequestContext,
+) -> crate::error::Result<LlmRequestSanitizeOutcome> {
+    ensure_runtime_owner()?;
+    let (entries, _full_payloads) = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_sanitize_request_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .registry_snapshot(&[RuntimeRegistrationKind::LlmSanitizeRequestGuardrail]);
+        (
+            state.llm_sanitize_request_entries(&scope_local_refs),
+            state.observability_full_payloads_enabled,
+        )
+    };
+    let entry = crate::context::registries::exact_guardrail_entry(&entries, registration)
+        .ok_or_else(|| {
+            FlowError::NotFound(format!(
+                "no LLM request sanitize guardrail is registered as '{registration}'"
+            ))
+        })?;
+    Ok(
+        NemoRelayContextState::llm_sanitize_request_one(request, context, &entry)
+            .await
+            .into(),
+    )
+}
+
+/// Run exactly one LLM response sanitize guardrail, named by its registration.
+///
+/// The response direction of [`invoke_llm_sanitize_request_registration`], with the same
+/// rule and the same reason.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when this process holds no registration of this class
+/// under that name.
+pub async fn invoke_llm_sanitize_response_registration(
+    registration: &str,
+    response: Json,
+    context: LlmSanitizeResponseContext,
+) -> crate::error::Result<LlmResponseSanitizeOutcome> {
+    ensure_runtime_owner()?;
+    let entries = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_sanitize_response_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .registry_snapshot(&[RuntimeRegistrationKind::LlmSanitizeResponseGuardrail]);
+        state.llm_sanitize_response_entries(&scope_local_refs)
+    };
+    let entry = crate::context::registries::exact_guardrail_entry(&entries, registration)
+        .ok_or_else(|| {
+            FlowError::NotFound(format!(
+                "no LLM response sanitize guardrail is registered as '{registration}'"
+            ))
+        })?;
+    Ok(
+        NemoRelayContextState::llm_sanitize_response_one(response, context, &entry)
+            .await
+            .into(),
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/llm_api_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/llm_sanitize_api_tests.rs"]
+mod llm_sanitize_api_tests;

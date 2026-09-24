@@ -1700,6 +1700,72 @@ what a sanitizer decides *with* is not something it can change.
 The contract is frozen again at that shape. A further field is added when another
 concrete sanitizer dependency demonstrates the need, not in anticipation of one.
 
+### The codec capability protocol, frozen and qualified
+
+The last two classes are the LLM sanitize pair, and the reason they are last is a
+decision rather than more of the same: an LLM sanitizer is given the call's *codec* beside
+the payload, and a codec is a live object this side holds. It cannot cross, and a plugin
+that could name any codec it liked would be choosing how the runtime reads a payload
+rather than being told. So the pair needs a capability protocol before it needs an
+implementation, which is the order this landed in.
+
+What a plugin gets is a **reference**, not a codec: `codec-<uuid v7>`, issued for one
+invocation and one direction. Three properties make that a capability rather than a name:
+
+- **Invocation binding.** A reference issued for operation A is not usable by operation
+  B, even when both calls use the same codec. Sequential reuse is refused, and so is
+  reuse between two calls that are both in flight.
+- **Direction binding.** A request codec and a response codec are different traits, so a
+  reference for one direction is not a weaker reference for the other.
+- **Identity binding.** The capability records which codec it was issued for; a plugin
+  asking to resolve a different *kind* of codec, or another codec of the same kind, is
+  refused for what it is rather than handed the one that was issued.
+
+**Lifetime is a guard, not a convention.** Issuing returns the reference beside a guard;
+when the invocation ends the guard drops and the record is gone. A reference used
+afterwards is not "expired" in any interesting sense — it is *unknown*, because nothing
+remembers it, and keeping every reference this process ever forgot would be a leak in
+exchange for a better sentence. That is why the refusal for a finished capability and the
+refusal for one that was never issued are the same refusal, which the tests state rather
+than leave to be discovered.
+
+This is deliberately the worker subsystem's shape rather than a new one. The worker
+boundary solved the same problem the same way (`WorkerCodecCapability` beside
+`WorkerCodecCapabilityGuard`, `codec-<uuid>` references, an invocation check and a
+direction check), and the native path adopts its invariants. What differs is which side
+holds the object.
+
+**What is qualified now, and what is not.** The reference's wire shape and its validation
+(bounded, prefixed, alphanumeric tail — a peer that guesses a well-formed reference has
+guessed a name, not a permission) and the capability record itself with the full refusal
+matrix are in, with tests: accept, unknown, finished, wrong operation, wrong direction,
+wrong kind, wrong identity, sequential reuse across calls, concurrent reuse between two
+live calls, and a guard that takes back only its own capability. The pair of exact
+registration doors the host will run — request and response — is in too, with the same
+rule as the event doors (exactly the named registration, the family never) and the same
+reporting (an omitted payload is an answer; the reason travels beside it), plus the
+property the codec work rests on: the door hands the sanitizer *the caller's* context
+rather than manufacturing one.
+
+What is deliberately not done yet is the transport that turns the protocol into service,
+and the order is fixed:
+
+1. the kernel serves the `ResolveCodec` RPC it already refuses as unimplemented, resolving
+   a reference against the capability record and executing decode/encode with the codec
+   object it holds;
+2. the host process answers a plugin's codec calls by asking the kernel over that RPC, so
+   the SDK's invocation-scoped codec handle works where the plugin runs;
+3. the kernel-side proxy per LLM sanitize class issues the capability for the sanitize
+   invocation, sends the reference with the payload and holds the guard for exactly the
+   call;
+4. the host arms rebuild the context, run the door, and answer.
+
+Only then can either class be advertised, because a class whose sanitizers cannot resolve
+the codec the call is using would have to either refuse calls that have one — most of them
+— or let a sanitizer think it had resolved something it had not. Until all four land,
+**the pair stays unserved and the count stays 14 of 16**: implementation existing is not
+qualification, and neither is half a protocol.
+
 **Class coverage: 14 of 16.** The three that crossed together are the mark, scope-start
 and scope-end sanitizers: one shape, one projection, and one installer parameterised
 by class. What each needed was a kernel proxy, a host-side runner and a core door that
