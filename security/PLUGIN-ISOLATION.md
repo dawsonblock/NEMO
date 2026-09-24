@@ -1468,6 +1468,34 @@ replaces the other: a boundary that served sixteen classes nobody registers woul
 be complete and useless, and a fixture that happens to register only servable
 classes says nothing about the classes that do not cross.
 
+**The five classes left, and the one question among them.** Four touch points per
+class, in this order: a core entry point that runs exactly one registration of the
+class (the shape of `invoke_tool_sanitize_request_registration`), a kernel proxy per
+class (the shape of `install_tool_sanitize`, which hands the host the copy an event
+would carry and treats a refusal as a payload not to publish), the host's invocation
+path for that class, and then the served set, the architecture expectation and the
+coverage tables.
+
+The three event sanitizers — mark, scope start, scope end — are the tool pair's
+shape and should go first: an event and the fields an observer would see, sanitized
+and returned, with no second lifetime and no codec.
+
+The LLM sanitize pair is not that shape, and the difference is a decision rather
+than a port. An LLM sanitize chain is given an `LlmSanitizeRequestContext` beside the
+request — a per-call codec identity with a resolved codec capability behind it —
+and in the host that capability exists only as a *completion*-scoped ABI object. A
+unary sanitize invocation across the boundary has no completion to hang it on, so
+before this pair is implemented one of these has to be chosen, written down, and
+held to:
+
+- the kernel resolves the codec and sends the identity, and the host refuses the
+  invocation when it cannot resolve that identity itself; or
+- a sanitizer for a call that has a codec is refused whole across the boundary
+  until a per-invocation codec capability exists.
+
+Either is defensible. Which one is a design choice rather than an implementation
+detail, which is why it is written here rather than discovered in a diff.
+
 **Class coverage: 11 of 16.** The five that do not cross are the mark and scope
 sanitizers and the two LLM sanitizers. The LLM stream execution intercept crossed
 when its qualification did: the duplex session, the actor-per-stream kernel side,
