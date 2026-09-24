@@ -1778,3 +1778,122 @@ async fn a_host_exits_when_its_kernel_goes_away() {
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// The sixteen-surface fixture can be inspected over the boundary, in full.
+///
+/// Inspection exists so an operator can ask what a *serving* session would
+/// refuse, which is the question a plugin author has when a load is refused
+/// whole. That answer has to survive the conversion: a description that repeated
+/// an attachment point would be refused on the way back, and the operator would
+/// learn nothing about the plugin that needed the answer most.
+///
+/// This is also the case that caught a real defect. The fixture's register
+/// callbacks run twice in this flow — once for the serving activation that is
+/// refused, once for the inspection that follows — and the loader used to record
+/// a *log* of every registration an instance ever made rather than the
+/// registrations it currently has, so the second run described each of them
+/// twice. The conversion refused the duplicate, which is what made the
+/// description unreadable exactly when it was needed.
+#[tokio::test]
+async fn the_full_fixture_is_inspectable_over_the_boundary() {
+    use nemo_relay_plugin_protocol::PluginRegistrationOperation as Operation;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_native",
+        "nemo-ph-inspection",
+        support::native_fixture(),
+        "nemo_relay_fixture_native_plugin",
+    );
+    let artifact = fixture.artifact();
+    let (manifest_sha256, library_sha256) =
+        nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+            .expect("the fixture's identity");
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    backend
+        .load(
+            nemo_relay_plugin_protocol::PluginLoadRequest {
+                plugin_id: "fixture_native".into(),
+                artifact,
+                identity: nemo_relay_plugin_protocol::PluginArtifactIdentity {
+                    manifest_sha256,
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect("the fixture should load in the child");
+
+    let components = [nemo_relay_plugin_protocol::PluginComponentConfiguration {
+        kind: "fixture_native".into(),
+        config_json: "{}".into(),
+    }];
+    // Serving first, and refused: the point of the inspection that follows.
+    let serving = backend
+        .activate(
+            nemo_relay_plugin_protocol::PluginActivateRequest {
+                discovery: false,
+                components: components.to_vec(),
+            },
+            context(),
+        )
+        .await;
+    assert!(
+        serving.is_err(),
+        "a serving activation of a plugin with unserved classes is refused whole"
+    );
+
+    let descriptors = backend
+        .activate(
+            nemo_relay_plugin_protocol::PluginActivateRequest {
+                discovery: true,
+                components: components.to_vec(),
+            },
+            context(),
+        )
+        .await
+        .expect("a discovery activation reports rather than refuses");
+
+    let operations: Vec<Operation> = descriptors
+        .iter()
+        .flat_map(|descriptor| descriptor.registrations.iter())
+        .map(|registration| registration.operation)
+        .collect();
+    // Every class the ABI exposes, in one report, each once — which is what the
+    // conversion above already enforced by accepting it.
+    for expected in [
+        Operation::Subscriber,
+        Operation::EventMetadataInjector,
+        Operation::MarkSanitizeGuardrail,
+        Operation::ScopeSanitizeStartGuardrail,
+        Operation::ScopeSanitizeEndGuardrail,
+        Operation::ToolSanitizeRequestGuardrail,
+        Operation::ToolSanitizeResponseGuardrail,
+        Operation::ToolConditionalExecutionGuardrail,
+        Operation::ToolRequestIntercept,
+        Operation::ToolExecutionIntercept,
+        Operation::LlmSanitizeRequestGuardrail,
+        Operation::LlmSanitizeResponseGuardrail,
+        Operation::LlmConditionalExecutionGuardrail,
+        Operation::LlmRequestIntercept,
+        Operation::LlmExecutionIntercept,
+        Operation::LlmStreamExecutionIntercept,
+    ] {
+        assert!(
+            operations.contains(&expected),
+            "the report names {} among {} registrations: {operations:?}",
+            expected.as_str(),
+            operations.len()
+        );
+    }
+    assert_eq!(
+        operations.len(),
+        17,
+        "the fixture registers seventeen attachment points across the sixteen classes: \
+         {operations:?}"
+    );
+
+    drop(backend);
+}

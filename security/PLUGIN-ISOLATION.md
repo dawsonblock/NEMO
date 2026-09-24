@@ -236,6 +236,20 @@ rather than being answered, because the two sides no longer agree about what the
 channel is. `a_wrapped_stream_is_pulled_over_the_session_channel` drives it over a
 real channel, credential check included.
 
+The acceptance gate for listing the class, stated before the work rather than after
+it: multi-chunk, one-chunk and zero-chunk completion; a plugin that answers without
+pulling; repeated `next`; monotonic sequences and refusal of a duplicate, a gap, a
+post-terminal chunk and a second terminal; credit exhaustion and production without
+credit; a stalled consumer against a producer that would otherwise run ahead;
+cancellation before the open, while open, and after the half-close; a deadline
+before the first chunk and between chunks; a host crash mid-stream; a wrong
+operation or call identity; concurrent streams; cleanup after every terminal and
+error path; mark attribution during streaming; and a cumulative as well as a
+per-frame byte budget. Several of those are already refused by `session.rs` and
+covered by its tests (sequences, terminals, unknown streams), and the driver's own
+tests cover the open/pull/end paths; the rest are the reason the class is not
+listed.
+
 What it does not include yet, and what the streaming increment still owes: the
 host's side of the channel (its client and the adapter that turns a plugin's pulls
 into messages), the proxy that parks a stream position, the upstream direction
@@ -1261,12 +1275,23 @@ see them, and the ordering the runtime gives them. The witness in the process te
 is a file the child writes, because a subscriber in another process has no other
 way to show the caller what it saw.
 
-## Coverage, which is the metric now
+## Coverage: two metrics, which answer different questions
 
-The useful question stopped being "how many registration classes are supported" and
-became "which real plugin is closest to being fully servable by
-`ProcessLoadedPlugins`". This is that calculation for the two fixtures the
-repository ships, because they are the plugins it actually has.
+Class coverage measures *architectural completeness* — how much of the ABI the
+boundary can carry at all. Plugin compatibility measures *migration impact* — how
+close the plugins the repository actually has are to being servable. Neither
+replaces the other: a boundary that served sixteen classes nobody registers would
+be complete and useless, and a fixture that happens to register only servable
+classes says nothing about the classes that do not cross.
+
+**Class coverage: 10 of 16.** The six that do not cross are the mark and scope
+sanitizers, the two LLM sanitizers, and the LLM stream execution intercept. Pinned
+by `the_boundary_serves_a_named_subset_of_the_registration_surface`, which fails on
+any change to either half.
+
+**Plugin compatibility: measured per plugin the repository ships.** Two of them
+are fixtures the tests drive, and one is the plugin a reader is pointed at first,
+so all three are real registration sets rather than hypotheticals.
 
 `fixture_intercept` — the one the process tests drive end to end:
 
@@ -1280,7 +1305,7 @@ repository ships, because they are the plugins it actually has.
 
 | | |
 |---|---|
-| registered classes | 16 — one of every class the ABI exposes |
+| registrations | 17 attachment points across all 16 classes (two subscribers, one from each plugin in the fixture's library) |
 | remotely supported | 10 (everything except the six named next) |
 | remaining blockers | 6 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response, LLM stream execution intercept |
 
@@ -1380,16 +1405,28 @@ does not support), so the flag changes what is *reported* and nothing else. The 
 proves both halves against the same plugin in the same host: serving refuses,
 inspecting reports, and the report contains an operation this kernel cannot serve.
 
-Running it turned up a defect in the repository's own fixture: `fixture_native`
-registers one injector name twice, and the *conversion* refuses a duplicate
-registration at the same attachment point
-(`a registration named …fixture_event_metadata_injector twice at the same attachment
-point`). That has a consequence worth stating: the sixteen-surface fixture cannot be
-activated *over the boundary* at all today, so it was never a valid coverage
-measurement — the 10/16 above comes from reading its source. Fixing the fixture, or
-deciding what a duplicate registration *means* (two injectors under one name is
-either a plugin bug or a contract the conversion is too strict about), is a
-prerequisite for measuring it properly.
+Running it turned up a defect, and the first reading of it was wrong. The
+conversion refused the report with "a registration named
+…fixture_event_metadata_injector twice at the same attachment point", which looked
+like a fixture that registered a name twice. It is not: the fixture registers each
+of its seventeen attachment points once, and the runtime's own registry refuses a
+name it already holds, so a genuine duplicate could not have been installed at all.
+
+What had happened is that `NativePluginInstance` recorded a *log* of every
+registration an instance ever made rather than the registrations it currently has.
+The flow that exposed it runs the plugin's register callbacks twice — a serving
+activation that is refused whole, then the inspection that asks what it registered
+— so the descriptor described seventeen attachment points as thirty-four, and the
+conversion refused the duplicate. The description was unreadable exactly when an
+operator needed it: the plugin whose load had just been refused was the one they
+were asking about.
+
+The loader now records the current registrations, keyed by attachment point, and
+`the_full_fixture_is_inspectable_over_the_boundary` drives the flow over a real
+child and asserts the report names all sixteen classes, seventeen attachment
+points, each once. That is the authoritative discovery the coverage below rests
+on: it is measured over the boundary now rather than by reading the fixture's
+source.
 
 **What NEMO already produces.** Activation is the authoritative source, and the
 boundary already surfaces it: `ProcessPluginBackend::activate` returns one

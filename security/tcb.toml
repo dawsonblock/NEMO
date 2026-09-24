@@ -124,8 +124,11 @@ max_transitive_packages = 265
 # `invoke_llm_execution_intercept_registration`, and the name-retaining registry
 # merge behind them, which are what let a hosted plugin's callback resume a chain
 # position that lives in this process. No `unsafe` moved with it, and no
-# dependency did either: the kernel gained API surface, not reach.
-max_source_lines = 73884
+# dependency did either: the kernel gained API surface, not reach. The last of it
+# is the loader recording the registrations an instance *has* rather than a log of
+# every one it ever made: a second activation against one instance used to double
+# its own description, which the conversion then refused.
+max_source_lines = 73905
 max_unsafe_occurrences = 299
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
@@ -263,7 +266,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 12316
+max_source_lines = 12334
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

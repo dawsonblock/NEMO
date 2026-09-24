@@ -2618,31 +2618,42 @@ mod tests {
         );
 
         // Inspecting: the same plugin, reported in full, so the classes this
-        // kernel cannot serve are visible as what they are. Read from the wire
-        // rather than through the conversion, because this fixture registers one
-        // injector name twice and the conversion refuses a duplicate registration
-        // — a real finding of its own, and one that means the sixteen-surface
-        // fixture cannot be activated *over the boundary* until it is fixed. The
-        // report is what this test is about, and it is visible before conversion.
+        // kernel cannot serve are visible as what they are. This is the second
+        // activation against one loaded instance — the serving attempt above was
+        // the first — so it also proves the description is the registrations the
+        // plugin *has* rather than a log of everything it ever made: a log would
+        // report each of these twice here, and the conversion refuses a
+        // duplicate at one attachment point.
         let discovery = activate(true)
             .await
             .expect("a served activation")
             .into_inner();
-        let Some(v1::activate_outcome::Result::Activated(response)) = discovery.result else {
-            panic!("a discovery session reports rather than refuses: {discovery:?}");
-        };
-        let serveable: Vec<i32> = crate::ProcessPluginBackend::supported_registration_operations()
-            .iter()
-            .map(|operation| {
-                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
-            })
-            .collect();
-        let reported: Vec<i32> = response
-            .descriptors
+        let descriptors = nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&discovery)
+            .expect("a converted activation")
+            .into_result()
+            .expect("a discovery session reports rather than refuses");
+        let serveable = crate::ProcessPluginBackend::supported_registration_operations();
+        let reported: Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation> = descriptors
             .iter()
             .flat_map(|descriptor| descriptor.registrations.iter())
             .map(|registration| registration.operation)
             .collect();
+        // Every registration the plugin holds, described once each. Two
+        // registrations may share a class — this fixture has two subscribers —
+        // so what must not repeat is the attachment point, which is the name.
+        let ids: Vec<&str> = descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .map(|registration| registration.registration_id.as_str())
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "an instance that has registered twice describes each attachment point once: {ids:?}"
+        );
         assert!(
             !reported.is_empty(),
             "the report is the plugin's actual registrations"
@@ -2653,6 +2664,13 @@ mod tests {
                 .any(|operation| !serveable.contains(operation)),
             "including the ones this kernel cannot serve, which is the point: \
              otherwise a plugin could never be measured as blocked — reported {reported:?}"
+        );
+        // And the report is the plugin's own set: seventeen attachment points
+        // across the sixteen classes the ABI exposes.
+        assert_eq!(
+            reported.len(),
+            17,
+            "the sixteen-surface fixture registers seventeen attachment points: {reported:?}"
         );
     }
 

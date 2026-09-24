@@ -415,21 +415,42 @@ struct NativePluginInstance {
     ///
     /// Written where the attachment point is known — inside each host
     /// registration function — and read when the activation describes itself.
-    /// The lock is only ever held to push or clone a `Vec`, so recovering from
-    /// a poisoned lock loses nothing: there is no half-updated invariant to
-    /// preserve, and refusing to record would silently produce an incomplete
+    /// The lock is only ever held to record or clone a `Vec`, so recovering
+    /// from a poisoned lock loses nothing: there is no half-updated invariant
+    /// to preserve, and refusing to record would silently produce an incomplete
     /// description of what is loaded.
+    ///
+    /// A plugin's register callbacks can run more than once against one loaded
+    /// instance: a session that activates, tears down and activates again runs
+    /// them each time, and so does the discovery path that has to know what a
+    /// serving activation would refuse. What this holds is therefore the
+    /// registrations the instance *currently* has, keyed by attachment point,
+    /// rather than a log of everything it ever made — a log would report a
+    /// plugin that registered seventeen callbacks as one that registered
+    /// thirty-four, and a description that doubles itself is a description no
+    /// reader can trust.
     registrations: Mutex<Vec<NativePluginRegistration>>,
     _library: Library,
 }
 
 impl NativePluginInstance {
     /// Record one registration the plugin made.
+    ///
+    /// A second registration at the same attachment point replaces the first:
+    /// within one activation the runtime's own registry refuses a name it
+    /// already holds, so reaching here twice means the instance was asked to
+    /// register again — after a teardown, or for an inspection — and what the
+    /// instance has now is what the second call installed.
     fn record_registration(&self, registration: NativePluginRegistration) {
-        self.registrations
+        let mut registrations = self
+            .registrations
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(registration);
+            .unwrap_or_else(PoisonError::into_inner);
+        registrations.retain(|existing| {
+            existing.qualified_name != registration.qualified_name
+                || existing.operation != registration.operation
+        });
+        registrations.push(registration);
     }
 
     /// Drop the records for a registration the plugin removed.
