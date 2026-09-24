@@ -293,11 +293,17 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # every producer is gone. Both the dispatcher and the actors also carry the
 # written form of the invariants they rest on, which is where most of the growth
 # is. No dependency moved, no `unsafe` did, and the streaming class is still not
-# served.
+# served. The last of it is the cancellation this work made reachable: a consumer
+# that read a stream to its end and let it go sends the same message as one that
+# cancelled a live stream, and a kernel that refused the first would end the
+# session over a race the boundary creates. Cancellation is idempotent where the
+# stream is already settled, and the host releases a stream it is done with so the
+# kernel can forget it — three tests, and the prose that says which cancellation
+# is still refused.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 15632
+max_source_lines = 15763
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

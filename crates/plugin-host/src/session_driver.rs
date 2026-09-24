@@ -1168,6 +1168,62 @@ mod tests {
         );
     }
 
+    /// A cancellation for a stream that already ended is a no-op, and the session
+    /// keeps serving after it.
+    ///
+    /// The end of a stream and its consumer being dropped are a race a peer cannot
+    /// win: both look the same from the far side of the boundary, and the drop
+    /// arrives as the cancellation that the end made unnecessary. Refusing it
+    /// would end a session over a race this boundary creates.
+    #[tokio::test]
+    async fn a_cancellation_for_a_stream_that_ended_leaves_the_session_serving() {
+        let mut session = Session::new();
+        session.park_producing("operation-1", vec![serde_json::json!({"chunk": 1})]);
+        let stream_id = session.opened("call-1", "operation-1").await;
+        session.pull("call-2", &stream_id).expect("a pull");
+        assert!(matches!(
+            session.answer().await,
+            PluginSessionPayload::StreamItem(_)
+        ));
+        session.pull("call-3", &stream_id).expect("a pull");
+        assert!(matches!(
+            session.answer().await,
+            PluginSessionPayload::StreamEnd(_)
+        ));
+
+        session
+            .cancel("cancel-1", &stream_id)
+            .expect("a cancellation for a stream that ended");
+        session
+            .release("release-1", &stream_id)
+            .expect("a release after the stream ended");
+        session.drained().await;
+
+        // And the session is still serving: a stream that ended is not a session
+        // that is broken.
+        session.park_producing("operation-2", vec![serde_json::json!({"chunk": 2})]);
+        let next = session.opened("call-4", "operation-2").await;
+        session.pull("call-5", &next).expect("a pull");
+        assert!(matches!(
+            session.answer().await,
+            PluginSessionPayload::StreamItem(_)
+        ));
+    }
+
+    /// A cancellation naming a stream this session never opened is the one
+    /// cancellation the session cannot treat as stale: it has no record to check
+    /// it against, so refusing it ends the channel rather than continuing with a
+    /// peer that names streams it was never given.
+    #[tokio::test]
+    async fn a_cancellation_for_a_stream_the_session_never_had_ends_the_channel() {
+        let mut session = Session::new();
+        let refused = session.cancel("cancel-1", "operation-1-1");
+        assert!(
+            refused.is_err(),
+            "a cancellation for a stream that was never opened: {refused:?}"
+        );
+    }
+
     /// A release drops the kernel's stream and forgets it.
     #[tokio::test]
     async fn a_release_drops_the_stream_the_kernel_was_producing() {

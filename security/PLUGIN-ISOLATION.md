@@ -301,6 +301,17 @@ session that ends drops every producer before its answer stream ends:
 `a_session_that_ends_drops_the_producers_it_was_serving` are the evidence, with
 the one-pull rule, cross-stream isolation and the panic case beside them.
 
+Cancellation itself is idempotent where the stream is already settled, which the
+actor work made necessary rather than optional: a consumer that read a stream to
+its end and let it go sends the same message as one that cancelled a live stream,
+and the two look the same from the far side of the boundary. Refusing the first
+would end a session over a race the boundary creates — and did, until
+`a_pull_yields_the_next_chunk_and_then_the_end` started asking the session to open
+another stream after one finished. What stays refused is the cancellation that
+names a stream this session has no record of, where it cannot tell a stale message
+from an invented one, and the host now releases a stream it is done with so the
+kernel can forget it rather than keeping a record of every stream it ever served.
+
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 

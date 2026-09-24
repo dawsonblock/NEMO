@@ -493,6 +493,21 @@ impl PluginSessionState {
     }
 
     /// Validate that the plugin cancelled a stream.
+    ///
+    /// Idempotent where the stream is already settled, deliberately. A
+    /// cancellation is a statement about demand — stop producing — and the party
+    /// that owns the demand cannot know whether the kernel has already stopped:
+    /// a stream that just ended and one the kernel is still producing look the
+    /// same to a consumer that has decided to let it go, and both arrive as this
+    /// message. The kernel has nothing left to stop in either case, so a repeat is
+    /// a no-op rather than a violation — and refusing it would end a session over
+    /// a race between a stream ending and its consumer being dropped, which is a
+    /// race this boundary creates rather than one the plugin can avoid.
+    ///
+    /// What is *not* a no-op is a cancellation naming a stream this session has no
+    /// record of: there the session cannot tell a stale message from an invented
+    /// one, and a peer that names streams it was never given is not one to keep
+    /// answering.
     pub fn receive_cancel(
         &mut self,
         cancel: &PluginStreamControl,
@@ -511,14 +526,8 @@ impl PluginSessionState {
                 stream.outstanding_pull = None;
                 Ok(())
             }
-            StreamState::Cancelled => Err(rejected(format!(
-                "stream {} was already cancelled",
-                cancel.stream_id
-            ))),
-            StreamState::Terminal => Err(rejected(format!(
-                "stream {} already ended",
-                cancel.stream_id
-            ))),
+            // Cancelled already, or over: the kernel has nothing left to stop.
+            StreamState::Cancelled | StreamState::Terminal => Ok(()),
         }
     }
 
@@ -903,11 +912,53 @@ mod tests {
                 })
                 .is_err()
         );
+        // A repeated cancellation is a no-op rather than a violation: the
+        // consumer cannot tell a stream it cancelled from one that ended first,
+        // and there is nothing left for the kernel to stop either way.
+        session
+            .receive_cancel(&PluginStreamControl {
+                host_call_id: "cancel-2".into(),
+                stream_id: "stream-1".into(),
+            })
+            .expect("a repeated cancellation");
+    }
+
+    /// A cancellation for a stream that ended is a no-op, and what a stream that
+    /// ended still refuses stays refused.
+    #[test]
+    fn a_cancellation_for_a_stream_that_ended_is_a_no_op() {
+        let mut session = session_with_stream();
+        pull(&mut session, "pull-1");
+        session
+            .send_end(&PluginStreamEnd {
+                host_call_id: "pull-1".into(),
+                stream_id: "stream-1".into(),
+            })
+            .expect("the end of the stream");
+        session
+            .receive_cancel(&PluginStreamControl {
+                host_call_id: "cancel-1".into(),
+                stream_id: "stream-1".into(),
+            })
+            .expect("a cancellation for a stream that ended");
+
+        // Ending is not the same as being open to demand: a pull for a stream
+        // that is over is still refused.
+        assert!(
+            session
+                .receive_pull(&PluginStreamPullRequest {
+                    host_call_id: "pull-2".into(),
+                    stream_id: "stream-1".into(),
+                })
+                .is_err()
+        );
+        // And a cancellation for a stream this session never had is still the
+        // message it cannot tell from an invented one.
         assert!(
             session
                 .receive_cancel(&PluginStreamControl {
                     host_call_id: "cancel-2".into(),
-                    stream_id: "stream-1".into(),
+                    stream_id: "stream-9".into(),
                 })
                 .is_err()
         );

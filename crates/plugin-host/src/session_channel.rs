@@ -394,16 +394,25 @@ impl Drop for PullStream {
         // asking, so a dropped stream is a cancellation rather than a stream the
         // kernel keeps feeding.
         if let Some((outbound, stream_id, session_id)) = self.cancellation.take() {
-            let cancellation = PluginSessionMessage {
-                session_id,
-                message: PluginSessionPayload::StreamCancel(PluginStreamControl {
-                    host_call_id: format!("cancel-{stream_id}"),
-                    stream_id,
-                }),
-            };
-            let _ = outbound.try_send(nemo_relay_plugin_proto::convert::session_message_to_wire(
-                &cancellation,
-            ));
+            // Cancelled and then released: the cancellation is what stops the
+            // kernel producing, and the release is what lets it forget the stream
+            // it is no longer producing. Without the second, a long-lived session
+            // would keep a record of every stream it ever served.
+            for control in [
+                PluginSessionPayload::StreamCancel,
+                PluginSessionPayload::StreamRelease,
+            ] {
+                let message = PluginSessionMessage {
+                    session_id: session_id.clone(),
+                    message: control(PluginStreamControl {
+                        host_call_id: format!("cancel-{stream_id}"),
+                        stream_id: stream_id.clone(),
+                    }),
+                };
+                let _ = outbound.try_send(
+                    nemo_relay_plugin_proto::convert::session_message_to_wire(&message),
+                );
+            }
         }
     }
 }
@@ -511,6 +520,21 @@ mod tests {
         assert!(
             stream.next().await.is_none(),
             "the kernel said the stream was over"
+        );
+
+        // A consumer that read the stream to its end and let it go is not a
+        // consumer that cancelled a live stream: the session must still be the
+        // one that served it, and the next stream it opens must be opened.
+        drop(stream);
+        let afterwards = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            channel.open_stream("operation-1", &request),
+        )
+        .await
+        .expect("the session answers an open after a stream it served has finished");
+        assert!(
+            afterwards.is_ok(),
+            "the session still serves a stream after one finished: {afterwards:?}"
         );
     }
 
