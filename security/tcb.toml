@@ -166,7 +166,12 @@ transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d
 [limits.nemo-relay-plugin-protocol]
 max_direct_dependencies = 4
 max_transitive_packages = 24
-max_source_lines = 1700
+# Raised for the projection's two conversions and the tests that pin them: the
+# projection is built from an event for one class (refusing an event of another), the
+# synthetic event is built back from it, and the tests require that no event identity —
+# uuid, parent, timestamp — crosses in either direction. No dependency moved and no
+# `unsafe` did.
+max_source_lines = 1968
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -374,10 +379,17 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # negative cases carry a control that the class is served at all, so none of them
 # can pass while the class is unserved. No dependency moved and no `unsafe` did:
 # this is what the boundary refuses, not what it reaches.
+#
+# Budget raise (serving the class): the kernel-side proxy for the three event sanitize
+# families, its three typed wrappers, the host's runner for the projection, and the
+# process-boundary qualification — a real child's sanitizers changing only the copy
+# this runtime publishes, and a failing one unable to publish what it was shown. The
+# recursion the qualification found is fixed on the core side, not here. No dependency
+# moved and no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 19077
+max_source_lines = 19520
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

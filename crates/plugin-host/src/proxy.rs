@@ -23,8 +23,9 @@ use nemo_relay::api::runtime::{LlmRequestInterceptFn, ToolInterceptFn, ToolSanit
 use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::plugin::execution::PluginManager;
 use nemo_relay_plugin_protocol::{
-    PluginDescriptor, PluginExecutionContext, PluginFailureCode, PluginHandle, PluginInvokeRequest,
-    PluginProtocolError, PluginRegistrationDescriptor, PluginRegistrationOperation, PluginSuccess,
+    PluginDescriptor, PluginEventSanitizeCall, PluginEventSanitizeClass, PluginExecutionContext,
+    PluginFailureCode, PluginHandle, PluginInvokeRequest, PluginProtocolError,
+    PluginRegistrationDescriptor, PluginRegistrationOperation, PluginSuccess,
 };
 
 /// What a proxy needs in order to invoke a registration safely.
@@ -187,6 +188,9 @@ pub struct RegistrationProxies {
     llm_request_intercepts: Vec<String>,
     subscribers: Vec<String>,
     metadata_injectors: Vec<String>,
+    mark_sanitize: Vec<String>,
+    scope_sanitize_start: Vec<String>,
+    scope_sanitize_end: Vec<String>,
     tool_sanitize_request: Vec<String>,
     tool_execution_intercepts: Vec<String>,
     llm_execution_intercepts: Vec<String>,
@@ -206,6 +210,9 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("llm_request_intercepts", &self.llm_request_intercepts)
             .field("subscribers", &self.subscribers)
             .field("metadata_injectors", &self.metadata_injectors)
+            .field("mark_sanitize", &self.mark_sanitize)
+            .field("scope_sanitize_start", &self.scope_sanitize_start)
+            .field("scope_sanitize_end", &self.scope_sanitize_end)
             .field("tool_sanitize_request", &self.tool_sanitize_request)
             .field("tool_execution_intercepts", &self.tool_execution_intercepts)
             .field("llm_execution_intercepts", &self.llm_execution_intercepts)
@@ -228,6 +235,9 @@ impl RegistrationProxies {
             .chain(self.llm_request_intercepts.iter())
             .chain(self.subscribers.iter())
             .chain(self.metadata_injectors.iter())
+            .chain(self.mark_sanitize.iter())
+            .chain(self.scope_sanitize_start.iter())
+            .chain(self.scope_sanitize_end.iter())
             .chain(self.tool_sanitize_request.iter())
             .chain(self.tool_execution_intercepts.iter())
             .chain(self.llm_execution_intercepts.iter())
@@ -250,6 +260,17 @@ impl Drop for RegistrationProxies {
         }
         for registration in &self.metadata_injectors {
             let _ = nemo_relay::api::registry::deregister_event_metadata_injector(registration);
+        }
+        for registration in &self.mark_sanitize {
+            let _ = nemo_relay::api::registry::deregister_mark_sanitize_guardrail(registration);
+        }
+        for registration in &self.scope_sanitize_start {
+            let _ =
+                nemo_relay::api::registry::deregister_scope_sanitize_start_guardrail(registration);
+        }
+        for registration in &self.scope_sanitize_end {
+            let _ =
+                nemo_relay::api::registry::deregister_scope_sanitize_end_guardrail(registration);
         }
         for registration in &self.subscribers {
             let _ = nemo_relay::api::subscriber::deregister_subscriber(registration);
@@ -297,6 +318,9 @@ pub fn install(
         llm_request_intercepts: Vec::new(),
         subscribers: Vec::new(),
         metadata_injectors: Vec::new(),
+        mark_sanitize: Vec::new(),
+        scope_sanitize_start: Vec::new(),
+        scope_sanitize_end: Vec::new(),
         tool_sanitize_request: Vec::new(),
         tool_execution_intercepts: Vec::new(),
         llm_execution_intercepts: Vec::new(),
@@ -337,6 +361,29 @@ pub fn install(
                 install_metadata_injector(&context, registration, &handle)?;
                 installed
                     .metadata_injectors
+                    .push(registration.registration_id.clone());
+            }
+            // The three event sanitize families. One installer parameterised by
+            // class, and three named wrappers over it: the class decides the
+            // projection, the registry and — from the registration's own record — the
+            // exact-registration door on the far side, and none of those is something
+            // a caller passes in.
+            PluginRegistrationOperation::MarkSanitizeGuardrail => {
+                install_mark_sanitize(&context, registration, &handle)?;
+                installed
+                    .mark_sanitize
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::ScopeSanitizeStartGuardrail => {
+                install_scope_sanitize_start(&context, registration, &handle)?;
+                installed
+                    .scope_sanitize_start
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::ScopeSanitizeEndGuardrail => {
+                install_scope_sanitize_end(&context, registration, &handle)?;
+                installed
+                    .scope_sanitize_end
                     .push(registration.registration_id.clone());
             }
             PluginRegistrationOperation::Subscriber => {
@@ -1366,6 +1413,242 @@ fn install_tool_sanitize(
     })
 }
 
+/// Install the proxy for one event sanitize registration.
+///
+/// Three families share one shape and one serialization, and that is exactly why
+/// the class is not a parameter of anything a caller can influence: the class this
+/// proxy was installed for decides the projection it builds, the registry it goes
+/// into, and — on the far side, from the registration's own record — the
+/// exact-registration door the host runs. A mark sanitizer that could be reached
+/// through the scope-start chain would be a capability the caller chose rather than
+/// one the kernel granted.
+///
+/// What crosses is the projection rather than the runtime's event: the name a
+/// sanitizer decides on, the phase when it is a scope event, and the mutable fields
+/// it may change. What comes back is those fields and nothing else, so the class,
+/// the registration identity, the operation identity and the envelope stay the
+/// kernel's — a remote sanitizer cannot rename, re-parent or re-time the event it
+/// sanitized, because it was never shown one.
+///
+/// Failure follows the family's rule: a payload that could not be sanitized is not
+/// published unsanitized. Here that means the callback fails and the chain clears
+/// the observability fields, and the failure is recorded, because a sanitizer that
+/// never worked and one that cleared everything look identical from the event alone.
+fn install_event_sanitize(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+    class: PluginEventSanitizeClass,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    // Beside the call, like the tool pair: these run from the dispatcher, off the
+    // task that made the call, so their answer has to arrive on a runtime the caller
+    // is not holding.
+    let off_path = context.off_path.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is an event sanitizer and this runtime started no runtime for work beside a \
+                 call, so its answer could never arrive",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::EventSanitizeFn = Arc::new(
+        move |event: std::sync::Arc<nemo_relay::api::event::Event>,
+              fields: nemo_relay::api::event::EventSanitizeFields| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let off_path = Arc::clone(&off_path);
+            Box::pin(async move {
+                let recording = registration_id.clone();
+                // Built here, from the class this proxy stands for and the event the
+                // chain handed it: an event of another kind is refused rather than
+                // forwarded, because a projection is not a place to discover that the
+                // chain and the class disagree.
+                let call = PluginEventSanitizeCall::from_event(class, &event, fields).map_err(
+                    |error| {
+                        let error = nemo_relay::error::FlowError::Internal(error.failure.message);
+                        crate::off_path::record_failure(
+                            crate::off_path::SANITIZE_FAILURE_MARK,
+                            &recording,
+                            &error.to_string(),
+                        );
+                        error
+                    },
+                )?;
+                let payload = serde_json::to_string(&call).map_err(|error| {
+                    nemo_relay::error::FlowError::Internal(format!(
+                        "a sanitizer projection could not be serialized: {error}"
+                    ))
+                })?;
+                let submitted = Arc::clone(&off_path).submit(async move {
+                    let execution = context.passive_execution_context(
+                        nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
+                    )?;
+                    let request = PluginInvokeRequest {
+                        handle,
+                        registration_id: registration_id.clone(),
+                        arguments: payload,
+                        budget_millis: execution.remaining_budget_millis,
+                    };
+                    let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                        scopes.enter(
+                            &execution.operation_request_id,
+                            nemo_relay::api::runtime::current_scope_stack(),
+                        )
+                    });
+                    // The off-path transport, never the primary one: this callback
+                    // runs beside the call, and the connection it uses is the one
+                    // whose tasks live on the runtime that awaits it.
+                    let outcome = off_path.invoke(request, execution).await.map_err(|error| {
+                        nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        }
+                    })?;
+                    match outcome.result {
+                        Ok(PluginSuccess::Invoked(response)) => {
+                            serde_json::from_str::<nemo_relay::api::event::EventSanitizeFields>(
+                                &response.output,
+                            )
+                            .map_err(|error| {
+                                nemo_relay::error::FlowError::Internal(format!(
+                                    "a proxied sanitizer answered with something that is not \
+                                     fields: {error}"
+                                ))
+                            })
+                        }
+                        Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                            "a proxied sanitizer answered with {}",
+                            other_name(&other)
+                        ))),
+                        Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id,
+                            dispatch: outcome.dispatch,
+                            certainty: outcome.certainty,
+                            failure,
+                        }),
+                    }
+                });
+                let Some(answer) = submitted else {
+                    // Saturation fails closed for this family: a payload that could
+                    // not be sanitized is not published unsanitized.
+                    let error = nemo_relay::error::FlowError::ResourceExhausted {
+                        resource: "plugin_observability_in_flight",
+                        limit: 0,
+                    };
+                    crate::off_path::record_failure(
+                        crate::off_path::SANITIZE_FAILURE_MARK,
+                        &recording,
+                        &error.to_string(),
+                    );
+                    return Err(error);
+                };
+                match crate::off_path::OffPathPluginExecutor::answer(answer)
+                    .await
+                    .and_then(|inner| inner)
+                {
+                    Ok(fields) => Ok(fields),
+                    Err(error) => {
+                        // The chain clears the observability fields, which is the
+                        // fail-closed answer; the record is what keeps a sanitizer
+                        // that could not decide from being invisible.
+                        crate::off_path::record_failure(
+                            crate::off_path::SANITIZE_FAILURE_MARK,
+                            &recording,
+                            &error.to_string(),
+                        );
+                        Err(error)
+                    }
+                }
+            })
+        },
+    );
+
+    let installed = match class {
+        PluginEventSanitizeClass::Mark => {
+            nemo_relay::api::registry::register_mark_sanitize_guardrail(
+                &registration.registration_id,
+                priority,
+                callable,
+            )
+        }
+        PluginEventSanitizeClass::ScopeStart => {
+            nemo_relay::api::registry::register_scope_sanitize_start_guardrail(
+                &registration.registration_id,
+                priority,
+                callable,
+            )
+        }
+        PluginEventSanitizeClass::ScopeEnd => {
+            nemo_relay::api::registry::register_scope_sanitize_end_guardrail(
+                &registration.registration_id,
+                priority,
+                callable,
+            )
+        }
+    };
+    installed.map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// The mark direction of [`install_event_sanitize`].
+fn install_mark_sanitize(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    install_event_sanitize(
+        context,
+        registration,
+        handle,
+        PluginEventSanitizeClass::Mark,
+    )
+}
+
+/// The scope-start direction of [`install_event_sanitize`].
+fn install_scope_sanitize_start(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    install_event_sanitize(
+        context,
+        registration,
+        handle,
+        PluginEventSanitizeClass::ScopeStart,
+    )
+}
+
+/// The scope-end direction of [`install_event_sanitize`].
+fn install_scope_sanitize_end(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    install_event_sanitize(
+        context,
+        registration,
+        handle,
+        PluginEventSanitizeClass::ScopeEnd,
+    )
+}
+
 /// Install the proxy for one event metadata injector.
 ///
 /// An injector adds: it answers with the keys it wants added, and the kernel
@@ -2183,13 +2466,14 @@ mod tests {
             "test-binding",
             5_000,
         );
-        // A class with no proxy at all. The streaming family used to be the
-        // example here and is not any more — it has a proxy, which is why this
-        // names a sanitizer: the classes that remain unproxied are the five whose
-        // shapes the boundary does not carry yet.
+        // A class with no proxy at all. The streaming family and then the three
+        // event sanitizers used to be the examples here and are not any more — both
+        // have proxies, which is why this names the pair whose shape the boundary
+        // does not carry yet: an LLM sanitize call is given a codec capability, and
+        // a unary invocation across the boundary has no completion to hang one on.
         let error = install(
             context,
-            &descriptor(PluginRegistrationOperation::MarkSanitizeGuardrail),
+            &descriptor(PluginRegistrationOperation::LlmSanitizeRequestGuardrail),
             PluginHandle {
                 plugin_id: "example".into(),
                 generation: 1,
@@ -2202,7 +2486,10 @@ mod tests {
         // installing what it can and forgetting the rest.
         assert_eq!(error.failure.code, PluginFailureCode::Rejected);
         assert!(
-            error.failure.message.contains("mark_sanitize_guardrail"),
+            error
+                .failure
+                .message
+                .contains("llm_sanitize_request_guardrail"),
             "{error:?}"
         );
     }

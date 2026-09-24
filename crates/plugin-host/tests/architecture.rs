@@ -498,6 +498,14 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
 /// kernel that routes instead of producing, and the mark window that follows
 /// execution across the plugin's own task — all of it qualified before it was
 /// advertised.
+///
+/// The last three to move are the event sanitizers — mark, scope start, scope end —
+/// and they moved together because they are one shape: a *projection* goes down (the
+/// name a sanitizer decides on, the phase when it is a scope event, and the mutable
+/// fields it may change) and the fields come back, so the class, the registration and
+/// the event's identity stay the kernel's. What each one needed was a proxy, a
+/// host-side runner and a core door that runs exactly the registration the kernel
+/// names, and all three were qualified through a real child before this list grew.
 #[test]
 fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     use nemo_relay_plugin_host::supervisor::ProcessPluginBackend;
@@ -517,6 +525,9 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
         Operation::ToolExecutionIntercept,
         Operation::LlmExecutionIntercept,
         Operation::LlmStreamExecutionIntercept,
+        Operation::MarkSanitizeGuardrail,
+        Operation::ScopeSanitizeStartGuardrail,
+        Operation::ScopeSanitizeEndGuardrail,
     ];
     assert_eq!(
         served, expected,
@@ -525,14 +536,13 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
          registration"
     );
 
-    // The half that does not cross, named so the gap is a fact in the tree and
-    // not something to rediscover: they are transforms with shapes of their own —
-    // three over events and two over provider payloads — and none of them needs a
-    // lifetime the boundary does not already have.
+    // The pair that does not cross, named so the gap is a fact in the tree and not
+    // something to rediscover: an LLM sanitize call is given a codec capability
+    // beside the request, and in the host that capability exists only as a
+    // *completion*-scoped ABI object. A unary invocation across the boundary has no
+    // completion to hang one on, so this pair is the one the codec-reference
+    // protocol has to be settled for before either direction can be advertised.
     let not_served = [
-        Operation::MarkSanitizeGuardrail,
-        Operation::ScopeSanitizeStartGuardrail,
-        Operation::ScopeSanitizeEndGuardrail,
         Operation::LlmSanitizeRequestGuardrail,
         Operation::LlmSanitizeResponseGuardrail,
     ];

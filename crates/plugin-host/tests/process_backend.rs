@@ -295,6 +295,353 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     );
 }
 
+// The classes whose answer is an event, through a real child. Single-threaded for
+// the same reason as the composition test above: the answer arrives over the
+// composition's own transport, so the caller's thread count must not decide whether
+// a sanitizer can answer.
+#[tokio::test]
+async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+    use nemo_relay_plugin_protocol::PluginComponentConfiguration;
+
+    // Three mark sanitizers, two scope-start sanitizers and one scope-end sanitizer
+    // are what this fixture registers, and the log is how "which of them ran" becomes
+    // a fact this process can read rather than an inference from the answer.
+    let log = std::env::temp_dir().join(format!(
+        "nemo-event-sanitizers-{}.log",
+        nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+    ));
+    let _ = std::fs::remove_file(&log);
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-event-sanitizers",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let loaded = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        [PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: serde_json::json!({ "sanitizer_log": log.to_string_lossy() }).to_string(),
+        }],
+    )
+    .await
+    .expect("a plugin served from another process");
+
+    // What this runtime published, as the runtime's own subscribers saw it.
+    let published: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let published = std::sync::Arc::clone(&published);
+        nemo_relay::api::subscriber::register_subscriber(
+            "process-backend-event-sanitizers",
+            std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+                published.lock().unwrap().push(serde_json::json!({
+                    "name": event.name(),
+                    "kind": event.kind(),
+                    "phase": event.scope_category().map(|phase| format!("{phase:?}")),
+                    "metadata": event.metadata().cloned(),
+                    "data": event.data().cloned(),
+                }));
+            }),
+        )
+        .expect("a subscriber");
+    }
+
+    // A mark this runtime emits itself, and a managed call: the mark goes through the
+    // mark chain, the call's scope start and end through the two scope chains.
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::scope::event(
+                nemo_relay::api::scope::EmitMarkEventParams::builder()
+                    .name("sanitizer-qualification-mark")
+                    .build(),
+            )
+            .expect("an emitted mark");
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("sanitizer_qualification_tool")
+                    .args(serde_json::json!({ "input": true }))
+                    .func(std::sync::Arc::new(|args| {
+                        Box::pin(async move { Ok(args.into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed call whose events the sanitizers in the child are shown");
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+
+    let published = published.lock().unwrap().clone();
+    let markers = |event: &serde_json::Value| -> Vec<String> {
+        event["metadata"]
+            .as_object()
+            .map(|metadata| {
+                metadata
+                    .iter()
+                    .filter(|(_, value)| value.as_bool() == Some(true))
+                    .map(|(key, _)| key.clone())
+                    .filter(|key| key.starts_with("fixture_"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // The mark: its own name survives — the sanitizer changes what observers see and
+    // not what the event is — and all three mark registrations contributed, because
+    // the chain in this process runs one proxy per registration.
+    let mark = published
+        .iter()
+        .find(|event| event["name"] == serde_json::json!("sanitizer-qualification-mark"))
+        .unwrap_or_else(|| panic!("the mark this runtime emitted was published: {published:#?}"));
+    assert_eq!(
+        markers(mark),
+        vec!["fixture_mark_a", "fixture_mark_b", "fixture_mark_c"],
+        "every mark sanitizer in the child contributed, in the chain's order"
+    );
+
+    // The two scope directions, each from its own family.
+    let scope_start = published
+        .iter()
+        .find(|event| {
+            event["kind"] == serde_json::json!("scope")
+                && event["phase"] == serde_json::json!("Start")
+                && markers(event)
+                    .iter()
+                    .any(|key| key.starts_with("fixture_scope"))
+        })
+        .unwrap_or_else(|| panic!("a sanitized scope start was published: {published:#?}"));
+    assert_eq!(
+        markers(scope_start),
+        vec!["fixture_scope_start_other", "fixture_scope_start_sanitize"],
+        "both scope-start registrations ran, and no other family did"
+    );
+    let scope_end = published
+        .iter()
+        .find(|event| {
+            event["kind"] == serde_json::json!("scope")
+                && event["phase"] == serde_json::json!("End")
+                && markers(event)
+                    .iter()
+                    .any(|key| key.starts_with("fixture_scope"))
+        })
+        .unwrap_or_else(|| panic!("a sanitized scope end was published: {published:#?}"));
+    assert_eq!(
+        markers(scope_end),
+        vec!["fixture_scope_end_sanitize"],
+        "the end direction runs its own registration only"
+    );
+
+    // And the child ran exactly the registration each proxy stands for, once per
+    // event: a host that ran the family per call would show each mark registration
+    // as many times as the family has members, and a kernel that collapsed the three
+    // proxies into one call would show one line per event. The log is read per class
+    // against the number of events this runtime published, because a managed call
+    // emits more than one of each.
+    let ran: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // The runtime's own records are published without the sanitize chain — the rule
+    // that keeps a sanitizer that cannot answer from looping on the record of its own
+    // failure — so they are not marks the chain serves and not counted here.
+    let published_marks = published
+        .iter()
+        .filter(|event| {
+            event["kind"] == serde_json::json!("mark")
+                && !event["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("nemo.plugin.")
+        })
+        .count();
+    let published_starts = published
+        .iter()
+        .filter(|event| {
+            event["kind"] == serde_json::json!("scope")
+                && event["phase"] == serde_json::json!("Start")
+        })
+        .count();
+    let published_ends = published
+        .iter()
+        .filter(|event| {
+            event["kind"] == serde_json::json!("scope")
+                && event["phase"] == serde_json::json!("End")
+        })
+        .count();
+    assert_eq!(
+        ran.iter()
+            .filter(|name| name.starts_with("fixture_mark"))
+            .count(),
+        published_marks * 3,
+        "{published_marks} mark events, three mark registrations each: {ran:?}"
+    );
+    assert_eq!(
+        ran.iter()
+            .filter(|name| name == &"fixture_scope_start_sanitize")
+            .count(),
+        published_starts,
+        "one scope-start sanitizer per start event: {ran:?}"
+    );
+    assert_eq!(
+        ran.iter()
+            .filter(|name| name == &"fixture_scope_start_other")
+            .count(),
+        published_starts,
+        "and its neighbour, once per start event: {ran:?}"
+    );
+    assert_eq!(
+        ran.iter()
+            .filter(|name| name == &"fixture_scope_end_sanitize")
+            .count(),
+        published_ends,
+        "one scope-end sanitizer per end event: {ran:?}"
+    );
+    // Every run of a chain is the family, once each, in priority order: three names
+    // per mark event and two per start event, with no name twice in one run.
+    for run in ran
+        .chunks(3)
+        .filter(|run| run.iter().all(|name| name.starts_with("fixture_mark")))
+    {
+        assert_eq!(
+            run,
+            ["fixture_mark_a", "fixture_mark_b", "fixture_mark_c"],
+            "a mark event's chain is each registration once, in priority order: {ran:?}"
+        );
+    }
+
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-event-sanitizers")
+        .expect("a deregistration");
+    let _ = std::fs::remove_file(&log);
+    drop(loaded);
+}
+
+// The confidentiality property through a real child: a sanitizer that could not
+// answer must not become a path by which what it was shown reaches anything
+// publishable. The proxy's own test asserts this with a scripted peer; this asserts
+// it with the peer being a process.
+#[tokio::test]
+async fn a_failing_sanitizer_in_the_child_cannot_publish_what_it_was_shown() {
+    use nemo_relay_plugin_host::{ProcessLoadedPlugins, confidentiality};
+    use nemo_relay_plugin_protocol::PluginComponentConfiguration;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-event-sanitizer-failure",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let loaded = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        [PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: serde_json::json!({ "event_sanitizer_failures": true }).to_string(),
+        }],
+    )
+    .await
+    .expect("a plugin served from another process");
+
+    // Everything this runtime published, and everything it recorded about a
+    // sanitizer that could not decide.
+    let published: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failures: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let published = std::sync::Arc::clone(&published);
+        let failures = std::sync::Arc::clone(&failures);
+        nemo_relay::api::subscriber::register_subscriber(
+            "process-backend-sanitize-failures",
+            std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+                if event.name() == nemo_relay_plugin_host::off_path::SANITIZE_FAILURE_MARK {
+                    failures.lock().unwrap().push(serde_json::json!({
+                        "data": event.data().cloned(),
+                    }));
+                }
+                published.lock().unwrap().push(serde_json::json!({
+                    "name": event.name(),
+                    "observable": event.to_json_value().to_string(),
+                }));
+            }),
+        )
+        .expect("a subscriber");
+    }
+
+    // A mark whose mutable observability fields each carry a value that must not
+    // survive a sanitizer that could not decide. The name is the runtime's own: it is
+    // identity rather than payload, so a sanitizer is shown it and cannot rewrite it.
+    let name = "sanitizer-qualification-secret";
+    let (fields, sentinel) = confidentiality::sentinel_fields();
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::scope::event(
+                nemo_relay::api::scope::EmitMarkEventParams::builder()
+                    .name(name)
+                    .data_opt(fields.data.clone())
+                    .metadata_opt(fields.metadata.clone())
+                    .category_profile_opt(fields.category_profile.clone())
+                    .build(),
+            )
+            .expect("an emitted mark");
+        },
+    )
+    .await;
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+
+    // The published copy: the fields were cleared rather than published, so nothing
+    // the sanitizer was shown is in it.
+    let published = published.lock().unwrap().clone();
+    let published_copy = published
+        .iter()
+        .find(|event| event["name"] == serde_json::json!(name))
+        .unwrap_or_else(|| panic!("the mark was published: {published:#?}"));
+    sentinel.assert_absent(
+        "the event this runtime published after a sanitizer failed",
+        published_copy["observable"]
+            .as_str()
+            .expect("a serialized event"),
+    );
+
+    // And the failure is a fact in this runtime's stream rather than a log line in
+    // the other process: the kernel knows which registration could not answer.
+    let failures = failures.lock().unwrap().clone();
+    assert!(
+        failures.iter().any(|failure| {
+            failure["data"]["registration"]
+                .as_str()
+                .is_some_and(|registration| registration.ends_with("fixture_mark_refuses"))
+        }),
+        "the refused sanitization was recorded against its registration: {failures:#?}"
+    );
+
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-sanitize-failures")
+        .expect("a deregistration");
+    drop(loaded);
+}
+
 #[tokio::test]
 async fn the_process_backend_satisfies_the_shared_lifecycle_suite() {
     // The same walk the in-process backend runs, with no forked expectations:
@@ -484,7 +831,13 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_never",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_request",
-            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_response"
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_sanitize_response",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_a",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_b",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_c",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_end_sanitize",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_start_other",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_start_sanitize"
         ],
         "every registration the plugin made is proxied here, in the classes this kernel serves"
     );
@@ -861,9 +1214,9 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     assert!(process_id.is_some(), "the plugin lived in another process");
 
     // Dropping the composition takes every registration out of this process's
-    // chains and ends the host: a complete plugin — all nine registrations this
-    // fixture makes, none of them left behind — may not outlive the runtime that
-    // installed it.
+    // chains and ends the host: a complete plugin — every registration this fixture
+    // makes, none of them left behind — may not outlive the runtime that installed
+    // it.
     let handles = loaded.handles().to_vec();
     let registrations: Vec<String> = loaded
         .registrations()
@@ -877,7 +1230,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
 
     assert_eq!(
         registrations.len(),
-        11,
+        17,
         "this is the complete-plugin regression: every registration the fixture makes was served"
     );
     assert!(

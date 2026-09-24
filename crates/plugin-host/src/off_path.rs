@@ -100,7 +100,12 @@ pub const METADATA_FAILURE_MARK: &str = "nemo.plugin.metadata.failed";
 /// is already reporting it and an observer of the record must not change what the
 /// caller sees.
 pub(crate) fn record_failure(mark: &str, registration: &str, reason: &str) {
-    let _ = nemo_relay::api::scope::event(
+    // A runtime record rather than an ordinary mark: the record of a failure is the
+    // runtime's own, and an ordinary mark is offered to the event sanitizers — which
+    // is the family whose failure is being recorded. Asking it about its own failure
+    // record is a loop: the sanitizer fails on the record, the runtime records that,
+    // and the record is a mark again.
+    let _ = nemo_relay::api::scope::runtime_mark(
         nemo_relay::api::scope::EmitMarkEventParams::builder()
             .name(mark)
             .data_opt(Some(serde_json::json!({

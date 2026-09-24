@@ -1570,7 +1570,9 @@ composition's own transport rather than over an in-process backend, so its tests
 process-boundary tests — the same suite that qualifies the class and moves the
 metric. The sentinel helper is the part those tests will reuse unchanged.
 
-**The five classes left, and the one question among them.** Four touch points per
+**The five classes left, and the one question among them.** *(Three of these five have
+since crossed — see "The event sanitizers cross" below. What remains of this note is
+the LLM pair and the codec decision at its end.)* Four touch points per
 class, in this order: a core entry point that runs exactly one registration of the
 class (the shape of `invoke_tool_sanitize_request_registration`), a kernel proxy per
 class (the shape of `install_tool_sanitize`, which hands the host the copy an event
@@ -1598,12 +1600,57 @@ held to:
 Either is defensible. Which one is a design choice rather than an implementation
 detail, which is why it is written here rather than discovered in a diff.
 
-**Class coverage: 11 of 16.** The five that do not cross are the mark and scope
-sanitizers and the two LLM sanitizers. The LLM stream execution intercept crossed
-when its qualification did: the duplex session, the actor-per-stream kernel side,
-its demand, budgets and deadlines, the mark window that follows execution, the
-terminal and transport rules, and the attribution, lifecycle and repeated-mixture
-tests all had to be green before the class was advertised. Pinned by
+### The event sanitizers cross, and one rule they needed from the kernel
+
+The three classes are served, and the shape they cross in is the projection the
+protocol crate declared: a `PluginEventSanitizeCall` goes down (class, event name, the
+phase when it is a scope event, and the mutable fields) and the fields come back. Four
+pieces make it true, one per layer:
+
+- the kernel's proxy per registration, built from the class it was installed for, so a
+  mark sanitizer cannot be reached through the scope-start chain and the class a caller
+  gets is one the kernel granted rather than one it asked for;
+- the host's runner, which validates the projection's class against the registration's
+  own record, builds the synthetic event, and answers with the mutable fields only;
+- the core door per class, which runs exactly the registration the kernel names — three
+  mark sanitizers in the fixture exist to make "the family, not the registration" a
+  test failure rather than a reading of the code;
+- and the sentinel, in every mutable field, asserted on the published event rather than
+  on the proxy's return value, so "the payload cannot be published" is what the test
+  says instead of "the call returned an error".
+
+Qualified through a real child, not only in process: the process suite now shows a
+managed call whose published copies carry the child's markers while the call's own
+result carries none — a sanitizer changes what observers see and not what the tool did
+— with each registration run exactly once per event (a host that ran the family per
+call, or a kernel that collapsed three proxies into one, changes the fixture's log),
+and a registered failure shape that must not be able to publish what it was shown.
+
+**The one thing that was missing, and where it was**: recording a failure was itself a
+mark. The kernel records a sanitizer that could not answer with
+`nemo.plugin.sanitize.failed`, that record is an event, and a sanitizer that refuses
+every mark is asked about it — so the first failure produced a record, the record
+produced a failure, and the runtime recursed until its stack gave out. Found by the
+real-child confidentiality case, which is the only place it shows: in process there was
+no remote mark sanitizer to fail on the record.
+
+The rule the fix states is the one observers already follow — *a record of a failure is
+the runtime's own, and a family is not asked about its own failure records*. It is
+implemented as `api::scope::runtime_mark`, which publishes a runtime-raised mark with
+no sanitizers and no injectors, and the three off-path families record through it. It
+is not a way to publish something a sanitizer should see: what a plugin emits is
+forwarded and published through the ordinary path, and a call to `runtime_mark` from a
+host process stays in that process, where the kernel has no subscribers.
+
+**Class coverage: 14 of 16.** The three that crossed together are the mark, scope-start
+and scope-end sanitizers: one shape, one projection, and one installer parameterised
+by class. What each needed was a kernel proxy, a host-side runner and a core door that
+runs exactly the registration the kernel names, and all three were qualified through a
+real child before the served set grew — see *The event sanitizers cross* below. The
+pair that does not cross is the two LLM sanitizers, and the reason is a decision rather
+than work: an LLM sanitize call is given a codec capability, and in the host that
+capability exists only as a *completion*-scoped ABI object, so a unary invocation
+across the boundary has no completion to hang one on. Pinned by
 `the_boundary_serves_a_named_subset_of_the_registration_surface`, which fails on any
 change to either half.
 

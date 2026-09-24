@@ -10,11 +10,11 @@
 //! payload are different facts, and only the second is the security property.
 //!
 //! So these helpers plant an unmistakable value in every field a sanitizer can see
-//! — the event name, the payload, the metadata, the category profile, the scope
-//! phase — force one failure path, and then look for those values in everything the
-//! runtime could publish: the fields the answer carried, the refusal that came back,
-//! the event the chain would emit. A test asserting only `is_err()` would pass while
-//! the payload travelled back in the error's own text.
+//! — the event name, the payload, the metadata, the category profile, and a scope
+//! event's attributes — force one failure path, and then look for those values in
+//! everything the runtime could publish: the fields the answer carried, the refusal
+//! that came back, the event the chain would emit. A test asserting only `is_err()`
+//! would pass while the payload travelled back in the error's own text.
 //!
 //! The suites that need this sit on both sides of the boundary: the host's own
 //! invocation tests are in this crate, and the process-boundary qualification runs
@@ -233,26 +233,47 @@ pub fn sentinel_scope_event(
     (event, planting.finish())
 }
 
+/// The mutable observability fields, with a sentinel in every one of them.
+///
+/// This is what a sanitizer may *rewrite*, which is narrower than what it is shown:
+/// an event's name and its scope phase are identity rather than payload, so a value
+/// planted there is published by the runtime whatever the sanitizer decides. A test
+/// asserting that a failure cannot publish its input wants these fields, and a test
+/// asserting that a sanitizer cannot rename an event wants the projection.
+pub fn sentinel_fields() -> (EventSanitizeFields, ConfidentialitySentinel) {
+    let mut planting = Planting::new();
+    let fields = planting.fields();
+    (fields, planting.finish())
+}
+
 /// The projection a kernel sends for one of the three classes, sentinel in every
 /// field it carries.
 ///
 /// This is what the host is handed and what a plugin's callback is shown, so it is
 /// the shape a failure path has to keep from reaching the runtime.
+///
+/// The phase is not one of those fields even though it is on the wire: it is
+/// derived from the class — the class *is* the capability, and the string states the
+/// same fact for a reader — so a projection carrying a planted value there would be
+/// describing a phase that does not exist, and the host refuses it before anything
+/// runs.
 pub fn sentinel_sanitize_call(
     class: PluginEventSanitizeClass,
 ) -> (PluginEventSanitizeCall, ConfidentialitySentinel) {
     let mut planting = Planting::new();
     let name = planting.plant("EVENT_NAME");
-    let scope = match class {
-        PluginEventSanitizeClass::Mark => None,
-        _ => Some(planting.plant("SCOPE")),
-    };
     let fields = planting.fields();
     (
         PluginEventSanitizeCall {
             class,
             name,
-            scope_category: scope,
+            // Written as the runtime names it rather than as a second copy of the
+            // spelling: one place decides what a phase is called on the wire.
+            scope_category: class.scope_category().and_then(|category| {
+                serde_json::to_value(category)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+            }),
             fields,
         },
         planting.finish(),

@@ -282,24 +282,19 @@ impl NativePlugin for InterceptPlugin {
                 })
             }
         })?;
-        // The three event sanitize families, and only when a test asks for them.
-        //
-        // This fixture registers exactly the classes a kernel can serve, which is
-        // what a qualification run needs; the event sanitizers are not servable
-        // yet, so registering them by default would make every composition test
-        // refuse the plugin whole. Gating them behind a config key keeps the
-        // default set honest while the Layer 2 gate is written against the shape
-        // the classes will have.
+        // The three event sanitize families. The kernel can proxy them, so they are
+        // part of this fixture's default set — the set that exists to be exactly what
+        // a kernel can serve.
+        register_event_sanitizers(ctx, sanitizer_log(config))?;
+        // The failure shapes are behaviours rather than classes, so a test asks for
+        // them: a registration that refuses on every mark would clear the fields of
+        // every mark event the other composition tests publish.
         if config
-            .get("event_sanitizers")
+            .get("event_sanitizer_failures")
             .and_then(Json::as_bool)
             .unwrap_or(false)
         {
-            let log = config
-                .get("sanitizer_log")
-                .and_then(Json::as_str)
-                .map(str::to_owned);
-            register_event_sanitizers(ctx, log)?;
+            register_event_sanitizer_failures(ctx, sanitizer_log(config))?;
         }
         ctx.register_tool_request_intercept(
             "fixture_intercept_rewrite",
@@ -324,8 +319,10 @@ impl NativePlugin for InterceptPlugin {
 /// to leave that one's marker and neither neighbour's, and an answer that carries
 /// two markers is a family that ran rather than a registration that answered.
 ///
-/// The last two are the failure shapes: one registration that refuses, and one that
-/// answers correctly with more bytes than the operation was allowed to receive.
+/// These are the well-behaved ones, and they are what this fixture registers by
+/// default now that the kernel serves the class: the failure shapes are
+/// [`register_event_sanitizer_failures`], which a test asks for by configuration
+/// rather than inheriting.
 ///
 /// When a test hands over a log path, every registration appends its own local name
 /// to it as it runs. A marker in an answer says which registration *answered*; the
@@ -394,7 +391,25 @@ pub fn register_event_sanitizers(ctx: &mut PluginContext<'_>, log: Option<String
                 Ok(marked_fields(fields, SCOPE_END_MARKER))
             }
         }
-    })?;
+    })
+}
+
+/// Register the failure shapes: a refusal, a throw, and an oversized answer.
+///
+/// These are behaviours rather than classes, so a test asks for them explicitly: a
+/// registration that refuses on every mark would clear the fields of every mark event
+/// the rest of the suite publishes.
+///
+/// A sanitizer that refuses does *not* answer with the payload it was given, which is
+/// the difference between a withheld payload and a published one; a callback that
+/// throws is a different finding from one that said no, because a host that reported
+/// them the same way would make one of them invisible. The oversized one answers
+/// correctly with more bytes than a small operation budget allows, which is what makes
+/// the response budget the thing under test.
+pub fn register_event_sanitizer_failures(
+    ctx: &mut PluginContext<'_>,
+    log: Option<String>,
+) -> Result<()> {
     // A sanitizer that refuses. What it does *not* do is answer with the payload it
     // was given, which is the difference between a withheld payload and a published
     // one.
@@ -443,6 +458,14 @@ pub fn register_event_sanitizers(ctx: &mut PluginContext<'_>, log: Option<String
             }
         }
     })
+}
+
+/// The log path a test handed over, if any.
+fn sanitizer_log(config: &Map<String, Json>) -> Option<String> {
+    config
+        .get("sanitizer_log")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
 }
 
 /// Append one registration's local name to the log a test handed over.

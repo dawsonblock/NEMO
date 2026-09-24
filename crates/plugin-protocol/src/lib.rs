@@ -21,6 +21,7 @@
 //! execution module names these types and enforces the deadline rule in front of
 //! every backend, while the loader and the transport stay behind the boundary.
 
+use nemo_relay_types::api::event::ScopeCategory;
 use serde::{Deserialize, Serialize};
 
 pub use nemo_relay_types::api::event::{DataSchema, EventSanitizeFields, LogSeverity};
@@ -647,6 +648,113 @@ pub struct PluginEventSanitizeCall {
     pub scope_category: Option<String>,
     /// The mutable observability fields the sanitizer may change.
     pub fields: EventSanitizeFields,
+}
+
+impl PluginEventSanitizeClass {
+    /// The lifecycle phase this class sanitizes, when it sanitizes a scope event.
+    ///
+    /// A mark has none, and that is the whole difference between the three
+    /// directions: the phase is what separates the scope pair, so a projection that
+    /// says both a class and a phase has said the same thing twice, and this is the
+    /// statement that is authoritative.
+    pub fn scope_category(self) -> Option<ScopeCategory> {
+        match self {
+            Self::Mark => None,
+            Self::ScopeStart => Some(ScopeCategory::Start),
+            Self::ScopeEnd => Some(ScopeCategory::End),
+        }
+    }
+}
+
+/// The wire name of a lifecycle phase, as it appears in a projection.
+fn phase_name(category: ScopeCategory) -> &'static str {
+    match category {
+        ScopeCategory::Start => "start",
+        ScopeCategory::End => "end",
+    }
+}
+
+impl PluginEventSanitizeCall {
+    /// Project one event for one class.
+    ///
+    /// The class is part of the capability rather than a field inside the payload,
+    /// so an event the class was never meant to see is refused here rather than
+    /// shown to a plugin: a mark sanitizer is not shown a scope, and the two scope
+    /// directions are not each other.
+    pub fn from_event(
+        class: PluginEventSanitizeClass,
+        event: &nemo_relay_types::api::event::Event,
+        fields: EventSanitizeFields,
+    ) -> Result<Self, PluginProtocolError> {
+        let shown = match event {
+            nemo_relay_types::api::event::Event::Mark(_) => None,
+            nemo_relay_types::api::event::Event::Scope(scope) => Some(scope.scope_category),
+        };
+        if shown != class.scope_category() {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!(
+                    "a {class:?} sanitizer was handed {} rather than the event its class \
+                     sanitizes",
+                    match shown {
+                        None => "a mark".to_string(),
+                        Some(category) => format!("a scope {}", phase_name(category)),
+                    }
+                ),
+            ));
+        }
+        Ok(Self {
+            class,
+            name: event.name().to_owned(),
+            scope_category: class.scope_category().map(phase_name).map(str::to_owned),
+            fields,
+        })
+    }
+
+    /// The event this projection stands for.
+    ///
+    /// The synthetic event *is* what the sanitizer was told it would see: the name
+    /// it decides on, the phase of the class it is for, and the mutable fields. The
+    /// rest of the runtime's own event never crossed, so there is nothing else to
+    /// rebuild — the identity fields here are this process's own, which is why a
+    /// sanitizer cannot rename the event it is sanitizing.
+    pub fn into_event(self) -> Result<nemo_relay_types::api::event::Event, PluginProtocolError> {
+        use nemo_relay_types::api::event::{
+            BaseEvent, Event, EventCategory, MarkEvent, ScopeEvent,
+        };
+
+        let expected = self.class.scope_category();
+        if self.scope_category.as_deref() != expected.map(phase_name) {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!(
+                    "a {0:?} projection states the phase {1:?}, which is not the phase its class \
+                     sanitizes",
+                    self.class, self.scope_category
+                ),
+            ));
+        }
+        let EventSanitizeFields {
+            data,
+            category_profile,
+            metadata,
+        } = self.fields;
+        let base = BaseEvent::builder()
+            .name(self.name)
+            .data_opt(data)
+            .metadata_opt(metadata)
+            .build();
+        Ok(match expected {
+            None => Event::Mark(MarkEvent::new(base, None, category_profile)),
+            Some(category) => Event::Scope(ScopeEvent::new(
+                base,
+                category,
+                Vec::new(),
+                EventCategory::custom(),
+                category_profile,
+            )),
+        })
+    }
 }
 
 /// One event, on its way to a plugin that observes it.
@@ -1696,5 +1804,165 @@ mod tests {
 
         assert_eq!(decoded, outcome);
         assert!(matches!(decoded.result, Err(ref carried) if carried == &failure));
+    }
+
+    /// A mark event whose identity is unmistakable, so a projection that carried any
+    /// of it would be caught by value rather than by key alone.
+    fn marked_event() -> nemo_relay_types::api::event::Event {
+        use nemo_relay_types::api::event::{BaseEvent, Event, MarkEvent};
+
+        let identity = Uuid::now_v7();
+        let root = Uuid::now_v7();
+        Event::Mark(MarkEvent::new(
+            BaseEvent::builder()
+                .name("example.mark")
+                .uuid(identity)
+                .parent_uuid_opt(Some(root))
+                .propagation_root_uuid_opt(Some(identity))
+                .data_opt(Some(serde_json::json!({ "payload": "value" })))
+                .metadata_opt(Some(serde_json::json!({ "key": "value" })))
+                .build(),
+            None,
+            None,
+        ))
+    }
+
+    /// The projection is the capability, so it carries the identity a sanitizer
+    /// decides on and nothing else the runtime happens to hold.
+    #[test]
+    fn a_projection_carries_no_event_identity() {
+        use nemo_relay_types::api::event::Event;
+
+        let event = marked_event();
+        let Event::Mark(mark) = &event else {
+            unreachable!("the helper builds a mark")
+        };
+        let call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::Mark,
+            &event,
+            event.sanitize_fields(),
+        )
+        .expect("a mark projection");
+        let serialized = serde_json::to_string(&call).expect("a serializable projection");
+
+        assert_eq!(call.name, "example.mark");
+        assert!(call.scope_category.is_none(), "a mark has no phase");
+        assert!(
+            serialized.contains("\"payload\":\"value\"")
+                && serialized.contains("\"key\":\"value\""),
+            "the mutable fields are what a sanitizer is shown: {serialized}"
+        );
+        let identity = mark.base.uuid.to_string();
+        let parent = mark.base.parent_uuid.expect("a parent").to_string();
+        let timestamp = mark.base.timestamp.to_rfc3339();
+        for carried in [identity, parent, timestamp, "atof_version".to_string()] {
+            assert!(
+                !serialized.contains(carried.as_str()),
+                "the projection carried {carried}: {serialized}"
+            );
+        }
+    }
+
+    /// The class is not interchangeable: a class is shown the kind of event it
+    /// sanitizes, and the two scope directions are not each other.
+    #[test]
+    fn a_projection_refuses_the_event_of_another_class() {
+        use nemo_relay_types::api::event::{
+            BaseEvent, Event, EventCategory, ScopeCategory, ScopeEvent,
+        };
+
+        let scope = |category| {
+            Event::Scope(ScopeEvent::new(
+                BaseEvent::builder().name("example.scope").build(),
+                category,
+                Vec::new(),
+                EventCategory::custom(),
+                None,
+            ))
+        };
+        let mark = marked_event();
+        let cases = [
+            (
+                PluginEventSanitizeClass::Mark,
+                scope(ScopeCategory::Start),
+                "a mark sanitizer",
+            ),
+            (
+                PluginEventSanitizeClass::Mark,
+                scope(ScopeCategory::End),
+                "a mark sanitizer",
+            ),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                mark.clone(),
+                "a start sanitizer",
+            ),
+            (PluginEventSanitizeClass::ScopeEnd, mark, "an end sanitizer"),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                scope(ScopeCategory::End),
+                "a start sanitizer",
+            ),
+            (
+                PluginEventSanitizeClass::ScopeEnd,
+                scope(ScopeCategory::Start),
+                "an end sanitizer",
+            ),
+        ];
+        for (class, event, what) in cases {
+            let fields = event.sanitize_fields();
+            let refused = PluginEventSanitizeCall::from_event(class, &event, fields);
+            assert!(refused.is_err(), "{what} was shown {:?}", event.kind());
+        }
+    }
+
+    /// The synthetic event is what the sanitizer was told it would see, and the
+    /// identity it is given is this process's rather than the runtime's.
+    #[test]
+    fn the_synthetic_event_is_what_the_projection_says() {
+        use nemo_relay_types::api::event::{Event, ScopeCategory};
+
+        let event = marked_event();
+        let fields = event.sanitize_fields();
+        let call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::Mark,
+            &event,
+            fields.clone(),
+        )
+        .expect("a mark projection");
+        let synthetic = call.into_event().expect("a synthetic mark");
+
+        assert_eq!(synthetic.name(), "example.mark");
+        assert_eq!(synthetic.sanitize_fields(), fields);
+        assert_ne!(
+            synthetic.uuid(),
+            event.uuid(),
+            "the sanitizer's copy is not the runtime's event"
+        );
+
+        // And a scope projection states its phase once: through its class.
+        let mut started = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::ScopeStart,
+            &Event::Scope(nemo_relay_types::api::event::ScopeEvent::new(
+                nemo_relay_types::api::event::BaseEvent::builder()
+                    .name("example.scope")
+                    .build(),
+                ScopeCategory::Start,
+                Vec::new(),
+                nemo_relay_types::api::event::EventCategory::custom(),
+                None,
+            )),
+            EventSanitizeFields::default(),
+        )
+        .expect("a start projection");
+        assert_eq!(started.scope_category.as_deref(), Some("start"));
+        let synthetic = started.clone().into_event().expect("a synthetic scope");
+        assert_eq!(synthetic.scope_category(), Some(ScopeCategory::Start));
+
+        started.scope_category = Some("end".to_string());
+        assert!(
+            started.into_event().is_err(),
+            "a projection stating the other phase is refused rather than believed"
+        );
     }
 }

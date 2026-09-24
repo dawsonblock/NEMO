@@ -538,6 +538,9 @@ impl ProcessPluginBackend {
             nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolExecutionIntercept,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmExecutionIntercept,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmStreamExecutionIntercept,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::MarkSanitizeGuardrail,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeStartGuardrail,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeEndGuardrail,
         ]
     }
 

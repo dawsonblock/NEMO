@@ -476,6 +476,17 @@ impl PluginHostService {
                         Err(error) => Ok(refusal(error.to_string())),
                     }
                 }
+                // The three event sanitize families. What crosses is the projection
+                // rather than the runtime's own event: the name a sanitizer decides
+                // on, the phase when it is a scope event, and the mutable fields it
+                // may change. What comes back is those fields and nothing else, so
+                // the class, the registration, the operation and the envelope stay
+                // the kernel's.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::MarkSanitizeGuardrail
+                | nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeStartGuardrail
+                | nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeEndGuardrail => {
+                    sanitized_event_fields(&request, operation).await
+                }
                 // The first class that wraps a call rather than answering one.
                 // The plugin's callback decides *when* the rest of the chain
                 // runs, and the rest of the chain is the kernel's, so the
@@ -1952,6 +1963,105 @@ async fn sanitized_tool_payload(
         Ok(None) => Ok(refusal(
             "the guardrail omitted the payload rather than publishing it unsanitized",
         )),
+        Err(error) => Ok(refusal(error.to_string())),
+    }
+}
+
+/// Run one event sanitize registration over the projection a kernel sent.
+///
+/// The class is part of the capability, so two things are checked before anything
+/// runs: that the projection names a class this registration is, and that the
+/// projection states the phase its class sanitizes. Both are refusals rather than
+/// coercions — three families share one serialization, and a structurally valid
+/// projection for another family is exactly the confusion the check exists for.
+///
+/// What the runtime's chain is given is a *synthetic* event built from the
+/// projection: the name the sanitizer decides on, the phase of its class, and the
+/// mutable fields. The sanitizer is not shown the kernel's event because the
+/// kernel's event never left the kernel, which is why nothing it answers with can
+/// rename, re-parent or re-time the event it sanitized.
+async fn sanitized_event_fields(
+    request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
+    operation: nemo_relay_plugin_protocol::PluginRegistrationOperation,
+) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
+    use nemo_relay_plugin_protocol::{
+        PluginEventSanitizeCall, PluginEventSanitizeClass, PluginRegistrationOperation,
+    };
+
+    let call: PluginEventSanitizeCall =
+        serde_json::from_str(&request.arguments).map_err(|error| {
+            refused(format!(
+                "an event sanitize payload must be a sanitizer projection: {error}"
+            ))
+        })?;
+    let expected = match operation {
+        PluginRegistrationOperation::MarkSanitizeGuardrail => PluginEventSanitizeClass::Mark,
+        PluginRegistrationOperation::ScopeSanitizeStartGuardrail => {
+            PluginEventSanitizeClass::ScopeStart
+        }
+        PluginRegistrationOperation::ScopeSanitizeEndGuardrail => {
+            PluginEventSanitizeClass::ScopeEnd
+        }
+        other => {
+            return Err(refused(format!(
+                "this host has no event sanitize runner for {}",
+                other.as_str()
+            )));
+        }
+    };
+    if call.class != expected {
+        return Err(refused(format!(
+            "registration '{}' is a {expected:?} sanitizer and the projection is for {:?}",
+            request.registration_id, call.class
+        )));
+    }
+    let event = call
+        .into_event()
+        .map_err(|error| refused(error.failure.message))?;
+    let sanitized = match operation {
+        PluginRegistrationOperation::MarkSanitizeGuardrail => {
+            nemo_relay::api::event::invoke_mark_sanitize_registration(
+                &request.registration_id,
+                event,
+            )
+            .await
+        }
+        PluginRegistrationOperation::ScopeSanitizeStartGuardrail => {
+            nemo_relay::api::event::invoke_scope_sanitize_start_registration(
+                &request.registration_id,
+                event,
+            )
+            .await
+        }
+        _ => {
+            nemo_relay::api::event::invoke_scope_sanitize_end_registration(
+                &request.registration_id,
+                event,
+            )
+            .await
+        }
+    };
+    match sanitized {
+        // Only the mutable fields go back. The chain here applied the answer to the
+        // synthetic event, and what the kernel publishes is those fields applied to
+        // *its* event — so the answer's identity fields, whatever they are, are never
+        // read.
+        Ok(sanitized) if sanitized.failure.is_none() => Ok(success(
+            serde_json::to_string(&sanitized.event.sanitize_fields()).map_err(|error| {
+                refused(format!(
+                    "the sanitized fields could not be serialized: {error}"
+                ))
+            })?,
+        )),
+        // A sanitizer that did not answer is a refusal rather than a payload that was
+        // cleared: the fields really are cleared either way, and the kernel is the
+        // side that has to record *why*, because the log line for it is in this
+        // process and the kernel's stream is where a plugin's failures belong.
+        Ok(sanitized) => Ok(refusal(format!(
+            "the {} sanitizer did not answer: {}",
+            operation.as_str(),
+            sanitized.failure.unwrap_or_default()
+        ))),
         Err(error) => Ok(refusal(error.to_string())),
     }
 }
@@ -5257,8 +5367,19 @@ mod tests {
         ("fixture_scope_end_sanitize", "fixture_scope_end_sanitize"),
     ];
 
-    /// The configuration that asks the fixture for the event sanitize families.
-    const EVENT_SANITIZERS: &str = r#"{"event_sanitizers": true}"#;
+    /// The configuration that asks the fixture for its failure shapes.
+    ///
+    /// The well-behaved registrations are part of the fixture's default set now that
+    /// the kernel serves the class; a sanitizer that refuses, one that throws and one
+    /// that answers oversized are behaviours a test asks for, because they would
+    /// otherwise change every other event the suite publishes.
+    ///
+    /// A value rather than a string of JSON, because it is handed to the activation as
+    /// one: a string of JSON here would be a JSON string on the wire, which the host
+    /// refuses as a configuration that is not an object.
+    fn event_sanitizer_failures() -> serde_json::Value {
+        serde_json::json!({ "event_sanitizer_failures": true })
+    }
 
     /// The response budget a success case states: above the fixture's payloads and
     /// below the transport's frame limit, which is a different limit.
@@ -5271,7 +5392,7 @@ mod tests {
     /// log file when it is given one, and "the call ran exactly this registration" is
     /// a claim about what ran rather than about what came back.
     async fn event_sanitize_session() -> Option<(FixtureSession, v1::ActivateOutcome)> {
-        event_sanitize_session_with(EVENT_SANITIZERS.into()).await
+        event_sanitize_session_with(serde_json::json!({})).await
     }
 
     async fn event_sanitize_session_with(
@@ -5566,7 +5687,9 @@ mod tests {
         // Core's plugin configuration is process-global, so a test that activates
         // a real plugin takes its turn.
         let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
-        let Some((session, activated)) = event_sanitize_session().await else {
+        let Some((session, activated)) =
+            event_sanitize_session_with(event_sanitizer_failures()).await
+        else {
             eprintln!("the intercept fixture is missing; skipping the refusal case");
             return;
         };
@@ -5590,7 +5713,9 @@ mod tests {
         // Core's plugin configuration is process-global, so a test that activates
         // a real plugin takes its turn.
         let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
-        let Some((session, activated)) = event_sanitize_session().await else {
+        let Some((session, activated)) =
+            event_sanitize_session_with(event_sanitizer_failures()).await
+        else {
             eprintln!("the intercept fixture is missing; skipping the panic case");
             return;
         };
@@ -5670,7 +5795,9 @@ mod tests {
         // Core's plugin configuration is process-global, so a test that activates
         // a real plugin takes its turn.
         let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
-        let Some((session, activated)) = event_sanitize_session().await else {
+        let Some((session, activated)) =
+            event_sanitize_session_with(event_sanitizer_failures()).await
+        else {
             eprintln!("the intercept fixture is missing; skipping the budget case");
             return;
         };
