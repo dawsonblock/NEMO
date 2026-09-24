@@ -259,6 +259,14 @@ cancellation rather than as a host that stopped asking without saying so.
 the producer is dropped — and `two_streams_on_one_channel_do_not_swap_answers`
 proves answers are routed by the call that asked rather than by stream.
 
+The window that test cannot reach is the one between asking the kernel for a stream
+and the kernel answering: the caller can walk away while the open is in flight, and
+then the identity of the stream the kernel is creating exists nowhere on this side.
+An answer nobody is waiting for is the last place it can be named, so the channel's
+reader cancels a `StreamOpened` it cannot deliver rather than dropping it, and
+`an_open_the_caller_left_cancels_the_kernel_s_producer` holds the kernel inside the
+open until the caller has gone and requires the producer to be dropped anyway.
+
 The upstream direction now exists as well. `PluginHost::InvokeStream` runs a
 streaming registration in the host and answers with the frames its *returned* stream
 produces — one frame per poll, so a kernel that stops reading stops the plugin
@@ -273,24 +281,15 @@ end to end.
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **The cancellation cascade, which the test for it currently fails.** Dropping the
-   kernel's consumer has to reach the producer behind it, and it does not:
-   `dropping_the_consumer_reaches_the_kernels_producer` walks the cascade with a drop
-   sentinel inside the real downstream producer, and the sentinel never fires —
-   neither the host's pull stream nor the kernel's driver saw a cancellation, so the
-   gap is in who owns the stream a callback *returns* rather than in the session
-   channel or the driver. The test is in the tree, ignored, with that reason: the
-   invariant is written down before the fix rather than after it, and it covers both
-   race points — dropping before any frame has crossed and after one has.
-2. **Interruptible outstanding pulls.** The kernel's driver answers one message at a
+1. **Interruptible outstanding pulls.** The kernel's driver answers one message at a
    time, so a cancellation arriving while it is producing waits for the pull it
    interrupted. The fix is the split the driver's own docs describe: reception stays
    serialized, production moves to a bounded task with a cancellation token, and one
    active pull per stream remains the rule.
-3. **Explicit credit**, scoped to the stream, starting at one.
-4. **Three budgets** — frame, cumulative bytes, and frame count — with every encoded
+2. **Explicit credit**, scoped to the stream, starting at one.
+3. **Three budgets** — frame, cumulative bytes, and frame count — with every encoded
    frame counted, terminal frames included.
-5. **Qualification**: deadlines before the first frame, during a pending pull and
+4. **Qualification**: deadlines before the first frame, during a pending pull and
    between frames; host death before the first frame and mid-stream; marks before,
    during and after streaming; and the terminal-frame rule pinned as a test, since it
    holds only while one stream has one producer. One limitation is written down rather than
@@ -371,9 +370,11 @@ fails the mark rather than growing the host's heap.
    streaming intercept needs the duplex session instead of a unary resume, and both
    halves of it exist — the kernel's driver, the host's channel, and the upstream
    direction where a callback's returned stream crosses back. What remains is
-   cancellation that reaches the producer behind a dropped consumer (the test for it
-   fails today), pulls that a cancellation can interrupt, credit, the three budget
-   limits, and the deadline/crash/mark qualification. The other
+   pulls that a cancellation can interrupt, credit, the three budget
+   limits, and the deadline/crash/mark qualification. Cancellation that reaches the
+   producer behind a dropped consumer used to be on that list and is not any more:
+   it holds for every state a consumer can leave in, including the open that is
+   still in flight. The other
    five classes need shapes of their own plus a core entry point that runs exactly
    one registration of that class.
 

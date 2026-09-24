@@ -99,6 +99,12 @@ impl KernelCallbacks {
         // The reader: one task for the host, because the kernel answers the calls
         // this host makes and every answer names the call it answers.
         let routing = std::sync::Arc::clone(&answers);
+        // Weak, because this reader is not what keeps the channel — and with it
+        // the kernel's session — alive: the host letting go of its end is the
+        // signal that ends the session, and a reader holding a sender would be
+        // holding that signal open.
+        let cancelling = outbound.downgrade();
+        let session = session_id.to_owned();
         tokio::spawn(async move {
             while let Some(answer) = answers_in.next().await {
                 let Ok(answer) = answer else { return };
@@ -107,12 +113,21 @@ impl KernelCallbacks {
                 else {
                     return;
                 };
-                let call = match &answer.message {
-                    PluginSessionPayload::StreamOpened(opened) => opened.host_call_id.clone(),
-                    PluginSessionPayload::StreamOpenFailed(failed) => failed.host_call_id.clone(),
-                    PluginSessionPayload::StreamItem(item) => item.host_call_id.clone(),
-                    PluginSessionPayload::StreamEnd(end) => end.host_call_id.clone(),
-                    PluginSessionPayload::StreamFailed(failed) => failed.host_call_id.clone(),
+                // The stream an answer names, when the answer is one that
+                // creates a stream: an answer nobody receives has to leave
+                // nothing behind, and only this answer can name what it left.
+                let (call, opened) = match &answer.message {
+                    PluginSessionPayload::StreamOpened(opened) => {
+                        (opened.host_call_id.clone(), Some(opened.stream_id.clone()))
+                    }
+                    PluginSessionPayload::StreamOpenFailed(failed) => {
+                        (failed.host_call_id.clone(), None)
+                    }
+                    PluginSessionPayload::StreamItem(item) => (item.host_call_id.clone(), None),
+                    PluginSessionPayload::StreamEnd(end) => (end.host_call_id.clone(), None),
+                    PluginSessionPayload::StreamFailed(failed) => {
+                        (failed.host_call_id.clone(), None)
+                    }
                     // Answers to calls this side did not make are not this side's
                     // to route; a session that sent one is answered by ending the
                     // channel, which the loop does by returning.
@@ -122,8 +137,39 @@ impl KernelCallbacks {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&call);
-                if let Some(waiting) = waiting {
-                    let _ = waiting.send(answer.message);
+                let delivered = match waiting {
+                    Some(waiting) => waiting.send(answer.message).is_ok(),
+                    None => false,
+                };
+                if delivered {
+                    continue;
+                }
+                // The call that asked for this stream is gone: the consumer
+                // walked away while the open was in flight, so the kernel has
+                // made a stream this host cannot hand to anyone. It is cancelled
+                // here because this is the last place its identity exists — the
+                // owner that would have cancelled it no longer does — and a
+                // stream nothing names is one the kernel keeps producing for.
+                //
+                // Awaited rather than tried: a cancellation dropped because a
+                // buffer was full is the leak this is here to prevent, and this
+                // reader is a task of its own rather than a `poll_next`, so it is
+                // the one place in the channel that can afford to wait.
+                if let Some(stream_id) = opened
+                    && let Some(cancelling) = cancelling.upgrade()
+                {
+                    let cancellation = PluginSessionMessage {
+                        session_id: session.clone(),
+                        message: PluginSessionPayload::StreamCancel(PluginStreamControl {
+                            host_call_id: format!("cancel-{stream_id}"),
+                            stream_id,
+                        }),
+                    };
+                    let _ = cancelling
+                        .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                            &cancellation,
+                        ))
+                        .await;
                 }
             }
         });
@@ -538,6 +584,12 @@ mod tests {
     /// stopped pulling would leave the kernel's producer alive, and a kernel
     /// holding a producer for a consumer that walked away is the leak this
     /// exists to prevent.
+    ///
+    /// The same has to hold one step earlier, when the consumer walks away while
+    /// the *open* is in flight: the kernel has been asked for a stream and has
+    /// not answered yet, so the identity the cancellation needs does not exist on
+    /// this side. `an_open_the_caller_left_cancels_the_kernel_s_producer` is that
+    /// window.
     #[tokio::test]
     async fn a_dropped_stream_cancels_the_kernel_s_producer() {
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -548,6 +600,7 @@ mod tests {
                 Ok(serde_json::json!({"chunk": 2})),
             ],
             watching,
+            None,
         )
         .await;
         let callbacks = callbacks(&endpoint).await;
@@ -576,6 +629,86 @@ mod tests {
             stopped.is_ok(),
             "the kernel dropped the producer the consumer walked away from"
         );
+    }
+
+    /// An open nobody is waiting for is cancelled rather than left producing.
+    ///
+    /// The narrowest window in the cascade: the plugin has asked the kernel for
+    /// the downstream stream of an operation and the kernel has not answered, so
+    /// the stream it is about to create has no name on this side yet. Waiting is
+    /// what makes that window reachable at all — the kernel is held inside the
+    /// open until the caller has already gone — and the proof is again on the
+    /// kernel's side, because a stream nobody names is one nothing else will
+    /// ever cancel.
+    #[tokio::test]
+    async fn an_open_the_caller_left_cancels_the_kernel_s_producer() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::new(OpenGate::new());
+        let endpoint = serve_kernel_with_marker(
+            vec![Ok(serde_json::json!({"chunk": 1}))],
+            std::sync::Arc::clone(&dropped),
+            Some(std::sync::Arc::clone(&gate)),
+        )
+        .await;
+        let callbacks = callbacks(&endpoint).await;
+        let channel = callbacks
+            .open_session(SESSION_ID)
+            .await
+            .expect("an open channel");
+        let request = LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        };
+
+        // The caller walks away while the kernel is inside the open: the future
+        // that would have received the stream is dropped, so the answer it would
+        // have carried has no owner on this side.
+        {
+            let opening = channel.open_stream("operation-1", &request);
+            let mut opening = std::pin::pin!(opening);
+            tokio::select! {
+                () = gate.entered.notified() => {}
+                answered = &mut opening => panic!(
+                    "the kernel answered before it opened the stream: {answered:?}"
+                ),
+            }
+        }
+        // The kernel finishes the open it was already in, and the stream it
+        // creates must not outlive the caller that asked for it.
+        gate.release.notify_one();
+
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "the stream the kernel opened for a caller that left was cancelled"
+        );
+    }
+
+    /// A pause the kernel takes inside the open it was asked for.
+    ///
+    /// The window between asking for a stream and the kernel answering it is too
+    /// narrow to hit by timing, and a test that tried would be a test about the
+    /// scheduler. The kernel parks where the test can see it and continues when
+    /// the test says so.
+    struct OpenGate {
+        /// Fires as the kernel enters the open.
+        entered: tokio::sync::Notify,
+        /// Released by the test to let the kernel create the producer.
+        release: tokio::sync::Notify,
+    }
+
+    impl OpenGate {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
     }
 
     /// Two streams on one channel pull independently, and their answers do not
@@ -635,9 +768,13 @@ mod tests {
     }
 
     /// The same kernel, with a producer that records when it is dropped.
+    ///
+    /// `gate` holds the kernel inside the open when a test needs to see the
+    /// window between asking for a stream and the kernel answering it.
     async fn serve_kernel_with_marker(
         chunks: Vec<Result<serde_json::Value, String>>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        gate: Option<std::sync::Arc<OpenGate>>,
     ) -> std::path::PathBuf {
         use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
 
@@ -646,6 +783,7 @@ mod tests {
             std::sync::Arc::new(move |_request| {
                 let chunks = chunks.clone();
                 let dropped = std::sync::Arc::clone(&dropped);
+                let gate = gate.clone();
                 Box::pin(async move {
                     let items: Vec<Result<serde_json::Value, nemo_relay::error::FlowError>> =
                         chunks
@@ -676,6 +814,10 @@ mod tests {
                             self.dropped
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
+                    }
+                    if let Some(gate) = &gate {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
                     }
                     Ok(nemo_relay::api::runtime::LlmJsonStream::new(Watched {
                         items: items.into_iter(),

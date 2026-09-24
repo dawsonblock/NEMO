@@ -269,10 +269,21 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # the forked child, allocates nothing, and takes no locks. The transitive set is
 # unchanged, so nothing new was pulled in behind them. Both counts leave the
 # kernel-process figure when the loader does.
+#
+# Budget raise (cancellation cascade): the cascade is one property with three
+# ownership states, and the tests that pin it cost more than the fix. The host's
+# session-channel reader now cancels a stream the kernel opened for a call that
+# is no longer waiting — the one window where the identity of what to cancel
+# exists nowhere else — which is thirty lines and one awaited send. The rest is
+# the evidence: the streaming-cascade test drives a real plugin over a real
+# socket in each of those states (a producer that reports its own creation and
+# drop, and a gate that holds the kernel inside an open so the consumer can leave
+# while it is in flight) and the session channel names the same window directly.
+# No dependency moved and no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 14126
+max_source_lines = 14392
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

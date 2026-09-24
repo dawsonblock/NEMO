@@ -1827,18 +1827,109 @@ mod tests {
         session_id: &str,
         chunks: Vec<serde_json::Value>,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
-        serve_kernel_with_stream_and_sentinel(session_id, chunks, None).await
+        serve_kernel_with_producer(session_id, chunks, KernelProducer::watching()).await
     }
 
-    /// The same kernel, with the producer's lifetime observable.
+    /// What a kernel's producer says about its own lifetime.
     ///
-    /// The sentinel fires when the stream the kernel was producing is *dropped*,
-    /// which is what a cancellation has to reach: a test that only watched the
-    /// session channel would see the message and not the effect.
-    async fn serve_kernel_with_stream_and_sentinel(
+    /// A cancellation is only proved by the last step of the cascade: the work
+    /// behind the consumer stops. A test that watched the session channel would
+    /// see a message about stopping rather than the effect, so the producer
+    /// reports when it was created and when it was dropped, and — for the window
+    /// no amount of timing can hit twice — parks where a test can see it and
+    /// continues when the test says so.
+    #[derive(Clone)]
+    struct KernelProducer {
+        /// Set once the kernel has created a producer for a stream.
+        produced: Arc<std::sync::atomic::AtomicBool>,
+        /// Set when that producer is dropped.
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        /// A pause the kernel takes before it creates the producer.
+        gate: Option<Arc<KernelGate>>,
+    }
+
+    impl KernelProducer {
+        /// A producer that says when it was made and when it was dropped.
+        fn watching() -> Self {
+            Self {
+                produced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                gate: None,
+            }
+        }
+
+        /// The same producer, with the kernel parking as it opens.
+        ///
+        /// The consumer walking away while the open is in flight is a race the
+        /// scheduler decides unless the kernel is held in it: this is what makes
+        /// it the state the test names.
+        fn gated() -> Self {
+            Self {
+                gate: Some(Arc::new(KernelGate {
+                    entered: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                })),
+                ..Self::watching()
+            }
+        }
+
+        /// Wait until the kernel has created its producer.
+        async fn await_produced(&self) {
+            self.await_flag(&self.produced, "the kernel created a producer")
+                .await;
+        }
+
+        /// Wait until the kernel is inside the open it was asked for.
+        async fn await_open_in_flight(&self) {
+            let gate = self
+                .gate
+                .as_ref()
+                .expect("only a gated producer opens in flight");
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+                .await
+                .expect("the kernel reaches the open it was asked for");
+        }
+
+        /// Let the kernel finish the open it is parked in.
+        fn release_open(&self) {
+            if let Some(gate) = &self.gate {
+                gate.release.notify_one();
+            }
+        }
+
+        /// Wait until the kernel's producer is gone.
+        async fn await_dropped(&self, when: &str) {
+            self.await_flag(
+                &self.dropped,
+                &format!("the kernel dropped its producer {when}"),
+            )
+            .await;
+        }
+
+        async fn await_flag(&self, flag: &std::sync::atomic::AtomicBool, what: &str) {
+            let reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(reached.is_ok(), "{what}");
+        }
+    }
+
+    /// A pause the kernel takes before it creates a producer.
+    struct KernelGate {
+        /// Fires as the kernel parks, so a test knows the open is in flight.
+        entered: tokio::sync::Notify,
+        /// Released by the test to let the kernel create the producer.
+        release: tokio::sync::Notify,
+    }
+
+    /// The kernel with a producer whose lifetime the test can observe.
+    async fn serve_kernel_with_producer(
         session_id: &str,
         chunks: Vec<serde_json::Value>,
-        dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+        producer: KernelProducer,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
         use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
         use tonic::transport::Server;
@@ -1847,12 +1938,12 @@ mod tests {
         let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
             Arc::new(move |_request| {
                 let chunks = chunks.clone();
-                let dropped = dropped.clone();
+                let producer = producer.clone();
                 Box::pin(async move {
                     /// A producer that says when it is gone.
                     struct Watched {
                         items: std::vec::IntoIter<serde_json::Value>,
-                        dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+                        dropped: Arc<std::sync::atomic::AtomicBool>,
                     }
                     impl tokio_stream::Stream for Watched {
                         type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
@@ -1865,14 +1956,20 @@ mod tests {
                     }
                     impl Drop for Watched {
                         fn drop(&mut self) {
-                            if let Some(dropped) = &self.dropped {
-                                dropped.store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
+                            self.dropped
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
+                    if let Some(gate) = &producer.gate {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
+                    }
+                    producer
+                        .produced
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(nemo_relay::api::runtime::LlmJsonStream::new(Watched {
                         items: chunks.into_iter(),
-                        dropped,
+                        dropped: Arc::clone(&producer.dropped),
                     }))
                 })
             });
@@ -3431,64 +3528,91 @@ mod tests {
     /// the *last* step, because that is the one that says the work stopped rather
     /// than that a message was sent.
     ///
-    /// Both race points are covered: dropping before any frame has crossed, and
-    /// dropping after one has. They are different ownership states — the first
-    /// happens while the plugin's stream has been opened but not yet polled, the
-    /// second while a frame is in flight — and a leak in either is the kind that
-    /// only shows up in production.
-    /// Ignored while the cascade is incomplete, and the reason is recorded here
-    /// rather than in a commit message: the test fails because the host never
-    /// drops the stream its callback returned for a streaming intercept, so the
-    /// cancellation is never sent and the kernel's producer outlives the consumer.
-    /// The trace that established it: neither the host's pull stream nor the
-    /// kernel's driver observed a cancellation, so the gap is in the ownership of
-    /// the returned stream between the ABI's stream table and the frames this host
-    /// hands the kernel.
-    #[ignore = "the cancellation cascade does not reach the kernel's producer yet; see the doc comment"]
+    /// Every state a consumer can walk away in is covered, because they are
+    /// different ownership states rather than different timings: the plugin's
+    /// downstream stream is open and nothing has been read from it, the open is
+    /// still in flight so the kernel is producing a stream the host has not been
+    /// told the name of, and a frame has already crossed. A leak in any of them
+    /// is the kind that only shows up in production.
     #[tokio::test]
     async fn dropping_the_consumer_reaches_the_kernels_producer() {
-        for frames_read in [0, 1] {
-            let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
-            let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
-                eprintln!("the native fixture is missing; skipping the cancellation case");
-                return;
-            };
-            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (service, session_id) = streaming_service(&artifact, Arc::clone(&dropped)).await;
+        the_cascade_holds_when_the_consumer_leaves(Leaving::BeforeAnyFrame).await;
+        the_cascade_holds_when_the_consumer_leaves(Leaving::WhileTheOpenIsInFlight).await;
+        the_cascade_holds_when_the_consumer_leaves(Leaving::AfterAFrame).await;
+    }
 
-            let answer = invoke_stream_frames(&service, &session_id).await;
-            {
-                use tokio_stream::StreamExt;
-                let mut frames = answer;
-                for _ in 0..frames_read {
-                    assert!(
-                        frames.next().await.is_some(),
-                        "a frame crossed before the consumer walked away"
-                    );
-                }
-                // The consumer walks away. Everything behind it should follow.
-                drop(frames);
+    /// When the consumer walks away, relative to the stream behind it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Leaving {
+        /// The downstream stream is open and unpolled.
+        BeforeAnyFrame,
+        /// The kernel is opening: it has been asked for a stream and has not
+        /// answered yet, so its name does not exist on this side.
+        WhileTheOpenIsInFlight,
+        /// A frame has crossed and a consumer is reading.
+        AfterAFrame,
+    }
+
+    impl Leaving {
+        /// How a failure names the state it was in.
+        fn describe(self) -> &'static str {
+            match self {
+                Self::BeforeAnyFrame => "with the stream open and unpolled",
+                Self::WhileTheOpenIsInFlight => "with the open still in flight",
+                Self::AfterAFrame => "after a frame crossed",
             }
-
-            let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await;
-            assert!(
-                released.is_ok(),
-                "after {frames_read} frame(s), dropping the consumer dropped the kernel's producer"
-            );
-            let _ = std::fs::remove_dir_all(&manifest_dir);
         }
+    }
+
+    /// One point in that race, driven end to end against a real plugin.
+    ///
+    /// The fixture is a real native plugin over a real socket to a real kernel,
+    /// so the cascade is the one production has; only the moment the consumer
+    /// leaves is chosen by the test.
+    async fn the_cascade_holds_when_the_consumer_leaves(leaving: Leaving) {
+        use tokio_stream::StreamExt;
+
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the cancellation case");
+            return;
+        };
+        let producer = match leaving {
+            Leaving::WhileTheOpenIsInFlight => KernelProducer::gated(),
+            _ => KernelProducer::watching(),
+        };
+        let (service, session_id) = streaming_service(&artifact, producer.clone()).await;
+        let mut frames = invoke_stream_frames(&service, &session_id).await;
+
+        match leaving {
+            // Waiting for the producer is what makes this the state the test
+            // names: the stream behind the consumer exists, and the consumer has
+            // read nothing from it.
+            Leaving::BeforeAnyFrame => producer.await_produced().await,
+            // The kernel is held in the open, so the consumer leaves before the
+            // stream it is opening has a name on this side of the boundary.
+            Leaving::WhileTheOpenIsInFlight => producer.await_open_in_flight().await,
+            Leaving::AfterAFrame => {
+                assert!(
+                    frames.next().await.is_some(),
+                    "a frame crossed before the consumer walked away"
+                );
+            }
+        }
+
+        // The consumer walks away. Everything behind it should follow.
+        drop(frames);
+        producer.release_open();
+
+        producer.await_dropped(leaving.describe()).await;
+        let _ = std::fs::remove_dir_all(&manifest_dir);
     }
 
     /// A host service that serves every class, with the fixture activated, and a
     /// kernel whose producer reports when it is dropped.
     async fn streaming_service(
         artifact: &str,
-        dropped: Arc<std::sync::atomic::AtomicBool>,
+        producer: KernelProducer,
     ) -> (PluginHostService, String) {
         let backend = Arc::new(crate::InProcessPluginBackend::new());
         let config = PluginHostConfig {
@@ -3517,13 +3641,13 @@ mod tests {
         .expect("an established session")
         .session_id;
 
-        let (endpoint, kernel) = serve_kernel_with_stream_and_sentinel(
+        let (endpoint, kernel) = serve_kernel_with_producer(
             &session_id,
             vec![
                 serde_json::json!({"chunk": 1}),
                 serde_json::json!({"chunk": 2}),
             ],
-            Some(dropped),
+            producer,
         )
         .await;
         // Kept for the test's lifetime, so the kernel's listener outlives the call.
