@@ -353,10 +353,21 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # was fixed, the four shapes of a frames stream (each also requiring the held chain
 # position to be given back), and the repeated mixture of three streams ending three
 # ways. No dependency moved and no `unsafe` did.
+#
+# Budget raise (qualification): the Layer 2 gate for the three event sanitize
+# classes is tests and one test-facing helper as well. The raise is the sentinel
+# helper (a value planted in every observable field, and the assertion that none of
+# it reaches an answer) plus the host's half of the nine properties: exactly one
+# registration runs, the class is the registration's own, and refusal, a throwing
+# callback, a malformed projection, an answer above the operation's budget and a
+# call naming another registration, session or runtime each fail closed. The
+# negative cases carry a control that the class is served at all, so none of them
+# can pass while the class is unserved. No dependency moved and no `unsafe` did:
+# this is what the boundary refuses, not what it reaches.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 18102
+max_source_lines = 19077
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

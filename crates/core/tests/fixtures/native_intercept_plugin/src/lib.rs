@@ -15,9 +15,9 @@
 //! is being qualified is the path, not the callback.
 
 use nemo_relay_plugin::{
-    CategoryProfile, ConfigDiagnostic, EventCategory, Json, LlmRequestInterceptOutcome,
-    NativePlugin, PendingMarkSpec, PluginContext, Result, ToolExecutionInterceptOutcome,
-    ToolExecutionResult, nemo_relay_plugin,
+    CategoryProfile, ConfigDiagnostic, EventCategory, EventSanitizeFields, Json,
+    LlmRequestInterceptOutcome, NativePlugin, PendingMarkSpec, PluginContext, Result,
+    ToolExecutionInterceptOutcome, ToolExecutionResult, nemo_relay_plugin,
 };
 use serde_json::{Map, json};
 
@@ -47,6 +47,33 @@ pub const LLM_EXECUTION_MARKER: &str = "native_intercept_llm_execution";
 
 /// The mark the execution intercept asks the call's owner to emit.
 pub const EXECUTION_PENDING_MARK: &str = "fixture.intercept.tool_execution.mark";
+
+/// The metadata key the first mark sanitizer adds.
+///
+/// Three mark sanitizers rather than one because the property these fixtures exist
+/// for is *which* registration ran: a family that is invoked whole would leave all
+/// three markers on the answer, and a chain that stopped at the first would leave
+/// one.
+pub const MARK_A_MARKER: &str = "fixture_mark_a";
+
+/// The metadata key the second mark sanitizer adds.
+pub const MARK_B_MARKER: &str = "fixture_mark_b";
+
+/// The metadata key the third mark sanitizer adds.
+pub const MARK_C_MARKER: &str = "fixture_mark_c";
+
+/// The metadata key the scope-start sanitizer adds.
+pub const SCOPE_START_MARKER: &str = "fixture_scope_start_sanitize";
+
+/// The metadata key the scope-end sanitizer adds.
+pub const SCOPE_END_MARKER: &str = "fixture_scope_end_sanitize";
+
+/// How much padding the answer of the oversized sanitizer carries.
+///
+/// Larger than any response budget the suite states, and small enough to stay
+/// inside the frame the transport allows: what has to trip is the operation's own
+/// budget rather than the frame limit.
+const OVERSIZED_PADDING_BYTES: usize = 8 * 1024;
 
 struct InterceptPlugin;
 
@@ -255,6 +282,25 @@ impl NativePlugin for InterceptPlugin {
                 })
             }
         })?;
+        // The three event sanitize families, and only when a test asks for them.
+        //
+        // This fixture registers exactly the classes a kernel can serve, which is
+        // what a qualification run needs; the event sanitizers are not servable
+        // yet, so registering them by default would make every composition test
+        // refuse the plugin whole. Gating them behind a config key keeps the
+        // default set honest while the Layer 2 gate is written against the shape
+        // the classes will have.
+        if config
+            .get("event_sanitizers")
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+        {
+            let log = config
+                .get("sanitizer_log")
+                .and_then(Json::as_str)
+                .map(str::to_owned);
+            register_event_sanitizers(ctx, log)?;
+        }
         ctx.register_tool_request_intercept(
             "fixture_intercept_rewrite",
             0,
@@ -269,6 +315,168 @@ impl NativePlugin for InterceptPlugin {
             },
         )
     }
+}
+
+/// Register one sanitizer per family, three of them in one family.
+///
+/// The three mark sanitizers differ only in the marker they add and the order they
+/// declare, because that is what the property needs: a call naming one of them has
+/// to leave that one's marker and neither neighbour's, and an answer that carries
+/// two markers is a family that ran rather than a registration that answered.
+///
+/// The last two are the failure shapes: one registration that refuses, and one that
+/// answers correctly with more bytes than the operation was allowed to receive.
+///
+/// When a test hands over a log path, every registration appends its own local name
+/// to it as it runs. A marker in an answer says which registration *answered*; the
+/// log says which registrations *ran*, and "B ran once while A and C did not run at
+/// all" is a claim only the second can make — a host that ran B twice would satisfy
+/// the first.
+pub fn register_event_sanitizers(ctx: &mut PluginContext<'_>, log: Option<String>) -> Result<()> {
+    ctx.register_mark_sanitize_guardrail("fixture_mark_a", 0, {
+        let log = log.clone();
+        move |_event, fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_mark_a");
+                Ok(marked_fields(fields, MARK_A_MARKER))
+            }
+        }
+    })?;
+    ctx.register_mark_sanitize_guardrail("fixture_mark_b", 10, {
+        let log = log.clone();
+        move |_event, fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_mark_b");
+                Ok(marked_fields(fields, MARK_B_MARKER))
+            }
+        }
+    })?;
+    ctx.register_mark_sanitize_guardrail("fixture_mark_c", 20, {
+        let log = log.clone();
+        move |_event, fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_mark_c");
+                Ok(marked_fields(fields, MARK_C_MARKER))
+            }
+        }
+    })?;
+    ctx.register_scope_sanitize_start_guardrail("fixture_scope_start_sanitize", 0, {
+        let log = log.clone();
+        move |_event, fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_scope_start_sanitize");
+                Ok(marked_fields(fields, SCOPE_START_MARKER))
+            }
+        }
+    })?;
+    // A second sanitizer of one family, so "the family does not run" is a claim
+    // about a neighbour rather than about the only registration there is.
+    ctx.register_scope_sanitize_start_guardrail("fixture_scope_start_other", 10, {
+        let log = log.clone();
+        move |_event, fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_scope_start_other");
+                Ok(marked_fields(fields, "fixture_scope_start_other"))
+            }
+        }
+    })?;
+    ctx.register_scope_sanitize_end_guardrail("fixture_scope_end_sanitize", 0, {
+        let log = log.clone();
+        move |_event, fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_scope_end_sanitize");
+                Ok(marked_fields(fields, SCOPE_END_MARKER))
+            }
+        }
+    })?;
+    // A sanitizer that refuses. What it does *not* do is answer with the payload it
+    // was given, which is the difference between a withheld payload and a published
+    // one.
+    ctx.register_mark_sanitize_guardrail("fixture_mark_refuses", 30, {
+        let log = log.clone();
+        move |_event, _fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_mark_refuses");
+                Err("the fixture refuses to sanitize".into())
+            }
+        }
+    })?;
+    // A callback that throws rather than refusing. The two are different findings —
+    // a sanitizer that said no and a sanitizer that fell over — and a host that
+    // reported them the same way would make one of them invisible.
+    ctx.register_mark_sanitize_guardrail("fixture_mark_panics", 35, {
+        let log = log.clone();
+        move |_event, _fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_mark_panics");
+                panic!("the fixture's mark sanitizer panics")
+            }
+        }
+    })?;
+    // A valid answer, far larger than a small response budget. The padding is
+    // written here rather than by the caller so the size of the answer is the
+    // fixture's and the budget is the operation's.
+    ctx.register_mark_sanitize_guardrail("fixture_mark_oversized", 40, {
+        let log = log.clone();
+        move |_event, mut fields| {
+            let log = log.clone();
+            async move {
+                log_run(log.as_deref(), "fixture_mark_oversized");
+                let mut metadata = match fields.metadata.take() {
+                    Some(Json::Object(object)) => object,
+                    _ => Map::new(),
+                };
+                metadata.insert(
+                    "fixture_mark_oversized".into(),
+                    Json::String("x".repeat(OVERSIZED_PADDING_BYTES)),
+                );
+                fields.metadata = Some(Json::Object(metadata));
+                Ok(fields)
+            }
+        }
+    })
+}
+
+/// Append one registration's local name to the log a test handed over.
+///
+/// A log that cannot be written is not a plugin failure: the fixture is
+/// qualification scaffolding, and a missing witness must not change the behaviour
+/// being witnessed.
+fn log_run(log: Option<&str>, name: &str) {
+    use std::io::Write;
+    let Some(path) = log else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{name}");
+    }
+}
+
+/// Add one marker to an event's metadata, leaving every other field alone.
+///
+/// A sanitizer's job is to change what observers see, so what it adds is visible
+/// and what it was handed is carried through: a fixture that dropped the payload it
+/// was given could not tell a sanitizer that ran from one that published nothing.
+fn marked_fields(mut fields: EventSanitizeFields, marker: &str) -> EventSanitizeFields {
+    let mut metadata = match fields.metadata.take() {
+        Some(Json::Object(object)) => object,
+        _ => Map::new(),
+    };
+    metadata.insert(marker.to_string(), Json::Bool(true));
+    fields.metadata = Some(Json::Object(metadata));
+    fields
 }
 
 nemo_relay_plugin!(nemo_relay_native_intercept_fixture, || InterceptPlugin);

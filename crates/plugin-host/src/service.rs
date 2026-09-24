@@ -2384,6 +2384,80 @@ mod tests {
                 .into_inner()
         }
 
+        /// Activate the loaded plugin with the configuration a test chooses.
+        ///
+        /// The same call as [`Self::activate`] with the one difference this suite
+        /// needs: the fixture registers the classes a kernel can proxy by default,
+        /// and the event sanitizers are asked for by configuration until the kernel
+        /// can proxy them, so the classes under test are the test's decision rather
+        /// than the fixture's default set.
+        async fn activate_with(&self, config_json: &str) -> v1::ActivateOutcome {
+            self.service
+                .activate(capable(v1::ActivateRequest {
+                    session_id: self.session_id.clone(),
+                    context: Some(context()),
+                    discovery: false,
+                    components: vec![v1::ComponentConfiguration {
+                        kind: "fixture_intercept".into(),
+                        config_json: config_json.to_owned(),
+                    }],
+                }))
+                .await
+                .expect("a served activation")
+                .into_inner()
+        }
+
+        /// One registration the activation reported, found by its local name.
+        ///
+        /// The runtime qualifies a plugin's names with the component namespace, so
+        /// what a test writes is a suffix of the identity a kernel would install a
+        /// proxy under. Reading it back from the report is what keeps a test from
+        /// spelling the qualification out by hand and drifting from it.
+        fn registration_named(&self, outcome: &v1::ActivateOutcome, local_name: &str) -> String {
+            let suffix = format!(":{local_name}");
+            let Some(v1::activate_outcome::Result::Activated(response)) = &outcome.result else {
+                panic!("the fixture's registrations are reported: {outcome:?}");
+            };
+            response
+                .descriptors
+                .iter()
+                .flat_map(|descriptor| descriptor.registrations.iter())
+                .find(|registration| registration.registration_id.ends_with(&suffix))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the fixture registered no '{local_name}': is the fixture built with the \
+                         registrations this suite is about? {outcome:?}"
+                    )
+                })
+                .registration_id
+                .clone()
+        }
+
+        /// Invoke one registration with the arguments and the response budget given.
+        async fn invoke_arguments(
+            &self,
+            registration: &str,
+            arguments: &str,
+            max_response_bytes: u32,
+        ) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
+            let answer = self
+                .service
+                .invoke(capable(v1::InvokeRequest {
+                    session_id: self.session_id.clone(),
+                    context: Some(context_with_budget(max_response_bytes)),
+                    handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(
+                        &self.handle,
+                    )),
+                    registration_id: registration.to_owned(),
+                    arguments: arguments.to_owned(),
+                }))
+                .await
+                .expect("a served invocation")
+                .into_inner();
+            nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&answer)
+                .expect("a converted invocation")
+        }
+
         /// The registration a report names, as the kernel would proxy it.
         fn tool_request_intercept(&self, outcome: &v1::ActivateOutcome) -> String {
             let Some(v1::activate_outcome::Result::Activated(response)) = &outcome.result else {
@@ -5132,5 +5206,573 @@ mod tests {
             attached.is_ok(),
             "the session's own capability attaches: {attached:?}"
         );
+    }
+
+    // -- The Layer 2 gate: the three event sanitize families ---------------------
+    //
+    // The classes under test are the mark, scope-start and scope-end sanitizers:
+    // three families that share one serialization, and cross the boundary as a
+    // *projection* — the identity a sanitizer decides on (the event's name, and the
+    // phase when it is a scope event) plus the mutable observability fields it may
+    // change. The kernel keeps the event, the class it asked under, the registration
+    // identity, the operation identity and the publication decision.
+    //
+    // What is here is the host's half: exactly one registration runs, the class it
+    // runs is the registration's own, and every failure is a failure rather than an
+    // unsanitized answer. What is deliberately not here is the kernel's half — the
+    // proxy that builds the projection, sends it beside the call and applies what
+    // comes back — because a sanitize proxy's answer arrives over the composition's
+    // own transport, so a test of it is a test with a host process in it. That
+    // qualification is the process-boundary suite's, and it reuses the sentinel
+    // assertion below.
+    //
+    // Every failure case also asserts the confidentiality property directly: a
+    // sentinel in every observable field, and an assertion that none of it reaches
+    // anything the answer carries. "The invocation was refused" is a weaker claim
+    // than "the payload cannot be published", and only the second is the property.
+
+    use nemo_relay_plugin_protocol::{
+        EventSanitizeFields, PluginEventSanitizeCall, PluginEventSanitizeClass, PluginSuccess,
+    };
+
+    use crate::confidentiality;
+
+    /// The fixture's three mark sanitizers, and the marker each one adds.
+    const MARK_SANITIZERS: [(&str, &str); 3] = [
+        ("fixture_mark_a", "fixture_mark_a"),
+        ("fixture_mark_b", "fixture_mark_b"),
+        ("fixture_mark_c", "fixture_mark_c"),
+    ];
+
+    /// Every marker the fixture's sanitizers can leave, by family.
+    const EVERY_MARKER: [(&str, &str); 6] = [
+        ("fixture_mark_a", "fixture_mark_a"),
+        ("fixture_mark_b", "fixture_mark_b"),
+        ("fixture_mark_c", "fixture_mark_c"),
+        (
+            "fixture_scope_start_sanitize",
+            "fixture_scope_start_sanitize",
+        ),
+        ("fixture_scope_start_other", "fixture_scope_start_other"),
+        ("fixture_scope_end_sanitize", "fixture_scope_end_sanitize"),
+    ];
+
+    /// The configuration that asks the fixture for the event sanitize families.
+    const EVENT_SANITIZERS: &str = r#"{"event_sanitizers": true}"#;
+
+    /// The response budget a success case states: above the fixture's payloads and
+    /// below the transport's frame limit, which is a different limit.
+    const EVENT_SANITIZE_BUDGET: u32 = 64 * 1024;
+
+    /// A host serving one session, with the fixture asked for the three families.
+    ///
+    /// The configuration is the caller's because two of these tests need a witness
+    /// rather than an answer: the fixture appends every registration it runs to a
+    /// log file when it is given one, and "the call ran exactly this registration" is
+    /// a claim about what ran rather than about what came back.
+    async fn event_sanitize_session() -> Option<(FixtureSession, v1::ActivateOutcome)> {
+        event_sanitize_session_with(EVENT_SANITIZERS.into()).await
+    }
+
+    async fn event_sanitize_session_with(
+        config: serde_json::Value,
+    ) -> Option<(FixtureSession, v1::ActivateOutcome)> {
+        let session = FixtureSession::start(
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await?;
+        let activated = session.activate_with(&config.to_string()).await;
+        assert!(
+            matches!(
+                activated.result,
+                Some(v1::activate_outcome::Result::Activated(_))
+            ),
+            "the fixture's event sanitizers should activate: {activated:?}"
+        );
+        Some((session, activated))
+    }
+
+    /// A fresh log for one invocation, and its path.
+    fn sanitizer_log() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nemo-event-sanitize-{}.log",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// The registrations that ran, in the order they ran.
+    fn ran(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The projection the kernel sends, serialized.
+    fn payload(call: &PluginEventSanitizeCall) -> String {
+        serde_json::to_string(call).expect("a serializable projection")
+    }
+
+    /// The fields an invocation answered with, or a panic naming what it answered.
+    fn answered_fields(
+        outcome: &nemo_relay_plugin_protocol::PluginExecutionOutcome,
+        what: &str,
+    ) -> EventSanitizeFields {
+        match &outcome.result {
+            Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
+                .unwrap_or_else(|error| {
+                    panic!("{what} answered with something that is not fields: {error}")
+                }),
+            other => panic!("{what} should have answered with fields, and answered {other:?}"),
+        }
+    }
+
+    /// The metadata an answer carries.
+    fn answered_metadata(
+        fields: &EventSanitizeFields,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        match fields.metadata.clone() {
+            Some(serde_json::Value::Object(metadata)) => metadata,
+            other => panic!("the answer carries metadata rather than {other:?}"),
+        }
+    }
+
+    /// Assert an answer is a refusal and that it carried none of the payload.
+    fn assert_refused(
+        outcome: &nemo_relay_plugin_protocol::PluginExecutionOutcome,
+        what: &str,
+        sentinel: &confidentiality::ConfidentialitySentinel,
+    ) {
+        match &outcome.result {
+            Err(failure) => assert!(
+                !failure.message.trim().is_empty(),
+                "a refusal carries its reason"
+            ),
+            Ok(success) => panic!("{what} should have been refused, and answered {success:?}"),
+        }
+        // The assertion that matters: an error is not the property, a payload that
+        // cannot be published is. The whole outcome is searched, because a refusal
+        // carries text.
+        sentinel.assert_outcome_absent(what, outcome);
+    }
+
+    /// The control every negative case carries: this class is served at all.
+    ///
+    /// Without it a refusal test passes for the wrong reason — a host that refuses
+    /// every invocation of a class refuses the case under test as well — and the
+    /// suite would be green before the class it is about can be served. It also
+    /// pins the shape a served answer has, so "refused" and "answered something
+    /// else entirely" cannot be confused for each other.
+    async fn assert_the_family_is_served(
+        session: &FixtureSession,
+        activated: &v1::ActivateOutcome,
+    ) {
+        let registration = session.registration_named(activated, "fixture_mark_a");
+        let (call, _sentinel) =
+            confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+        let outcome = session
+            .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+            .await;
+        let _fields = answered_fields(&outcome, "the control case");
+    }
+
+    /// Property A, the exact registration.
+    ///
+    /// The normal event sanitizer mechanism is *chain*-oriented: every visible
+    /// registration of a class runs in priority order, and each answer is applied to
+    /// the event the next one is shown. A host serving one named registration must
+    /// not fall back to that. Three mark sanitizers are registered with distinct
+    /// markers, one is named, and the answer has to carry that one's marker and
+    /// neither neighbour's — and the fixture's own log has to show that exactly that
+    /// one ran, once, because a marker says who answered rather than who ran.
+    #[tokio::test]
+    async fn a_sanitize_invocation_runs_exactly_the_registration_the_call_names() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        for (name, marker) in MARK_SANITIZERS {
+            let log = sanitizer_log();
+            let config = serde_json::json!({
+                "event_sanitizers": true,
+                "sanitizer_log": log.to_string_lossy(),
+            });
+            let Some((session, activated)) = event_sanitize_session_with(config).await else {
+                eprintln!("the intercept fixture is missing; skipping the exact-registration case");
+                return;
+            };
+            let registration = session.registration_named(&activated, name);
+            let (call, _sentinel) =
+                confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+            let outcome = session
+                .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+                .await;
+            let fields = answered_fields(&outcome, name);
+            let metadata = answered_metadata(&fields);
+            assert_eq!(
+                metadata.get(marker).cloned(),
+                Some(serde_json::json!(true)),
+                "invoking {name} should run it: {metadata:?}"
+            );
+            for (neighbour, neighbour_marker) in MARK_SANITIZERS {
+                if neighbour == name {
+                    continue;
+                }
+                assert!(
+                    metadata.get(neighbour_marker).is_none(),
+                    "invoking {name} ran {neighbour} as well, which is the family rather than \
+                     the registration: {metadata:?}"
+                );
+            }
+            assert_eq!(
+                ran(&log),
+                vec![name.to_string()],
+                "invoking {name} should run it once and run nothing else"
+            );
+            let _ = std::fs::remove_file(&log);
+            // The payload itself survives on this path, and that is the point of
+            // the distinction: a sanitizer that ran *sanitized* the payload, so what
+            // it chose to keep is publishable. The sentinel assertions belong to the
+            // failure cases, where nothing may be.
+        }
+    }
+
+    /// Property B, the same-family and same-shape neighbours.
+    ///
+    /// The scope families share the event shape with the mark family — the
+    /// projection differs in one field — so each family's own registration is
+    /// invoked and its answer is required to carry exactly one marker: its own.
+    #[tokio::test]
+    async fn a_sanitizers_neighbours_are_not_invoked_by_its_call() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let log = sanitizer_log();
+        let config = serde_json::json!({
+            "event_sanitizers": true,
+            "sanitizer_log": log.to_string_lossy(),
+        });
+        let Some((session, activated)) = event_sanitize_session_with(config).await else {
+            eprintln!("the intercept fixture is missing; skipping the isolation case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        for (name, marker, class) in [
+            (
+                "fixture_mark_b",
+                "fixture_mark_b",
+                PluginEventSanitizeClass::Mark,
+            ),
+            (
+                "fixture_scope_start_sanitize",
+                "fixture_scope_start_sanitize",
+                PluginEventSanitizeClass::ScopeStart,
+            ),
+            (
+                "fixture_scope_end_sanitize",
+                "fixture_scope_end_sanitize",
+                PluginEventSanitizeClass::ScopeEnd,
+            ),
+        ] {
+            let registration = session.registration_named(&activated, name);
+            let (call, _sentinel) = confidentiality::sentinel_sanitize_call(class);
+            let before = ran(&log);
+            let outcome = session
+                .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+                .await;
+            let metadata = answered_metadata(&answered_fields(&outcome, name));
+            assert_eq!(
+                metadata.get(marker).cloned(),
+                Some(serde_json::json!(true)),
+                "invoking {name} should run it: {metadata:?}"
+            );
+            for (neighbour, neighbour_marker) in EVERY_MARKER {
+                if neighbour == name {
+                    continue;
+                }
+                assert!(
+                    metadata.get(neighbour_marker).is_none(),
+                    "invoking {name} ran {neighbour}, which shares the shape but not the \
+                     capability: {metadata:?}"
+                );
+            }
+            let mut expected = before;
+            expected.push(name.to_string());
+            assert_eq!(
+                ran(&log),
+                expected,
+                "invoking {name} should run it once and nothing else"
+            );
+        }
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// Property C, the wrong class.
+    ///
+    /// The three families share an event serialization, which makes class confusion
+    /// easier rather than safer: a structurally valid call for one class delivered
+    /// to a registration of another is refused, in both directions, because the class
+    /// is part of the capability rather than a field inside the payload.
+    #[tokio::test]
+    async fn a_call_whose_class_is_not_the_registrations_class_is_refused() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the wrong-class case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        for (name, class) in [
+            (
+                "fixture_scope_start_sanitize",
+                PluginEventSanitizeClass::Mark,
+            ),
+            ("fixture_scope_end_sanitize", PluginEventSanitizeClass::Mark),
+            ("fixture_mark_a", PluginEventSanitizeClass::ScopeStart),
+            ("fixture_mark_b", PluginEventSanitizeClass::ScopeEnd),
+        ] {
+            let registration = session.registration_named(&activated, name);
+            let (call, sentinel) = confidentiality::sentinel_sanitize_call(class);
+            assert_eq!(call.class, class, "the payload says which class it is for");
+            let outcome = session
+                .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+                .await;
+            assert_refused(
+                &outcome,
+                &format!("a {class:?} call naming {name}"),
+                &sentinel,
+            );
+            if let Err(failure) = &outcome.result {
+                assert!(
+                    failure.code == nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                    "a class mismatch is a refusal: {failure:?}"
+                );
+            }
+        }
+    }
+
+    /// Property D, an explicit refusal.
+    ///
+    /// A sanitizer that says no withholds the payload: the answer is a refusal, and
+    /// no part of what it was shown can be published from it.
+    #[tokio::test]
+    async fn a_refused_sanitization_is_a_refusal_rather_than_an_unsanitized_answer() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the refusal case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        let registration = session.registration_named(&activated, "fixture_mark_refuses");
+        let (call, sentinel) =
+            confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+        let outcome = session
+            .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+            .await;
+        assert_refused(&outcome, "a sanitizer that refused", &sentinel);
+    }
+
+    /// Property E, a plugin that throws.
+    ///
+    /// The same rule, reached a different way: a callback that panicked did not
+    /// decide, and an answer it did not decide on is not published.
+    #[tokio::test]
+    async fn a_sanitizer_that_throws_is_a_failure_rather_than_an_unsanitized_answer() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the panic case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        let registration = session.registration_named(&activated, "fixture_mark_panics");
+        let (call, sentinel) =
+            confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+        let outcome = session
+            .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+            .await;
+        assert_refused(&outcome, "a sanitizer that threw", &sentinel);
+    }
+
+    /// Property F, a malformed call.
+    ///
+    /// The projection is a wire type, so a peer can send anything: an empty object,
+    /// a class outside the closed set, or a projection missing the fields it must
+    /// carry. Each is refused at conversion, and the sentinel inside it is not
+    /// echoed.
+    #[tokio::test]
+    async fn a_malformed_sanitize_call_is_refused() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the malformed case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        let registration = session.registration_named(&activated, "fixture_mark_a");
+        let (call, sentinel) =
+            confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+        let mut with_unknown_class =
+            serde_json::to_value(&call).expect("a serializable projection");
+        with_unknown_class["class"] = serde_json::json!("a_class_that_is_not_in_the_set");
+        // The malformed shapes carry the call's own sentinel name, so "the refusal
+        // did not echo the payload" is a claim about this payload rather than about
+        // an empty one.
+        let with_broken_fields = serde_json::json!({
+            "class": "mark",
+            "name": call.name,
+            "fields": "not an object",
+        });
+        let with_no_fields = serde_json::json!({
+            "class": "mark",
+            "name": call.name,
+        });
+        for (what, payload) in [
+            ("an empty payload", "{}".to_string()),
+            (
+                "a class outside the closed set",
+                with_unknown_class.to_string(),
+            ),
+            (
+                "a projection whose fields are not fields",
+                with_broken_fields.to_string(),
+            ),
+            ("a projection with no fields", with_no_fields.to_string()),
+        ] {
+            let outcome = session
+                .invoke_arguments(&registration, &payload, EVENT_SANITIZE_BUDGET)
+                .await;
+            assert_refused(&outcome, what, &sentinel);
+        }
+    }
+
+    /// Property G, the response budget.
+    ///
+    /// A valid answer that is larger than the operation was allowed to return is
+    /// refused before it can be published, and the refusal is where the payload must
+    /// not reappear: an oversized answer that was truncated and sent would satisfy
+    /// "the invocation failed" while publishing the part that fitted.
+    #[tokio::test]
+    async fn an_answer_above_the_operations_budget_is_refused() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the budget case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        let registration = session.registration_named(&activated, "fixture_mark_oversized");
+        let (mut call, call_sentinel) =
+            confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+        let (fields, fields_sentinel) = confidentiality::oversized_fields(8 * 1024);
+        call.fields = fields;
+        let outcome = session
+            .invoke_arguments(&registration, &payload(&call), 1024)
+            .await;
+        match &outcome.result {
+            Err(failure) => assert!(
+                matches!(
+                    failure.code,
+                    nemo_relay_plugin_protocol::PluginFailureCode::OversizedFrame { .. }
+                ),
+                "an oversized answer is refused as one: {failure:?}"
+            ),
+            other => panic!("an oversized answer is refused, and this answered {other:?}"),
+        }
+        // Both what the fixture added and what it was handed:
+        fields_sentinel.assert_outcome_absent("an oversized sanitizer's refusal", &outcome);
+        call_sentinel.assert_outcome_absent("an oversized sanitizer's refusal", &outcome);
+    }
+
+    /// Property H, the identities.
+    ///
+    /// The registration identity and the operation identity belong to the kernel, so
+    /// the host is asked to run *that* registration under *that* operation. A call
+    /// naming a registration this plugin does not have, a session this host did not
+    /// establish, or a runtime this host is not bound to is refused, and a refusal is
+    /// not an answer: nothing the caller sent comes back through it.
+    ///
+    /// What is pinned here is that the host takes none of the three from the caller's
+    /// word. The fourth — that an answer naming another *operation* is refused — is
+    /// the transport's, and the client that pairs a request with its answer is where
+    /// it lives, so the session suite is where it is pinned.
+    #[tokio::test]
+    async fn a_call_naming_another_registration_session_or_runtime_is_refused() {
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the identity case");
+            return;
+        };
+        assert_the_family_is_served(&session, &activated).await;
+
+        let registration = session.registration_named(&activated, "fixture_mark_a");
+        let (call, sentinel) =
+            confidentiality::sentinel_sanitize_call(PluginEventSanitizeClass::Mark);
+        let arguments = payload(&call);
+
+        // A registration this plugin does not have.
+        let unknown = format!("{registration}_that_does_not_exist");
+        let outcome = session
+            .invoke_arguments(&unknown, &arguments, EVENT_SANITIZE_BUDGET)
+            .await;
+        assert_refused(&outcome, "a call naming another registration", &sentinel);
+
+        // A session this host did not establish.
+        let answer = session
+            .service
+            .invoke(capable(v1::InvokeRequest {
+                session_id: "a-session-this-host-did-not-establish".into(),
+                context: Some(context_with_budget(EVENT_SANITIZE_BUDGET)),
+                handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(
+                    &session.handle,
+                )),
+                registration_id: registration.clone(),
+                arguments: arguments.clone(),
+            }))
+            .await
+            .expect("a served invocation")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&answer)
+            .expect("a converted invocation");
+        assert_refused(&outcome, "a call naming another session", &sentinel);
+
+        // An operation bound to another runtime, which is a message from another
+        // session wearing this one's identity.
+        let mut elsewhere = context_with_budget(EVENT_SANITIZE_BUDGET);
+        elsewhere.runtime_binding_digest = "another-runtime".into();
+        let answer = session
+            .service
+            .invoke(capable(v1::InvokeRequest {
+                session_id: session.session_id.clone(),
+                context: Some(elsewhere),
+                handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(
+                    &session.handle,
+                )),
+                registration_id: registration,
+                arguments,
+            }))
+            .await
+            .expect("a served invocation")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&answer)
+            .expect("a converted invocation");
+        assert_refused(&outcome, "a call bound to another runtime", &sentinel);
     }
 }

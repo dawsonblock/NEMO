@@ -1517,6 +1517,59 @@ already-served class whose payload is an event:
   not published unsanitized — and for the off-path submission the sanitizers need
   because they run beside a call.
 
+**The Layer 2 gate is written, and it corrects one thing above.** The reconnaissance
+in the two bullets above concluded that the wire carries an event. It does not, and
+the contract that says so was already in the tree when that note was written: the
+protocol crate declares `PluginEventSanitizeClass` (closed: mark, scope start, scope
+end) and `PluginEventSanitizeCall` — the projection a sanitizer is shown, which is
+the event's name, the scope phase when it is a scope event, and the mutable
+observability fields, and nothing else. Not the uuid, not the timestamps, not the
+propagation root. Shipping the runtime's own `Event` across the boundary because
+this side happens to have one is what the projection exists to refuse, so the gate
+is written against the projection rather than against `PluginObservedEvent`, and the
+two types above were its first consumers. The disclosure ratchet that landed with it
+(`the_sanitizer_projection_discloses_exactly_its_approved_fields`) is what keeps a
+field from reaching a plugin by accident.
+
+What landed is the host's half of the nine properties, in
+[service.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/service.rs):
+exactly one registration runs when a call names it (three mark sanitizers with
+distinct markers, one named, neither neighbour's marker on the answer); a neighbour
+in the same family and in a family that shares the shape is not invoked; a call
+whose class is not the registration's own is refused in both directions; and a
+refusal, a throwing callback, a malformed projection, an answer above the
+operation's response budget and a call naming another registration, session or
+runtime each fail closed.
+
+Every negative case carries two things that make it mean something. The first is the
+**control**: the class is served at all before anything is required of it, because a
+host that refuses every invocation of a class refuses the case under test as well —
+without the control, four of the eight properties passed while the class was
+unserved. The second is the **sentinel**:
+[confidentiality.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/confidentiality.rs)
+plants an unmistakable value in every observable field (event name, payload at two
+levels, metadata, category profile, scope phase), forces the failure, and asserts
+that neither a planted value nor the marker they carry appears anywhere in the
+answer — including in a refusal's own text, which is where a payload that was
+supposed to be withheld comes back if nothing checks. The helper is public because
+the two suites that need it sit on opposite sides of the boundary, exactly as
+`conformance` does.
+
+The tests are red today, deliberately, and with one reason: `cargo test -p
+nemo-relay-plugin-host --lib` fails all eight — the exact-registration ones on the
+call they name, the rest on their control — and every one of those failures names
+the same cause, *"this host does not serve mark_sanitize_guardrail invocations
+yet"*. The fixture registers the three families behind an `event_sanitizers`
+configuration key for the same reason — its default set is "the classes a kernel can
+serve", and until the proxy exists these are not those classes.
+
+What this gate deliberately does not cover is the kernel's half: the proxy that
+builds the projection, submits it beside the call and applies what comes back. It
+cannot be reached without a peer, because a sanitize proxy's answer arrives over the
+composition's own transport rather than over an in-process backend, so its tests are
+process-boundary tests — the same suite that qualifies the class and moves the
+metric. The sentinel helper is the part those tests will reuse unchanged.
+
 **The five classes left, and the one question among them.** Four touch points per
 class, in this order: a core entry point that runs exactly one registration of the
 class (the shape of `invoke_tool_sanitize_request_registration`), a kernel proxy per
