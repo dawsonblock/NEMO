@@ -27,7 +27,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use nemo_relay::api::runtime::{
-    LlmExecutionNextFn, MiddlewareContinuationContext, ToolExecutionNextFn,
+    LlmExecutionNextFn, LlmStreamExecutionNextFn, MiddlewareContinuationContext,
+    ToolExecutionNextFn,
 };
 
 /// One continuation the kernel is holding.
@@ -67,6 +68,12 @@ pub enum ParkedChain {
     Tool(ToolExecutionNextFn),
     /// The remainder of a non-streaming provider call.
     Llm(LlmExecutionNextFn),
+    /// The remainder of a streaming provider call.
+    ///
+    /// Held for as long as the stream it produces is being pulled rather than
+    /// until one call returns: a plugin paces a stream itself, so the position
+    /// has to outlive the request that opened it.
+    LlmStream(LlmStreamExecutionNextFn),
 }
 
 impl std::fmt::Debug for ParkedContinuation {
@@ -154,6 +161,24 @@ impl Continuations {
             operation_request_id,
             registration_id,
             ParkedChain::Llm(next),
+        )
+    }
+
+    /// Hold the remainder of a streaming provider call.
+    ///
+    /// The same parked position as the other families, with a continuation that
+    /// answers with a stream instead of a value: what resumes it is a pull, and
+    /// what finishes it is the plugin releasing the stream.
+    pub fn hold_llm_stream(
+        &self,
+        operation_request_id: &str,
+        registration_id: &str,
+        next: LlmStreamExecutionNextFn,
+    ) -> ContinuationGuard<'_> {
+        self.hold(
+            operation_request_id,
+            registration_id,
+            ParkedChain::LlmStream(next),
         )
     }
 
@@ -271,6 +296,22 @@ mod tests {
         assert!(matches!(
             continuations.parked("operation-llm").map(|held| held.chain),
             Some(ParkedChain::Llm(_))
+        ));
+
+        let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn = Arc::new(|_request| {
+            Box::pin(async move {
+                Err(nemo_relay::error::FlowError::Internal(
+                    "this test does not produce a stream".to_string(),
+                ))
+            })
+        });
+        let _streaming =
+            continuations.hold_llm_stream("operation-stream", "registration-3", stream);
+        assert!(matches!(
+            continuations
+                .parked("operation-stream")
+                .map(|held| held.chain),
+            Some(ParkedChain::LlmStream(_))
         ));
     }
 

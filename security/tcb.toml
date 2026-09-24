@@ -249,7 +249,9 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # implements the boundary grew, which is the direction the milestone expects —
 # this crate is the destination the loader moves to, not the kernel. The
 # continuation machinery is now shared by the tool and provider families, so the
-# second family cost a tagged position and an arm rather than a second mechanism. Four direct
+# second family cost a tagged position and an arm rather than a second mechanism.
+# The duplex session's driver is the streaming family's first piece: the kernel's
+# side of the channel a plugin pulls a wrapped stream over. Four direct
 # dependencies arrived with it: `getrandom` for the 256-bit session capability,
 # `subtle` for the comparison that must not leak it, `rustix` for the resource
 # ceilings applied between `fork` and `exec`, and `futures-util` for catching a
@@ -261,7 +263,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 11436
+max_source_lines = 12316
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

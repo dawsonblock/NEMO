@@ -221,6 +221,32 @@ handshake, the attach and every operation that reads or changes session state.
 Both refusals are structured outcomes rather than transport failures, so the
 kernel can tell "the host said no" from "the channel broke".
 
+**The duplex session, which streaming needs.** Most of the boundary is one request
+and one answer; a stream is not. A plugin wrapping a provider call pulls the
+downstream stream a chunk at a time, may cancel it, and may release it while a pull
+is outstanding, so the session channel carries open/pull/item/end/cancel/release
+and the plugin paces the kernel's work behind them. The kernel's side of that
+channel exists: `crates/plugin-host/src/session_driver.rs` turns those messages
+into the kernel's actions — calling the parked chain position, producing the next
+item, stopping when the plugin stops asking — while every validation stays in
+`crates/plugin-host/src/session.rs`, which refuses a pull for a stream that is not
+open, a second pull while one is outstanding, and a release of a stream the session
+does not hold. A message the kernel does not receive from a host ends the channel
+rather than being answered, because the two sides no longer agree about what the
+channel is. `a_wrapped_stream_is_pulled_over_the_session_channel` drives it over a
+real channel, credential check included.
+
+What it does not include yet, and what the streaming increment still owes: the
+host's side of the channel (its client and the adapter that turns a plugin's pulls
+into messages), the proxy that parks a stream position, the upstream direction
+where the plugin's returned stream crosses back, and the qualification streaming
+needs — ordering, backpressure, half-close, cancellation while a pull is
+outstanding, host death mid-stream. One limitation is written down rather than
+implied: the driver reads and answers one message at a time, so a cancellation that
+arrives while the kernel is producing is answered after the pull it interrupted. The
+class stays unlisted until those land, so a plugin registering it is refused whole
+rather than half-served.
+
 **What keeps a host from outliving its kernel.** The supervisor kills the child when
 it drops, and that is not enough on its own: a reference to the composition can be
 released a moment after the drop, and a process that exits inside that window
@@ -288,11 +314,16 @@ fails the mark rather than growing the host's heap.
    `crates/plugin-host/tests/architecture.rs` pins both halves. The tool execution
    intercept was the first to move: it needed the kernel to hold a suspended
    chain position and resume it when the host asked, which is what
-   `crates/plugin-host/src/continuations.rs` and the `Continue` RPC now do. The
-   LLM execution intercept should reuse that machinery; the streaming one needs
-   more (ordering, backpressure, half-close, cancellation, terminal states), and
-   the remaining five need shapes of their own plus a core entry point that runs
-   exactly one registration of that class.
+   `crates/plugin-host/src/continuations.rs` and the `Continue` RPC now do, and the
+   provider intercept reuses that machinery rather than adding a second. The
+   streaming intercept needs the duplex session instead of a unary resume: its
+   kernel side is written and tested
+   (`crates/plugin-host/src/session_driver.rs`), and what remains is the host's
+   side of that channel, the proxy that parks a stream position, the upstream
+   direction, and streaming qualification (ordering, backpressure, half-close,
+   cancellation while a pull is outstanding, host death mid-stream). The other
+   five classes need shapes of their own plus a core entry point that runs exactly
+   one registration of that class.
 
    **This is a consequence of the CLI cutover too, and it is deliberate rather
    than incidental.** A plugin that registers one of the eight unserved classes
@@ -644,9 +675,11 @@ Still open, in the order they need closing:
    intercepts have the continuation mechanism they needed
    (`crates/plugin-host/src/continuations.rs` plus the `Continue` RPC), and the
    provider family reuses the tool family's rather than adding one. What is still
-   missing is the rest of the duplex session: the streaming family plus the
-   completion and pull-stream vocabulary in
-   `crates/plugin-host/src/session.rs` still need a driver. The reasoning about restarting still
+   missing is the rest of the duplex session: the kernel's side of the channel is
+   written (`crates/plugin-host/src/session_driver.rs`), so what remains is the
+   host's side of it, the proxy that parks a stream position, the upstream
+   direction where a plugin's returned stream crosses back, and the qualification
+   streaming needs. The reasoning about restarting still
    holds and is still implemented: a host that exits is reported as
    `HostCrashed`, the backend can replace it, and the kernel decides whether to
    keep using the replacement, because only the kernel knows what the previous

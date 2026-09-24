@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::operation_scopes::OperationScopes;
 use futures_util::FutureExt;
+use futures_util::StreamExt;
 use nemo_relay::api::scope::EmitMarkEventParams;
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_proto::v1::relay_runtime_client::RelayRuntimeClient;
@@ -33,6 +34,14 @@ use nemo_relay_plugin_protocol::{PluginHostCallOutcome, PluginMarkEmit};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
+
+/// How many answers may be queued for one session channel.
+///
+/// A session channel answers what it is asked, so the queue is between the
+/// driver that produced an answer and the transport that sends it. Bounded
+/// because an unbounded one would let a host that stopped reading grow this
+/// process, which is the same rule the mark queue follows.
+const SESSION_CHANNEL_CAPACITY: usize = 64;
 
 /// Metadata header the host presents on every call back into the kernel.
 ///
@@ -355,6 +364,18 @@ impl RelayRuntime for RelayRuntimeService {
                                 }
                             }
                         }
+                        // A stream is resumed by pulling it, one message at a
+                        // time, on the session channel: one answer cannot be the
+                        // whole of it, so a unary resume addressed here is
+                        // refused with that reason rather than answered with the
+                        // first chunk.
+                        crate::continuations::ParkedChain::LlmStream(_) => {
+                            Err(nemo_relay::error::FlowError::InvalidArgument(
+                                "this position is a stream: it is resumed by pulling it rather \
+                                 than by one answer"
+                                    .to_string(),
+                            ))
+                        }
                     };
                     answered.map_err(|error| error.to_string())
                 };
@@ -407,11 +428,68 @@ impl RelayRuntime for RelayRuntimeService {
 
     async fn session(
         &self,
-        _request: Request<tonic::Streaming<v1::PluginSessionMessage>>,
+        request: Request<tonic::Streaming<v1::PluginSessionMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        Err(Status::unimplemented(
-            "this kernel does not serve the duplex session yet",
-        ))
+        // The channel a host opens to pull the streams its plugins are wrapping.
+        // The credential is the session's, checked as it is on every other call a
+        // host makes back: a channel that carries streams is not a lesser one.
+        self.authenticate(&request)?;
+        let mut inbound = request.into_inner();
+        let session_id = self.config.session_id.clone();
+        let continuations = Arc::clone(&self.config.continuations);
+        let (answers, outbound) = tokio::sync::mpsc::channel(SESSION_CHANNEL_CAPACITY);
+
+        tokio::spawn(async move {
+            let mut driver =
+                crate::session_driver::SessionDriver::new(session_id.clone(), continuations);
+            while let Some(message) = inbound.next().await {
+                let Ok(message) = message else {
+                    // The host's side of the channel broke; nothing is owed to a
+                    // session that is no longer there.
+                    return;
+                };
+                let message =
+                    match nemo_relay_plugin_proto::convert::session_message_from_wire(&message) {
+                        Ok(message) => message,
+                        Err(_) => {
+                            // A message the conversion refuses is one this kernel
+                            // cannot attribute to this session, and the two sides no
+                            // longer agree about what the channel is: it ends rather
+                            // than continuing with one side's picture of it.
+                            return;
+                        }
+                    };
+                if message.session_id != session_id {
+                    return;
+                }
+                match driver.handle(message).await {
+                    Ok(owed) => {
+                        for answer in owed {
+                            if answers
+                                .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                                    &answer,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    // A refused message ends the channel: the state machine says
+                    // the session is no longer the one this host thinks it has,
+                    // and answering anyway would be guessing on its behalf.
+                    Err(_) => return,
+                }
+            }
+        });
+
+        // The channel's answers are messages, not failures: a refusal the plugin
+        // can read is a message, and a transport error here would be the kernel
+        // telling the host that the session broke while it is still serving it.
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(outbound).map(Ok),
+        )))
     }
 }
 
@@ -475,8 +553,10 @@ mod tests {
     use nemo_relay::api::subscriber::{
         deregister_subscriber, flush_subscribers, register_subscriber,
     };
+    use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
     use std::sync::{Arc, Mutex};
     use tonic::metadata::MetadataValue;
+    use tonic::transport::Server;
 
     /// Core's registries are process-global, so the tests that install into them
     /// take turns. The lock is this module's, so a test here cannot interleave
@@ -840,6 +920,43 @@ mod tests {
         );
     }
 
+    /// A stream position is not resumed by one answer, and says so.
+    ///
+    /// The shape rule the unary path enforces: a tool position takes arguments,
+    /// a provider position takes a request, and a stream is resumed by pulling it
+    /// one message at a time — so a unary resume addressed to a stream is refused
+    /// with that reason rather than answered with its first chunk.
+    #[tokio::test]
+    async fn a_stream_position_does_not_answer_a_unary_resume() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn = Arc::new(|_request| {
+            Box::pin(async move {
+                Err(nemo_relay::error::FlowError::Internal(
+                    "this test does not produce a stream".to_string(),
+                ))
+            })
+        });
+        let _held = service.config.continuations.hold_llm_stream(
+            "operation-stream",
+            "registration-1",
+            stream,
+        );
+
+        let outcome = service
+            .r#continue(authenticated_continuation(continuation("operation-stream")))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        let answer = nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome");
+        let failure = answer.result.expect_err("the refusal");
+        assert!(
+            failure.message.contains("is a stream"),
+            "the refusal says what the position is: {failure:?}"
+        );
+    }
+
     /// A continuation that names another session is refused before anything is
     /// looked up: this kernel serves one session, and a position in another
     /// kernel's chain is not this one's to resume.
@@ -887,6 +1004,163 @@ mod tests {
                 .expect_err("a malformed continuation");
             assert_eq!(refused.code(), tonic::Code::InvalidArgument);
         }
+    }
+
+    /// Serve the kernel's side of one session on a real socket.
+    ///
+    /// The driver's own tests call it directly; this is about everything around
+    /// it, which only exists over a channel: the credential, the conversion, the
+    /// session check, and answers that arrive as messages rather than as
+    /// failures.
+    async fn serve_session_channel(
+        service: RelayRuntimeService,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-session-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a socket directory");
+        let endpoint = directory.join("k");
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("a kernel socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RelayRuntimeServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+            let _ = std::fs::remove_dir_all(&directory);
+        });
+        (endpoint, serving)
+    }
+
+    /// A host pulls a wrapped stream over the session channel, and the answers
+    /// come back as messages.
+    #[tokio::test]
+    async fn a_wrapped_stream_is_pulled_over_the_session_channel() {
+        use nemo_relay_plugin_protocol::{
+            PluginSessionMessage, PluginSessionPayload, PluginStreamOpenRequest,
+            PluginStreamPullRequest,
+        };
+
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn = Arc::new(|_request| {
+            Box::pin(async move {
+                Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                    tokio_stream::iter(vec![
+                        Ok(serde_json::json!({"chunk": 1})),
+                        Ok(serde_json::json!({"chunk": 2})),
+                    ]),
+                ))
+            })
+        });
+        // Parked through the same registry the service will drive: the guard
+        // borrows it, so the service takes the shared handle rather than the
+        // registry itself.
+        let continuations = Arc::clone(&service.config.continuations);
+        let _held = continuations.hold_llm_stream("operation-1", "registration-1", stream);
+        let (endpoint, serving) = serve_session_channel(service).await;
+
+        let mut client = connect_to_kernel(&endpoint, nemo_relay_plugin_protocol::MAX_FRAME_BYTES)
+            .await
+            .expect("a client");
+        let (outbound, inbound) = tokio::sync::mpsc::channel(8);
+        let credential = CREDENTIAL.parse().expect("a header value");
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(inbound));
+        request
+            .metadata_mut()
+            .insert(SESSION_CREDENTIAL_HEADER, credential);
+        let mut answers = client
+            .session(request)
+            .await
+            .expect("a served session channel")
+            .into_inner();
+
+        let message = |payload: PluginSessionPayload| PluginSessionMessage {
+            session_id: SESSION_ID.into(),
+            message: payload,
+        };
+        outbound
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &message(PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
+                    host_call_id: "call-1".into(),
+                    operation_request_id: "operation-1".into(),
+                    request_json: serde_json::json!({"headers": {}, "content": {}}).to_string(),
+                })),
+            ))
+            .await
+            .expect("a sent open");
+        let opened = answers.next().await.expect("an answer").expect("a message");
+        let opened = nemo_relay_plugin_proto::convert::session_message_from_wire(&opened)
+            .expect("a converted answer");
+        let PluginSessionPayload::StreamOpened(opened) = opened.message else {
+            panic!("the kernel opens the stream: {opened:?}");
+        };
+        let stream_id = opened.stream_id;
+
+        for expected in [1, 2] {
+            outbound
+                .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                    &message(PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                        host_call_id: format!("pull-{expected}"),
+                        stream_id: stream_id.clone(),
+                    })),
+                ))
+                .await
+                .expect("a sent pull");
+            let item = answers.next().await.expect("an answer").expect("a message");
+            let item = nemo_relay_plugin_proto::convert::session_message_from_wire(&item)
+                .expect("a converted answer");
+            let PluginSessionPayload::StreamItem(item) = item.message else {
+                panic!("a pull is answered with the next item: {item:?}");
+            };
+            assert_eq!(
+                item.chunk_json,
+                serde_json::json!({"chunk": expected}).to_string()
+            );
+        }
+
+        outbound
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &message(PluginSessionPayload::StreamPull(PluginStreamPullRequest {
+                    host_call_id: "pull-3".into(),
+                    stream_id: stream_id.clone(),
+                })),
+            ))
+            .await
+            .expect("a sent pull");
+        let end = answers.next().await.expect("an answer").expect("a message");
+        let end = nemo_relay_plugin_proto::convert::session_message_from_wire(&end)
+            .expect("a converted answer");
+        assert!(
+            matches!(end.message, PluginSessionPayload::StreamEnd(_)),
+            "the third pull learns the stream is over: {end:?}"
+        );
+
+        drop(outbound);
+        serving.abort();
+    }
+
+    /// A session channel without the credential is refused at the door, like
+    /// every other call a host makes back.
+    #[tokio::test]
+    async fn a_session_channel_needs_this_session_s_credential() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let (endpoint, serving) = serve_session_channel(service).await;
+
+        let mut client = connect_to_kernel(&endpoint, nemo_relay_plugin_protocol::MAX_FRAME_BYTES)
+            .await
+            .expect("a client");
+        let (_outbound, inbound) = tokio::sync::mpsc::channel(8);
+        let refused = client
+            .session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                inbound,
+            )))
+            .await
+            .expect_err("a session channel with no credential");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+        serving.abort();
     }
 
     #[tokio::test]

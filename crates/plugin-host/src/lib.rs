@@ -444,6 +444,8 @@ pub mod runtime_service;
 pub mod service;
 /// The kernel's view of one plugin session: the invariants that need memory.
 pub mod session;
+/// The kernel's side of the duplex session channel.
+pub mod session_driver;
 /// The kernel's side of the process boundary: spawning, handshaking, and the
 /// backend that reaches a host process.
 pub mod supervisor;
