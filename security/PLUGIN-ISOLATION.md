@@ -270,10 +270,30 @@ the downstream stream the kernel is producing for that operation, the chunks it
 marked on the way back, and the terminal frame — both halves of the boundary,
 end to end.
 
-What it does not include yet, and what the streaming increment still owes: credit
-(the return path is paced by the kernel's reading rather than by an explicit window),
-and the rest of the acceptance gate above — deadlines, host death mid-stream,
-per-frame and cumulative budgets, and mark attribution during streaming. One limitation is written down rather than
+What it does not include yet, and what the streaming increment still owes, in the
+order they have to be closed:
+
+1. **The cancellation cascade, which the test for it currently fails.** Dropping the
+   kernel's consumer has to reach the producer behind it, and it does not:
+   `dropping_the_consumer_reaches_the_kernels_producer` walks the cascade with a drop
+   sentinel inside the real downstream producer, and the sentinel never fires —
+   neither the host's pull stream nor the kernel's driver saw a cancellation, so the
+   gap is in who owns the stream a callback *returns* rather than in the session
+   channel or the driver. The test is in the tree, ignored, with that reason: the
+   invariant is written down before the fix rather than after it, and it covers both
+   race points — dropping before any frame has crossed and after one has.
+2. **Interruptible outstanding pulls.** The kernel's driver answers one message at a
+   time, so a cancellation arriving while it is producing waits for the pull it
+   interrupted. The fix is the split the driver's own docs describe: reception stays
+   serialized, production moves to a bounded task with a cancellation token, and one
+   active pull per stream remains the rule.
+3. **Explicit credit**, scoped to the stream, starting at one.
+4. **Three budgets** — frame, cumulative bytes, and frame count — with every encoded
+   frame counted, terminal frames included.
+5. **Qualification**: deadlines before the first frame, during a pending pull and
+   between frames; host death before the first frame and mid-stream; marks before,
+   during and after streaming; and the terminal-frame rule pinned as a test, since it
+   holds only while one stream has one producer. One limitation is written down rather than
 implied: the kernel's driver reads and answers one message at a time, so a
 cancellation that arrives while it is producing is answered after the pull it
 interrupted. The class stays unlisted until those land, so a plugin registering it is
@@ -348,12 +368,12 @@ fails the mark rather than growing the host's heap.
    chain position and resume it when the host asked, which is what
    `crates/plugin-host/src/continuations.rs` and the `Continue` RPC now do, and the
    provider intercept reuses that machinery rather than adding a second. The
-   streaming intercept needs the duplex session instead of a unary resume: its
-   kernel side is written and tested
-   (`crates/plugin-host/src/session_driver.rs`), and what remains is the host's
-   side of that channel, the proxy that parks a stream position, the upstream
-   direction, and streaming qualification (ordering, backpressure, half-close,
-   cancellation while a pull is outstanding, host death mid-stream). The other
+   streaming intercept needs the duplex session instead of a unary resume, and both
+   halves of it exist — the kernel's driver, the host's channel, and the upstream
+   direction where a callback's returned stream crosses back. What remains is
+   cancellation that reaches the producer behind a dropped consumer (the test for it
+   fails today), pulls that a cancellation can interrupt, credit, the three budget
+   limits, and the deadline/crash/mark qualification. The other
    five classes need shapes of their own plus a core entry point that runs exactly
    one registration of that class.
 

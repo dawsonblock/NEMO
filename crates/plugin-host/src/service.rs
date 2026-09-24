@@ -1827,6 +1827,19 @@ mod tests {
         session_id: &str,
         chunks: Vec<serde_json::Value>,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
+        serve_kernel_with_stream_and_sentinel(session_id, chunks, None).await
+    }
+
+    /// The same kernel, with the producer's lifetime observable.
+    ///
+    /// The sentinel fires when the stream the kernel was producing is *dropped*,
+    /// which is what a cancellation has to reach: a test that only watched the
+    /// session channel would see the message and not the effect.
+    async fn serve_kernel_with_stream_and_sentinel(
+        session_id: &str,
+        chunks: Vec<serde_json::Value>,
+        dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
         use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
         use tonic::transport::Server;
 
@@ -1834,10 +1847,33 @@ mod tests {
         let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
             Arc::new(move |_request| {
                 let chunks = chunks.clone();
+                let dropped = dropped.clone();
                 Box::pin(async move {
-                    Ok(nemo_relay::api::runtime::LlmJsonStream::new(
-                        tokio_stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>()),
-                    ))
+                    /// A producer that says when it is gone.
+                    struct Watched {
+                        items: std::vec::IntoIter<serde_json::Value>,
+                        dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+                    }
+                    impl tokio_stream::Stream for Watched {
+                        type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
+                        fn poll_next(
+                            mut self: std::pin::Pin<&mut Self>,
+                            _context: &mut std::task::Context<'_>,
+                        ) -> std::task::Poll<Option<Self::Item>> {
+                            std::task::Poll::Ready(self.items.next().map(Ok))
+                        }
+                    }
+                    impl Drop for Watched {
+                        fn drop(&mut self) {
+                            if let Some(dropped) = &self.dropped {
+                                dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Ok(nemo_relay::api::runtime::LlmJsonStream::new(Watched {
+                        items: chunks.into_iter(),
+                        dropped,
+                    }))
                 })
             });
         // Held for the test's lifetime: the kernel's session outlives this call.
@@ -3383,6 +3419,212 @@ mod tests {
 
         kernel.abort();
         let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
+    /// Cancelling the outer consumer reaches the kernel's producer.
+    ///
+    /// The whole point of a boundary is that a caller who walks away takes the
+    /// work with them. This walks the cascade the streaming path is supposed to
+    /// have — the kernel's consumer dropped, the host stops polling, the plugin's
+    /// returned stream dropped, the session channel closed, the kernel told, and
+    /// the producer the kernel was running for that stream dropped — and observes
+    /// the *last* step, because that is the one that says the work stopped rather
+    /// than that a message was sent.
+    ///
+    /// Both race points are covered: dropping before any frame has crossed, and
+    /// dropping after one has. They are different ownership states — the first
+    /// happens while the plugin's stream has been opened but not yet polled, the
+    /// second while a frame is in flight — and a leak in either is the kind that
+    /// only shows up in production.
+    /// Ignored while the cascade is incomplete, and the reason is recorded here
+    /// rather than in a commit message: the test fails because the host never
+    /// drops the stream its callback returned for a streaming intercept, so the
+    /// cancellation is never sent and the kernel's producer outlives the consumer.
+    /// The trace that established it: neither the host's pull stream nor the
+    /// kernel's driver observed a cancellation, so the gap is in the ownership of
+    /// the returned stream between the ABI's stream table and the frames this host
+    /// hands the kernel.
+    #[ignore = "the cancellation cascade does not reach the kernel's producer yet; see the doc comment"]
+    #[tokio::test]
+    async fn dropping_the_consumer_reaches_the_kernels_producer() {
+        for frames_read in [0, 1] {
+            let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+            let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+                eprintln!("the native fixture is missing; skipping the cancellation case");
+                return;
+            };
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (service, session_id) = streaming_service(&artifact, Arc::clone(&dropped)).await;
+
+            let answer = invoke_stream_frames(&service, &session_id).await;
+            {
+                use tokio_stream::StreamExt;
+                let mut frames = answer;
+                for _ in 0..frames_read {
+                    assert!(
+                        frames.next().await.is_some(),
+                        "a frame crossed before the consumer walked away"
+                    );
+                }
+                // The consumer walks away. Everything behind it should follow.
+                drop(frames);
+            }
+
+            let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                released.is_ok(),
+                "after {frames_read} frame(s), dropping the consumer dropped the kernel's producer"
+            );
+            let _ = std::fs::remove_dir_all(&manifest_dir);
+        }
+    }
+
+    /// A host service that serves every class, with the fixture activated, and a
+    /// kernel whose producer reports when it is dropped.
+    async fn streaming_service(
+        artifact: &str,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (PluginHostService, String) {
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let mut handshake = handshake_request(&config);
+        handshake.supported_registration_operations = EVERY_REGISTRATION_OPERATION
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+            })
+            .collect();
+        let session_id = handshake_outcome_from_wire(
+            &service
+                .handshake(capable(handshake))
+                .await
+                .expect("a served handshake")
+                .into_inner(),
+        )
+        .expect("a converted handshake")
+        .into_result()
+        .expect("an established session")
+        .session_id;
+
+        let (endpoint, kernel) = serve_kernel_with_stream_and_sentinel(
+            &session_id,
+            vec![
+                serde_json::json!({"chunk": 1}),
+                serde_json::json!({"chunk": 2}),
+            ],
+            Some(dropped),
+        )
+        .await;
+        // Kept for the test's lifetime, so the kernel's listener outlives the call.
+        std::mem::forget(kernel);
+        let callbacks = crate::runtime_service::KernelCallbacks::new(
+            crate::runtime_service::connect_to_kernel(
+                &endpoint,
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("a kernel client"),
+            KERNEL_CREDENTIAL,
+        )
+        .expect("the kernel credential");
+        let service = service.with_kernel_callbacks(callbacks);
+
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(artifact)
+                .expect("the fixture's identity");
+        service
+            .load(capable(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact: artifact.to_owned(),
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load");
+        let activated = service
+            .activate(capable(v1::ActivateRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                discovery: false,
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+            }))
+            .await
+            .expect("a served activation")
+            .into_inner();
+        nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&activated)
+            .expect("a converted activation")
+            .into_result()
+            .expect("the session serves every class this fixture registers");
+        (service, session_id)
+    }
+
+    /// Start the streaming invocation the cancellation cases drop.
+    async fn invoke_stream_frames(
+        service: &PluginHostService,
+        session_id: &str,
+    ) -> <PluginHostService as v1::plugin_host_server::PluginHost>::InvokeStreamStream {
+        let descriptors = service
+            .inspect(capable(v1::InspectRequest {
+                session_id: session_id.to_owned(),
+                context: Some(context()),
+                handle: None,
+            }))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let descriptors = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&descriptors)
+            .expect("a converted inspection")
+            .into_result()
+            .expect("an inspection");
+        let registration = descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .find(|registration| {
+                registration.operation
+                    == nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmStreamExecutionIntercept
+            })
+            .expect("the fixture registers a streaming intercept")
+            .registration_id
+            .clone();
+
+        let mut streaming_context = context();
+        streaming_context.operation_request_id = "operation-stream".into();
+        service
+            .invoke_stream(capable(v1::InvokeRequest {
+                session_id: session_id.to_owned(),
+                context: Some(streaming_context),
+                handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(
+                    &nemo_relay_plugin_protocol::PluginHandle {
+                        plugin_id: "fixture_native".into(),
+                        generation: 1,
+                    },
+                )),
+                registration_id: registration,
+                arguments: serde_json::json!({
+                    "name": "fixture_provider",
+                    "request": {"headers": {}, "content": {"model": "fixture-model"}},
+                })
+                .to_string(),
+            }))
+            .await
+            .expect("a served streaming invocation")
+            .into_inner()
     }
 
     #[tokio::test]
