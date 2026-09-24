@@ -367,13 +367,24 @@ mid-flight stream and requires the consumer to be told, and
 stream that was never asked for anything to lose their producers when the session
 goes — at the driver level, where the actors are.
 
+The same rule was standing in for itself in the other direction, where the kernel
+reads the frames a host answered with: `FramesAsChunks` ended the caller's stream
+when the frames stopped, whether or not the frame that says a streaming call is
+over had arrived. A host that answered and stopped — or a session that broke
+between two frames — was therefore handed to the caller as a finished stream. A
+stream of frames without its terminal frame is now a failure naming what was
+missing, and `a_stream_of_frames_that_stops_without_a_terminal_frame_is_a_failure`
+pins all three shapes: answered and stopped (a failure), ended with the frame that
+says so (an end), and failed (the failure, then an end).
+
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **Qualification**: host death and kernel death in every phase, marks before,
-   during and after streaming, and the terminal-frame rule pinned as a test, since
-   it holds only while one stream has one producer. The class stays unlisted until
-   those land, so a plugin registering it is refused whole rather than half-served.
+1. **Qualification**: marks before, during and after streaming, and the remaining
+   host-death and kernel-death phases, which the terminal-frame and
+   transport-disappearance tests above are the first of. The class stays unlisted
+   until those land, so a plugin registering it is refused whole rather than
+   half-served.
 
 **What keeps a host from outliving its kernel.** The supervisor kills the child when
 it drops, and that is not enough on its own: a reference to the composition can be

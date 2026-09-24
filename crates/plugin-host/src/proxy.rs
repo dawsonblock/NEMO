@@ -903,7 +903,9 @@ fn install_llm_stream_execution_intercept(
                     })?;
                 Ok(nemo_relay::api::runtime::LlmJsonStream::new(
                     FramesAsChunks {
-                        frames,
+                        operation_request_id: frames.operation_request_id().to_owned(),
+                        frames: Box::pin(frames),
+                        terminal: false,
                         _held: held,
                     },
                 ))
@@ -932,7 +934,24 @@ fn install_llm_stream_execution_intercept(
 /// the next one. The parked chain position is held here so it outlives the call
 /// that started the stream and is released when the stream is finished with.
 struct FramesAsChunks {
-    frames: crate::supervisor::PluginStreamFrames,
+    /// The invocation these frames answer.
+    operation_request_id: String,
+    /// The frames, one at a time: reading is what asks the host for the next one.
+    frames: std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<
+                        nemo_relay_plugin_protocol::PluginStreamChunk,
+                        PluginProtocolError,
+                    >,
+                > + Send,
+        >,
+    >,
+    /// Whether the frames said the stream was over.
+    ///
+    /// The terminal frame is the only thing that says a streaming call was
+    /// complete, so this is what tells an end from a stream that stopped.
+    terminal: bool,
     _held: crate::continuations::ContinuationGuard,
 }
 
@@ -947,7 +966,7 @@ impl tokio_stream::Stream for FramesAsChunks {
         use std::task::Poll;
 
         let this = self.as_mut().get_mut();
-        let operation = this.frames.operation_request_id().to_owned();
+        let operation = this.operation_request_id.clone();
         match std::pin::Pin::new(&mut this.frames).poll_next(context) {
             Poll::Ready(Some(Ok(frame))) => match frame.chunk {
                 PluginStreamChunkKind::Data(data) => match serde_json::from_str(&data) {
@@ -958,7 +977,10 @@ impl tokio_stream::Stream for FramesAsChunks {
                 },
                 // The plugin said the stream was over; the caller's stream ends
                 // here rather than waiting for a frame that is not coming.
-                PluginStreamChunkKind::End => Poll::Ready(None),
+                PluginStreamChunkKind::End => {
+                    this.terminal = true;
+                    Poll::Ready(None)
+                }
                 PluginStreamChunkKind::Failed(failure) => {
                     Poll::Ready(Some(Err(nemo_relay::error::FlowError::PluginInvocation {
                         registration: operation,
@@ -981,7 +1003,29 @@ impl tokio_stream::Stream for FramesAsChunks {
                     },
                 })))
             }
-            Poll::Ready(None) => Poll::Ready(None),
+            // The frames stopped. A streaming call is complete when the frame that
+            // says so arrives and not otherwise: a host that answered and stopped,
+            // or a session that broke, has said neither, and handing the caller a
+            // truncated stream as a finished one is the failure this refuses.
+            Poll::Ready(None) => {
+                if this.terminal {
+                    Poll::Ready(None)
+                } else {
+                    this.terminal = true;
+                    Poll::Ready(Some(Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: operation.clone(),
+                        dispatch: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted,
+                        certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown,
+                        failure: nemo_relay_plugin_protocol::PluginFailure {
+                            code: nemo_relay_plugin_protocol::PluginFailureCode::MalformedResponse,
+                            message: format!(
+                                "the stream of operation '{operation}' stopped without the frame \
+                                 that says it was over"
+                            ),
+                        },
+                    })))
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1594,6 +1638,99 @@ mod tests {
             future,
         )
         .await
+    }
+
+    /// The frames a streaming invocation answers with, as the kernel reads them.
+    ///
+    /// The rule this pins is the one a terminal frame exists for: a stream is
+    /// complete when the frame that says so arrives, and a host that stops after
+    /// answering — or a session that broke — has said neither.
+    #[tokio::test]
+    async fn a_stream_of_frames_that_stops_without_a_terminal_frame_is_a_failure() {
+        use nemo_relay_plugin_protocol::{DispatchState, OutcomeCertainty, PluginStreamChunkKind};
+        use tokio_stream::StreamExt;
+
+        /// The guard a stream of frames holds while it is being read.
+        fn held() -> crate::continuations::ContinuationGuard {
+            let continuations = Arc::new(crate::continuations::Continuations::new());
+            continuations.hold_llm_stream(
+                "operation-1",
+                "registration-1",
+                Arc::new(|_request| {
+                    Box::pin(async move {
+                        Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                            tokio_stream::iter(Vec::<
+                                Result<nemo_relay::json::Json, nemo_relay::error::FlowError>,
+                            >::new()),
+                        ))
+                    })
+                }),
+            )
+        }
+
+        let chunk = |kind: PluginStreamChunkKind| nemo_relay_plugin_protocol::PluginStreamChunk {
+            operation_request_id: "operation-1".into(),
+            chunk: kind,
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+        };
+        let frames = |frames: Vec<nemo_relay_plugin_protocol::PluginStreamChunk>| FramesAsChunks {
+            operation_request_id: "operation-1".into(),
+            frames: Box::pin(tokio_stream::iter(frames.into_iter().map(Ok))),
+            terminal: false,
+            _held: held(),
+        };
+
+        // A stream that answers and stops is not a stream that finished.
+        let mut stopped = frames(vec![chunk(PluginStreamChunkKind::Data(
+            serde_json::json!({"chunk": 1}).to_string(),
+        ))]);
+        assert_eq!(
+            stopped.next().await.expect("a chunk").expect("a chunk"),
+            serde_json::json!({"chunk": 1})
+        );
+        let refused = stopped
+            .next()
+            .await
+            .expect("the end of the frames is an answer")
+            .expect_err("a stream that stopped without saying so is a failure");
+        assert!(
+            refused
+                .to_string()
+                .contains("without the frame that says it was over"),
+            "the failure says what was missing: {refused}"
+        );
+        assert!(
+            stopped.next().await.is_none(),
+            "and then the stream is over, having said why"
+        );
+
+        // A stream that says it is over is one that finished.
+        let mut finished = frames(vec![
+            chunk(PluginStreamChunkKind::Data(
+                serde_json::json!({"chunk": 1}).to_string(),
+            )),
+            chunk(PluginStreamChunkKind::End),
+        ]);
+        assert!(finished.next().await.expect("a chunk").is_ok());
+        assert!(
+            finished.next().await.is_none(),
+            "the terminal frame is what ends the caller's stream"
+        );
+
+        // A stream that failed says why, and its end is the end.
+        let mut failed = frames(vec![chunk(PluginStreamChunkKind::Failed(
+            nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                message: "the provider fell over".into(),
+            },
+        ))]);
+        let failure = failed
+            .next()
+            .await
+            .expect("an answer")
+            .expect_err("a failed stream is a failure");
+        assert!(failure.to_string().contains("fell over"), "{failure}");
     }
 
     /// A sanitize proxy needs the runtime that can answer it.
