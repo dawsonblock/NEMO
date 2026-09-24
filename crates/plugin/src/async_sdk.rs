@@ -209,14 +209,14 @@ impl MarkWindow {
     ///
     /// A host that opened no window — the in-process backend, or a call outside a
     /// plugin callback — captures nothing, and the plugin's marks stay its own.
-    pub(crate) fn capture(host: HostV4) -> Option<Self> {
+    pub(crate) fn capture(host: HostV4) -> Option<Arc<Self>> {
         let host = host.windows?;
         let mut window = std::ptr::null_mut();
         let status = unsafe { (host.capture_mark_window_thread)(&mut window) };
         if status != NemoRelayStatus::Ok || window.is_null() {
             return None;
         }
-        Some(Self { host, window })
+        Some(Arc::new(Self { host, window }))
     }
 
     /// Installs this window for the work being polled, answering what was there.
@@ -722,7 +722,7 @@ unsafe extern "C" fn unary_trampoline(
 fn drive_unary(
     future: UnaryFuture,
     binding: Result<ScopePollBinding>,
-    window: Option<MarkWindow>,
+    window: Option<Arc<MarkWindow>>,
     completion: Completion,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
@@ -870,12 +870,13 @@ struct ScopedFuture<F> {
     ///
     /// Carried into the future rather than read from the thread when a mark is
     /// raised: the future runs on this plugin's executor, where the host's own
-    /// window is not in scope and never will be.
-    window: Option<MarkWindow>,
+    /// window is not in scope and never will be. Shared with the stream the future
+    /// returns, because both belong to the call the window was opened for.
+    window: Option<Arc<MarkWindow>>,
 }
 
 impl<F> ScopedFuture<F> {
-    fn new(future: F, binding: ScopePollBinding, window: Option<MarkWindow>) -> Self {
+    fn new(future: F, binding: ScopePollBinding, window: Option<Arc<MarkWindow>>) -> Self {
         Self {
             future,
             binding,
@@ -898,7 +899,7 @@ where
             Err(error) => return Poll::Ready(Err(error)),
         };
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
-        let installed = this.window.as_ref().and_then(MarkWindow::install);
+        let installed = this.window.as_ref().and_then(|window| window.install());
         let result = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx);
         MarkWindow::restore(installed);
         match restore.restore() {
@@ -916,11 +917,11 @@ struct ScopedStream<S> {
     /// This is the part a callback that merely *returns* a stream would otherwise
     /// lose: the stream is polled long after the call that created it returned, and
     /// the marks it raises while being polled belong to the same operation.
-    window: Option<MarkWindow>,
+    window: Option<Arc<MarkWindow>>,
 }
 
 impl<S> ScopedStream<S> {
-    fn new(stream: S, binding: ScopePollBinding, window: Option<MarkWindow>) -> Self {
+    fn new(stream: S, binding: ScopePollBinding, window: Option<Arc<MarkWindow>>) -> Self {
         Self {
             stream,
             binding,
@@ -943,7 +944,7 @@ where
             Err(error) => return Poll::Ready(Some(Err(error))),
         };
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
-        let installed = this.window.as_ref().and_then(MarkWindow::install);
+        let installed = this.window.as_ref().and_then(|window| window.install());
         let result = unsafe { Pin::new_unchecked(&mut this.stream) }.poll_next(cx);
         MarkWindow::restore(installed);
         match restore.restore() {
@@ -1123,9 +1124,8 @@ unsafe extern "C" fn stream_trampoline(
                 return;
             }
         };
-        let mut window = window;
         let future: StreamFuture =
-            Box::pin(ScopedFuture::new(future, future_binding, window.take()));
+            Box::pin(ScopedFuture::new(future, future_binding, window.clone()));
         let stream = tokio::select! {
             result = AssertUnwindSafe(future).catch_unwind() => match result {
                 Ok(result) => result,

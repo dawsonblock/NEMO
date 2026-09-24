@@ -422,19 +422,19 @@ says so (an end), and failed (the failure, then an end).
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **The mark-attribution matrix.** The mechanism exists and its first test is
-   green; what it owes now is the matrix that qualifies it. A streaming call has
-   four positions a mark can be raised in — before the plugin opens the downstream
-   stream, while the downstream producer is active, between the chunks it returns
-   upstream, and after the last chunk but before the terminal frame — and all four
-   have to survive the boundary *with the operation they belong to*, which two
-   concurrent streams interleaved several ways is what proves: eight marks arriving
-   is not the property, eight marks arriving each attributed to their own operation
-   is. Beside that: the context's lifecycle (a cancellation, a deadline, a terminal,
-   a failed callback and a plugin-task panic each leave no window behind, and a
-   session or host shutdown clears them) and the continuation case (two downstream
-   continuations of one callback stay attributed to the original operation while
-   their own call identities stay distinct).
+1. **The mark-context lifecycle, the stale window, and the continuation case.** The
+   four-position matrix is in the tree and green:
+   `a_mark_belongs_to_the_operation_whose_callback_raised_it` runs two concurrent
+   streams through three schedules it chose rather than hoped for — the run carries
+   its schedule, and each stream waits its turn before raising its next mark — and
+   requires each mark to be attributed to its own operation, with each position
+   raised exactly once per stream and in the callback's order. What it does not yet
+   cover is the rest of the context's life: a cancellation, a deadline, a terminal,
+   a failed callback and a plugin-task panic each have to leave no window behind,
+   the old opaque handle has to be *refused* once its call is over rather than
+   attributed to a later operation, a session or host shutdown has to clear the
+   contexts, and the two-continuation case has to keep both marks attributed to the
+   original operation while the two continuations keep distinct call identities.
 2. **The rest of the qualification matrix**, which needs no new mechanism: the
    cases are in the tree and the counts are asserted with them. Host death is
    `a_session_that_ends_mid_stream_fails_the_stream` (a caller is told rather than

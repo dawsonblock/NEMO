@@ -331,18 +331,21 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # that finished, which is what the terminal frame exists to distinguish, and the
 # three shapes of a frames stream are now one test.
 #
-# Budget raise (qualification): the streaming qualification work is mostly tests,
-# and it found one thing that cannot be fixed here — the mark window does not
-# follow an asynchronous callback onto the plugin's own task, so a streaming mark
-# never reaches the kernel. The raise is the fixture's mark, the ignored test that
-# records that finding with its measurement, the four shapes of a frames stream
-# (each now also requiring the held chain position to be given back), and the
-# repeated mixture of three streams ending three ways. No dependency moved and no
-# `unsafe` did.
+# Budget raise (mark matrix): the attribution matrix is a harness and three forced
+# schedules — a kernel serving two operations from one session, a harness that gives
+# both invocations the same schedule, and the schedules themselves — plus the
+# fixture's four marking positions and the gate that makes their order the test's
+# rather than the scheduler's. No dependency moved and no `unsafe` did.
+#
+# Budget raise (qualification): the streaming qualification work is mostly tests.
+# The raise is the fixture's mark, the test that records what was missing before it
+# was fixed, the four shapes of a frames stream (each also requiring the held chain
+# position to be given back), and the repeated mixture of three streams ending three
+# ways. No dependency moved and no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 17466
+max_source_lines = 17785
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

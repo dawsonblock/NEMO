@@ -1980,7 +1980,13 @@ mod tests {
         session_id: &str,
         chunks: Vec<serde_json::Value>,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
-        serve_kernel_with_producer(session_id, chunks, KernelProducer::watching()).await
+        serve_kernel_with_producer(
+            session_id,
+            "operation-stream",
+            chunks,
+            KernelProducer::watching(),
+        )
+        .await
     }
 
     /// What a kernel's producer says about its own lifetime.
@@ -2081,57 +2087,75 @@ mod tests {
     /// The kernel with a producer whose lifetime the test can observe.
     async fn serve_kernel_with_producer(
         session_id: &str,
+        operation: &str,
         chunks: Vec<serde_json::Value>,
+        producer: KernelProducer,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
+        serve_kernel_with_producers(session_id, vec![(operation, chunks)], producer).await
+    }
+
+    /// The same kernel, serving one stream per operation.
+    ///
+    /// The matrix needs two operations in flight at once and one host talking to
+    /// both, which is what a kernel is: one session, several streams, each of them
+    /// producing for its own operation.
+    async fn serve_kernel_with_producers(
+        session_id: &str,
+        operations: Vec<(&str, Vec<serde_json::Value>)>,
         producer: KernelProducer,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
         use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
         use tonic::transport::Server;
 
         let continuations = Arc::new(crate::continuations::Continuations::new());
-        let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
-            Arc::new(move |_request| {
-                let chunks = chunks.clone();
-                let producer = producer.clone();
-                Box::pin(async move {
-                    /// A producer that says when it is gone.
-                    struct Watched {
-                        items: std::vec::IntoIter<serde_json::Value>,
-                        dropped: Arc<std::sync::atomic::AtomicBool>,
-                    }
-                    impl tokio_stream::Stream for Watched {
-                        type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
-                        fn poll_next(
-                            mut self: std::pin::Pin<&mut Self>,
-                            _context: &mut std::task::Context<'_>,
-                        ) -> std::task::Poll<Option<Self::Item>> {
-                            std::task::Poll::Ready(self.items.next().map(Ok))
+        for (operation, chunks) in operations {
+            let producer = producer.clone();
+            let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
+                Arc::new(move |_request| {
+                    let chunks = chunks.clone();
+                    let producer = producer.clone();
+                    Box::pin(async move {
+                        /// A producer that says when it is gone.
+                        struct Watched {
+                            items: std::vec::IntoIter<serde_json::Value>,
+                            dropped: Arc<std::sync::atomic::AtomicBool>,
                         }
-                    }
-                    impl Drop for Watched {
-                        fn drop(&mut self) {
-                            self.dropped
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        impl tokio_stream::Stream for Watched {
+                            type Item =
+                                Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
+                            fn poll_next(
+                                mut self: std::pin::Pin<&mut Self>,
+                                _context: &mut std::task::Context<'_>,
+                            ) -> std::task::Poll<Option<Self::Item>> {
+                                std::task::Poll::Ready(self.items.next().map(Ok))
+                            }
                         }
-                    }
-                    if let Some(gate) = &producer.gate {
-                        gate.entered.notify_one();
-                        gate.release.notified().await;
-                    }
-                    producer
-                        .produced
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(nemo_relay::api::runtime::LlmJsonStream::new(Watched {
-                        items: chunks.into_iter(),
-                        dropped: Arc::clone(&producer.dropped),
-                    }))
-                })
-            });
-        // Held for the test's lifetime: the kernel's session outlives this call.
-        std::mem::forget(continuations.hold_llm_stream(
-            "operation-stream",
-            "registration-stream",
-            stream,
-        ));
+                        impl Drop for Watched {
+                            fn drop(&mut self) {
+                                self.dropped
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        if let Some(gate) = &producer.gate {
+                            gate.entered.notify_one();
+                            gate.release.notified().await;
+                        }
+                        producer
+                            .produced
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(nemo_relay::api::runtime::LlmJsonStream::new(Watched {
+                            items: chunks.into_iter(),
+                            dropped: Arc::clone(&producer.dropped),
+                        }))
+                    })
+                });
+            // Held for the test's lifetime: the kernel's session outlives this call.
+            std::mem::forget(continuations.hold_llm_stream(
+                operation,
+                "registration-stream",
+                stream,
+            ));
+        }
 
         let runtime = crate::runtime_service::RelayRuntimeService::new(
             crate::runtime_service::RelayRuntimeConfig {
@@ -3671,6 +3695,287 @@ mod tests {
         let _ = std::fs::remove_dir_all(&manifest_dir);
     }
 
+    /// A host with two operations in flight and the marks they raise, as forwarded.
+    async fn matrix_service(
+        artifact: &str,
+    ) -> (
+        Arc<PluginHostService>,
+        String,
+        tokio::sync::mpsc::Receiver<ForwardedStep>,
+    ) {
+        let (mark_sender, mark_steps) = tokio::sync::mpsc::channel::<ForwardedStep>(64);
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service =
+            PluginHostService::new(backend, config.clone()).with_mark_forwarding(mark_sender);
+        let session_id = establish_session(&service, &config).await;
+
+        // One stream per operation, one chunk each: exactly the four positions a
+        // mark can be raised in, so a count that is wrong is wrong for a reason.
+        let (endpoint, kernel) = serve_kernel_with_producers(
+            &session_id,
+            vec![
+                ("operation-A", vec![serde_json::json!({"chunk": "A"})]),
+                ("operation-B", vec![serde_json::json!({"chunk": "B"})]),
+            ],
+            KernelProducer::watching(),
+        )
+        .await;
+        // Kept for the test's lifetime, so the kernel's listener outlives the call.
+        std::mem::forget(kernel);
+        let service = Arc::new(load_and_activate(service, &endpoint, &session_id, artifact).await);
+        (service, session_id, mark_steps)
+    }
+
+    /// Establish a session on `service`, answering its identity.
+    async fn establish_session(service: &PluginHostService, config: &PluginHostConfig) -> String {
+        let mut handshake = handshake_request(config);
+        handshake.supported_registration_operations = EVERY_REGISTRATION_OPERATION
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+            })
+            .collect();
+        handshake_outcome_from_wire(
+            &service
+                .handshake(capable(handshake))
+                .await
+                .expect("a served handshake")
+                .into_inner(),
+        )
+        .expect("a converted handshake")
+        .into_result()
+        .expect("an established session")
+        .session_id
+    }
+
+    /// Point `service` at the kernel at `endpoint`, load the fixture and activate it.
+    async fn load_and_activate(
+        service: PluginHostService,
+        endpoint: &std::path::Path,
+        session_id: &str,
+        artifact: &str,
+    ) -> PluginHostService {
+        let callbacks = crate::runtime_service::KernelCallbacks::new(
+            crate::runtime_service::connect_to_kernel(
+                endpoint,
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("a kernel client"),
+            KERNEL_CREDENTIAL,
+        )
+        .expect("the kernel credential");
+        let service = service.with_kernel_callbacks(callbacks);
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(artifact)
+                .expect("the fixture's identity");
+        service
+            .load(capable(v1::LoadRequest {
+                session_id: session_id.to_owned(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact: artifact.to_owned(),
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load");
+        let activated = service
+            .activate(capable(v1::ActivateRequest {
+                session_id: session_id.to_owned(),
+                context: Some(context()),
+                discovery: false,
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+            }))
+            .await
+            .expect("a served activation")
+            .into_inner();
+        nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&activated)
+            .expect("a converted activation")
+            .into_result()
+            .expect("the session serves every class this fixture registers");
+        service
+    }
+
+    /// Every mark two concurrent streams raised, in the order they were forwarded.
+    ///
+    /// The schedule says which stream may take its next step, one at a time, so the
+    /// interleaving is the test's rather than the runtime's; the marks themselves
+    /// are read from the host's forwarder, which is where a mark that reached the
+    /// kernel would have to appear.
+    async fn marks_under_schedule(
+        artifact: &str,
+        generation: u64,
+        schedule: &[&str],
+    ) -> Vec<(String, String, String)> {
+        let (service, session_id, mut steps) = matrix_service(artifact).await;
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&seen);
+        let forwarding = tokio::spawn(async move {
+            while let Some(step) = steps.recv().await {
+                match step {
+                    ForwardedStep::Mark { mark, .. } => {
+                        let data: serde_json::Value = mark
+                            .data_json
+                            .as_deref()
+                            .and_then(|data| serde_json::from_str(data).ok())
+                            .unwrap_or(serde_json::Value::Null);
+                        recording.lock().unwrap().push((
+                            mark.operation_request_id.clone(),
+                            data["stream"].as_str().unwrap_or_default().to_owned(),
+                            data["position"].as_str().unwrap_or_default().to_owned(),
+                        ));
+                    }
+                    ForwardedStep::Flush { done } => {
+                        let _ = done.send(Ok(()));
+                    }
+                }
+            }
+        });
+
+        // Both invocations run at once, and neither returns until the schedule lets
+        // its callback open the downstream stream.
+        let starting = |operation: &'static str, content: serde_json::Value| {
+            let service = Arc::clone(&service);
+            let session_id = session_id.clone();
+            tokio::spawn(async move {
+                invoke_stream_frames(&service, &session_id, operation, content).await
+            })
+        };
+        // Both invocations carry the schedule, and each stream waits its turn
+        // before raising its next mark: the interleaving is the test's rather than
+        // the scheduler's.
+        let named = |stream: &str| {
+            serde_json::json!({
+                "model": "fixture-model",
+                "fixture_stream": stream,
+                "fixture_schedule": schedule,
+                "fixture_generation": generation,
+            })
+        };
+        let first = starting("operation-A", named("A"));
+        let second = starting("operation-B", named("B"));
+
+        let mut frames = first.await.expect("stream A's invocation");
+        let mut other = second.await.expect("stream B's invocation");
+        for frames in [&mut frames, &mut other] {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                use tokio_stream::StreamExt;
+                while let Some(frame) = frames.next().await {
+                    let frame = frame.expect("a frame");
+                    if matches!(
+                        frame.chunk,
+                        Some(v1::stream_chunk::Chunk::End(_))
+                            | Some(v1::stream_chunk::Chunk::Failure(_))
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
+        forwarding.abort();
+        seen.lock().unwrap().clone()
+    }
+
+    /// A mark belongs to the operation whose callback raised it, in whatever order
+    /// the two streams reach their marks.
+    ///
+    /// The property is attribution rather than delivery: eight marks arriving would
+    /// say nothing about whether each one belonged to the operation that raised it,
+    /// which is what two streams interleaved three ways is here to prove — each run
+    /// with the schedule the test chose rather than the one the scheduler produced.
+    /// Within a stream the order is the callback's, and between the two streams
+    /// there is no order to require, so none is.
+    #[tokio::test]
+    async fn a_mark_belongs_to_the_operation_whose_callback_raised_it() {
+        const POSITIONS: [&str; 4] = [
+            "before-downstream",
+            "downstream-active",
+            "between-frames",
+            "before-terminal",
+        ];
+
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the matrix case");
+            return;
+        };
+        for (generation, schedule) in [
+            // Alternating; then one stream ahead and back; then the other first.
+            ["A", "B", "A", "B", "A", "B", "A", "B"],
+            ["A", "A", "B", "B", "B", "A", "B", "A"],
+            ["B", "A", "B", "A", "A", "B", "A", "B"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marks = marks_under_schedule(&artifact, generation as u64 + 1, &schedule).await;
+
+            // No cross-attribution: a mark raised by one stream's callback belongs
+            // to that stream's operation and never to the other's.
+            for (operation, stream, position) in &marks {
+                let expected = if stream == "A" {
+                    "operation-A"
+                } else {
+                    "operation-B"
+                };
+                assert_eq!(
+                    operation, expected,
+                    "the mark stream {stream} raised at '{position}' belongs to \
+                     {expected} under {schedule:?}: {marks:?}"
+                );
+            }
+
+            // No missing marks and no duplicates: each stream raises each of the
+            // four positions exactly once.
+            let mut raised: Vec<(String, String)> = marks
+                .iter()
+                .map(|(_, stream, position)| (stream.clone(), position.clone()))
+                .collect();
+            raised.sort();
+            let mut expected: Vec<(String, String)> = Vec::new();
+            for stream in ["A", "B"] {
+                for position in POSITIONS {
+                    expected.push((stream.to_string(), position.to_string()));
+                }
+            }
+            expected.sort();
+            assert_eq!(
+                raised, expected,
+                "every position of both streams arrived once under {schedule:?}: {marks:?}"
+            );
+
+            // Within a stream, the order is the order the callback reaches the
+            // positions in. Between the streams there is none, so none is asserted.
+            for stream in ["A", "B"] {
+                let order: Vec<&str> = marks
+                    .iter()
+                    .filter(|(_, raised_by, _)| raised_by == stream)
+                    .map(|(_, _, position)| position.as_str())
+                    .collect();
+                assert_eq!(
+                    order,
+                    POSITIONS.to_vec(),
+                    "stream {stream} raised its marks in the callback's order under \
+                     {schedule:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
     /// A mark a streaming callback raises reaches the host's forwarder.
     ///
     /// The mark window is the host's, opened around the callback it invokes; the
@@ -3716,7 +4021,13 @@ mod tests {
             }
         });
 
-        let mut frames = invoke_stream_frames(&service, &session_id).await;
+        let mut frames = invoke_stream_frames(
+            &service,
+            &session_id,
+            "operation-stream",
+            serde_json::json!({"model": "fixture-model"}),
+        )
+        .await;
         while let Some(frame) =
             tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
                 .await
@@ -3816,7 +4127,13 @@ mod tests {
             _ => KernelProducer::watching(),
         };
         let (service, session_id) = streaming_service(&artifact, producer.clone()).await;
-        let mut frames = invoke_stream_frames(&service, &session_id).await;
+        let mut frames = invoke_stream_frames(
+            &service,
+            &session_id,
+            "operation-stream",
+            serde_json::json!({"model": "fixture-model"}),
+        )
+        .await;
 
         match leaving {
             // Waiting for the producer is what makes this the state the test
@@ -3899,6 +4216,7 @@ mod tests {
 
         let (endpoint, kernel) = serve_kernel_with_producer(
             &session_id,
+            "operation-stream",
             vec![
                 serde_json::json!({"chunk": 1}),
                 serde_json::json!({"chunk": 2}),
@@ -3958,6 +4276,8 @@ mod tests {
     async fn invoke_stream_frames(
         service: &PluginHostService,
         session_id: &str,
+        operation: &str,
+        content: serde_json::Value,
     ) -> <PluginHostService as v1::plugin_host_server::PluginHost>::InvokeStreamStream {
         let descriptors = service
             .inspect(capable(v1::InspectRequest {
@@ -3984,7 +4304,7 @@ mod tests {
             .clone();
 
         let mut streaming_context = context();
-        streaming_context.operation_request_id = "operation-stream".into();
+        streaming_context.operation_request_id = operation.to_owned();
         service
             .invoke_stream(capable(v1::InvokeRequest {
                 session_id: session_id.to_owned(),
@@ -3998,7 +4318,7 @@ mod tests {
                 registration_id: registration,
                 arguments: serde_json::json!({
                     "name": "fixture_provider",
-                    "request": {"headers": {}, "content": {"model": "fixture-model"}},
+                    "request": {"headers": {}, "content": content},
                 })
                 .to_string(),
             }))
