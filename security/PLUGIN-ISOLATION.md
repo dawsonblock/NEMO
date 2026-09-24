@@ -419,22 +419,15 @@ missing, and `a_stream_of_frames_that_stops_without_a_terminal_frame_is_a_failur
 pins all three shapes: answered and stopped (a failure), ended with the frame that
 says so (an end), and failed (the failure, then an end).
 
-What it does not include yet, and what the streaming increment still owes, in the
-order they have to be closed:
+What the streaming increment owed is closed. The order it was closed in, and the
+one a later change should be held to: the duplex session; one actor per stream with
+its lifecycle, demand, budgets and call-owned deadline; explicit credit; the three
+ceilings; the strict terminal rule and the transport-loss rule; the producer, actor
+and parked-position cleanup on every exit; and the mark window that follows
+execution across the plugin's own task, with its four-position attribution,
+lifecycle, non-reuse and negotiation gates. The gate list it was held to is the one
+at the end of this document.
 
-1. **The mark-context lifecycle, the stale window, and the continuation case.** The
-   four-position matrix is in the tree and green:
-   `a_mark_belongs_to_the_operation_whose_callback_raised_it` runs two concurrent
-   streams through three schedules it chose rather than hoped for — the run carries
-   its schedule, and each stream waits its turn before raising its next mark — and
-   requires each mark to be attributed to its own operation, with each position
-   raised exactly once per stream and in the callback's order. What it does not yet
-   cover is the rest of the context's life: a cancellation, a deadline, a terminal,
-   a failed callback and a plugin-task panic each have to leave no window behind,
-   the old opaque handle has to be *refused* once its call is over rather than
-   attributed to a later operation, a session or host shutdown has to clear the
-   contexts, and the two-continuation case has to keep both marks attributed to the
-   original operation while the two continuations keep distinct call identities.
 2. **The rest of the qualification matrix**, which needs no new mechanism: the
    cases are in the tree and the counts are asserted with them. Host death is
    `a_session_that_ends_mid_stream_fails_the_stream` (a caller is told rather than
@@ -1475,10 +1468,14 @@ replaces the other: a boundary that served sixteen classes nobody registers woul
 be complete and useless, and a fixture that happens to register only servable
 classes says nothing about the classes that do not cross.
 
-**Class coverage: 10 of 16.** The six that do not cross are the mark and scope
-sanitizers, the two LLM sanitizers, and the LLM stream execution intercept. Pinned
-by `the_boundary_serves_a_named_subset_of_the_registration_surface`, which fails on
-any change to either half.
+**Class coverage: 11 of 16.** The five that do not cross are the mark and scope
+sanitizers and the two LLM sanitizers. The LLM stream execution intercept crossed
+when its qualification did: the duplex session, the actor-per-stream kernel side,
+its demand, budgets and deadlines, the mark window that follows execution, the
+terminal and transport rules, and the attribution, lifecycle and repeated-mixture
+tests all had to be green before the class was advertised. Pinned by
+`the_boundary_serves_a_named_subset_of_the_registration_surface`, which fails on any
+change to either half.
 
 **Plugin compatibility: measured per plugin the repository ships.** Two of them
 are fixtures the tests drive, and one is the plugin a reader is pointed at first,
@@ -1497,16 +1494,16 @@ so all three are real registration sets rather than hypotheticals.
 | | |
 |---|---|
 | registrations | 17 attachment points across all 16 classes (two subscribers, one from each plugin in the fixture's library) |
-| remotely supported | 10 (everything except the six named next) |
-| remaining blockers | 6 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response, LLM stream execution intercept |
+| remotely supported | 11 (everything except the five named next) |
+| remaining blockers | 5 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response |
 
 `examples/rust-native-plugin` — the plugin a reader is pointed at first:
 
 | | |
 |---|---|
 | registered classes | 15: metadata injector, tool + LLM request intercepts, subscriber, mark and scope-start/end sanitizers, tool and LLM sanitize request/response, tool + LLM conditional, tool and LLM execution intercepts, LLM stream execution intercept |
-| remotely supported | 10 (everything except the six named next) |
-| remaining blockers | 6 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response, LLM stream execution intercept |
+| remotely supported | 11 (everything except the five named next) |
+| remaining blockers | 5 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response |
 
 That is the number worth watching, and for the example it is six: three
 mark/scope sanitizers, two LLM sanitizers, and the streaming intercept. Both of its

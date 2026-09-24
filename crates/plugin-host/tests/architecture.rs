@@ -493,7 +493,11 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
 /// decision with a diff, and as two lists so that the gap is visible rather than
 /// implied. The first entry to move was the tool execution intercept: the class
 /// that wraps a call, which needed the kernel to hold a suspended chain position
-/// and resume it when the host asked.
+/// and resume it when the host asked. The last, so far, is the LLM stream execution
+/// intercept: the class whose answer is a stream, which needed the duplex session, a
+/// kernel that routes instead of producing, and the mark window that follows
+/// execution across the plugin's own task — all of it qualified before it was
+/// advertised.
 #[test]
 fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     use nemo_relay_plugin_host::supervisor::ProcessPluginBackend;
@@ -512,6 +516,7 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
         Operation::ToolSanitizeResponseGuardrail,
         Operation::ToolExecutionIntercept,
         Operation::LlmExecutionIntercept,
+        Operation::LlmStreamExecutionIntercept,
     ];
     assert_eq!(
         served, expected,
@@ -521,16 +526,15 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     );
 
     // The half that does not cross, named so the gap is a fact in the tree and
-    // not something to rediscover: three of them wrap the call they intercept
-    // (execution and streaming intercepts) and need the duplex session, and five
-    // are transforms with shapes of their own.
+    // not something to rediscover: they are transforms with shapes of their own —
+    // three over events and two over provider payloads — and none of them needs a
+    // lifetime the boundary does not already have.
     let not_served = [
         Operation::MarkSanitizeGuardrail,
         Operation::ScopeSanitizeStartGuardrail,
         Operation::ScopeSanitizeEndGuardrail,
         Operation::LlmSanitizeRequestGuardrail,
         Operation::LlmSanitizeResponseGuardrail,
-        Operation::LlmStreamExecutionIntercept,
     ];
     for operation in not_served {
         assert!(
