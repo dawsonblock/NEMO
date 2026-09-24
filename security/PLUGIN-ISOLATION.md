@@ -1490,6 +1490,17 @@ wrong registration, wrong operation, budget exceeded, host gone — and assert t
 sentinel value can appear in anything subsequently publishable. "The proxy returned
 an error" is weaker than "the secret cannot be published".
 
+**The two reads Layer 2 was waiting on, answered.** The event type's field
+conversion is public — `Event::sanitize_fields` and `Event::apply_sanitize_fields` in
+`crates/types/src/api/event.rs` — so a proxy that is handed the sanitized event by the
+host can turn it back into the fields the chain consumes, and no new core helper is
+needed for the authority split to hold. And the event-carrying precedent to copy is
+`install_metadata_injector` in
+[proxy.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/proxy.rs:1381), not the tool pair: it is the served class whose payload is an event,
+with `install_tool_sanitize` supplying the off-path submission and the
+do-not-publish-on-refusal rule. Layer 2 therefore has everything it needs and is a
+write rather than a decision.
+
 **Where Layer 2 of the event sanitizers starts, from the reconnaissance.** Two
 things the next session should not have to rediscover, both found by reading the one
 already-served class whose payload is an event:
