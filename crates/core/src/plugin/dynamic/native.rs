@@ -56,25 +56,26 @@ use crate::plugin::{
 use chrono::{DateTime, Utc};
 use libloading::{Library, Symbol};
 use nemo_relay_plugin::{
-    NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,
-    NemoRelayNativeAsyncCallbackState, NemoRelayNativeAsyncCompletion,
-    NemoRelayNativeAsyncLlmStreamOpenCb, NemoRelayNativeAsyncLlmStreamPullCb,
-    NemoRelayNativeAsyncMiddlewareCb, NemoRelayNativeAsyncMiddlewareKind, NemoRelayNativeAsyncNext,
-    NemoRelayNativeAsyncNextResultCb, NemoRelayNativeAsyncNextStreamCb, NemoRelayNativeAsyncStream,
+    NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
+    NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY, NemoRelayNativeAsyncCallbackState,
+    NemoRelayNativeAsyncCompletion, NemoRelayNativeAsyncLlmStreamOpenCb,
+    NemoRelayNativeAsyncLlmStreamPullCb, NemoRelayNativeAsyncMiddlewareCb,
+    NemoRelayNativeAsyncMiddlewareKind, NemoRelayNativeAsyncNext, NemoRelayNativeAsyncNextResultCb,
+    NemoRelayNativeAsyncNextStreamCb, NemoRelayNativeAsyncStream,
     NemoRelayNativeAsyncStreamMiddlewareCb, NemoRelayNativeConditionalMiddlewareCb,
     NemoRelayNativeEventSanitizeCb, NemoRelayNativeEventSubscriberCb, NemoRelayNativeFreeFn,
     NemoRelayNativeHostApiV1, NemoRelayNativeHostApiV3, NemoRelayNativeHostApiV4,
-    NemoRelayNativeLlmAsyncStream, NemoRelayNativeLlmCodecKind, NemoRelayNativeLlmConditionalCb,
-    NemoRelayNativeLlmExecutionCb, NemoRelayNativeLlmRequestCodec,
+    NemoRelayNativeHostApiV5, NemoRelayNativeLlmAsyncStream, NemoRelayNativeLlmCodecKind,
+    NemoRelayNativeLlmConditionalCb, NemoRelayNativeLlmExecutionCb, NemoRelayNativeLlmRequestCodec,
     NemoRelayNativeLlmRequestInterceptCb, NemoRelayNativeLlmResponseCodec,
     NemoRelayNativeLlmSanitizeRequestCb, NemoRelayNativeLlmSanitizeRequestContext,
     NemoRelayNativeLlmSanitizeResponseCb, NemoRelayNativeLlmSanitizeResponseContext,
-    NemoRelayNativeLlmStreamExecutionCb, NemoRelayNativeLlmStreamV1, NemoRelayNativePluginContext,
-    NemoRelayNativePluginEntry, NemoRelayNativePluginRuntime, NemoRelayNativePluginV1,
-    NemoRelayNativeScopeHandle, NemoRelayNativeScopeStack, NemoRelayNativeScopeStackBinding,
-    NemoRelayNativeScopeType, NemoRelayNativeString, NemoRelayNativeToolConditionalCb,
-    NemoRelayNativeToolExecutionCb, NemoRelayNativeToolJsonCb, NemoRelayNativeWithScopeStackCb,
-    NemoRelayStatus,
+    NemoRelayNativeLlmStreamExecutionCb, NemoRelayNativeLlmStreamV1, NemoRelayNativeMarkWindow,
+    NemoRelayNativePluginContext, NemoRelayNativePluginEntry, NemoRelayNativePluginRuntime,
+    NemoRelayNativePluginV1, NemoRelayNativeScopeHandle, NemoRelayNativeScopeStack,
+    NemoRelayNativeScopeStackBinding, NemoRelayNativeScopeType, NemoRelayNativeString,
+    NemoRelayNativeToolConditionalCb, NemoRelayNativeToolExecutionCb, NemoRelayNativeToolJsonCb,
+    NemoRelayNativeWithScopeStackCb, NemoRelayStatus,
 };
 use serde_json::{Map, Value as Json};
 use sha2::{Digest, Sha256};
@@ -817,16 +818,19 @@ fn load_one_native_plugin(
                 ))
             })?;
         let mut status = entry(native_host_api(), &mut plugin);
-        // Older SDKs reject newer tables. Negotiate from the current v4 table
-        // through separately frozen v3 and v2 tables so their struct sizes and
-        // function pointers do not change as the current ABI grows.
-        if status == NemoRelayStatus::InvalidArg {
+        // Older SDKs reject newer tables. Negotiate from the current table through
+        // separately frozen v4, v3 and v2 tables so their struct sizes and function
+        // pointers do not change as the current ABI grows.
+        for table in [
+            native_host_api_v4(),
+            native_host_api_v3(),
+            native_host_api_v2(),
+        ] {
+            if status != NemoRelayStatus::InvalidArg {
+                break;
+            }
             drop_native_plugin_descriptor(&mut plugin);
-            status = entry(native_host_api_v3(), &mut plugin);
-        }
-        if status == NemoRelayStatus::InvalidArg {
-            drop_native_plugin_descriptor(&mut plugin);
-            status = entry(native_host_api_v2(), &mut plugin);
+            status = entry(table, &mut plugin);
         }
         if status != NemoRelayStatus::Ok {
             drop_native_plugin_descriptor(&mut plugin);
@@ -1380,8 +1384,27 @@ unsafe extern "C" fn native_llm_response_codec_decode(
 }
 
 fn native_host_api() -> *const NemoRelayNativeHostApiV1 {
+    static HOST_API: OnceLock<NemoRelayNativeHostApiV5> = OnceLock::new();
+    &HOST_API.get_or_init(build_native_host_api_v5).v4.v3.v1 as *const NemoRelayNativeHostApiV1
+}
+
+/// The frozen v4 table, for plugins built against an SDK that stops at v4.
+///
+/// A plugin that only knows v4 refuses the current table — its own supported range
+/// ends before this host's version — and the refusal says nothing about what the
+/// two could have agreed on. Offering the version it was built against is what
+/// keeps an older plugin working while the current ABI grows, and it is why each
+/// older table is frozen rather than derived from the current one.
+fn native_host_api_v4() -> *const NemoRelayNativeHostApiV1 {
     static HOST_API: OnceLock<NemoRelayNativeHostApiV4> = OnceLock::new();
-    &HOST_API.get_or_init(build_native_host_api_v4).v3.v1 as *const NemoRelayNativeHostApiV1
+    &HOST_API.get_or_init(build_frozen_host_api_v4).v3.v1 as *const NemoRelayNativeHostApiV1
+}
+
+fn build_frozen_host_api_v4() -> NemoRelayNativeHostApiV4 {
+    let mut v4 = build_native_host_api_v4();
+    v4.v3.v1.abi_version = NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS;
+    v4.v3.v1.struct_size = std::mem::size_of::<NemoRelayNativeHostApiV4>();
+    v4
 }
 
 fn native_host_api_v3() -> *const NemoRelayNativeHostApiV1 {
@@ -1479,6 +1502,18 @@ fn build_native_host_api_v3() -> NemoRelayNativeHostApiV3 {
     }
 }
 
+fn build_native_host_api_v5() -> NemoRelayNativeHostApiV5 {
+    let mut v4 = build_native_host_api_v4();
+    v4.v3.v1.abi_version = NEMO_RELAY_NATIVE_ABI_VERSION;
+    v4.v3.v1.struct_size = std::mem::size_of::<NemoRelayNativeHostApiV5>();
+    NemoRelayNativeHostApiV5 {
+        v4,
+        capture_mark_window_thread: native_capture_mark_window_thread,
+        release_mark_window: native_release_mark_window,
+        emit_mark_in_window: native_emit_mark_in_window,
+    }
+}
+
 fn build_native_host_api_v4() -> NemoRelayNativeHostApiV4 {
     let mut v3 = build_native_host_api_v3();
     v3.v1.abi_version = NEMO_RELAY_NATIVE_ABI_VERSION;
@@ -1511,6 +1546,109 @@ fn build_native_host_api_v4() -> NemoRelayNativeHostApiV4 {
             native_plugin_runtime_register_conditional_middleware_guardrail_callback,
         plugin_context_register_conditional_middleware_guardrail_callback:
             native_plugin_context_register_conditional_middleware_guardrail_callback,
+    }
+}
+
+/// The mark window an invocation is running under, as an owned handle.
+///
+/// Captured where the host opens it — around the callback it is invoking — and
+/// carried from there by whoever will be running the callback's work, because the
+/// work outlives the call: a stream the callback returns is polled long after the
+/// invocation that created it returned, and the marks it raises then belong to the
+/// same operation as the ones raised during the call.
+type MarkWindowHandle = Arc<dyn crate::plugin::execution::MarkForwarder>;
+
+/// Captures the mark window the calling invocation runs under.
+///
+/// Answers a null handle when there is no window: a callback invoked outside the
+/// host's own mark-forwarding window — as the in-process backend invokes one — has
+/// no operation to attribute its marks to through this path, and the plugin's own
+/// runtime handles them locally, which is what it already does.
+unsafe extern "C" fn native_capture_mark_window_thread(
+    out: *mut *mut NemoRelayNativeMarkWindow,
+) -> NemoRelayStatus {
+    if out.is_null() {
+        set_native_last_error("mark window capture received null out pointer");
+        return NemoRelayStatus::NullPointer;
+    }
+    clear_native_last_error();
+    let window = crate::plugin::execution::current_mark_forwarder()
+        .map(|forwarder| Box::into_raw(Box::new(forwarder)) as *mut NemoRelayNativeMarkWindow)
+        .unwrap_or(ptr::null_mut());
+    unsafe { *out = window };
+    NemoRelayStatus::Ok
+}
+
+/// Releases one owned mark-window handle.
+unsafe extern "C" fn native_release_mark_window(window: *mut NemoRelayNativeMarkWindow) {
+    if !window.is_null() {
+        drop(unsafe { Box::from_raw(window as *mut MarkWindowHandle) });
+    }
+}
+
+/// Emits a mark through the window it was raised under.
+///
+/// The window, not the call, says whose mark this is: a plugin chooses what a mark
+/// says and not which operation it belongs to. A null window is refused rather than
+/// attributed to whatever the calling thread happens to be doing — a mark with no
+/// operation is a mark nobody can place, and placing it somewhere is worse than
+/// saying so.
+unsafe extern "C" fn native_emit_mark_in_window(
+    window: *const NemoRelayNativeMarkWindow,
+    name: *const NemoRelayNativeString,
+    parent: *const NemoRelayNativeScopeHandle,
+    data_json: *const NemoRelayNativeString,
+    metadata_json: *const NemoRelayNativeString,
+    data_schema_json: *const NemoRelayNativeString,
+    severity: *const NemoRelayNativeString,
+    timestamp_unix_micros: *const i64,
+) -> NemoRelayStatus {
+    if window.is_null() {
+        set_native_last_error("mark emission requires the window it belongs to");
+        return NemoRelayStatus::InvalidArg;
+    }
+    clear_native_last_error();
+    let forwarder = unsafe { (window as *const MarkWindowHandle).as_ref() }.expect("checked above");
+    let name = match read_name(name) {
+        Ok(name) => name,
+        Err(status) => return status,
+    };
+    let data = match optional_json_from_native_string(data_json, "mark data") {
+        Ok(data) => data,
+        Err(status) => return status,
+    };
+    let metadata = match optional_json_from_native_string(metadata_json, "mark metadata") {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    let data_schema = match optional_typed_json_from_native_string::<DataSchema>(
+        data_schema_json,
+        "mark data schema",
+    ) {
+        Ok(data_schema) => data_schema,
+        Err(status) => return status,
+    };
+    let severity = match optional_severity_from_native_string(severity) {
+        Ok(severity) => severity,
+        Err(status) => return status,
+    };
+    let timestamp = match optional_timestamp_from_native(timestamp_unix_micros) {
+        Ok(timestamp) => timestamp,
+        Err(status) => return status,
+    };
+    let parent_ref = native_scope_ref(parent);
+    let params = EmitMarkEventParams::builder()
+        .name(&name)
+        .parent_opt(parent_ref)
+        .data_opt(data)
+        .metadata_opt(metadata)
+        .data_schema_opt(data_schema)
+        .severity_opt(severity)
+        .timestamp_opt(timestamp)
+        .build();
+    match crate::api::scope::forwarded_mark(&params).and_then(|mark| forwarder.forward(&mark)) {
+        Ok(()) => NemoRelayStatus::Ok,
+        Err(err) => status_from_flow_error(err),
     }
 }
 

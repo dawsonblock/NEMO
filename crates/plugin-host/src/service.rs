@@ -144,12 +144,34 @@ pub enum ForwardedStep {
     },
 }
 
+/// Closes a call's mark window when it goes out of scope.
+///
+/// A guard rather than a call per exit path, for the reason the activation guard
+/// is one: an invocation can end in more ways than it can start, and a window left
+/// open is a window a later mark can be attributed through.
+struct ClosedOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ClosedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The sink a plugin's callback raises marks into.
 struct ForwardingSink {
     sender: MarkForwardingSender,
     session_id: String,
     /// The operation this host is running, which every mark belongs to.
     operation_request_id: String,
+    /// Whether the invocation this window was opened for is over.
+    ///
+    /// A window is opened around one call, and the work of that call may keep a
+    /// task of its own running after the call returned — a streaming callback's
+    /// returned stream is polled long afterwards. Once the invocation is over, a
+    /// window that is still held is a *stale* window: attributing its marks to the
+    /// operation would be attributing them to whatever holds that identity now, so
+    /// the mark is refused instead.
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A distinct identity per mark, minted here because a callback can raise
     /// several marks within one operation.
     host_calls: std::sync::atomic::AtomicU64,
@@ -160,6 +182,12 @@ impl nemo_relay::plugin::execution::MarkForwarder for ForwardingSink {
         &self,
         mark: &nemo_relay::plugin::execution::ForwardedMark,
     ) -> nemo_relay::error::Result<()> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(nemo_relay::error::FlowError::Internal(format!(
+                "the invocation '{}' this mark belongs to has ended",
+                self.operation_request_id
+            )));
+        }
         let host_call_id = format!(
             "{}-{}",
             self.operation_request_id,
@@ -808,8 +836,51 @@ fn presented_capability<T>(request: &Request<T>) -> Option<String> {
 struct PluginFrames {
     stream: nemo_relay::api::runtime::LlmJsonStream,
     operation_request_id: String,
-    /// Whether the terminal frame has been sent, so the stream ends once.
-    terminal: bool,
+    /// The frame that ends this call, held until the call's marks are delivered.
+    ///
+    /// The terminal frame is the kernel's proof that the invocation is over, so it
+    /// may not cross before the marks that belong to the invocation: a mark the
+    /// kernel reads after the call ended is one it cannot attribute, and one whose
+    /// window it will refuse.
+    ending: Option<v1::StreamChunk>,
+    /// The delivery of those marks, while it is in flight.
+    flushing: Option<MarkDelivery>,
+    /// Whether the frame that ends this call has been sent, so the stream ends once.
+    ended: bool,
+    /// The channel this call's marks go to, when the host has one.
+    marks: Option<MarkForwardingSender>,
+    /// The window this call opened, closed when these frames go with it.
+    closed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for PluginFrames {
+    fn drop(&mut self) {
+        // The consumer is gone, so this call is over: nothing may be attributed to
+        // it any more, whichever task of the plugin is still holding its window.
+        if let Some(closed) = &self.closed {
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// One call's marks being delivered, and whether they were.
+///
+/// Answered rather than assumed: a call whose marks could not be delivered
+/// produced evidence this kernel will never see, so the frame that ends it is a
+/// failure rather than the end the plugin asked for.
+type MarkDelivery = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+fn flush_marks(sender: MarkForwardingSender) -> MarkDelivery {
+    Box::pin(async move {
+        let (done, delivered) = tokio::sync::oneshot::channel();
+        sender
+            .send(ForwardedStep::Flush { done })
+            .await
+            .map_err(|_| "this host can no longer reach the kernel".to_string())?;
+        delivered.await.map_err(|_| {
+            "this host stopped forwarding before the call's marks were delivered".to_string()
+        })?
+    })
 }
 
 impl tokio_stream::Stream for PluginFrames {
@@ -821,22 +892,61 @@ impl tokio_stream::Stream for PluginFrames {
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
 
-        let this = self.as_mut().get_mut();
-        if this.terminal {
-            return Poll::Ready(None);
-        }
-        match std::pin::Pin::new(&mut this.stream).poll_next(context) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(v1::StreamChunk {
-                operation_request_id: this.operation_request_id.clone(),
-                chunk: Some(v1::stream_chunk::Chunk::Data(chunk.to_string())),
-                // A frame that is not terminal carries no certainty about the
-                // call; what it does carry is that the plugin produced it.
-                dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted as i32,
-                outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown as i32,
-            }))),
-            Poll::Ready(Some(Err(error))) => {
-                this.terminal = true;
-                Poll::Ready(Some(Ok(v1::StreamChunk {
+        loop {
+            let this = self.as_mut().get_mut();
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            // The end of the call waits for the marks of the call.
+            if let Some(ending) = this.ending.take() {
+                if let Some(mut flushing) = this.flushing.take() {
+                    match flushing.as_mut().poll(context) {
+                        Poll::Pending => {
+                            this.ending = Some(ending);
+                            this.flushing = Some(flushing);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(error)) => {
+                            this.ended = true;
+                            if let Some(closed) = &this.closed {
+                                closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            return Poll::Ready(Some(Ok(v1::StreamChunk {
+                                operation_request_id: this.operation_request_id.clone(),
+                                chunk: Some(v1::stream_chunk::Chunk::Failure(v1::PluginFailure {
+                                    code: nemo_relay_plugin_proto::v1::FailureCode::Rejected as i32,
+                                    message: format!(
+                                        "the marks this call raised could not be delivered: {error}"
+                                    ),
+                                    ..Default::default()
+                                })),
+                                dispatch_state:
+                                    nemo_relay_plugin_protocol::DispatchState::DispatchAttempted
+                                        as i32,
+                                outcome_certainty:
+                                    nemo_relay_plugin_protocol::OutcomeCertainty::Unknown as i32,
+                            })));
+                        }
+                    }
+                }
+                this.ended = true;
+                return Poll::Ready(Some(Ok(ending)));
+            }
+            let ending = match std::pin::Pin::new(&mut this.stream).poll_next(context) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    return Poll::Ready(Some(Ok(v1::StreamChunk {
+                        operation_request_id: this.operation_request_id.clone(),
+                        chunk: Some(v1::stream_chunk::Chunk::Data(chunk.to_string())),
+                        // A frame that is not terminal carries no certainty about
+                        // the call; what it does carry is that the plugin produced it.
+                        dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted
+                            as i32,
+                        outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown
+                            as i32,
+                    })));
+                }
+                Poll::Ready(Some(Err(error))) => v1::StreamChunk {
                     operation_request_id: this.operation_request_id.clone(),
                     chunk: Some(v1::stream_chunk::Chunk::Failure(v1::PluginFailure {
                         code: nemo_relay_plugin_proto::v1::FailureCode::Rejected as i32,
@@ -848,20 +958,24 @@ impl tokio_stream::Stream for PluginFrames {
                     dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted
                         as i32,
                     outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown as i32,
-                })))
-            }
-            Poll::Ready(None) => {
-                this.terminal = true;
-                Poll::Ready(Some(Ok(v1::StreamChunk {
+                },
+                Poll::Ready(None) => v1::StreamChunk {
                     operation_request_id: this.operation_request_id.clone(),
                     chunk: Some(v1::stream_chunk::Chunk::End(true)),
                     dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted
                         as i32,
                     outcome_certainty:
                         nemo_relay_plugin_protocol::OutcomeCertainty::ConfirmedSuccess as i32,
-                })))
+                },
+                Poll::Pending => return Poll::Pending,
+            };
+            // The marks this call raised leave before the frame that ends it, and
+            // the window this call opened closes with those frames.
+            this.ending = Some(ending);
+            this.flushing = this.marks.clone().map(flush_marks);
+            if let Some(closed) = &this.closed {
+                closed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1337,12 +1451,17 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         // forwarder is installed around exactly that call.
         let outcome = match &self.mark_forwarding {
             Some(sender) => {
+                let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let sink = std::sync::Arc::new(ForwardingSink {
                     sender: sender.clone(),
                     session_id: wire.session_id.clone(),
                     operation_request_id: operation_request_id.clone(),
+                    closed: std::sync::Arc::clone(&closed),
                     host_calls: std::sync::atomic::AtomicU64::new(0),
                 });
+                // The window is open for the call and no longer: what closes it is
+                // this guard, on every way out of the invocation.
+                let _window = ClosedOnDrop(closed);
                 let answered = nemo_relay::plugin::execution::with_mark_forwarder(
                     sink,
                     self.serve_invocation(wire, presented.as_deref()),
@@ -1584,14 +1703,44 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 })
             });
 
-        let stream = match nemo_relay::api::llm::invoke_llm_stream_execution_intercept_registration(
-            &invocation.registration_id,
-            &name,
-            provider_request,
-            next,
-        )
-        .await
-        {
+        // The window this call's marks belong to, opened for as long as the call's
+        // work runs. A streaming callback's work outlives this call — the stream it
+        // returns is polled long afterwards — so the window is not a scope around
+        // the call: it is a handle the callback's own task carries, and it stays
+        // open until the call's frames are done with.
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marks = self.mark_forwarding.clone();
+        let answered = match &marks {
+            Some(sender) => {
+                let sink = std::sync::Arc::new(ForwardingSink {
+                    sender: sender.clone(),
+                    session_id: wire.session_id.clone(),
+                    operation_request_id: context.operation_request_id.clone(),
+                    closed: std::sync::Arc::clone(&closed),
+                    host_calls: std::sync::atomic::AtomicU64::new(0),
+                });
+                nemo_relay::plugin::execution::with_mark_forwarder(
+                    sink,
+                    nemo_relay::api::llm::invoke_llm_stream_execution_intercept_registration(
+                        &invocation.registration_id,
+                        &name,
+                        provider_request,
+                        next,
+                    ),
+                )
+                .await
+            }
+            None => {
+                nemo_relay::api::llm::invoke_llm_stream_execution_intercept_registration(
+                    &invocation.registration_id,
+                    &name,
+                    provider_request,
+                    next,
+                )
+                .await
+            }
+        };
+        let stream = match answered {
             Ok(stream) => stream,
             Err(error) => {
                 return Ok(Response::new(refusal(
@@ -1604,7 +1753,11 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         Ok(Response::new(Box::pin(PluginFrames {
             stream,
             operation_request_id: context.operation_request_id.clone(),
-            terminal: false,
+            ending: None,
+            flushing: None,
+            ended: false,
+            marks,
+            closed: Some(closed),
         })))
     }
 
@@ -3520,26 +3673,12 @@ mod tests {
 
     /// A mark a streaming callback raises reaches the host's forwarder.
     ///
-    /// A streaming call has four positions a mark can be raised in — before the
-    /// plugin opens the downstream stream, while the downstream producer is
-    /// active, between the chunks it returns upstream, and after the last chunk
-    /// but before the terminal frame — and all four have to survive the boundary
-    /// with the call they belong to. The fixture raises the first of them today,
-    /// so this asserts the mechanism before the matrix that will compare
-    /// attribution across two concurrent streams.
-    ///
-    /// Ignored because it cannot pass yet, and the reason is recorded here rather
-    /// than in a commit message: the host opens the mark window around a *unary*
-    /// callback, where the callback body runs inside it, and a streaming
-    /// callback's body runs on the plugin's own executor task instead — outside
-    /// any window this process opens. The mark is therefore emitted into the host
-    /// process's own event stream and never reaches the kernel. This is measured
-    /// rather than assumed: with the window installed around the streaming
-    /// registration as well as around the callback, no `ForwardedStep::Mark` is
-    /// raised at all. The fix is the window following the plugin's task, which is
-    /// the same capture-and-restore the scope binding already does — work on the
-    /// plugin SDK's side of the ABI, and not part of this qualification pass.
-    #[ignore = "a streaming callback's mark does not reach the host's forwarder; see the doc comment"]
+    /// The mark window is the host's, opened around the callback it invokes; the
+    /// work that raises the mark runs on an executor task of the plugin's own, so
+    /// the window has to be captured where it is open and carried across that
+    /// boundary. This is the first position a streaming call can raise a mark in —
+    /// before the plugin opens the downstream stream — and it is the one the
+    /// fixture raises today.
     #[tokio::test]
     async fn a_streaming_callback_s_mark_reaches_the_host_s_forwarder() {
         use tokio_stream::StreamExt;
@@ -3549,10 +3688,35 @@ mod tests {
             eprintln!("the native fixture is missing; skipping the mark case");
             return;
         };
-        let ((service, session_id), mut marks) =
+        let ((service, session_id), mut steps) =
             streaming_service_with_marks(&artifact, KernelProducer::watching(), true).await;
+        // The supervisor's half: the marks a callback raises are forwarded on, and
+        // the call's end waits for them, so something has to deliver them while the
+        // frames are being read.
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&seen);
+        let forwarding = tokio::spawn(async move {
+            while let Some(step) = steps.recv().await {
+                match step {
+                    ForwardedStep::Mark { mark, .. } => {
+                        recording.lock().unwrap().push((
+                            mark.name.clone(),
+                            mark.operation_request_id.clone(),
+                            mark.data_json
+                                .as_deref()
+                                .and_then(|data| serde_json::from_str(data).ok())
+                                .unwrap_or(serde_json::Value::Null),
+                        ));
+                    }
+                    ForwardedStep::Flush { done } => {
+                        let _ = done.send(Ok(()));
+                    }
+                }
+            }
+        });
+
         let mut frames = invoke_stream_frames(&service, &session_id).await;
-        // Reading the frames is what runs the callback and produces through it.
         while let Some(frame) =
             tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
                 .await
@@ -3567,34 +3731,23 @@ mod tests {
             }
         }
         drop(frames);
+        forwarding.abort();
 
-        // What the callback raised, as the host recorded it for the kernel.
-        let mut seen = Vec::new();
-        while let Ok(Some(step)) =
-            tokio::time::timeout(std::time::Duration::from_millis(250), marks.recv()).await
-        {
-            if let ForwardedStep::Mark { mark, .. } = step {
-                seen.push(mark);
-            }
-        }
+        let seen = seen.lock().unwrap().clone();
         let raised = seen
             .iter()
-            .find(|mark| mark.name == "fixture.native.llm_stream.mark");
-        let raised = raised.unwrap_or_else(|| {
-            panic!("the mark the streaming callback raised crossed to the forwarder: {seen:?}")
-        });
+            .find(|(name, _, _)| name == "fixture.native.llm_stream.mark")
+            .unwrap_or_else(|| {
+                panic!("the mark the streaming callback raised crossed to the forwarder: {seen:?}")
+            });
         assert_eq!(
-            raised.operation_request_id, "operation-stream",
-            "a mark belongs to the call whose callback raised it"
+            raised.1, "operation-stream",
+            "the window says which operation the mark belongs to, and the plugin cannot change it"
         );
         assert_eq!(
-            raised.data_json.as_deref().map(|data| {
-                serde_json::from_str::<serde_json::Value>(data)
-                    .expect("the mark's data is JSON")["position"]
-                    .clone()
-            }),
-            Some(serde_json::json!("before-downstream")),
-            "and the position it was raised in is the one the plugin named"
+            raised.2["position"],
+            serde_json::json!("before-downstream"),
+            "the position the plugin named is the position that arrived"
         );
         let _ = std::fs::remove_dir_all(&manifest_dir);
     }
@@ -3943,6 +4096,7 @@ mod tests {
             sender,
             session_id: "session-1".into(),
             operation_request_id: "operation-1".into(),
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_calls: std::sync::atomic::AtomicU64::new(0),
         };
         let mark = ForwardedMark {

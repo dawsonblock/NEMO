@@ -52,12 +52,19 @@ use serde_json::Map;
 ///
 /// Version 4 adds completion-scoped codecs, pull-based LLM streams, extended
 /// mark emission, runtime diagnostics, and activation-owned runtime-registration
-/// discovery and dynamic conditional middleware guardrail control. Hosts retain
-/// frozen version-3 and version-2 tables for already-built plugins that target
-/// those layouts.
-pub const NEMO_RELAY_NATIVE_ABI_VERSION: u32 = 4;
+/// discovery and dynamic conditional middleware guardrail control. Version 5 adds
+/// the mark window: an invocation-scoped attribution context the host captures and
+/// a plugin carries across its own asynchronous work, so a mark raised outside the
+/// synchronous call that created a callback still belongs to the operation whose
+/// callback raised it. Hosts retain frozen version-4, version-3 and version-2
+/// tables for already-built plugins that target those layouts.
+pub const NEMO_RELAY_NATIVE_ABI_VERSION: u32 = 5;
 /// ABI version that introduced completion-based asynchronous middleware.
 pub const NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE: u32 = 3;
+/// ABI version that introduced the v4 host extension: completion-scoped codecs,
+/// pull-based LLM streams, extended mark emission, runtime diagnostics, and
+/// activation-owned dynamic gate control.
+pub const NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS: u32 = 4;
 
 /// Legacy native plugin ABI accepted by Relay hosts for compatibility.
 pub const NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY: u32 = 2;
@@ -1168,6 +1175,49 @@ pub type NemoRelayNativeEmitMarkV2Fn = unsafe extern "C" fn(
 pub type NemoRelayNativeGetRuntimeDiagnosticsFn =
     unsafe extern "C" fn(out_json: *mut *mut NemoRelayNativeString) -> NemoRelayStatus;
 
+/// Opaque handle on the mark window an invocation is running under.
+///
+/// The host owns the handle: it is what the host captured when it opened the
+/// window around a callback, and it names the operation that callback belongs to.
+/// A plugin may carry one and emit marks through it; it cannot read it, change it,
+/// or make one up that names an operation the host did not open a window for.
+pub struct NemoRelayNativeMarkWindow;
+
+/// Captures the mark window the calling invocation is running under.
+///
+/// Called on the thread the host invoked a callback on, before the callback's work
+/// moves to a task of the plugin's own: what is captured is the window the host
+/// opened, and from then on it is the plugin's to carry rather than the thread's.
+/// On success `out` receives one owned handle, which must be released exactly once
+/// with [`NemoRelayNativeReleaseMarkWindowFn`]. A host that opened no window writes
+/// a null handle and answers [`NemoRelayStatus::Ok`]: a mark raised with no window
+/// is the host process's own, which is what an invocation outside a plugin
+/// callback means.
+pub type NemoRelayNativeCaptureMarkWindowFn =
+    unsafe extern "C" fn(out: *mut *mut NemoRelayNativeMarkWindow) -> NemoRelayStatus;
+
+/// Releases one owned mark-window handle.
+pub type NemoRelayNativeReleaseMarkWindowFn =
+    unsafe extern "C" fn(window: *mut NemoRelayNativeMarkWindow);
+
+/// Emits a mark through the window it was raised under.
+///
+/// The attribution — which operation the mark belongs to — comes from the window
+/// and not from the call: a plugin chooses what a mark says, not whose it is.
+/// A window the host has already settled (the operation was cancelled, ended, or
+/// failed) refuses the mark rather than attributing it to whatever holds that
+/// identity now.
+pub type NemoRelayNativeEmitMarkInWindowFn = unsafe extern "C" fn(
+    window: *const NemoRelayNativeMarkWindow,
+    name: *const NemoRelayNativeString,
+    parent: *const NemoRelayNativeScopeHandle,
+    data_json: *const NemoRelayNativeString,
+    metadata_json: *const NemoRelayNativeString,
+    data_schema_json: *const NemoRelayNativeString,
+    severity: *const NemoRelayNativeString,
+    timestamp_unix_micros: *const i64,
+) -> NemoRelayStatus;
+
 /// ABI-v4 host extension for typed asynchronous middleware, mark options,
 /// diagnostics, and activation-owned dynamic gate control.
 ///
@@ -1309,6 +1359,28 @@ pub struct NemoRelayNativeHostApiV4 {
 
 unsafe impl Send for NemoRelayNativeHostApiV3 {}
 unsafe impl Sync for NemoRelayNativeHostApiV3 {}
+
+/// ABI-v5 host extension for the mark window.
+///
+/// The complete ABI-v4 table is the prefix, preserving layout compatibility.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NemoRelayNativeHostApiV5 {
+    /// Frozen ABI-v4 compatibility prefix.
+    pub v4: NemoRelayNativeHostApiV4,
+    /// Captures the mark window the calling invocation runs under.
+    pub capture_mark_window_thread: NemoRelayNativeCaptureMarkWindowFn,
+    /// Releases one owned mark-window handle.
+    pub release_mark_window: NemoRelayNativeReleaseMarkWindowFn,
+    /// Emits a mark through the window it was raised under.
+    pub emit_mark_in_window: NemoRelayNativeEmitMarkInWindowFn,
+}
+
+// SAFETY: the v5 host table is immutable after construction. Its function
+// pointers and inherited host metadata may be invoked from any plugin thread.
+unsafe impl Send for NemoRelayNativeHostApiV5 {}
+unsafe impl Sync for NemoRelayNativeHostApiV5 {}
+
 // SAFETY: the v4 host table is immutable after construction. Its function
 // pointers and inherited host metadata may be invoked from any plugin thread.
 unsafe impl Send for NemoRelayNativeHostApiV4 {}
@@ -1443,7 +1515,7 @@ impl Drop for PluginRuntime {
 impl PluginRuntime {
     /// Creates a runtime handle from the host ABI table.
     pub fn new(host: &NemoRelayNativeHostApiV1) -> Self {
-        let v4 = (host.abi_version >= NEMO_RELAY_NATIVE_ABI_VERSION
+        let v4 = (host.abi_version >= NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS
             && host.struct_size >= std::mem::size_of::<NemoRelayNativeHostApiV4>())
         .then(|| unsafe { *(host as *const _ as *const NemoRelayNativeHostApiV4) });
         Self {
@@ -2147,6 +2219,29 @@ pub fn emit_mark(
         HostString::new(host, name).ok_or_else(|| "failed to allocate mark name".to_string())?;
     let data = OptionalHostJson::new(host, data)?;
     let metadata = OptionalHostJson::new(host, metadata)?;
+    // A window installed around the work that raised this mark says whose mark it
+    // is. The plugin chose what the mark says; the window the host opened says
+    // which operation it belongs to, and a mark raised without one is the host
+    // process's own rather than an operation's.
+    if let Some(window) = crate::async_sdk::installed_mark_window() {
+        let status = unsafe {
+            (window.emit)(
+                window.window,
+                name.as_ptr(),
+                ptr::null(),
+                data.as_ptr(),
+                metadata.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        return if status == NemoRelayStatus::Ok {
+            Ok(())
+        } else {
+            Err(format!("emit_mark failed: {status:?}"))
+        };
+    }
     let status = unsafe {
         (host.emit_mark)(
             name.as_ptr(),
@@ -2198,6 +2293,33 @@ fn emit_mark_v2_call(
                 })
         })
         .transpose()?;
+    // The same rule as `emit_mark`: the window, when one was installed around
+    // this work, is what makes the mark an operation's rather than the process's.
+    if let Some(window) = crate::async_sdk::installed_mark_window() {
+        let status = unsafe {
+            (window.emit)(
+                window.window,
+                name.as_ptr(),
+                ptr::null(),
+                data.as_ptr(),
+                metadata.as_ptr(),
+                data_schema
+                    .as_ref()
+                    .map(HostString::as_ptr)
+                    .unwrap_or(ptr::null()),
+                severity
+                    .as_ref()
+                    .map(HostString::as_ptr)
+                    .unwrap_or(ptr::null()),
+                ptr::null(),
+            )
+        };
+        return if status == NemoRelayStatus::Ok {
+            Ok(())
+        } else {
+            Err(format!("emit_mark_v2 failed: {status:?}"))
+        };
+    }
     let status = unsafe {
         emit_mark_v2(
             name.as_ptr(),
@@ -2303,6 +2425,9 @@ pub trait NativePlugin: Send + 'static {
 /// Borrowed safe wrapper around a host plugin registration context.
 pub struct PluginContext<'a> {
     host: &'a NemoRelayNativeHostApiV1,
+    /// The typed-async table the host offered, read where the host table was
+    /// copied rather than from a pointer into it.
+    typed_async: Option<async_sdk::HostV4>,
     raw: *mut NemoRelayNativePluginContext,
     executor: Arc<async_sdk::NativeExecutor>,
 }
@@ -2312,25 +2437,29 @@ impl<'a> PluginContext<'a> {
     /// Creates a plugin context wrapper from raw ABI parts.
     ///
     /// # Safety
-    /// `host` and `raw` must remain valid for the lifetime of this wrapper.
+    /// `host` must be the host's own API table — not a copy of part of it — with
+    /// the struct size it announces, and both `host` and `raw` must remain valid
+    /// for the lifetime of this wrapper.
     pub unsafe fn from_raw(
         host: &'a NemoRelayNativeHostApiV1,
         raw: *mut NemoRelayNativePluginContext,
     ) -> Self {
         Self {
             host,
+            typed_async: None,
             raw,
             executor: async_sdk::NativeExecutor::new(NativeExecutorConfig::default(), "standalone"),
         }
     }
 
     unsafe fn from_raw_with_executor(
-        host: &'a NemoRelayNativeHostApiV1,
+        host: &'a OwnedHostApi,
         raw: *mut NemoRelayNativePluginContext,
         executor: Arc<async_sdk::NativeExecutor>,
     ) -> Self {
         Self {
-            host,
+            host: host.v1(),
+            typed_async: host.typed_async(),
             raw,
             executor,
         }
@@ -2363,7 +2492,7 @@ impl<'a> PluginContext<'a> {
             + Sync
             + 'static,
     {
-        if self.host.abi_version < NEMO_RELAY_NATIVE_ABI_VERSION
+        if self.host.abi_version < NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS
             || self.host.struct_size < std::mem::size_of::<NemoRelayNativeHostApiV4>()
         {
             return Err("host does not support conditional middleware guardrails".into());
@@ -3054,11 +3183,16 @@ enum OwnedHostApi {
     V1(NemoRelayNativeHostApiV1),
     V3(NemoRelayNativeHostApiV3),
     V4(NemoRelayNativeHostApiV4),
+    V5(NemoRelayNativeHostApiV5),
 }
 
 impl OwnedHostApi {
     unsafe fn copy_from(host: &NemoRelayNativeHostApiV1) -> Self {
         if host.abi_version >= NEMO_RELAY_NATIVE_ABI_VERSION
+            && host.struct_size >= std::mem::size_of::<NemoRelayNativeHostApiV5>()
+        {
+            Self::V5(unsafe { *(host as *const _ as *const NemoRelayNativeHostApiV5) })
+        } else if host.abi_version >= NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS
             && host.struct_size >= std::mem::size_of::<NemoRelayNativeHostApiV4>()
         {
             Self::V4(unsafe { *(host as *const _ as *const NemoRelayNativeHostApiV4) })
@@ -3076,6 +3210,27 @@ impl OwnedHostApi {
             Self::V1(host) => host,
             Self::V3(host) => &host.v1,
             Self::V4(host) => &host.v3.v1,
+            Self::V5(host) => &host.v4.v3.v1,
+        }
+    }
+
+    /// The typed-async table and, when the host offers it, the mark-window table.
+    ///
+    /// Read from this process's own copy of the host table rather than from a
+    /// pointer into the host's: an extension lives *past* the version a plugin
+    /// compiles against, and the copy is the only place this side is guaranteed to
+    /// have the bytes for the version it announced.
+    fn typed_async(&self) -> Option<crate::async_sdk::HostV4> {
+        match self {
+            Self::V4(v4) => Some(crate::async_sdk::HostV4 {
+                v4: *v4,
+                windows: None,
+            }),
+            Self::V5(v5) => Some(crate::async_sdk::HostV4 {
+                v4: v5.v4,
+                windows: Some(*v5),
+            }),
+            Self::V1(_) | Self::V3(_) => None,
         }
     }
 }
@@ -3158,7 +3313,7 @@ unsafe extern "C" fn register_trampoline<P: NativePlugin>(
         };
         let mut ctx = unsafe {
             PluginContext::from_raw_with_executor(
-                host,
+                &state.host,
                 ctx,
                 async_sdk::NativeExecutor::new(executor_config, plugin.plugin_kind()),
             )

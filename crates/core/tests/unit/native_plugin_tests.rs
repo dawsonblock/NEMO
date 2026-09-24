@@ -633,16 +633,26 @@ fn assert_native_digest_edges() {
     assert!(verify_sha256(&temp.path().join("missing"), "00").is_err());
 }
 
+#[allow(clippy::cognitive_complexity)] // One assertion per field of four tables.
 fn assert_native_host_api_versions() {
     let current = native_host_api();
+    let frozen_v4 = native_host_api_v4();
     let frozen_v3 = native_host_api_v3();
     let legacy = native_host_api_v2();
     assert!(!current.is_null());
+    assert!(!frozen_v4.is_null());
     assert!(!frozen_v3.is_null());
     assert!(!legacy.is_null());
     assert_eq!(
         unsafe { (*current).abi_version },
         NEMO_RELAY_NATIVE_ABI_VERSION
+    );
+    // Every older table is frozen at the version it was built for, so a plugin
+    // that only knows that version sees the shape it was compiled against rather
+    // than a prefix of the current one.
+    assert_eq!(
+        unsafe { (*frozen_v4).abi_version },
+        NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS
     );
     assert_eq!(unsafe { (*frozen_v3).abi_version }, 3);
     assert_eq!(
@@ -651,6 +661,10 @@ fn assert_native_host_api_versions() {
     );
     assert_eq!(
         unsafe { (*current).struct_size },
+        std::mem::size_of::<NemoRelayNativeHostApiV5>()
+    );
+    assert_eq!(
+        unsafe { (*frozen_v4).struct_size },
         std::mem::size_of::<NemoRelayNativeHostApiV4>()
     );
     assert_eq!(
@@ -663,7 +677,22 @@ fn assert_native_host_api_versions() {
     );
     #[cfg(target_pointer_width = "64")]
     {
-        assert_eq!(std::mem::align_of::<NemoRelayNativeHostApiV4>(), 8);
+        assert_eq!(std::mem::align_of::<NemoRelayNativeHostApiV5>(), 8);
+        assert_eq!(std::mem::size_of::<NemoRelayNativeHostApiV5>(), 624);
+        assert_eq!(std::mem::offset_of!(NemoRelayNativeHostApiV5, v4), 0);
+        assert_eq!(
+            std::mem::offset_of!(NemoRelayNativeHostApiV5, capture_mark_window_thread),
+            600
+        );
+        assert_eq!(
+            std::mem::offset_of!(NemoRelayNativeHostApiV5, release_mark_window),
+            608
+        );
+        assert_eq!(
+            std::mem::offset_of!(NemoRelayNativeHostApiV5, emit_mark_in_window),
+            616
+        );
+        // The frozen v4 table is the current table's prefix, unchanged in shape.
         assert_eq!(std::mem::size_of::<NemoRelayNativeHostApiV4>(), 600);
         assert_eq!(std::mem::offset_of!(NemoRelayNativeHostApiV4, v3), 0);
         assert_eq!(
@@ -1737,7 +1766,7 @@ fn assert_native_json_output_and_host_api() {
     assert_eq!(host_api.abi_version, NEMO_RELAY_NATIVE_ABI_VERSION);
     assert_eq!(
         host_api.struct_size,
-        std::mem::size_of::<NemoRelayNativeHostApiV4>()
+        std::mem::size_of::<NemoRelayNativeHostApiV5>()
     );
 }
 

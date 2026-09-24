@@ -81,15 +81,15 @@
 //!    outstanding — a stream's frames are answers to demand, and the ending is one
 //!    of them.
 //!
-//! What the streaming increment still owes is one mechanism and no more of this
-//! one: the mark window has to follow an asynchronous callback onto the plugin's
-//! own task before a streaming mark can reach the kernel, which is the plugin
-//! SDK's side of the ABI rather than this session's. Everything else the class
-//! owed is here and asserted — the deadline, the ceilings, the terminal rule, and
-//! the shutdown that drops every producer — and the mixture of them is run rather
-//! than argued in `streams_that_end_every_way_at_once_leave_nothing_behind`. The
-//! class is not served until the marks land, so nothing depends on the actor's
-//! shape yet.
+//! What the streaming increment still owes is the mark-attribution matrix and the
+//! last of the death phases, not more of this session: the mark window now follows
+//! execution across the plugin's own task boundary — the SDK's side of the ABI,
+//! with the session carrying the resulting marks like any other frame — and
+//! everything else the class owed is here and asserted: the deadline, the ceilings,
+//! the terminal rule, and the shutdown that drops every producer, with the mixture
+//! run rather than argued in
+//! `streams_that_end_every_way_at_once_leave_nothing_behind`. The class is not
+//! served until the matrix lands, so nothing depends on the actor's shape yet.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;

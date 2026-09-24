@@ -11,7 +11,7 @@ in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
 surface, and `just tcb-report` prints the number this milestone is judged on:
 
 ```
-kernel-process unsafe tokens: 622
+kernel-process unsafe tokens: 645
 ```
 
 `just tcb-report` checks that figure against the measurement rather than
@@ -154,6 +154,48 @@ backend rather than to a re-export, because it is the only external caller of
   conformance runs against both backends until the in-process one is removed.
 - `kernel-process unsafe tokens` falls. The milestone is judged on that number
   in `just tcb-report`, not on the tier total and not on crate relocation.
+
+**The mark window, and what it taught the ABI.** The one gap the qualification
+pass found was that a mark raised by an asynchronous callback never left the host
+process: the host opens its mark window around a *unary* callback, where the
+callback body runs inside it, and an asynchronous callback's body runs on a task of
+the plugin's own — outside any window this process opens. Installing the window
+around the streaming registration as well changed nothing, which was the
+measurement; the missing piece was that the window has to *follow execution*.
+
+It now does, and the rule is general rather than streaming-specific: an ambient
+context with semantic meaning has to be captured where it is set and restored
+across every task boundary the plugin owns. Mark windows are the first casualty
+observed, and the same rule applies to the scope stack the SDK already carries,
+and to anything security-relevant added later.
+
+The mechanism is ABI v5: `capture_mark_window_thread` reads the window the host
+opened and answers one opaque handle, `emit_mark_in_window` emits through it and
+nothing else, and `release_mark_window` gives it back. The handle names the
+operation — a plugin cannot substitute an operation identity, because the identity
+is the window's — and a window the host has closed refuses the mark rather than
+attributing it to whatever holds that identity now. The plugin SDK captures at the
+call, and carries the window into the executor task and into the *returned stream*
+as well as into the callback's own future, which is the part a callback that merely
+constructs and returns a stream would otherwise lose: the stream is polled long
+after the call that created it returned, and its marks belong to the same
+operation. Installation is per poll and taken back afterwards, because a poll is
+synchronous and two streams on one thread must not see each other's window.
+
+Two things fell out of building it. The host now offers an older plugin the version
+it was built against — a frozen v4 table — rather than only the current one: a
+plugin whose supported range ends at v4 refuses a v5 table, and that refusal says
+nothing about what the two could have agreed on. And the host's end of a stream's
+marks is ordered: a call's marks are delivered *before* the frame that ends the
+call, and a failure to deliver them turns the ending into a failure, because a call
+whose evidence the kernel will never see is not one the kernel may read as
+complete.
+
+`a_streaming_callback_s_mark_reaches_the_host_s_forwarder` is the first test: it
+drives a streaming invocation to its end and requires the mark the callback raised
+before opening its downstream stream to arrive at the forwarder with the operation
+the window names and the position the plugin named. It was ignored while the
+mechanism was missing and is not any more.
 
 ## Current state
 
@@ -380,27 +422,19 @@ says so (an end), and failed (the failure, then an end).
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **The mark window does not follow a streaming callback.** This is the one thing
-   the qualification pass found that the class cannot be advertised without, and it
-   is measured rather than assumed. The host opens the mark window around a
-   *unary* callback, where the callback body runs inside it, and the plugin SDK
-   runs an asynchronous callback's body on the plugin's own executor task — outside
-   any window the host process opens. A mark a streaming callback raises is
-   therefore emitted into the host process's own event stream and never reaches the
-   kernel: with the window installed around the streaming registration as well as
-   around the callback, no `ForwardedStep::Mark` is raised at all, which is what
-   `a_streaming_callback_s_mark_reaches_the_host_s_forwarder` records — ignored,
-   with that reason, so the invariant is written down before the fix rather than
-   after it. The fix is the window following the plugin's task, which is the same
-   capture-and-restore the scope binding already does, and it is work on the plugin
-   SDK's side of the ABI rather than in the session. Until it lands, the four
-   positions a streaming mark can be raised in — before the plugin opens the
-   downstream stream, while the downstream producer is active, between the chunks
-   it returns upstream, and after the last chunk but before the terminal frame —
-   are not carried, and neither is the two-stream attribution matrix that would
-   show a mark cannot migrate to a neighbouring operation. A mark that cannot be
-   delivered is not a lost log line: the class stays unlisted, so a plugin
-   registering it is refused whole.
+1. **The mark-attribution matrix.** The mechanism exists and its first test is
+   green; what it owes now is the matrix that qualifies it. A streaming call has
+   four positions a mark can be raised in — before the plugin opens the downstream
+   stream, while the downstream producer is active, between the chunks it returns
+   upstream, and after the last chunk but before the terminal frame — and all four
+   have to survive the boundary *with the operation they belong to*, which two
+   concurrent streams interleaved several ways is what proves: eight marks arriving
+   is not the property, eight marks arriving each attributed to their own operation
+   is. Beside that: the context's lifecycle (a cancellation, a deadline, a terminal,
+   a failed callback and a plugin-task panic each leave no window behind, and a
+   session or host shutdown clears them) and the continuation case (two downstream
+   continuations of one callback stay attributed to the original operation while
+   their own call identities stay distinct).
 2. **The rest of the qualification matrix**, which needs no new mechanism: the
    cases are in the tree and the counts are asserted with them. Host death is
    `a_session_that_ends_mid_stream_fails_the_stream` (a caller is told rather than

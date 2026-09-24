@@ -148,10 +148,125 @@ impl Drop for NativeExecutor {
 }
 
 #[derive(Clone, Copy)]
-struct HostV4(NemoRelayNativeHostApiV4);
+pub(crate) struct HostV4 {
+    /// The ABI-v4 table, read from the host's own where the plugin was loaded.
+    pub(crate) v4: NemoRelayNativeHostApiV4,
+    /// The mark-window operations of ABI v5, when the host offers them.
+    ///
+    /// Read from the host's own table rather than from the v4 prefix a plugin
+    /// compiles against: the extension lives *past* that prefix, and a plugin's
+    /// copy of the prefix has nothing there to read.
+    pub(crate) windows: Option<NemoRelayNativeHostApiV5>,
+}
 
 unsafe impl Send for HostV4 {}
 unsafe impl Sync for HostV4 {}
+
+impl HostV4 {
+    /// Reads the typed-async table, and the mark-window table after it, from the
+    /// host's own table.
+    ///
+    /// Only for a context built by hand around the host's table itself — the plugin
+    /// entry copies the table and hands the context that copy, so production never
+    /// reads through a pointer into the host's memory. Nothing is read past the
+    /// size the host announced.
+    ///
+    /// # Safety
+    /// `host` must point at the host's own API table, valid for as long as this
+    /// value lives.
+    unsafe fn read(host: &NemoRelayNativeHostApiV1) -> Option<Self> {
+        if host.abi_version < NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS
+            || host.struct_size < std::mem::size_of::<NemoRelayNativeHostApiV4>()
+        {
+            return None;
+        }
+        let host = host as *const NemoRelayNativeHostApiV1;
+        let v4 = unsafe { *(host as *const NemoRelayNativeHostApiV4) };
+        let windows = (unsafe { &*host }.abi_version >= NEMO_RELAY_NATIVE_ABI_VERSION
+            && unsafe { &*host }.struct_size >= std::mem::size_of::<NemoRelayNativeHostApiV5>())
+        .then(|| unsafe { *(host as *const NemoRelayNativeHostApiV5) });
+        Some(Self { v4, windows })
+    }
+}
+
+/// The mark window a callback is running under, captured where the host opened it.
+///
+/// A callback's work does not stay on the call that created it: the callback
+/// future, and the stream it may return, run on an executor task of the plugin's
+/// own. The window is therefore captured at the call and carried by that work —
+/// installed around each poll and taken back afterwards — rather than read from
+/// whatever the thread happens to be doing when a mark is raised.
+pub(crate) struct MarkWindow {
+    host: NemoRelayNativeHostApiV5,
+    window: *mut NemoRelayNativeMarkWindow,
+}
+
+unsafe impl Send for MarkWindow {}
+unsafe impl Sync for MarkWindow {}
+
+impl MarkWindow {
+    /// Captures the window the calling invocation runs under, if there is one.
+    ///
+    /// A host that opened no window — the in-process backend, or a call outside a
+    /// plugin callback — captures nothing, and the plugin's marks stay its own.
+    pub(crate) fn capture(host: HostV4) -> Option<Self> {
+        let host = host.windows?;
+        let mut window = std::ptr::null_mut();
+        let status = unsafe { (host.capture_mark_window_thread)(&mut window) };
+        if status != NemoRelayStatus::Ok || window.is_null() {
+            return None;
+        }
+        Some(Self { host, window })
+    }
+
+    /// Installs this window for the work being polled, answering what was there.
+    fn install(&self) -> Option<InstalledWindow> {
+        CURRENT_MARK_WINDOW.with(|current| {
+            current.replace(Some(InstalledWindow {
+                window: self.window,
+                emit: self.host.emit_mark_in_window,
+            }))
+        })
+    }
+
+    /// Puts back whatever was installed before this window's work was polled.
+    fn restore(previous: Option<InstalledWindow>) {
+        let _ = CURRENT_MARK_WINDOW.try_with(|current| current.set(previous));
+    }
+}
+
+impl Drop for MarkWindow {
+    fn drop(&mut self) {
+        unsafe { (self.host.release_mark_window)(self.window) };
+    }
+}
+
+/// What a poll installs while it runs: the host's window, and how to emit through it.
+#[derive(Clone, Copy)]
+pub(crate) struct InstalledWindow {
+    pub(crate) window: *const NemoRelayNativeMarkWindow,
+    pub(crate) emit: NemoRelayNativeEmitMarkInWindowFn,
+}
+
+thread_local! {
+    /// The window the plugin's own task is executing under right now.
+    ///
+    /// Installed for one poll at a time and taken back when the poll returns.
+    /// Polls are synchronous and do not interleave, so two streams on one thread
+    /// cannot observe each other's window — and a task that is not running
+    /// callback code has no window at all, which is what keeps a mark from being
+    /// attributed to whichever operation last ran here.
+    static CURRENT_MARK_WINDOW: std::cell::Cell<Option<InstalledWindow>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The window to emit a mark through, when the caller is running plugin code.
+pub(crate) fn installed_mark_window() -> Option<InstalledWindow> {
+    CURRENT_MARK_WINDOW
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten()
+}
 
 struct Completion {
     host: HostV4,
@@ -163,29 +278,29 @@ unsafe impl Sync for Completion {}
 
 impl Completion {
     fn resolve<T: Serialize>(&self, value: &T) -> Result<()> {
-        let value = HostString::from_json(&self.host.0.v3.v1, value)
+        let value = HostString::from_json(&self.host.v4.v3.v1, value)
             .ok_or_else(|| "failed to serialize native async middleware result".to_string())?;
         let status =
-            unsafe { (self.host.0.v3.async_completion_resolve_json)(self.raw, value.as_ptr()) };
+            unsafe { (self.host.v4.v3.async_completion_resolve_json)(self.raw, value.as_ptr()) };
         status_result(status, "resolve native async middleware completion")
     }
 
     fn reject(&self, message: &str) {
-        if let Some(message) = HostString::new(&self.host.0.v3.v1, message) {
+        if let Some(message) = HostString::new(&self.host.v4.v3.v1, message) {
             unsafe {
-                (self.host.0.v3.async_completion_reject)(self.raw, message.as_ptr());
+                (self.host.v4.v3.async_completion_reject)(self.raw, message.as_ptr());
             }
         }
     }
 
     fn is_cancelled(&self) -> bool {
-        unsafe { (self.host.0.v3.async_completion_is_cancelled)(self.raw) }
+        unsafe { (self.host.v4.v3.async_completion_is_cancelled)(self.raw) }
     }
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
-        unsafe { (self.host.0.v3.async_completion_release)(self.raw) };
+        unsafe { (self.host.v4.v3.async_completion_release)(self.raw) };
     }
 }
 
@@ -205,12 +320,12 @@ impl CompletionRef {
         let resolved = if matches!(codec, LlmCodecIdentity::None) {
             None
         } else {
-            let status = unsafe { (self.host.0.async_completion_retain)(self.raw) };
+            let status = unsafe { (self.host.v4.async_completion_retain)(self.raw) };
             status_result(status, "retain native async completion capability")?;
             Some(LlmSanitizeRequestCodec {
-                async_host: self.host.0,
+                async_host: self.host.v4,
                 completion: self.raw,
-                completion_release: self.host.0.v3.async_completion_release,
+                completion_release: self.host.v4.v3.async_completion_release,
                 _lifetime: PhantomData,
             })
         };
@@ -224,12 +339,12 @@ impl CompletionRef {
         let resolved = if matches!(codec, LlmCodecIdentity::None) {
             None
         } else {
-            let status = unsafe { (self.host.0.async_completion_retain)(self.raw) };
+            let status = unsafe { (self.host.v4.async_completion_retain)(self.raw) };
             status_result(status, "retain native async completion capability")?;
             Some(LlmSanitizeResponseCodec {
-                async_host: self.host.0,
+                async_host: self.host.v4,
                 completion: self.raw,
-                completion_release: self.host.0.v3.async_completion_release,
+                completion_release: self.host.v4.v3.async_completion_release,
                 _lifetime: PhantomData,
             })
         };
@@ -247,7 +362,7 @@ unsafe impl Sync for NextInner {}
 
 impl Drop for NextInner {
     fn drop(&mut self) {
-        unsafe { (self.host.0.v3.async_next_release)(self.raw) };
+        unsafe { (self.host.v4.v3.async_next_release)(self.raw) };
     }
 }
 
@@ -285,7 +400,7 @@ pub struct LlmStreamNext(Arc<NextInner>);
 impl LlmStreamNext {
     /// Opens an independent pull-based downstream stream.
     pub async fn call(&self, request: LlmRequest) -> Result<LlmJsonAsyncStream> {
-        let request = HostString::from_json(&self.0.host.0.v3.v1, &request)
+        let request = HostString::from_json(&self.0.host.v4.v3.v1, &request)
             .ok_or_else(|| "failed to serialize LLM stream request".to_string())?;
         let (sender, receiver) = futures::channel::oneshot::channel();
         let callback_state = Box::into_raw(Box::new(OpenState {
@@ -293,7 +408,7 @@ impl LlmStreamNext {
             host: self.0.host,
         }));
         let status = unsafe {
-            (self.0.host.0.async_next_open_llm_stream)(
+            (self.0.host.v4.async_next_open_llm_stream)(
                 self.0.raw,
                 request.as_ptr(),
                 open_stream_callback,
@@ -303,7 +418,7 @@ impl LlmStreamNext {
         if status != NemoRelayStatus::Ok {
             drop(unsafe { Box::from_raw(callback_state) });
             return Err(status_message(
-                &self.0.host.0.v3.v1,
+                &self.0.host.v4.v3.v1,
                 status,
                 "open LLM stream",
             ));
@@ -337,8 +452,8 @@ impl Drop for OpenedStream {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe {
-                (self.host.0.async_llm_stream_cancel)(self.raw);
-                (self.host.0.async_llm_stream_release)(self.raw);
+                (self.host.v4.async_llm_stream_cancel)(self.raw);
+                (self.host.v4.async_llm_stream_release)(self.raw);
             }
         }
     }
@@ -361,7 +476,7 @@ unsafe extern "C" fn open_stream_callback(
             raw: stream,
         })
     } else if !error.is_null() {
-        Err(read_host_string(&state.host.0.v3.v1, error)
+        Err(read_host_string(&state.host.v4.v3.v1, error)
             .unwrap_or_else(|_| "failed to open LLM stream".into()))
     } else {
         Err("host returned neither an LLM stream nor an error".into())
@@ -392,7 +507,7 @@ impl Stream for PullStream {
                 host: self.host,
             }));
             let status = unsafe {
-                (self.host.0.async_llm_stream_pull)(
+                (self.host.v4.async_llm_stream_pull)(
                     self.raw,
                     pull_stream_callback,
                     callback_state.cast(),
@@ -402,7 +517,7 @@ impl Stream for PullStream {
                 drop(unsafe { Box::from_raw(callback_state) });
                 self.finished = true;
                 return Poll::Ready(Some(Err(status_message(
-                    &self.host.0.v3.v1,
+                    &self.host.v4.v3.v1,
                     status,
                     "pull LLM stream",
                 ))));
@@ -440,9 +555,9 @@ impl Stream for PullStream {
 impl Drop for PullStream {
     fn drop(&mut self) {
         if !self.finished {
-            unsafe { (self.host.0.async_llm_stream_cancel)(self.raw) };
+            unsafe { (self.host.v4.async_llm_stream_cancel)(self.raw) };
         }
-        unsafe { (self.host.0.async_llm_stream_release)(self.raw) };
+        unsafe { (self.host.v4.async_llm_stream_release)(self.raw) };
     }
 }
 
@@ -460,12 +575,12 @@ unsafe extern "C" fn pull_stream_callback(
 ) {
     let state = unsafe { Box::from_raw(user_data.cast::<PullState>()) };
     let result = if !error.is_null() {
-        Err(read_host_string(&state.host.0.v3.v1, error)
+        Err(read_host_string(&state.host.v4.v3.v1, error)
             .unwrap_or_else(|_| "LLM stream pull failed".into()))
     } else if done {
         Ok(None)
     } else if !chunk_json.is_null() {
-        read_json_value(&state.host.0.v3.v1, chunk_json, "LLM stream chunk")
+        read_json_value(&state.host.v4.v3.v1, chunk_json, "LLM stream chunk")
             .map_err(|status| format!("invalid LLM stream chunk: {status:?}"))
             .map(Some)
     } else {
@@ -475,7 +590,7 @@ unsafe extern "C" fn pull_stream_callback(
 }
 
 async fn invoke_unary_next<T: Serialize>(next: &NextInner, value: &T) -> Result<Json> {
-    let value = HostString::from_json(&next.host.0.v3.v1, value)
+    let value = HostString::from_json(&next.host.v4.v3.v1, value)
         .ok_or_else(|| "failed to serialize native continuation input".to_string())?;
     let (sender, receiver) = futures::channel::oneshot::channel();
     let callback_state = Box::into_raw(Box::new(UnaryState {
@@ -483,7 +598,7 @@ async fn invoke_unary_next<T: Serialize>(next: &NextInner, value: &T) -> Result<
         host: next.host,
     }));
     let status = unsafe {
-        (next.host.0.v3.async_next_invoke_result)(
+        (next.host.v4.v3.async_next_invoke_result)(
             next.raw,
             value.as_ptr(),
             unary_next_callback,
@@ -493,7 +608,7 @@ async fn invoke_unary_next<T: Serialize>(next: &NextInner, value: &T) -> Result<
     if status != NemoRelayStatus::Ok {
         drop(unsafe { Box::from_raw(callback_state) });
         return Err(status_message(
-            &next.host.0.v3.v1,
+            &next.host.v4.v3.v1,
             status,
             "invoke native continuation",
         ));
@@ -520,11 +635,11 @@ unsafe extern "C" fn unary_next_callback(
 ) {
     let state = unsafe { Box::from_raw(user_data.cast::<UnaryState>()) };
     let result = if !error.is_null() {
-        Err(read_host_string(&state.host.0.v3.v1, error)
+        Err(read_host_string(&state.host.v4.v3.v1, error)
             .unwrap_or_else(|_| "native continuation failed".into()))
     } else {
         read_json_value(
-            &state.host.0.v3.v1,
+            &state.host.v4.v3.v1,
             value_json,
             "native continuation result",
         )
@@ -570,23 +685,27 @@ unsafe extern "C" fn unary_trampoline(
             raw: next,
         })
     });
-    let invocation = read_json_value(&state.host.0.v3.v1, invocation_json, "async invocation")
+    let invocation = read_json_value(&state.host.v4.v3.v1, invocation_json, "async invocation")
         .map_err(|status| format!("invalid async invocation: {status:?}"));
-    let binding = ScopePollBinding::capture(state.host.0.v3.v1);
+    let binding = ScopePollBinding::capture(state.host.v4.v3.v1);
+    // Captured on this call, where the host's window is in scope, and carried into
+    // the executor task where the callback's own work runs.
+    let window = MarkWindow::capture(state.host);
     let future = catch_unwind(AssertUnwindSafe(|| match invocation {
         Ok(invocation) => (state.adapter)(invocation, next, completion_ref),
         Err(error) => Box::pin(async move { Err(error) }) as UnaryFuture,
     }));
     if let Err(error) = state.executor.ensure_started() {
         completion.reject(&error);
-        set_last_error(&state.host.0.v3.v1, &error);
+        set_last_error(&state.host.v4.v3.v1, &error);
         return NemoRelayNativeAsyncCallbackState::Pending as u32;
     }
     let task = match future {
-        Ok(future) => drive_unary(future, binding, completion),
+        Ok(future) => drive_unary(future, binding, window, completion),
         Err(_) => drive_unary(
             Box::pin(async move { Err("typed native middleware callback panicked".into()) }),
             binding,
+            window,
             completion,
         ),
     };
@@ -595,7 +714,7 @@ unsafe extern "C" fn unary_trampoline(
     }) {
         // A stopped executor cannot retain plugin code. The callback-owned
         // handles have already been reclaimed by dropping `task`.
-        set_last_error(&state.host.0.v3.v1, &error);
+        set_last_error(&state.host.v4.v3.v1, &error);
     }
     NemoRelayNativeAsyncCallbackState::Pending as u32
 }
@@ -603,11 +722,12 @@ unsafe extern "C" fn unary_trampoline(
 fn drive_unary(
     future: UnaryFuture,
     binding: Result<ScopePollBinding>,
+    window: Option<MarkWindow>,
     completion: Completion,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
         let future: UnaryFuture = match binding {
-            Ok(binding) => Box::pin(ScopedFuture::new(future, binding)),
+            Ok(binding) => Box::pin(ScopedFuture::new(future, binding, window)),
             Err(error) => {
                 completion.reject(&error);
                 return;
@@ -746,11 +866,21 @@ impl Drop for ScopePollBinding {
 struct ScopedFuture<F> {
     future: F,
     binding: ScopePollBinding,
+    /// The mark window the callback was invoked under, if the host opened one.
+    ///
+    /// Carried into the future rather than read from the thread when a mark is
+    /// raised: the future runs on this plugin's executor, where the host's own
+    /// window is not in scope and never will be.
+    window: Option<MarkWindow>,
 }
 
 impl<F> ScopedFuture<F> {
-    fn new(future: F, binding: ScopePollBinding) -> Self {
-        Self { future, binding }
+    fn new(future: F, binding: ScopePollBinding, window: Option<MarkWindow>) -> Self {
+        Self {
+            future,
+            binding,
+            window,
+        }
     }
 }
 
@@ -768,7 +898,9 @@ where
             Err(error) => return Poll::Ready(Err(error)),
         };
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
+        let installed = this.window.as_ref().and_then(MarkWindow::install);
         let result = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx);
+        MarkWindow::restore(installed);
         match restore.restore() {
             Ok(()) => result,
             Err(error) => Poll::Ready(Err(error)),
@@ -779,11 +911,21 @@ where
 struct ScopedStream<S> {
     stream: S,
     binding: ScopePollBinding,
+    /// The mark window the callback was invoked under.
+    ///
+    /// This is the part a callback that merely *returns* a stream would otherwise
+    /// lose: the stream is polled long after the call that created it returned, and
+    /// the marks it raises while being polled belong to the same operation.
+    window: Option<MarkWindow>,
 }
 
 impl<S> ScopedStream<S> {
-    fn new(stream: S, binding: ScopePollBinding) -> Self {
-        Self { stream, binding }
+    fn new(stream: S, binding: ScopePollBinding, window: Option<MarkWindow>) -> Self {
+        Self {
+            stream,
+            binding,
+            window,
+        }
     }
 }
 
@@ -801,7 +943,9 @@ where
             Err(error) => return Poll::Ready(Some(Err(error))),
         };
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
+        let installed = this.window.as_ref().and_then(MarkWindow::install);
         let result = unsafe { Pin::new_unchecked(&mut this.stream) }.poll_next(cx);
+        MarkWindow::restore(installed);
         match restore.restore() {
             Ok(()) => result,
             Err(error) => Poll::Ready(Some(Err(error))),
@@ -869,18 +1013,18 @@ unsafe impl Sync for OutputStream {}
 
 impl OutputStream {
     fn cancelled(&self) -> bool {
-        unsafe { (self.host.0.v3.async_stream_is_cancelled)(self.raw) }
+        unsafe { (self.host.v4.v3.async_stream_is_cancelled)(self.raw) }
     }
 
     async fn push(&self, value: &Json) -> Result<()> {
-        let value = HostString::from_json(&self.host.0.v3.v1, value)
+        let value = HostString::from_json(&self.host.v4.v3.v1, value)
             .ok_or_else(|| "failed to serialize native stream chunk".to_string())?;
         loop {
             if self.cancelled() {
                 return Err("native stream consumer cancelled".into());
             }
             let status =
-                unsafe { (self.host.0.v3.async_stream_push_json)(self.raw, value.as_ptr()) };
+                unsafe { (self.host.v4.v3.async_stream_push_json)(self.raw, value.as_ptr()) };
             match status {
                 NemoRelayStatus::Ok => return Ok(()),
                 NemoRelayStatus::Backpressured => {
@@ -893,19 +1037,19 @@ impl OutputStream {
 
     fn finish(&self) -> Result<()> {
         status_result(
-            unsafe { (self.host.0.v3.async_stream_finish)(self.raw) },
+            unsafe { (self.host.v4.v3.async_stream_finish)(self.raw) },
             "finish native stream",
         )
     }
 
     async fn reject(&self, error: &str) {
-        if let Some(error) = HostString::new(&self.host.0.v3.v1, error) {
+        if let Some(error) = HostString::new(&self.host.v4.v3.v1, error) {
             loop {
                 if self.cancelled() {
                     break;
                 }
                 let status =
-                    unsafe { (self.host.0.v3.async_stream_reject)(self.raw, error.as_ptr()) };
+                    unsafe { (self.host.v4.v3.async_stream_reject)(self.raw, error.as_ptr()) };
                 match status {
                     NemoRelayStatus::Backpressured => {
                         tokio::time::sleep(CANCELLATION_POLL_INTERVAL).await;
@@ -917,9 +1061,9 @@ impl OutputStream {
     }
 
     fn reject_once(&self, error: &str) {
-        if let Some(error) = HostString::new(&self.host.0.v3.v1, error) {
+        if let Some(error) = HostString::new(&self.host.v4.v3.v1, error) {
             unsafe {
-                (self.host.0.v3.async_stream_reject)(self.raw, error.as_ptr());
+                (self.host.v4.v3.async_stream_reject)(self.raw, error.as_ptr());
             }
         }
     }
@@ -927,7 +1071,7 @@ impl OutputStream {
 
 impl Drop for OutputStream {
     fn drop(&mut self) {
-        unsafe { (self.host.0.v3.async_stream_release)(self.raw) };
+        unsafe { (self.host.v4.v3.async_stream_release)(self.raw) };
     }
 }
 
@@ -950,11 +1094,15 @@ unsafe extern "C" fn stream_trampoline(
         host: state.host,
         raw: next,
     }));
-    let invocation = read_json_value(&state.host.0.v3.v1, invocation_json, "stream invocation")
+    let invocation = read_json_value(&state.host.v4.v3.v1, invocation_json, "stream invocation")
         .map_err(|status| format!("invalid native stream invocation: {status:?}"));
-    let bindings = ScopePollBinding::capture(state.host.0.v3.v1).and_then(|future| {
-        ScopePollBinding::capture(state.host.0.v3.v1).map(|stream| (future, stream))
+    let bindings = ScopePollBinding::capture(state.host.v4.v3.v1).and_then(|future| {
+        ScopePollBinding::capture(state.host.v4.v3.v1).map(|stream| (future, stream))
     });
+    // One window for the callback and for the stream it returns: the stream is
+    // polled long after the callback's own future has resolved, and its marks
+    // belong to the same operation either way.
+    let window = MarkWindow::capture(state.host);
     let future = catch_unwind(AssertUnwindSafe(|| match invocation {
         Ok(invocation) => (state.adapter)(invocation, next),
         Err(error) => Box::pin(async move { Err(error) }) as StreamFuture,
@@ -964,7 +1112,7 @@ unsafe extern "C" fn stream_trampoline(
     });
     if let Err(error) = state.executor.ensure_started() {
         output.reject_once(&error);
-        set_last_error(&state.host.0.v3.v1, &error);
+        set_last_error(&state.host.v4.v3.v1, &error);
         return NemoRelayNativeAsyncCallbackState::Pending as u32;
     }
     let task = async move {
@@ -975,7 +1123,9 @@ unsafe extern "C" fn stream_trampoline(
                 return;
             }
         };
-        let future: StreamFuture = Box::pin(ScopedFuture::new(future, future_binding));
+        let mut window = window;
+        let future: StreamFuture =
+            Box::pin(ScopedFuture::new(future, future_binding, window.take()));
         let stream = tokio::select! {
             result = AssertUnwindSafe(future).catch_unwind() => match result {
                 Ok(result) => result,
@@ -984,7 +1134,7 @@ unsafe extern "C" fn stream_trampoline(
             () = wait_for_stream_cancellation(&output) => return,
         };
         let mut stream = match stream {
-            Ok(stream) => ScopedStream::new(stream, stream_binding),
+            Ok(stream) => ScopedStream::new(stream, stream_binding, window),
             Err(error) => {
                 output.reject(&error).await;
                 return;
@@ -1026,7 +1176,7 @@ unsafe extern "C" fn stream_trampoline(
         }
     };
     if let Err(error) = state.executor.spawn(task) {
-        set_last_error(&state.host.0.v3.v1, &error);
+        set_last_error(&state.host.v4.v3.v1, &error);
     }
     NemoRelayNativeAsyncCallbackState::Pending as u32
 }
@@ -1070,15 +1220,19 @@ impl CodecIdentityInvocation {
 }
 
 impl PluginContext<'_> {
+    /// The typed-async table the host offered this plugin, if it offered one.
+    ///
+    /// Taken from the context's copy of the host table rather than read through a
+    /// pointer into the host's: an extension lives past the version a plugin was
+    /// built against, and a copy that stopped at the old version has nothing there.
     fn host_v4(&self) -> Result<HostV4> {
-        if self.host.abi_version < NEMO_RELAY_NATIVE_ABI_VERSION
-            || self.host.struct_size < std::mem::size_of::<NemoRelayNativeHostApiV4>()
-        {
-            return Err("typed async native middleware requires Relay ABI v4".into());
+        if let Some(typed_async) = self.typed_async {
+            return Ok(typed_async);
         }
-        Ok(HostV4(unsafe {
-            *(self.host as *const _ as *const NemoRelayNativeHostApiV4)
-        }))
+        // A context built by hand around the host's own table rather than one the
+        // plugin entry copied: the tables are read where the host says they are.
+        unsafe { HostV4::read(self.host) }
+            .ok_or_else(|| "typed async native middleware requires Relay ABI v4".to_string())
     }
 
     fn register_unary_adapter(

@@ -164,7 +164,7 @@ pub struct PopScopeParams<'a> {
 /// The correlation identities are absent by design: the process running the
 /// callback knows which operation it is in, and the event parameters do not
 /// carry that.
-fn forwarded_mark(
+pub(crate) fn forwarded_mark(
     params: &EmitMarkEventParams<'_>,
 ) -> Result<crate::plugin::execution::ForwardedMark> {
     let encode = |value: &Json, what: &str| -> Result<String> {

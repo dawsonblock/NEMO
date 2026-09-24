@@ -128,8 +128,8 @@ max_transitive_packages = 265
 # is the loader recording the registrations an instance *has* rather than a log of
 # every one it ever made: a second activation against one instance used to double
 # its own description, which the conversion then refused.
-max_source_lines = 73980
-max_unsafe_occurrences = 299
+max_source_lines = 74118
+max_unsafe_occurrences = 305
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
 
@@ -182,11 +182,18 @@ max_unsafe_occurrences = 0
 direct_dependency_digest = "02e902c5c51bdce194bcd36fc2a50e4af2468a338a405f1db48b6bc6dcbddcf2"
 transitive_dependency_digest = "1e5116e90ef0d74d6165fdbe239ac51fa536f8375be84749b3ba86fa0784d0ac"
 
+# Raised for the mark window, which is the SDK's side of ABI v5: an ambient
+# execution context that has to be captured where the host opens it and restored
+# across every task boundary the plugin owns — the callback's future and the
+# stream it returns alike. That is raw-pointer work by construction (the window is
+# an opaque host handle), which is where the `unsafe` growth is, and it is the
+# same shape as the scope binding the SDK already carried rather than a second
+# context system beside it.
 [limits.nemo-relay-plugin]
 max_direct_dependencies = 6
 max_transitive_packages = 39
-max_source_lines = 5055
-max_unsafe_occurrences = 315
+max_source_lines = 5364
+max_unsafe_occurrences = 332
 direct_dependency_digest = "c86fd580622db0b895e08d9ac8092f41be20e3e1eb4767b7f1d6c22a989ab1ec"
 transitive_dependency_digest = "9bc8864a9ca6215adb9194008a652fee077ae25f65f56cd6a10e07b44c0ced92"
 
@@ -335,7 +342,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 17310
+max_source_lines = 17466
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -346,6 +353,13 @@ transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9e
 [limits.nemo-relay-plugin-proto]
 max_direct_dependencies = 4
 max_transitive_packages = 108
+# ABI v5 adds the mark window: the kernel captures the window it opened, a plugin
+# carries the handle across its own tasks, and a mark is emitted through it. The
+# three functions are the extension, and the `unsafe` growth is theirs — an opaque
+# handle is a raw pointer by definition. The rest of the raise is the negotiation
+# that keeps older plugins working now that the current table is a version they do
+# not know: a frozen v4 table is offered before the v3 and v2 ones.
+#
 # Raised for the two helpers that measure an answer against its operation's
 # budget — `invoke_outcome_encoded_len` and `check_invoke_outcome_budget` — which
 # both sides of the boundary call so a response budget is one measurement rather
