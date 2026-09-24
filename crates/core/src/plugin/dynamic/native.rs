@@ -514,6 +514,10 @@ impl Drop for StagedArtifact {
 /// The source is read through an open handle so the digest describes an instance
 /// rather than a name, and the copy is re-hashed before it is handed back: the
 /// bytes that will be loaded are bytes this function has read twice.
+///
+/// The copy exists because an approved load never executes the approved path: a
+/// path can be repointed between the moment it was approved and the moment it is
+/// opened, and a copy nothing else can reach cannot be.
 pub(crate) fn stage_verified_library(
     library_path: &Path,
     approved_library_sha256: &str,
@@ -547,26 +551,28 @@ pub(crate) fn stage_verified_library(
         )));
     }
 
-    // The directory name is derived from the digest rather than from any part of
-    // the source path, so nothing an attacker controls decides where the copy
-    // lands, and two loads of one artifact cannot collide.
-    let root = std::env::temp_dir().join(format!("nemo-native-artifacts-{}", std::process::id()));
-    let dir = root.join(&source_digest[..source_digest.len().min(32)]);
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.recursive(true).create(&dir).map_err(|error| {
-        PluginError::Internal(format!(
-            "failed to create the staging directory '{}': {error}",
-            dir.display()
-        ))
-    })?;
+    // Nothing an attacker controls decides where the copy lands: the directory
+    // is this load's own, its mode denies other users, and its name is random
+    // rather than derived from the digest, so two loads of one artifact cannot
+    // land on each other. The digest-derived name this replaces mapped every
+    // load of one artifact to one path, which is exactly the case that collides
+    // — and a second load truncating the file the first is running from is the
+    // collision that matters.
+    let dir = create_staging_directory()?;
 
     let staged = dir.join("library");
-    let mut destination = std::fs::File::create(&staged).map_err(|error| {
+    // Exclusive creation, so a destination that already exists is an error
+    // rather than something this load overwrites. The directory is fresh, so
+    // this refuses a pre-existing target instead of trusting that there is none.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut destination = options.open(&staged).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&dir);
         PluginError::Internal(format!(
             "failed to create the staged artifact '{}': {error}",
             staged.display()
@@ -602,6 +608,43 @@ pub(crate) fn stage_verified_library(
         )));
     }
     Ok((staged, StagedArtifact { dir }))
+}
+
+/// Create the private directory one staged artifact lives in.
+///
+/// The name is random rather than derived from the digest or the process id, and
+/// the directory is created exclusively: nothing else can choose the path a load
+/// writes into, and nothing can arrange for the path to exist before it does. A
+/// digest-derived name under a process-derived root is predictable, which is the
+/// property that makes it possible for another process running as the same user
+/// to put something there first. A retry is not a workaround for that: the first
+/// name is unavailable, so another is chosen rather than reusing it.
+fn create_staging_directory() -> crate::plugin::Result<PathBuf> {
+    for _ in 0..16 {
+        let dir =
+            std::env::temp_dir().join(format!("nemo-native-artifacts-{}", Uuid::new_v4().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            // A name already taken is another load's, not this one's: the next
+            // attempt gets a name nobody holds rather than sharing that one.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(PluginError::Internal(format!(
+                    "failed to create the staging directory '{}': {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Err(PluginError::Internal(
+        "failed to create a private staging directory for a native plugin".to_string(),
+    ))
 }
 
 fn load_one_native_plugin(
@@ -839,11 +882,31 @@ fn validate_plugin_descriptor(
 ///
 /// Returns the manifest digest and the library digest, both SHA-256 in hex.
 pub fn plugin_artifact_identity(manifest_ref: &str) -> crate::plugin::Result<(String, String)> {
-    let manifest_path = PathBuf::from(manifest_ref);
+    // One read, one hash, one parse. The manifest that is hashed has to be the
+    // manifest the library is resolved from: reading the path a second time
+    // could return different bytes, and the pair returned here would then
+    // describe a state no artifact was ever in — a digest from one manifest
+    // beside a library another one named.
+    let manifest_path = {
+        let path = PathBuf::from(manifest_ref);
+        if path.is_dir() {
+            path.join(DYNAMIC_PLUGIN_MANIFEST_FILENAME)
+        } else {
+            path
+        }
+    };
     let manifest_bytes =
         std::fs::read(&manifest_path).map_err(|error| missing_artifact(manifest_ref, &error))?;
+    let manifest_sha256 = sha256_hex(&manifest_bytes);
 
-    let (manifest, _resolved_manifest) = DynamicPluginManifest::load_from_path(manifest_ref)?;
+    let manifest = DynamicPluginManifest::parse_toml(
+        std::str::from_utf8(&manifest_bytes).map_err(|error| {
+            PluginError::InvalidConfig(format!(
+                "'{}' is not UTF-8: {error}",
+                manifest_path.display()
+            ))
+        })?,
+    )?;
     let DynamicPluginManifestLoad::RustDynamic(load) = &manifest.load else {
         return Err(PluginError::InvalidConfig(format!(
             "dynamic plugin manifest {manifest_ref} is not a rust_dynamic load contract"
@@ -855,10 +918,14 @@ pub fn plugin_artifact_identity(manifest_ref: &str) -> crate::plugin::Result<(St
             PluginError::InvalidConfig(format!("{manifest_ref} does not declare load.library"))
         })?,
     );
-    let library_bytes = std::fs::read(&library_path)
+    // Hashed through an open handle rather than from the path, so the digest
+    // describes the bytes of one file instance rather than whatever the name
+    // points at when the read happens.
+    let mut library = std::fs::File::open(&library_path)
         .map_err(|error| missing_artifact(&library_path.display().to_string(), &error))?;
+    let library_sha256 = sha256_of_reader(&mut library)?;
 
-    Ok((sha256_hex(&manifest_bytes), sha256_hex(&library_bytes)))
+    Ok((manifest_sha256, library_sha256))
 }
 
 /// Describe an artifact that could not be read.

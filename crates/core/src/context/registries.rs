@@ -205,3 +205,28 @@ pub(crate) fn merge_execution_intercept_callables<F: Clone>(
     all.sort_by_key(|(_, priority)| *priority);
     all
 }
+
+/// Merge global and scope-local execution-intercept entries by priority.
+///
+/// The callable-only form above is what the engine builds a chain from, and a
+/// callable does not know which name it was registered under. A caller that has
+/// to run *one* named registration — the dynamic-plugin boundary, whose
+/// registrations were made in another process — needs the entry.
+pub(crate) fn merge_execution_intercept_entries<'a, F>(
+    global: &'a SortedRegistry<ExecutionIntercept<F>>,
+    scope_locals: &'a [&'a SortedRegistry<ExecutionIntercept<F>>],
+    kind: RuntimeRegistrationKind,
+) -> Vec<&'a ExecutionIntercept<F>> {
+    let mut all = Vec::new();
+    all.extend(
+        global
+            .sorted_values()
+            .into_iter()
+            .filter(|entry| runtime_registration_is_enabled(kind, &entry.name)),
+    );
+    for registry in scope_locals {
+        all.extend(registry.sorted_values());
+    }
+    all.sort_by_key(|entry| entry.priority);
+    all
+}

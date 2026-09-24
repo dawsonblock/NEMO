@@ -24,11 +24,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::operation_scopes::OperationScopes;
+use futures_util::FutureExt;
 use nemo_relay::api::scope::EmitMarkEventParams;
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_proto::v1::relay_runtime_client::RelayRuntimeClient;
 use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntime;
-use nemo_relay_plugin_protocol::PluginMarkEmit;
+use nemo_relay_plugin_protocol::{PluginHostCallOutcome, PluginMarkEmit};
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
@@ -67,6 +69,82 @@ pub async fn connect_to_kernel(
         .max_encoding_message_size(maximum_frame_bytes as usize))
 }
 
+/// The kernel this host calls back into.
+///
+/// The calls a plugin makes that are *not* answers to anything: a mark it
+/// raised, and — the reason this type exists — the continuation of a call it is
+/// wrapping. An execution intercept decides when the rest of the chain runs, and
+/// the rest of the chain lives in the kernel, so the plugin's `next` is a call
+/// this side makes rather than a function it holds.
+///
+/// A host started without one can still serve the classes that answer a call,
+/// and cannot serve the classes that wrap one: there would be no chain to
+/// resume, and a plugin that called `next` would be waiting for a result nobody
+/// could produce.
+#[derive(Clone)]
+pub struct KernelCallbacks {
+    client: RelayRuntimeClient<Channel>,
+    credential: MetadataValue<Ascii>,
+}
+
+impl std::fmt::Debug for KernelCallbacks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The credential is not printed, and neither is the channel: what a
+        // reader needs is whether this host has a kernel, not how to reach it.
+        formatter
+            .debug_struct("KernelCallbacks")
+            .finish_non_exhaustive()
+    }
+}
+
+impl KernelCallbacks {
+    /// The calls this host may make, with the credential they must carry.
+    ///
+    /// # Errors
+    /// Returns an error when the credential cannot be a metadata value, which
+    /// means it could not have been the credential this session was given.
+    pub fn new(client: RelayRuntimeClient<Channel>, credential: &str) -> Result<Self, String> {
+        let credential = credential
+            .parse()
+            .map_err(|error| format!("the kernel credential is not a header value: {error}"))?;
+        Ok(Self { client, credential })
+    }
+
+    /// Ask the kernel to run the rest of a chain this host is holding a position in.
+    ///
+    /// # Errors
+    /// Returns the kernel's own words when it refuses — a chain position that is
+    /// no longer held, a session that is not this one, a credential that is not
+    /// this session's — and the transport's when the kernel cannot be reached.
+    pub async fn run_continuation(
+        &self,
+        session_id: &str,
+        operation_request_id: &str,
+        host_call_id: &str,
+        invocation_json: &str,
+    ) -> Result<PluginHostCallOutcome, String> {
+        let wire = nemo_relay_plugin_proto::v1::ContinuationRequest {
+            session_id: session_id.to_owned(),
+            operation_request_id: operation_request_id.to_owned(),
+            host_call_id: host_call_id.to_owned(),
+            invocation_json: invocation_json.to_owned(),
+        };
+        let mut request = Request::new(wire);
+        request
+            .metadata_mut()
+            .insert(SESSION_CREDENTIAL_HEADER, self.credential.clone());
+        let outcome = self
+            .client
+            .clone()
+            .r#continue(request)
+            .await
+            .map_err(|status| status.to_string())?
+            .into_inner();
+        nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .map_err(|error| error.failure.message)
+    }
+}
+
 /// Configuration for the kernel's side of one plugin session.
 #[derive(Debug, Clone)]
 pub struct RelayRuntimeConfig {
@@ -80,6 +158,12 @@ pub struct RelayRuntimeConfig {
     pub runtime_binding_digest: String,
     /// The scope stack each in-flight operation belongs to.
     pub operation_scopes: Arc<OperationScopes>,
+    /// The continuations this kernel is holding for the plugins it is running.
+    ///
+    /// A plugin whose intercept wraps a call asks the kernel to run the rest of
+    /// the chain; this is where the kernel keeps the position it is being asked
+    /// to resume.
+    pub continuations: Arc<crate::continuations::Continuations>,
 }
 
 /// Serves the calls a plugin's host makes back into the kernel.
@@ -183,10 +267,137 @@ impl RelayRuntime for RelayRuntimeService {
 
     async fn r#continue(
         &self,
-        _request: Request<v1::ContinuationRequest>,
+        request: Request<v1::ContinuationRequest>,
     ) -> Result<Response<v1::ContinuationOutcome>, Status> {
-        Err(Status::unimplemented(
-            "this kernel does not serve continuations yet",
+        self.authenticate(&request)?;
+        let wire = request.into_inner();
+        if wire.session_id != self.config.session_id {
+            return Err(Status::permission_denied(
+                "this kernel serves one session, and the continuation names another",
+            ));
+        }
+        // Validated before the lookup, so a malformed request is refused for what
+        // it is rather than reported as "no such continuation".
+        let continuation = nemo_relay_plugin_proto::convert::continuation_request_from_wire(&wire)
+            .map_err(|error| Status::invalid_argument(error.failure.message))?;
+
+        // The position the plugin is asking to resume. Absent means the kernel is
+        // not running an intercept that asked for one: either the operation is
+        // not in flight, or the intercept that owned the continuation has already
+        // settled — and a chain position whose call has returned is not one the
+        // kernel may resume.
+        let parked = self
+            .config
+            .continuations
+            .parked(&continuation.operation_request_id)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "this kernel is not holding a continuation for that operation: nothing it is \
+                     running asked for one",
+                )
+            })?;
+
+        let args: nemo_relay::json::Json = serde_json::from_str(&continuation.invocation_json)
+            .map_err(|error| {
+                Status::invalid_argument(format!("a continuation must carry JSON: {error}"))
+            })?;
+
+        // Run it under the context captured where the chain was: the downstream
+        // call belongs to the operation's scope and budget, not to whichever task
+        // this request happened to arrive on. Each call gets its own snapshot of
+        // the scope stack, because the ABI lets an intercept run its continuation
+        // more than once and two branches must not share one stack.
+        let context = parked.context.isolated().map_err(|error| {
+            Status::internal(format!(
+                "the continuation's context could not be isolated: {error}"
+            ))
+        })?;
+        // The call's own budget, narrowed to what is left of it: the resumed
+        // chain belongs to the call it is part of, so a registration down there
+        // sees the managed budget the call had — and a plugin that held its
+        // continuation cannot enlarge it.
+        let now_unix_ms = nemo_relay::api::runtime::budget_now_unix_ms();
+        // What the plugin settled on, in the shape its family takes: a tool call
+        // resumes with argument JSON, a provider call with a request. The entry
+        // knows which, so the wire does not have to say.
+        let resume = |context: nemo_relay::api::runtime::MiddlewareContinuationContext| {
+            let budget = parked
+                .budget
+                .map(|budget| budget.narrowed_to(u64::MAX, now_unix_ms));
+            let chain = parked.chain.clone();
+            let args = args.clone();
+            async move {
+                // One shape out of the entry: the answer as JSON, or why there is
+                // none. Which family produced it is the entry's business, not the
+                // caller's.
+                let running = async move {
+                    // No `?` in here: this block is what the answer comes out
+                    // of, so each arm produces the answer or the reason there is
+                    // none rather than returning early.
+                    let answered = match chain {
+                        crate::continuations::ParkedChain::Tool(next) => {
+                            match context.invoke(move || next(args)).await {
+                                Ok(result) => serde_json::to_value(result).map_err(|error| {
+                                    nemo_relay::error::FlowError::Internal(format!(
+                                        "the tool result could not be serialized: {error}"
+                                    ))
+                                }),
+                                Err(error) => Err(error),
+                            }
+                        }
+                        crate::continuations::ParkedChain::Llm(next) => {
+                            match serde_json::from_value::<nemo_relay::api::llm::LlmRequest>(args) {
+                                Ok(request) => context.invoke(move || next(request)).await,
+                                Err(error) => {
+                                    Err(nemo_relay::error::FlowError::InvalidArgument(format!(
+                                        "a provider continuation must carry a request: {error}"
+                                    )))
+                                }
+                            }
+                        }
+                    };
+                    answered.map_err(|error| error.to_string())
+                };
+                match budget {
+                    Some(budget) => {
+                        nemo_relay::api::runtime::with_execution_budget(budget, running).await
+                    }
+                    None => running.await,
+                }
+            }
+        };
+        // A panic anywhere in the resumed chain is this request's failure rather
+        // than a task that vanishes: the host is waiting for an answer, and none
+        // would ever come.
+        let answer = match std::panic::AssertUnwindSafe(resume(context))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(result)) => Ok(serde_json::to_string(&result).map_err(|error| {
+                Status::internal(format!(
+                    "the continuation's result could not be serialized: {error}"
+                ))
+            })?),
+            Ok(Err(message)) => Err(nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                message,
+            }),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a continuation panicked".to_string());
+                Err(nemo_relay_plugin_protocol::PluginFailure {
+                    code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                    message: format!("the wrapped call panicked: {message}"),
+                })
+            }
+        };
+        Ok(Response::new(
+            nemo_relay_plugin_proto::convert::continuation_outcome_to_wire(
+                &nemo_relay_plugin_protocol::PluginHostCallOutcome { result: answer },
+            ),
         ))
     }
 
@@ -284,6 +495,7 @@ mod tests {
             protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
             runtime_binding_digest: "runtime-service-binding".into(),
             operation_scopes: Arc::clone(&scopes),
+            continuations: Arc::new(crate::continuations::Continuations::new()),
         });
         (service, scopes)
     }
@@ -310,6 +522,371 @@ mod tests {
             MetadataValue::try_from(CREDENTIAL).expect("a header value"),
         );
         request
+    }
+
+    fn continuation(operation_request_id: &str) -> v1::ContinuationRequest {
+        v1::ContinuationRequest {
+            session_id: SESSION_ID.into(),
+            operation_request_id: operation_request_id.into(),
+            host_call_id: "host-call-1".into(),
+            invocation_json: "{\"input\":true}".into(),
+        }
+    }
+
+    fn authenticated_continuation(
+        wire: v1::ContinuationRequest,
+    ) -> Request<v1::ContinuationRequest> {
+        let mut request = Request::new(wire);
+        request.metadata_mut().insert(
+            SESSION_CREDENTIAL_HEADER,
+            MetadataValue::try_from(CREDENTIAL).expect("a header value"),
+        );
+        request
+    }
+
+    /// Park a continuation for one operation, with a chain that answers `result`.
+    fn park<'a>(
+        service: &'a RelayRuntimeService,
+        operation_request_id: &str,
+        next: nemo_relay::api::runtime::ToolExecutionNextFn,
+    ) -> crate::continuations::ContinuationGuard<'a> {
+        service
+            .config
+            .continuations
+            .hold_tool(operation_request_id, "registration-1", next)
+    }
+
+    /// A continuation names a chain position, and the kernel runs the one it is
+    /// holding — the rest of the call, with the arguments the plugin settled on.
+    #[tokio::test]
+    async fn a_continuation_runs_the_chain_the_kernel_is_holding() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let next: nemo_relay::api::runtime::ToolExecutionNextFn = Arc::new(move |args| {
+            let recorder = Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder.lock().unwrap().push(args.clone());
+                Ok(nemo_relay::api::tool::ToolExecutionResult::new(
+                    serde_json::json!({ "downstream": true }),
+                ))
+            })
+        });
+        let _held = park(&service, "operation-continue", next);
+
+        let outcome = service
+            .r#continue(authenticated_continuation(continuation(
+                "operation-continue",
+            )))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        let answer = nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome");
+        let value = answer.result.expect("the chain answered");
+        let value: serde_json::Value = serde_json::from_str(&value).expect("JSON");
+        // The wire carries the whole result, not just its payload: the annotation
+        // is part of what the plugin's `next` hands back.
+        assert_eq!(value["result"]["downstream"], true, "{value}");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [serde_json::json!({"input": true})],
+            "the arguments the plugin settled on are the ones the chain received"
+        );
+    }
+
+    /// A chain that fails answers with the failure, not with an empty success: a
+    /// plugin waiting on a result it will never get is the one outcome it cannot
+    /// recover from.
+    #[tokio::test]
+    async fn a_continuation_that_fails_answers_with_the_failure() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let next: nemo_relay::api::runtime::ToolExecutionNextFn = Arc::new(|_args| {
+            Box::pin(async {
+                Err(nemo_relay::error::FlowError::NotFound(
+                    "the wrapped call has nothing to run".to_string(),
+                ))
+            })
+        });
+        let _held = park(&service, "operation-fails", next);
+
+        let outcome = service
+            .r#continue(authenticated_continuation(continuation("operation-fails")))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        let answer = nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome");
+        let failure = answer.result.expect_err("the chain's failure");
+        assert!(
+            failure.message.contains("nothing to run"),
+            "the kernel's own words reach the plugin: {failure:?}"
+        );
+    }
+
+    /// A continuation for an operation nothing is holding is refused.
+    ///
+    /// Two facts wear the same refusal, and they are the same fact: the operation
+    /// was never in flight here, or the intercept that owned the position has
+    /// already settled. Either way the chain position is not one this kernel may
+    /// resume — and answering as if it had been resumed would run the *wrong*
+    /// call.
+    #[tokio::test]
+    async fn a_continuation_for_an_unheld_operation_is_refused() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let refused = service
+            .r#continue(authenticated_continuation(continuation(
+                "operation-nobody-holds",
+            )))
+            .await
+            .expect_err("a continuation the kernel is not holding");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("not holding a continuation"),
+            "{refused:?}"
+        );
+
+        // And a position that *was* held stops being held when the intercept
+        // settles: the same request is refused afterwards.
+        let next: nemo_relay::api::runtime::ToolExecutionNextFn = Arc::new(|args| {
+            Box::pin(async move { Ok(nemo_relay::api::tool::ToolExecutionResult::new(args)) })
+        });
+        let held = park(&service, "operation-settled", next);
+        drop(held);
+        let refused = service
+            .r#continue(authenticated_continuation(continuation(
+                "operation-settled",
+            )))
+            .await
+            .expect_err("a continuation whose intercept has settled");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// A resumed chain runs under the call's own budget, narrowed to what is
+    /// left of it.
+    ///
+    /// The chain runs on this kernel's server task, which has no budget of its
+    /// own. Without the call's budget the downstream registration would refuse
+    /// for having none, and without narrowing it a plugin could hold its
+    /// continuation to buy the call more time than the action granted.
+    #[tokio::test]
+    async fn a_continuation_runs_under_the_calls_remaining_budget() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let seen: Arc<std::sync::Mutex<Vec<Option<nemo_relay::api::runtime::ExecutionBudget>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let next: nemo_relay::api::runtime::ToolExecutionNextFn = Arc::new(move |args| {
+            let recorder = Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(nemo_relay::api::runtime::current_execution_budget());
+                Ok(nemo_relay::api::tool::ToolExecutionResult::new(args))
+            })
+        });
+
+        // Parked inside a managed call, as the proxy parks it, and resumed from a
+        // task that has no budget at all — which is the whole point.
+        let deadline = nemo_relay::api::runtime::budget_now_unix_ms() + 30_000;
+        let budget = nemo_relay::api::runtime::ExecutionBudget::new(deadline, 30_000);
+        let held = nemo_relay::api::runtime::with_execution_budget(budget, async {
+            park(&service, "operation-budget", next)
+        })
+        .await;
+
+        assert!(
+            nemo_relay::api::runtime::current_execution_budget().is_none(),
+            "this task has no budget of its own, so the continuation cannot inherit one \
+             from where it runs"
+        );
+        let outcome = service
+            .r#continue(authenticated_continuation(continuation("operation-budget")))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome")
+            .result
+            .expect("the chain answered");
+
+        let seen = seen.lock().unwrap().clone();
+        let inherited = seen
+            .first()
+            .copied()
+            .flatten()
+            .expect("the chain ran under the call's budget");
+        assert_eq!(
+            inherited.deadline_unix_ms,
+            Some(deadline),
+            "the resumed chain keeps the call's deadline"
+        );
+        assert!(
+            inherited.remaining_budget_millis <= budget.remaining_budget_millis,
+            "and only what is left of it: {} of {}",
+            inherited.remaining_budget_millis,
+            budget.remaining_budget_millis
+        );
+        drop(held);
+    }
+
+    /// A panic while resuming is this request's failure, not a task that
+    /// disappears: the host is waiting for an answer and would wait forever.
+    #[tokio::test]
+    async fn a_continuation_that_panics_answers_with_a_failure() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let next: nemo_relay::api::runtime::ToolExecutionNextFn =
+            Arc::new(|_args| Box::pin(async move { panic!("the wrapped call panicked") }));
+        let _held = park(&service, "operation-panics", next);
+
+        let outcome = service
+            .r#continue(authenticated_continuation(continuation("operation-panics")))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        let answer = nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome");
+        let failure = answer.result.expect_err("the panic as a failure");
+        assert!(
+            failure.message.contains("panicked"),
+            "the answer says what happened: {failure:?}"
+        );
+    }
+
+    /// The provider half resumes the chain it parked, and the entry decides
+    /// which shape the request has.
+    ///
+    /// The wire carries one unary resume for every family; what differs is what
+    /// the parked position accepts and answers. This is that: a request shaped
+    /// for a provider call resumes a provider position, and one shaped for a tool
+    /// call is refused by the entry rather than by a discriminator on the wire.
+    #[tokio::test]
+    async fn a_provider_continuation_resumes_a_provider_position() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let next: nemo_relay::api::runtime::LlmExecutionNextFn = Arc::new(move |request| {
+            let recorder = Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder.lock().unwrap().push(request.content.clone());
+                Ok(serde_json::json!({ "downstream": true }))
+            })
+        });
+        let _held =
+            service
+                .config
+                .continuations
+                .hold_llm("operation-provider", "registration-1", next);
+
+        let mut wire = continuation("operation-provider");
+        wire.invocation_json =
+            serde_json::json!({"headers": {}, "content": {"model": "fixture"}}).to_string();
+        let outcome = service
+            .r#continue(authenticated_continuation(wire))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        let answer = nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome");
+        let value = answer.result.expect("the chain answered");
+        let value: serde_json::Value = serde_json::from_str(&value).expect("JSON");
+        assert_eq!(value["downstream"], true, "{value}");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [serde_json::json!({"model": "fixture"})],
+            "the request the plugin settled on is the one the chain received"
+        );
+    }
+
+    /// A resume that carries the wrong family's shape is refused by the position
+    /// it addresses rather than guessed at.
+    #[tokio::test]
+    async fn a_continuation_of_the_wrong_shape_is_refused() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let next: nemo_relay::api::runtime::LlmExecutionNextFn = Arc::new(|request| {
+            Box::pin(
+                async move { Ok(serde_json::to_value(request).expect("a request serializes")) },
+            )
+        });
+        let _held =
+            service
+                .config
+                .continuations
+                .hold_llm("operation-shape", "registration-1", next);
+
+        // Tool-shaped arguments, addressed to a provider position.
+        let mut wire = continuation("operation-shape");
+        wire.invocation_json = serde_json::json!({"input": true}).to_string();
+        let outcome = service
+            .r#continue(authenticated_continuation(wire))
+            .await
+            .expect("a served continuation")
+            .into_inner();
+        let answer = nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
+            .expect("a converted outcome");
+        let failure = answer.result.expect_err("the refusal");
+        assert!(
+            failure.message.contains("must carry a request"),
+            "the refusal says what the position expected: {failure:?}"
+        );
+    }
+
+    /// A continuation that names another session is refused before anything is
+    /// looked up: this kernel serves one session, and a position in another
+    /// kernel's chain is not this one's to resume.
+    #[tokio::test]
+    async fn a_continuation_for_another_session_is_refused() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        let next: nemo_relay::api::runtime::ToolExecutionNextFn = Arc::new(|args| {
+            Box::pin(async move { Ok(nemo_relay::api::tool::ToolExecutionResult::new(args)) })
+        });
+        let _held = park(&service, "operation-other-session", next);
+
+        let mut wire = continuation("operation-other-session");
+        wire.session_id = "another-session".into();
+        let refused = service
+            .r#continue(authenticated_continuation(wire))
+            .await
+            .expect_err("a continuation naming another session");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// A continuation that carries nothing to run, or belongs to no operation, is
+    /// refused for what it is rather than reported as a missing position.
+    #[tokio::test]
+    async fn a_malformed_continuation_is_refused_as_malformed() {
+        let _guard = RUNTIME_SERVICE_LOCK.lock().await;
+        let (service, _scopes) = service();
+        for wire in [
+            v1::ContinuationRequest {
+                operation_request_id: "  ".into(),
+                ..continuation("operation-1")
+            },
+            v1::ContinuationRequest {
+                host_call_id: String::new(),
+                ..continuation("operation-1")
+            },
+            v1::ContinuationRequest {
+                invocation_json: String::new(),
+                ..continuation("operation-1")
+            },
+        ] {
+            let refused = service
+                .r#continue(authenticated_continuation(wire))
+                .await
+                .expect_err("a malformed continuation");
+            assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[tokio::test]

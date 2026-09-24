@@ -37,6 +37,23 @@ const PROTOCOL: &str = "NEMO_RELAY_PLUGIN_HOST_PROTOCOL";
 const KERNEL_SOCKET: &str = "NEMO_RELAY_KERNEL_SOCKET";
 /// Credential the kernel gave this host for those calls.
 const KERNEL_CREDENTIAL: &str = "NEMO_RELAY_KERNEL_CREDENTIAL";
+/// Largest frame this host will accept, when it should be smaller than the
+/// protocol's ceiling.
+///
+/// Set by whoever starts the host, because the size a process is willing to
+/// receive is its own decision: the handshake then negotiates the smaller of
+/// this and what the kernel offers, and both sides carry one number afterwards.
+const FRAME_BYTES: &str = "NEMO_RELAY_PLUGIN_HOST_FRAME_BYTES";
+/// How many forwarded marks this host may hold before it stops accepting more.
+///
+/// The marks come from a plugin and the drain comes from a socket, so the queue
+/// is the buffer between two speeds neither of which this process controls. A
+/// bound is what keeps a plugin that emits faster than the kernel reads from
+/// growing this process without limit; the value is large enough that an
+/// ordinary burst is absorbed and small enough to be a bound.
+const MARK_QUEUE_CAPACITY: &str = "NEMO_RELAY_PLUGIN_HOST_MARK_QUEUE";
+/// Pending marks a host holds when nothing said otherwise.
+const DEFAULT_MARK_QUEUE_CAPACITY: usize = 1024;
 
 fn main() -> ExitCode {
     let socket = match std::env::var_os(SOCKET) {
@@ -53,6 +70,23 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    let maximum_frame_bytes = match std::env::var(FRAME_BYTES) {
+        Ok(value) => match value.parse::<u32>() {
+            Ok(limit) if limit > 0 && limit <= nemo_relay_plugin_protocol::MAX_FRAME_BYTES => limit,
+            Ok(limit) => {
+                eprintln!(
+                    "{FRAME_BYTES} is {limit}: a host accepts between 1 and {} bytes",
+                    nemo_relay_plugin_protocol::MAX_FRAME_BYTES
+                );
+                return ExitCode::from(2);
+            }
+            Err(_) => {
+                eprintln!("{FRAME_BYTES} is not a number: {value}");
+                return ExitCode::from(2);
+            }
+        },
+        Err(_) => nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+    };
     let config = PluginHostConfig {
         protocol_version: match std::env::var(PROTOCOL) {
             Ok(version) => match version.parse() {
@@ -66,7 +100,25 @@ fn main() -> ExitCode {
         },
         runtime_binding_digest: std::env::var(BINDING).unwrap_or_default(),
         session_credential: credential,
-        maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        maximum_frame_bytes,
+    };
+    // A capacity of zero is refused rather than treated as a default: it would
+    // mean "accept no mark at all", which is not a bound anybody meant.
+    let mark_queue_capacity = match std::env::var(MARK_QUEUE_CAPACITY) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(capacity) if capacity > 0 => capacity,
+            Ok(_) => {
+                eprintln!(
+                    "{MARK_QUEUE_CAPACITY} is zero: a host that queues nothing serves nothing"
+                );
+                return ExitCode::from(2);
+            }
+            Err(_) => {
+                eprintln!("{MARK_QUEUE_CAPACITY} is not a number: {value}");
+                return ExitCode::from(2);
+            }
+        },
+        Err(_) => DEFAULT_MARK_QUEUE_CAPACITY,
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -79,6 +131,19 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // A host belongs to the kernel that started it, and nothing else keeps it
+    // alive: a kernel that exits — cleanly, by crashing, or by being killed —
+    // closes the write end of this pipe, and a host that stayed after that would
+    // be a process nobody owns, holding a socket nobody reads. The supervisor
+    // also kills the child when it drops; this is what covers the case where it
+    // never gets to.
+    std::thread::spawn(|| {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        let mut byte = [0u8; 1];
+        let _ = stdin.read(&mut byte);
+        std::process::exit(0);
+    });
     runtime.block_on(async move {
         let listener = match UnixListener::bind(&socket) {
             Ok(listener) => listener,
@@ -103,13 +168,29 @@ fn main() -> ExitCode {
             (Some(endpoint), Ok(kernel_credential)) if !kernel_credential.is_empty() => {
                 match nemo_relay_plugin_host::runtime_service::connect_to_kernel(
                     &endpoint,
-                    nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+                    config.maximum_frame_bytes,
                 )
                 .await
                 {
                     Ok(mut client) => {
+                        // The same connection serves both callbacks: the marks a
+                        // plugin raises and the continuation of a call it wraps.
+                        // The continuation gets its own client handle so a long
+                        // wrapped call cannot hold up the mark queue behind it.
+                        let callbacks = nemo_relay_plugin_host::runtime_service::KernelCallbacks::new(
+                            client.clone(),
+                            &kernel_credential,
+                        )
+                        .map_err(|error| {
+                            eprintln!("{KERNEL_CREDENTIAL} is unusable: {error}");
+                            ExitCode::from(2)
+                        });
+                        let callbacks = match callbacks {
+                            Ok(callbacks) => callbacks,
+                            Err(code) => return code,
+                        };
                         let (sender, mut steps) =
-                            tokio::sync::mpsc::unbounded_channel::<ForwardedStep>();
+                            tokio::sync::mpsc::channel::<ForwardedStep>(mark_queue_capacity);
                         tokio::spawn(async move {
                             let mut failure: Option<String> = None;
                             while let Some(step) = steps.recv().await {
@@ -151,7 +232,7 @@ fn main() -> ExitCode {
                                 }
                             }
                         });
-                        Some(sender)
+                        Some((sender, callbacks))
                     }
                     Err(error) => {
                         eprintln!(
@@ -164,15 +245,17 @@ fn main() -> ExitCode {
             }
             _ => None,
         };
-        let service = PluginHostService::new(backend, config);
-        let service = match forwarding {
-            Some(sender) => service.with_mark_forwarding(sender),
-            None => service,
-        };
         // The transport decoder is configured from the same limit the handshake
         // negotiates. A transport default that disagreed with the protocol would
         // make the negotiated frame size declarative rather than enforced.
-        let frame_limit = nemo_relay_plugin_protocol::MAX_FRAME_BYTES as usize;
+        let frame_limit = config.maximum_frame_bytes as usize;
+        let service = PluginHostService::new(backend, config);
+        let service = match forwarding {
+            Some((sender, callbacks)) => service
+                .with_mark_forwarding(sender)
+                .with_kernel_callbacks(callbacks),
+            None => service,
+        };
         let served = Server::builder()
             .add_service(
                 PluginHostServer::new(service)

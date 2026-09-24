@@ -16,3 +16,7 @@ crate-type = ["cdylib"]
 [dependencies]
 nemo-relay-plugin = { path = "../../../../plugin" }
 serde_json = "1"
+# For the concurrent continuation the execution intercept offers: the ABI lets a
+# plugin call `next` more than once while it runs, and a fixture that only ever
+# called it once would not exercise that.
+tokio = { version = "1", features = ["macros", "rt"] }

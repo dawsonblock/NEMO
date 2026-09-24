@@ -423,7 +423,13 @@ impl PluginExecutionBackend for InProcessPluginBackend {
 
 /// A second transport attached to a session the kernel established.
 pub mod attached;
+/// The capability a session's transports have to present.
+pub mod capability;
 pub mod conformance;
+/// The continuations a kernel holds for the plugins that asked for them.
+pub mod continuations;
+/// The bounds a host process is started under.
+pub mod limits;
 /// Delivering this runtime's events to observers in another process.
 pub mod observer;
 /// The runtime that work beside a call runs on.
@@ -512,9 +518,29 @@ impl ProcessLoadedPlugins {
                 "a registration cap of zero milliseconds would refuse every invocation",
             ));
         }
-        // The off-path runtime belongs to this composition and outlives every
-        // proxy installed from it: work done beside a call must be answerable by
-        // a thread the caller is not holding.
+        // What is about to be loaded is approved before anything is started: a
+        // load that cannot happen — an artifact that is missing, or that is not
+        // the approved one — is refused without a process to clean up, and the
+        // refusal is the same one the loader would have given.
+        let mut approved = Vec::new();
+        for (plugin_id, artifact) in specs {
+            let (manifest_sha256, library_sha256) =
+                nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact).map_err(
+                    |error| {
+                        refused(format!(
+                            "plugin '{plugin_id}' could not be approved: {error}"
+                        ))
+                    },
+                )?;
+            approved.push((
+                plugin_id,
+                artifact,
+                PluginArtifactIdentity {
+                    manifest_sha256,
+                    library_sha256,
+                },
+            ));
+        }
         let backend = Arc::new(ProcessPluginBackend::launch(config).await?);
         // The off-path runtime belongs to this composition and outlives every
         // proxy installed from it. It attaches a transport of its own, created on
@@ -531,22 +557,16 @@ impl ProcessLoadedPlugins {
         ));
 
         let mut handles = Vec::new();
-        for (plugin_id, artifact) in specs {
-            // The identity is approved here, before anything is loaded, so the
-            // host confirms what it was told to load rather than deciding for
-            // itself what the reference points at.
-            let (manifest_sha256, library_sha256) =
-                nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                    .map_err(|error| refused(error.to_string()))?;
+        // The host confirms the identity it was given rather than deciding for
+        // itself what a reference points at; the approval above is what it is
+        // confirming.
+        for (plugin_id, artifact, identity) in approved {
             let loaded = manager
                 .load(
                     PluginLoadRequest {
                         plugin_id,
                         artifact,
-                        identity: PluginArtifactIdentity {
-                            manifest_sha256,
-                            library_sha256,
-                        },
+                        identity,
                     },
                     lifecycle_context(&binding, "load"),
                 )
@@ -584,6 +604,7 @@ impl ProcessLoadedPlugins {
         // call that raised it.
         let context = crate::proxy::ProxyContext::new(manager, binding, registration_cap_millis)
             .with_operation_scopes(backend.operation_scopes())
+            .with_continuations(backend.continuations())
             .with_observability_budget(observability.budget_millis)
             .with_off_path_executor(Arc::clone(&off_path));
         let mut proxies = Vec::new();

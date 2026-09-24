@@ -74,6 +74,12 @@ enum HostSession {
         identity: nemo_relay_plugin_protocol::PluginSessionIdentity,
         /// Registration classes the kernel can install a proxy for.
         supported_registration_operations: Vec<PluginRegistrationOperation>,
+        /// What every operation on this session's transports has to present.
+        ///
+        /// The credential authorises establishing the session; this authorises
+        /// using it. Without it, naming the session would be enough to call it,
+        /// and a session's name is what an attach announces.
+        capability: crate::capability::SessionCapability,
     },
     /// After the session closed. Every later request is refused, including a
     /// handshake that would start another one.
@@ -90,8 +96,24 @@ pub struct PluginHostService {
     session: Mutex<HostSession>,
     /// Where the marks this host's plugins raise are sent, when this host was
     /// given a kernel to send them to.
-    mark_forwarding: Option<tokio::sync::mpsc::UnboundedSender<ForwardedStep>>,
+    mark_forwarding: Option<MarkForwardingSender>,
+    /// The kernel this host may call back into, when one started it.
+    ///
+    /// Needed by the classes that wrap a call: their continuation is the
+    /// kernel's remainder of the chain, so a plugin's `next` is a call this side
+    /// makes.
+    kernel: Option<crate::runtime_service::KernelCallbacks>,
 }
+
+/// This host's end of the channel its forwarded marks travel on.
+///
+/// Bounded rather than unbounded, because the marks come from a plugin and the
+/// drain comes from a socket: a plugin that raises marks faster than the kernel
+/// reads them would otherwise grow this process's heap without limit, and the
+/// process separation that contains its crashes would not contain that. The
+/// capacity is whoever starts the host's decision, so how much a host may buffer
+/// is configuration rather than a constant buried in the execution path.
+pub type MarkForwardingSender = tokio::sync::mpsc::Sender<ForwardedStep>;
 
 /// One step on the path a forwarded mark takes back to the kernel.
 ///
@@ -118,7 +140,7 @@ pub enum ForwardedStep {
 
 /// The sink a plugin's callback raises marks into.
 struct ForwardingSink {
-    sender: tokio::sync::mpsc::UnboundedSender<ForwardedStep>,
+    sender: MarkForwardingSender,
     session_id: String,
     /// The operation this host is running, which every mark belongs to.
     operation_request_id: String,
@@ -139,7 +161,7 @@ impl nemo_relay::plugin::execution::MarkForwarder for ForwardingSink {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         );
         self.sender
-            .send(ForwardedStep::Mark {
+            .try_send(ForwardedStep::Mark {
                 session_id: self.session_id.clone(),
                 mark: Box::new(nemo_relay_plugin_protocol::PluginMarkEmit {
                     operation_request_id: self.operation_request_id.clone(),
@@ -153,10 +175,24 @@ impl nemo_relay::plugin::execution::MarkForwarder for ForwardingSink {
                     timestamp_unix_micros: mark.timestamp_unix_micros,
                 }),
             })
-            .map_err(|_| {
-                nemo_relay::error::FlowError::Internal(
-                    "the kernel this host forwards marks to is no longer reachable".to_string(),
-                )
+            // Both refusals are the same fact to the caller: this mark did not
+            // leave, so the invocation cannot be reported as having produced the
+            // evidence it says it produced. A full queue is a host that is not
+            // keeping up with its plugin, and dropping the mark quietly would
+            // make the kernel's view of the invocation wrong rather than late.
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    nemo_relay::error::FlowError::Internal(
+                        "the kernel this host forwards marks to is not keeping up with this \
+                         plugin's marks"
+                            .to_string(),
+                    )
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    nemo_relay::error::FlowError::Internal(
+                        "the kernel this host forwards marks to is no longer reachable".to_string(),
+                    )
+                }
             })
     }
 }
@@ -170,6 +206,7 @@ impl PluginHostService {
             host_instance_id: Uuid::now_v7().to_string(),
             session: Mutex::new(HostSession::New),
             mark_forwarding: None,
+            kernel: None,
         }
     }
 
@@ -179,11 +216,21 @@ impl PluginHostService {
     /// has the connection back to the kernel. Without one, a mark a plugin raises
     /// is emitted into this process's own runtime, where the kernel's subscribers
     /// cannot see it.
-    pub fn with_mark_forwarding(
-        mut self,
-        sender: tokio::sync::mpsc::UnboundedSender<ForwardedStep>,
-    ) -> Self {
+    pub fn with_mark_forwarding(mut self, sender: MarkForwardingSender) -> Self {
         self.mark_forwarding = Some(sender);
+        self
+    }
+
+    /// Give this host the kernel it may call back into.
+    ///
+    /// A host without one serves the classes that answer a call; the classes
+    /// that wrap one are refused, because their continuation would have nowhere
+    /// to run.
+    pub fn with_kernel_callbacks(
+        mut self,
+        kernel: crate::runtime_service::KernelCallbacks,
+    ) -> Self {
+        self.kernel = Some(kernel);
         self
     }
 
@@ -194,6 +241,7 @@ impl PluginHostService {
     async fn serve_invocation(
         &self,
         wire: v1::InvokeRequest,
+        presented: Option<&str>,
     ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
         let outcome: Result<
             nemo_relay_plugin_protocol::PluginExecutionOutcome,
@@ -203,7 +251,7 @@ impl PluginHostService {
                 if let Err(error) = self.established(&wire.session_id) {
                     return Ok(refusal(error.failure.message));
                 }
-                let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+                let context = self.prepare(&wire.session_id, presented, wire.context.as_ref())?;
                 let request = invoke_request_from_wire(&wire, &context)?;
 
                 // Which registration this is comes from the host's own record of
@@ -393,6 +441,213 @@ impl PluginHostService {
                         Err(error) => Ok(refusal(error.to_string())),
                     }
                 }
+                // The first class that wraps a call rather than answering one.
+                // The plugin's callback decides *when* the rest of the chain
+                // runs, and the rest of the chain is the kernel's, so the
+                // continuation the callback calls is a call this process makes
+                // back into the kernel with the arguments the callback settled
+                // on. What comes back is the downstream result, which is what
+                // the callback is waiting for.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolExecutionIntercept => {
+                    let Some(kernel) = self.kernel.clone() else {
+                        // Refused rather than run without a continuation: a
+                        // callback whose `next` goes nowhere would either hang or
+                        // silently skip the call it was meant to wrap.
+                        return Ok(refusal(
+                            "this host has no kernel to continue a wrapped call through, so an execution \
+                             intercept cannot be served here",
+                        ));
+                    };
+                    let payload: serde_json::Value = serde_json::from_str(&request.arguments)
+                        .map_err(|error| {
+                            refused(format!(
+                                "a tool execution intercept payload must be JSON: {error}"
+                            ))
+                        })?;
+                    let tool = payload
+                        .get("tool")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            refused("a tool execution intercept payload names no tool")
+                        })?
+                        .to_string();
+                    let args = payload.get("args").cloned().ok_or_else(|| {
+                        refused("a tool execution intercept payload carries no arguments")
+                    })?;
+                    let session_id = wire.session_id.clone();
+                    let operation_request_id = context.operation_request_id.clone();
+                    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    // Each call mints its own identity: the ABI lets an intercept
+                    // call its continuation more than once — retries and fan-out
+                    // are what the isolated context per call exists for — so the
+                    // kernel is told which call it is answering, not merely that
+                    // one arrived.
+                    let next: nemo_relay::api::runtime::ToolExecutionNextFn =
+                        std::sync::Arc::new(move |args: serde_json::Value| {
+                            let kernel = kernel.clone();
+                            let session_id = session_id.clone();
+                            let operation_request_id = operation_request_id.clone();
+                            let calls = std::sync::Arc::clone(&calls);
+                            Box::pin(async move {
+                                let host_call_id = format!(
+                                    "{operation_request_id}-{}",
+                                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                );
+                                let answered = kernel
+                                    .run_continuation(
+                                        &session_id,
+                                        &operation_request_id,
+                                        &host_call_id,
+                                        &args.to_string(),
+                                    )
+                                    .await;
+                                match answered {
+                                    Ok(outcome) => match outcome.result {
+                                        Ok(value) => serde_json::from_str(&value).map_err(|error| {
+                                            nemo_relay::error::FlowError::Internal(format!(
+                                                "the kernel's continuation answered with something that is not a tool \
+                                                 result: {error}"
+                                            ))
+                                        }),
+                                        // The kernel's chain failed. The ABI carries an
+                                        // intercept's continuation error as text, so what
+                                        // travels back is the kernel's own words and the
+                                        // code it refused with — not a registration this
+                                        // process could have named.
+                                        Err(failure) => Err(
+                                            nemo_relay::error::FlowError::Internal(format!(
+                                                "the wrapped call failed: {} ({:?})",
+                                                failure.message, failure.code
+                                            )),
+                                        ),
+                                    },
+                                    Err(error) => Err(nemo_relay::error::FlowError::Internal(format!(
+                                        "the wrapped call could not be continued: {error}"
+                                    ))),
+                                }
+                            })
+                        });
+                    match nemo_relay::api::tool::invoke_tool_execution_intercept_registration(
+                        &request.registration_id,
+                        &tool,
+                        args,
+                        next,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => Ok(success(serde_json::to_string(&outcome).map_err(
+                            |error| {
+                                refused(format!(
+                                    "the execution intercept's outcome could not be serialized: {error}"
+                                ))
+                            },
+                        )?)),
+                        Err(error) => Ok(refusal(error.to_string())),
+                    }
+                }
+                // The tool execution intercept's twin, one layer up: the
+                // plugin decides when the provider call runs, and the call is the
+                // kernel's, so `next` is a call back into it. What travels is the
+                // provider request down and the provider response back.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmExecutionIntercept => {
+                    let Some(kernel) = self.kernel.clone() else {
+                        return Ok(refusal(
+                            "this host has no kernel to continue a wrapped call through, so an \
+                             execution intercept cannot be served here",
+                        ));
+                    };
+                    let payload: serde_json::Value = serde_json::from_str(&request.arguments)
+                        .map_err(|error| {
+                            refused(format!(
+                                "an LLM execution intercept payload must be JSON: {error}"
+                            ))
+                        })?;
+                    let name = payload
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            refused("an LLM execution intercept payload names no provider")
+                        })?
+                        .to_owned();
+                    let request_json = payload.get("request").cloned().ok_or_else(|| {
+                        refused("an LLM execution intercept payload carries no request")
+                    })?;
+                    let provider_request: nemo_relay::api::llm::LlmRequest =
+                        serde_json::from_value(request_json).map_err(|error| {
+                            refused(format!(
+                                "an LLM execution intercept payload carries something that is \
+                                 not a request: {error}"
+                            ))
+                        })?;
+                    let session_id = wire.session_id.clone();
+                    let operation_request_id = context.operation_request_id.clone();
+                    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let next: nemo_relay::api::runtime::LlmExecutionNextFn =
+                        std::sync::Arc::new(move |request| {
+                            let kernel = kernel.clone();
+                            let session_id = session_id.clone();
+                            let operation_request_id = operation_request_id.clone();
+                            let calls = std::sync::Arc::clone(&calls);
+                            Box::pin(async move {
+                                let host_call_id = format!(
+                                    "{operation_request_id}-{}",
+                                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                );
+                                let sent = serde_json::to_string(&request).map_err(|error| {
+                                    nemo_relay::error::FlowError::Internal(format!(
+                                        "the request could not be serialized: {error}"
+                                    ))
+                                })?;
+                                let answered = kernel
+                                    .run_continuation(
+                                        &session_id,
+                                        &operation_request_id,
+                                        &host_call_id,
+                                        &sent,
+                                    )
+                                    .await;
+                                match answered {
+                                    Ok(outcome) => match outcome.result {
+                                        Ok(value) => {
+                                            serde_json::from_str(&value).map_err(|error| {
+                                                nemo_relay::error::FlowError::Internal(format!(
+                                                    "the kernel's continuation answered with \
+                                                     something that is not a response: {error}"
+                                                ))
+                                            })
+                                        }
+                                        Err(failure) => Err(
+                                            nemo_relay::error::FlowError::Internal(format!(
+                                                "the wrapped call failed: {} ({:?})",
+                                                failure.message, failure.code
+                                            )),
+                                        ),
+                                    },
+                                    Err(error) => Err(nemo_relay::error::FlowError::Internal(
+                                        format!("the wrapped call could not be continued: {error}"),
+                                    )),
+                                }
+                            })
+                        });
+                    match nemo_relay::api::llm::invoke_llm_execution_intercept_registration(
+                        &request.registration_id,
+                        &name,
+                        provider_request,
+                        next,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(success(serde_json::to_string(&response).map_err(
+                            |error| {
+                                refused(format!(
+                                    "the execution intercept's response could not be \
+                                     serialized: {error}"
+                                ))
+                            },
+                        )?)),
+                        Err(error) => Ok(refusal(error.to_string())),
+                    }
+                }
                 // Every other class is refused by name rather than answered as
                 // an empty success, because a caller cannot tell the two apart
                 // and would read one as the other.
@@ -489,12 +744,28 @@ fn success(output: String) -> nemo_relay_plugin_protocol::PluginExecutionOutcome
 
 /// A registration refused, or the invocation never reached one.
 fn refusal(message: impl Into<String>) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
+    refusal_with(
+        nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+        message,
+    )
+}
+
+/// A refusal that carries the code the host refused the invocation with.
+///
+/// The reason a call was refused is part of the answer, not decoration: a
+/// response that broke the operation's budget is a different finding from a
+/// callback that refused, and a caller reading the code has to be able to tell
+/// them apart.
+fn refusal_with(
+    code: nemo_relay_plugin_protocol::PluginFailureCode,
+    message: impl Into<String>,
+) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
     use nemo_relay_plugin_protocol::{DispatchState, OutcomeCertainty, PluginExecutionOutcome};
     PluginExecutionOutcome {
         dispatch: DispatchState::NotDispatched,
         certainty: OutcomeCertainty::ConfirmedFailure,
         result: Err(nemo_relay_plugin_protocol::PluginFailure {
-            code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+            code,
             message: message.into(),
         }),
     }
@@ -508,12 +779,65 @@ fn refused(message: impl Into<String>) -> PluginProtocolError {
     )
 }
 
+/// The capability a request presents, as its own value.
+///
+/// Owned rather than borrowed because the message it arrived with is taken apart
+/// immediately afterwards: the capability belongs to the transport, and reading
+/// it before the payload keeps the two from being confused for each other.
+fn presented_capability<T>(request: &Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get(crate::capability::SESSION_CAPABILITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The lifetime of one activation's registrations.
+///
+/// Activation runs a plugin's register callbacks, so the callbacks live in this
+/// process from the moment it returns. Whoever installed them has to take them
+/// back down, and a teardown written as one call per exit path is a teardown
+/// that the exit paths which do not call it skip — which is how inspection came
+/// to leave a plugin registered while reporting itself read-only.
+///
+/// This makes the teardown a property of the activation's lifetime instead. The
+/// guard clears whatever is active when it drops, so success, refusal and every
+/// early return roll back the same way, and only a session that means to serve
+/// what it activated says so before it returns.
+struct ActivationGuard {
+    /// Whether this activation's registrations are kept.
+    committed: bool,
+}
+
+impl ActivationGuard {
+    fn new() -> Self {
+        Self { committed: false }
+    }
+
+    /// Keep what this activation installed: this session serves it.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ActivationGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Best effort, and a no-op when nothing is active, so a guard that drops
+        // after a failed activation is not a second failure of its own.
+        let _ = nemo_relay::plugin::clear_plugin_configuration();
+    }
+}
+
 #[tonic::async_trait]
 impl v1::plugin_host_server::PluginHost for PluginHostService {
     async fn handshake(
         &self,
         request: Request<v1::HandshakeRequest>,
     ) -> Result<Response<v1::HandshakeOutcome>, Status> {
+        let presented = presented_capability(&request);
         let request = match handshake_request_from_wire(&request.into_inner()) {
             Ok(request) => request,
             Err(error) => {
@@ -547,14 +871,38 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 ),
             )));
         }
+        // The capability the kernel minted, which every operation after this one
+        // has to present. A session established without one would be a session
+        // any peer that learned its name could use.
+        let Some(capability) = crate::capability::SessionCapability::parse(presented.as_deref())
+        else {
+            return Ok(Response::new(handshake_outcome_to_wire(
+                LifecycleOutcome::Failed(
+                    refused(
+                        "the handshake presented no session capability, so the session it asks \
+                         for would not be one this host can authorise",
+                    )
+                    .failure,
+                ),
+            )));
+        };
 
         let session_id = Uuid::now_v7().to_string();
+        // One limit for both directions, and it is the smaller of what this host
+        // will accept and what the kernel asked for. Reporting only this host's
+        // own limit would let a kernel configured for a smaller frame be answered
+        // with a larger one, and a session's frame limit has to be a size both
+        // sides have agreed they can carry.
+        let negotiated_frame_limit = self
+            .config
+            .maximum_frame_bytes
+            .min(request.maximum_frame_bytes);
         let identity = PluginSessionIdentity {
             protocol_version: self.config.protocol_version,
             session_id: session_id.clone(),
             host_instance_id: self.host_instance_id.clone(),
             host_nonce: Uuid::now_v7().to_string(),
-            maximum_frame_bytes: self.config.maximum_frame_bytes,
+            maximum_frame_bytes: negotiated_frame_limit,
             supported_features: Vec::new(),
             // The host accepts what it is offered. It cannot ask for more, and
             // an offer it does not need is none of its business.
@@ -568,6 +916,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                         supported_registration_operations: request
                             .supported_registration_operations
                             .clone(),
+                        capability,
                     };
                 }
                 HostSession::Active { .. } => {
@@ -605,6 +954,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         let refused_attach = |failure: nemo_relay_plugin_protocol::PluginFailure| {
             Response::new(attach_outcome_to_wire(LifecycleOutcome::Failed(failure)))
         };
+        let presented = presented_capability(&request);
         let request = match attach_request_from_wire(&request.into_inner()) {
             Ok(request) => request,
             Err(error) => return Ok(refused_attach(error.failure)),
@@ -643,10 +993,24 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 HostSession::Active {
                     identity,
                     supported_registration_operations,
+                    capability,
                 } => {
                     if request.session_id != identity.session_id {
                         return Ok(refused_attach(
                             refused("this host did not establish that session").failure,
+                        ));
+                    }
+                    // The credential proved which host this is; the capability
+                    // proves this transport is one of the session's. An attach
+                    // that could be made with the credential alone would let
+                    // anyone who could start a host use one it did not start.
+                    if !capability.matches(presented.as_deref()) {
+                        return Ok(refused_attach(
+                            refused(
+                                "the attaching transport did not present this session's \
+                                 capability",
+                            )
+                            .failure,
                         ));
                     }
                     if request.protocol_version != identity.protocol_version {
@@ -691,9 +1055,14 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::LoadRequest>,
     ) -> Result<Response<v1::LoadOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         let outcome = async {
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let context = self.prepare(
+                &wire.session_id,
+                presented.as_deref(),
+                wire.context.as_ref(),
+            )?;
             let request = load_request_from_wire(&wire)?;
             let response = self.backend.load(request, context.clone()).await?;
             // A load that cannot be served in full is a load that does not
@@ -730,9 +1099,14 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::UnloadRequest>,
     ) -> Result<Response<v1::UnloadOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         let outcome = async {
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let context = self.prepare(
+                &wire.session_id,
+                presented.as_deref(),
+                wire.context.as_ref(),
+            )?;
             let request = unload_request_from_wire(&wire)?;
             self.backend.unload(request, context).await
         }
@@ -746,9 +1120,14 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::InspectRequest>,
     ) -> Result<Response<v1::InspectOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         let outcome = async {
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let context = self.prepare(
+                &wire.session_id,
+                presented.as_deref(),
+                wire.context.as_ref(),
+            )?;
             let request = inspect_request_from_wire(&wire)?;
             self.backend.inspect(request, context).await
         }
@@ -762,10 +1141,22 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::ActivateRequest>,
     ) -> Result<Response<v1::ActivateOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         let outcome = async {
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let context = self.prepare(
+                &wire.session_id,
+                presented.as_deref(),
+                wire.context.as_ref(),
+            )?;
             let activation = activate_request_from_wire(&wire)?;
+
+            // Everything this activation installs is this guard's, until the
+            // session says it will serve it. A discovery session never does, so
+            // the guard is what makes inspection leave the process as it found
+            // it — on the reporting path, on the refusal path, and on the error
+            // paths, rather than on whichever of them remembers to clean up.
+            let mut guard = ActivationGuard::new();
 
             // Activation runs the plugin's register callbacks in *this*
             // process: the configuration comes from the kernel, the callbacks
@@ -807,9 +1198,9 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
             // classes included, because those are what it is looking for. A
             // serving session refuses instead, and the reason is the same in both
             // directions: one wants to know what it cannot serve, the other must
-            // not appear to serve it. Nothing is installed either way — the host
-            // reports and the kernel decides — so the flag changes what is
-            // reported and nothing else.
+            // not appear to serve it. The host reports and the kernel decides, so
+            // the flag changes what is reported — and, through the guard, whether
+            // what was activated outlives the call at all.
             if activation.discovery {
                 return Ok(descriptors);
             }
@@ -824,12 +1215,13 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 }
             }
             if !unsupported.is_empty() {
-                // Fail closed without leaving anything registered: the callbacks
-                // were installed by this activation call, so clearing the
-                // configuration takes them back down.
-                let _ = nemo_relay::plugin::clear_plugin_configuration();
+                // Fail closed without leaving anything registered: the guard
+                // takes back down the callbacks this activation installed.
                 return Err(refused(unsupported.join("; ")));
             }
+            // This session serves what it activated, so the registrations are
+            // its to hold until the session ends.
+            guard.commit();
             Ok(descriptors)
         }
         .await;
@@ -842,6 +1234,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::InvokeRequest>,
     ) -> Result<Response<v1::InvokeOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         // Every answer names the invocation it answers, so a request that
         // carries no operation to name is refused at the transport level: an
@@ -858,6 +1251,13 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 "an invocation must carry a context naming the operation it belongs to",
             ));
         };
+        // The budget the operation chose, read before the request is consumed by
+        // the call it governs: it is the answer's to satisfy, and it has to
+        // outlive the call to be checked against what the call produced.
+        let response_budget = wire
+            .context
+            .as_ref()
+            .map(|context| context.max_response_bytes);
         // The window in which a plugin's callback runs is the window in which
         // its marks belong to the kernel rather than to this process, so the
         // forwarder is installed around exactly that call.
@@ -871,7 +1271,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 });
                 let answered = nemo_relay::plugin::execution::with_mark_forwarder(
                     sink,
-                    self.serve_invocation(wire),
+                    self.serve_invocation(wire, presented.as_deref()),
                 )
                 .await;
                 // What the invocation raised is delivered before the answer that
@@ -880,7 +1280,12 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 // see, so the answer it would have given is not one the kernel
                 // may read as complete.
                 let (done, delivered) = tokio::sync::oneshot::channel();
-                if sender.send(ForwardedStep::Flush { done }).is_err() {
+                // Waiting for room rather than refusing: the flush is what makes
+                // the marks ahead of it accounted for, so a flush that could not
+                // be queued would report the invocation complete while its
+                // evidence was still here. A kernel that stopped reading is
+                // reached by the operation's own deadline instead.
+                if sender.send(ForwardedStep::Flush { done }).await.is_err() {
                     return Err(Status::unavailable(
                         "this host can no longer reach the kernel its plugins' marks belong to",
                     ));
@@ -901,7 +1306,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 }
                 answered
             }
-            None => self.serve_invocation(wire).await,
+            None => self.serve_invocation(wire, presented.as_deref()).await,
         };
 
         let outcome = match outcome {
@@ -910,6 +1315,22 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         };
         let outcome = execution_outcome_to_wire(&outcome, &operation_request_id)
             .map_err(|error| Status::internal(error.failure.message))?;
+        // A budget nobody measures is advice. The transport's frame limit is not
+        // the same limit: an answer that fits the frame can still be far larger
+        // than the operation was allowed to return, so the host measures what it
+        // is about to send and refuses here, where the kernel can read the reason
+        // rather than having the answer truncated somewhere below it.
+        if let Some(budget) = response_budget
+            && let Err(oversized) =
+                nemo_relay_plugin_proto::convert::check_invoke_outcome_budget(&outcome, budget)
+        {
+            let refusal = execution_outcome_to_wire(
+                &refusal_with(oversized.failure.code, oversized.failure.message),
+                &operation_request_id,
+            )
+            .map_err(|error| Status::internal(error.failure.message))?;
+            return Ok(Response::new(refusal));
+        }
         Ok(Response::new(outcome))
     }
 
@@ -917,6 +1338,8 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         _request: Request<v1::CancelOperationRequest>,
     ) -> Result<Response<v1::CancelOperationOutcome>, Status> {
+        // Nothing to authorise: this answer is the same for every caller, and
+        // there is no session state behind it for a capability to protect.
         Ok(Response::new(cancel_outcome_to_wire(
             LifecycleOutcome::Failed(nemo_relay_plugin_protocol::PluginFailure {
                 code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
@@ -929,9 +1352,14 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::HealthRequest>,
     ) -> Result<Response<v1::HealthOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         let outcome = async {
-            let context = self.prepare(&wire.session_id, wire.context.as_ref())?;
+            let context = self.prepare(
+                &wire.session_id,
+                presented.as_deref(),
+                wire.context.as_ref(),
+            )?;
             self.backend.health(context).await
         }
         .await;
@@ -950,6 +1378,9 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         // No stream is produced, and the stream says so: a stream that simply
         // stopped would be a truncation the kernel cannot distinguish from a
         // host that died mid-answer.
+        //
+        // Like `cancel_operation`, this answer does not depend on the caller, so
+        // there is nothing here a capability would be protecting.
         let refusal = v1::StreamChunk {
             // Named when the caller named one, for the same reason a unary
             // answer names its invocation: a terminal frame that belongs to no
@@ -977,11 +1408,15 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::SessionCloseRequest>,
     ) -> Result<Response<v1::SessionCloseOutcome>, Status> {
+        let presented = presented_capability(&request);
         let wire = request.into_inner();
         // A refusal travels as an outcome rather than as a transport status: a
         // session that is already gone is a result, and a channel failure is a
         // different event that the kernel has to read differently.
-        if let Err(error) = self.established(&wire.session_id) {
+        let established = self
+            .established(&wire.session_id)
+            .and_then(|()| self.capability_admitted(presented.as_deref()));
+        if let Err(error) = established {
             return Ok(Response::new(session_close_outcome_to_wire(
                 LifecycleOutcome::Failed(error.failure),
             )));
@@ -1049,9 +1484,11 @@ impl PluginHostService {
     fn prepare(
         &self,
         session_id: &str,
+        capability: Option<&str>,
         context: Option<&v1::PluginExecutionContext>,
     ) -> Result<nemo_relay_plugin_protocol::PluginExecutionContext, PluginProtocolError> {
         self.established(session_id)?;
+        self.capability_admitted(capability)?;
         let envelope = operation_envelope_from_wire(session_id, context)?;
         // The host checks the context against this session itself rather than
         // trusting the kernel to have done it: a peer that reaches this service
@@ -1066,6 +1503,29 @@ impl PluginHostService {
                 .unwrap_or(0),
         )?;
         Ok(envelope.context)
+    }
+
+    /// Refuse an operation that did not present the session's capability.
+    ///
+    /// The session's identity says which session a request means; this says the
+    /// request may use it. A peer that learned the identity — an attach
+    /// announces it — is not therefore a peer that established the session, and
+    /// this is where those two stop being the same thing.
+    fn capability_admitted(&self, presented: Option<&str>) -> Result<(), PluginProtocolError> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|error| refused(format!("the session lock was poisoned: {error}")))?;
+        match &*session {
+            HostSession::Active { capability, .. } if capability.matches(presented) => Ok(()),
+            HostSession::Active { .. } => Err(refused(
+                "the request did not present the capability this session requires",
+            )),
+            // A host that is not serving refuses everything, and a request that
+            // presented no capability is refused by the same rule as one that
+            // presented the wrong one.
+            _ => Err(refused("this host has not established a session")),
+        }
     }
 }
 
@@ -1143,6 +1603,31 @@ mod tests {
         (PluginHostService::new(backend, config.clone()), config)
     }
 
+    /// The capability the tests' requests present.
+    ///
+    /// A fixed value rather than a minted one, so a test can say which request
+    /// presents which capability — including a request that presents another
+    /// session's.
+    const TEST_CAPABILITY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A request presenting `capability`.
+    fn with_capability<T>(message: T, capability: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            crate::capability::SESSION_CAPABILITY_HEADER,
+            capability
+                .parse()
+                .expect("a test capability is a header value"),
+        );
+        request
+    }
+
+    /// A request presenting the capability every established session is given.
+    fn capable<T>(message: T) -> Request<T> {
+        with_capability(message, TEST_CAPABILITY)
+    }
+
     fn handshake_request(config: &PluginHostConfig) -> v1::HandshakeRequest {
         v1::HandshakeRequest {
             protocol_version: u32::from(PROTOCOL_VERSION),
@@ -1177,9 +1662,198 @@ mod tests {
         )
     }
 
+    /// The same context, with the response budget this test is about.
+    fn context_with_budget(max_response_bytes: u32) -> v1::PluginExecutionContext {
+        let mut wire = context();
+        wire.max_response_bytes = max_response_bytes;
+        wire
+    }
+
+    /// The single-registration fixture, and the manifest written to describe it.
+    ///
+    /// This fixture registers exactly the classes a kernel can serve, so a
+    /// session that supports everything can activate it. That is what makes it
+    /// the right fixture for asking what activation itself did: a refused
+    /// activation would be a statement about the registration set rather than
+    /// about the activation.
+    fn intercept_fixture() -> Option<(std::path::PathBuf, String)> {
+        let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                    "../../target/test-plugin-fixtures/debug/\
+                     libnemo_relay_native_intercept_fixture.dylib",
+                )
+            });
+        if !library.exists() {
+            return None;
+        }
+        let manifest_dir =
+            std::env::temp_dir().join(format!("nemo-ph-intercept-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&manifest_dir).expect("a manifest directory");
+        let manifest = manifest_dir.join("relay-plugin.toml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "manifest_version = 1\n\n[plugin]\nid = \"fixture_intercept\"\nkind = \
+                 \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \
+                 \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = \
+                 [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \
+                 \"nemo_relay_native_intercept_fixture\"\n",
+                env!("CARGO_PKG_VERSION"),
+                library.display()
+            ),
+        )
+        .expect("write the manifest");
+        Some((manifest_dir, manifest.to_string_lossy().into_owned()))
+    }
+
+    /// A host serving one session, with the single-registration fixture loaded.
+    ///
+    /// The session supports every registration class, so activation is decided
+    /// by what the plugin registered rather than by what the session can proxy.
+    struct FixtureSession {
+        service: PluginHostService,
+        session_id: String,
+        handle: nemo_relay_plugin_protocol::PluginHandle,
+        manifest_dir: std::path::PathBuf,
+    }
+
+    impl FixtureSession {
+        async fn start(maximum_frame_bytes: u32, offered_frame_bytes: u32) -> Option<Self> {
+            let (manifest_dir, artifact) = intercept_fixture()?;
+            let backend = Arc::new(crate::InProcessPluginBackend::new());
+            let config = PluginHostConfig {
+                protocol_version: PROTOCOL_VERSION,
+                runtime_binding_digest: "binding".into(),
+                session_credential: "credential".into(),
+                maximum_frame_bytes,
+            };
+            let service = PluginHostService::new(backend, config.clone());
+            let mut request = handshake_request(&config);
+            request.maximum_frame_bytes = offered_frame_bytes;
+            request.supported_registration_operations = EVERY_REGISTRATION_OPERATION
+                .iter()
+                .map(|operation| {
+                    nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+                })
+                .collect();
+            let session_id = handshake_outcome_from_wire(
+                &service
+                    .handshake(capable(request))
+                    .await
+                    .expect("a served handshake")
+                    .into_inner(),
+            )
+            .expect("a converted handshake")
+            .into_result()
+            .expect("an established session")
+            .session_id;
+
+            let (manifest_sha256, library_sha256) =
+                nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                    .expect("the fixture's identity");
+            let loaded = service
+                .load(capable(v1::LoadRequest {
+                    session_id: session_id.clone(),
+                    context: Some(context()),
+                    plugin_id: "fixture_intercept".into(),
+                    artifact,
+                    manifest_digest: manifest_sha256,
+                    library_digest: library_sha256,
+                }))
+                .await
+                .expect("a served load")
+                .into_inner();
+            let handle = nemo_relay_plugin_proto::convert::load_outcome_from_wire(&loaded)
+                .expect("a converted load")
+                .into_result()
+                .expect("a load")
+                .handle;
+            Some(Self {
+                service,
+                session_id,
+                handle,
+                manifest_dir,
+            })
+        }
+
+        /// Activate the loaded plugin, reporting or serving what it registered.
+        async fn activate(&self, discovery: bool) -> v1::ActivateOutcome {
+            self.service
+                .activate(capable(v1::ActivateRequest {
+                    session_id: self.session_id.clone(),
+                    context: Some(context()),
+                    discovery,
+                    components: vec![v1::ComponentConfiguration {
+                        kind: "fixture_intercept".into(),
+                        config_json: "{}".into(),
+                    }],
+                }))
+                .await
+                .expect("a served activation")
+                .into_inner()
+        }
+
+        /// The registration a report names, as the kernel would proxy it.
+        fn tool_request_intercept(&self, outcome: &v1::ActivateOutcome) -> String {
+            let Some(v1::activate_outcome::Result::Activated(response)) = &outcome.result else {
+                panic!("the fixture's registrations are reported: {outcome:?}");
+            };
+            response
+                .descriptors
+                .iter()
+                .flat_map(|descriptor| descriptor.registrations.iter())
+                .find(|registration| {
+                    registration.operation
+                        == nemo_relay_plugin_proto::convert::registration_operation_to_wire(
+                            nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept,
+                        )
+                })
+                .expect("the fixture registers a tool request intercept")
+                .registration_id
+                .clone()
+        }
+
+        /// Run one tool request intercept, with the response budget given.
+        async fn invoke(
+            &self,
+            registration: &str,
+            max_response_bytes: u32,
+        ) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
+            let answer = self
+                .service
+                .invoke(capable(v1::InvokeRequest {
+                    session_id: self.session_id.clone(),
+                    context: Some(context_with_budget(max_response_bytes)),
+                    handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(
+                        &self.handle,
+                    )),
+                    registration_id: registration.to_owned(),
+                    arguments: serde_json::json!({"tool": "fixture_tool", "args": {"input": true}})
+                        .to_string(),
+                }))
+                .await
+                .expect("a served invocation")
+                .into_inner();
+            nemo_relay_plugin_proto::convert::execution_outcome_from_wire(&answer)
+                .expect("a converted invocation")
+        }
+    }
+
+    impl Drop for FixtureSession {
+        fn drop(&mut self) {
+            // Activation installs callbacks into this process's registries, so a
+            // test that served them takes them back down rather than leaving them
+            // for whichever test runs next.
+            let _ = nemo_relay::plugin::clear_plugin_configuration();
+            let _ = std::fs::remove_dir_all(&self.manifest_dir);
+        }
+    }
+
     async fn establish(service: &PluginHostService, config: &PluginHostConfig) -> String {
         let outcome = service
-            .handshake(Request::new(handshake_request(config)))
+            .handshake(capable(handshake_request(config)))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1209,7 +1883,7 @@ mod tests {
         nemo_relay_plugin_protocol::PluginAttachedSession,
     > {
         let outcome = service
-            .attach(Request::new(request))
+            .attach(capable(request))
             .await
             .expect("a served attach")
             .into_inner();
@@ -1222,7 +1896,7 @@ mod tests {
         let (service, config) = service();
         let session_id = establish(&service, &config).await;
         let before = service
-            .inspect(Request::new(v1::InspectRequest {
+            .inspect(capable(v1::InspectRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 handle: None,
@@ -1266,7 +1940,7 @@ mod tests {
         // And the session is still the handshake's: a second handshake is refused
         // exactly as it was before an attach existed.
         let refused = service
-            .handshake(Request::new(handshake_request(&config)))
+            .handshake(capable(handshake_request(&config)))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1280,7 +1954,7 @@ mod tests {
 
         // Nothing about the loaded set changed, because nothing was loaded.
         let after = service
-            .inspect(Request::new(v1::InspectRequest {
+            .inspect(capable(v1::InspectRequest {
                 session_id,
                 context: Some(context()),
                 handle: None,
@@ -1388,7 +2062,7 @@ mod tests {
 
         let session_id = establish(&service, &config).await;
         let closed = service
-            .session_close(Request::new(v1::SessionCloseRequest {
+            .session_close(capable(v1::SessionCloseRequest {
                 session_id: session_id.clone(),
             }))
             .await
@@ -1419,7 +2093,7 @@ mod tests {
         let mut request = handshake_request(&config);
         request.session_credential = "another-credential".into();
         let outcome = service
-            .handshake(Request::new(request))
+            .handshake(capable(request))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1434,7 +2108,7 @@ mod tests {
         let mut request = handshake_request(&config);
         request.runtime_binding_digest = "another-binding".into();
         let outcome = service
-            .handshake(Request::new(request))
+            .handshake(capable(request))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1450,7 +2124,7 @@ mod tests {
     async fn a_host_accepts_the_read_capabilities_it_was_offered_and_no_others() {
         let (service, config) = service();
         let outcome = service
-            .handshake(Request::new(handshake_request(&config)))
+            .handshake(capable(handshake_request(&config)))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1486,7 +2160,7 @@ mod tests {
 
         // Before a session exists, nothing is served.
         let outcome = service
-            .load(Request::new(load("unknown")))
+            .load(capable(load("unknown")))
             .await
             .expect("a served load")
             .into_inner();
@@ -1496,7 +2170,7 @@ mod tests {
         // rather than served.
         let session_id = establish(&service, &config).await;
         let outcome = service
-            .load(Request::new(load("another-session")))
+            .load(capable(load("another-session")))
             .await
             .expect("a served load")
             .into_inner();
@@ -1506,7 +2180,7 @@ mod tests {
         // backend rather than from the session check: an inspection of an empty
         // host is an empty list.
         let outcome = service
-            .inspect(Request::new(v1::InspectRequest {
+            .inspect(capable(v1::InspectRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 handle: None,
@@ -1525,7 +2199,7 @@ mod tests {
         // A close naming another session is a refusal, and it reports itself as
         // one rather than as a broken channel.
         let outcome = service
-            .session_close(Request::new(v1::SessionCloseRequest {
+            .session_close(capable(v1::SessionCloseRequest {
                 session_id: "another-session".into(),
             }))
             .await
@@ -1549,7 +2223,7 @@ mod tests {
         // spawns a process per session, so a host that accepted another would
         // make "which session is this?" a question with two answers.
         let outcome = service
-            .handshake(Request::new(handshake_request(&config)))
+            .handshake(capable(handshake_request(&config)))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1563,7 +2237,7 @@ mod tests {
         // Closing ends it, and nothing is served afterwards — including another
         // handshake.
         let outcome = service
-            .session_close(Request::new(v1::SessionCloseRequest {
+            .session_close(capable(v1::SessionCloseRequest {
                 session_id: session_id.clone(),
             }))
             .await
@@ -1576,7 +2250,7 @@ mod tests {
             Ok(())
         );
         let outcome = service
-            .inspect(Request::new(v1::InspectRequest {
+            .inspect(capable(v1::InspectRequest {
                 session_id,
                 context: Some(context()),
                 handle: None,
@@ -1591,7 +2265,7 @@ mod tests {
                 .is_err()
         );
         let outcome = service
-            .handshake(Request::new(handshake_request(&config)))
+            .handshake(capable(handshake_request(&config)))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1737,7 +2411,7 @@ mod tests {
         let session_id = establish(&service, &config).await;
 
         let outcome = service
-            .load(Request::new(v1::LoadRequest {
+            .load(capable(v1::LoadRequest {
                 session_id,
                 context: Some(context()),
                 plugin_id: "example".into(),
@@ -1825,7 +2499,7 @@ mod tests {
             })
             .collect();
         let outcome = service
-            .handshake(Request::new(request))
+            .handshake(capable(request))
             .await
             .expect("a served handshake")
             .into_inner();
@@ -1839,7 +2513,7 @@ mod tests {
             nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
                 .expect("the fixture's identity");
         service
-            .load(Request::new(v1::LoadRequest {
+            .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 plugin_id: "fixture_native".into(),
@@ -1852,7 +2526,7 @@ mod tests {
             .into_inner();
 
         let outcome = service
-            .activate(Request::new(v1::ActivateRequest {
+            .activate(capable(v1::ActivateRequest {
                 session_id,
                 context: Some(context()),
                 components: vec![v1::ComponentConfiguration {
@@ -1907,7 +2581,7 @@ mod tests {
             nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
                 .expect("the fixture's identity");
         service
-            .load(Request::new(v1::LoadRequest {
+            .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 plugin_id: "fixture_native".into(),
@@ -1919,7 +2593,7 @@ mod tests {
             .expect("a served load");
 
         let activate = |discovery: bool| {
-            service.activate(Request::new(v1::ActivateRequest {
+            service.activate(capable(v1::ActivateRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 components: vec![v1::ComponentConfiguration {
@@ -2009,7 +2683,7 @@ mod tests {
             nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
                 .expect("the fixture's identity");
         service
-            .load(Request::new(v1::LoadRequest {
+            .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 plugin_id: "fixture_native".into(),
@@ -2022,7 +2696,7 @@ mod tests {
             .into_inner();
 
         let outcome = service
-            .activate(Request::new(v1::ActivateRequest {
+            .activate(capable(v1::ActivateRequest {
                 discovery: false,
                 session_id,
                 context: Some(context()),
@@ -2103,7 +2777,7 @@ mod tests {
             .collect();
         let session_id = handshake_outcome_from_wire(
             &service
-                .handshake(Request::new(request))
+                .handshake(capable(request))
                 .await
                 .expect("a served handshake")
                 .into_inner(),
@@ -2117,7 +2791,7 @@ mod tests {
             nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
                 .expect("the fixture's identity");
         let load = service
-            .load(Request::new(v1::LoadRequest {
+            .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 plugin_id: "fixture_native".into(),
@@ -2135,7 +2809,7 @@ mod tests {
             .handle;
 
         let activated = service
-            .activate(Request::new(v1::ActivateRequest {
+            .activate(capable(v1::ActivateRequest {
                 session_id: session_id.clone(),
                 context: Some(context()),
                 discovery: false,
@@ -2166,7 +2840,7 @@ mod tests {
             .clone();
 
         let invoked = service
-            .invoke(Request::new(v1::InvokeRequest {
+            .invoke(capable(v1::InvokeRequest {
                 session_id,
                 context: Some(context()),
                 handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(&handle)),
@@ -2197,7 +2871,7 @@ mod tests {
         // A registration this host does not hold is refused rather than mapped
         // to whichever one happens to be close.
         let unknown = service
-            .invoke(Request::new(v1::InvokeRequest {
+            .invoke(capable(v1::InvokeRequest {
                 session_id: "session-1".into(),
                 context: Some(context()),
                 handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(&handle)),
@@ -2243,7 +2917,7 @@ mod tests {
         };
 
         let absent = service
-            .invoke(Request::new(invocation(None)))
+            .invoke(capable(invocation(None)))
             .await
             .expect_err("an invocation with no context has no operation to name");
         assert_eq!(absent.code(), tonic::Code::InvalidArgument, "{absent:?}");
@@ -2251,7 +2925,7 @@ mod tests {
         let mut unnamed = context();
         unnamed.operation_request_id = "  ".into();
         let blank = service
-            .invoke(Request::new(invocation(Some(unnamed))))
+            .invoke(capable(invocation(Some(unnamed))))
             .await
             .expect_err("an invocation whose context names no operation");
         assert_eq!(blank.code(), tonic::Code::InvalidArgument, "{blank:?}");
@@ -2289,5 +2963,458 @@ mod tests {
         };
         let outcome: LifecycleOutcome<()> = LifecycleOutcome::from_result(Err(failure));
         assert!(matches!(outcome, LifecycleOutcome::Failed(_)));
+    }
+
+    /// A plugin's telemetry is bounded, and the bound is what refuses it.
+    ///
+    /// Marks come from a callback and leave over a socket, so the queue between
+    /// them is the buffer between two speeds the host does not control. Filling
+    /// it has to fail the mark rather than grow this process: an unbounded queue
+    /// would let one plugin that emits faster than the kernel reads decide how
+    /// much memory the host process is allowed to use.
+    #[tokio::test]
+    async fn a_full_mark_queue_refuses_the_mark_rather_than_buffering_it() {
+        use nemo_relay::plugin::execution::{ForwardedMark, MarkForwarder};
+
+        let capacity = 4;
+        let (sender, mut steps) = tokio::sync::mpsc::channel(capacity);
+        let sink = ForwardingSink {
+            sender,
+            session_id: "session-1".into(),
+            operation_request_id: "operation-1".into(),
+            host_calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let mark = ForwardedMark {
+            name: "example.mark".into(),
+            parent: None,
+            data_json: None,
+            metadata_json: None,
+            data_schema: None,
+            severity: None,
+            timestamp_unix_micros: None,
+        };
+
+        for raised in 0..capacity {
+            sink.forward(&mark)
+                .unwrap_or_else(|error| panic!("mark {raised} has room: {error}"));
+        }
+        let refused = sink
+            .forward(&mark)
+            .expect_err("a queue with no room refuses the mark");
+        assert!(
+            refused.to_string().contains("not keeping up"),
+            "the refusal says why the mark did not leave: {refused}"
+        );
+
+        // The marks that were accepted are the marks that arrive, in order, and
+        // nothing was silently dropped to make room.
+        let mut delivered = 0;
+        while let Ok(step) = steps.try_recv() {
+            if let ForwardedStep::Mark { mark, .. } = step {
+                assert_eq!(mark.name, "example.mark");
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, capacity as i64,
+            "the accepted marks are the ones the kernel will see"
+        );
+    }
+
+    /// Establish a session against a host configured for `host_limit`, offered
+    /// `offered`, and report the frame limit the session came back with.
+    async fn negotiated_frame_limit(host_limit: u32, offered: u32) -> u32 {
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: host_limit,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let mut request = handshake_request(&config);
+        request.maximum_frame_bytes = offered;
+        let outcome = service
+            .handshake(capable(request))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        handshake_outcome_from_wire(&outcome)
+            .expect("a converted handshake")
+            .into_result()
+            .expect("an established session")
+            .maximum_frame_bytes
+    }
+
+    /// One limit for both directions, and it is the smaller of the two.
+    ///
+    /// A host that reported its own limit regardless of what the kernel offered
+    /// would open a session at a size the kernel never agreed to carry, and every
+    /// transport built from that session would inherit it.
+    #[tokio::test]
+    async fn a_session_negotiates_the_smaller_of_the_two_frame_limits() {
+        let megabyte = 1024 * 1024;
+        assert_eq!(
+            negotiated_frame_limit(2 * megabyte, megabyte).await,
+            megabyte,
+            "the kernel's smaller offer is what the session carries"
+        );
+        assert_eq!(
+            negotiated_frame_limit(megabyte, 2 * megabyte).await,
+            megabyte,
+            "the host's smaller limit is what the session carries"
+        );
+        assert_eq!(
+            negotiated_frame_limit(2 * megabyte, 2 * megabyte).await,
+            2 * megabyte,
+            "two sides that agree keep what they agreed on"
+        );
+        assert_eq!(
+            negotiated_frame_limit(
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES
+            )
+            .await,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            "and the protocol's ceiling is a size like any other"
+        );
+    }
+
+    /// A handshake that would carry no frame at all is refused rather than
+    /// negotiated down to nothing.
+    #[tokio::test]
+    async fn a_session_cannot_be_established_on_no_frame_at_all() {
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        let service = PluginHostService::new(backend, config.clone());
+        let mut request = handshake_request(&config);
+        request.maximum_frame_bytes = 0;
+        let outcome = service
+            .handshake(capable(request))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        let outcome = handshake_outcome_from_wire(&outcome).expect("a converted handshake");
+        assert!(
+            outcome.into_result().is_err(),
+            "a session that accepts no frame is not a session"
+        );
+    }
+
+    /// Inspection reports what activation produced and keeps nothing of it.
+    ///
+    /// The contract discovery exists to keep is that asking what a plugin would
+    /// register is not the same as registering it. A session that answered with
+    /// the descriptors and left the callbacks installed would answer questions
+    /// about a process that had been changed by the question.
+    #[tokio::test]
+    async fn a_discovery_activation_leaves_the_process_as_it_found_it() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some(session) = FixtureSession::start(
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await
+        else {
+            eprintln!("the intercept fixture is missing; skipping the discovery case");
+            return;
+        };
+        // From a known baseline rather than from whatever ran before this: what
+        // is being asserted is the state this call leaves behind.
+        let _ = nemo_relay::plugin::clear_plugin_configuration();
+        assert!(
+            nemo_relay::plugin::active_plugin_report().is_none(),
+            "the test starts with no active configuration"
+        );
+
+        let inspected = session.activate(true).await;
+        let registration = session.tool_request_intercept(&inspected);
+        assert!(
+            nemo_relay::plugin::active_plugin_report().is_none(),
+            "an inspection that reported registrations left none of them behind"
+        );
+
+        // And the registration the report named is not one this process can run:
+        // the callbacks went away with the inspection that made them.
+        let after_discovery = session.invoke(&registration, 64 * 1024).await;
+        assert!(
+            after_discovery.result.is_err(),
+            "nothing is registered after an inspection: {after_discovery:?}"
+        );
+
+        // The same registration is reachable once a session means to serve it,
+        // which is what makes the refusal above a statement about the inspection
+        // rather than about the fixture.
+        let served = session.activate(false).await;
+        let served_registration = session.tool_request_intercept(&served);
+        assert!(
+            nemo_relay::plugin::active_plugin_report().is_some(),
+            "a serving activation is an active configuration"
+        );
+        let after_serving = session.invoke(&served_registration, 64 * 1024).await;
+        assert!(
+            after_serving.result.is_ok(),
+            "a serving activation runs the registration: {after_serving:?}"
+        );
+    }
+
+    /// Inspecting twice reports the same thing twice.
+    ///
+    /// The second report is the one that shows the first left nothing behind: an
+    /// inspection that installed its callbacks would answer the second call from
+    /// a process the first call had already changed.
+    #[tokio::test]
+    async fn a_discovery_activation_reports_the_same_registrations_twice() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some(session) = FixtureSession::start(
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await
+        else {
+            eprintln!("the intercept fixture is missing; skipping the discovery case");
+            return;
+        };
+        let registration_ids = |outcome: &v1::ActivateOutcome| {
+            let Some(v1::activate_outcome::Result::Activated(response)) = &outcome.result else {
+                panic!("the fixture's registrations are reported: {outcome:?}");
+            };
+            response
+                .descriptors
+                .iter()
+                .flat_map(|descriptor| descriptor.registrations.iter())
+                .map(|registration| registration.registration_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        let first = session.activate(true).await;
+        let second = session.activate(true).await;
+        assert_eq!(
+            registration_ids(&first),
+            registration_ids(&second),
+            "one artifact inspected twice reports the same registrations"
+        );
+        assert!(
+            nemo_relay::plugin::active_plugin_report().is_none(),
+            "and neither inspection left a configuration behind"
+        );
+    }
+
+    /// The budget an operation carries is the size of the answer it may receive.
+    ///
+    /// Measured at the boundary: the answer at the budget is served, the answer
+    /// one byte above it is refused, and the refusal says that is what happened
+    /// rather than looking like a callback that declined to run.
+    #[tokio::test]
+    async fn an_answer_larger_than_the_operations_budget_is_refused() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some(session) = FixtureSession::start(
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await
+        else {
+            eprintln!("the intercept fixture is missing; skipping the budget case");
+            return;
+        };
+        let served = session.activate(false).await;
+        let registration = session.tool_request_intercept(&served);
+
+        let answered = session.invoke(&registration, 64 * 1024).await;
+        assert!(answered.result.is_ok(), "the registration answers");
+        let wire =
+            nemo_relay_plugin_proto::convert::execution_outcome_to_wire(&answered, "operation-1")
+                .expect("the answer's wire form");
+        let size = nemo_relay_plugin_proto::convert::invoke_outcome_encoded_len(&wire) as u32;
+        assert!(size > 1, "an answer is at least a message: {size}");
+
+        let at_budget = session.invoke(&registration, size).await;
+        assert!(
+            at_budget.result.is_ok(),
+            "an answer exactly at its operation's budget is served: {at_budget:?}"
+        );
+
+        let above_budget = session.invoke(&registration, size - 1).await;
+        match above_budget.result {
+            Err(failure) => assert!(
+                matches!(failure.code, PluginFailureCode::OversizedFrame { .. }),
+                "the refusal names the budget that was exceeded: {failure:?}"
+            ),
+            Ok(_) => panic!("an answer one byte above its budget is refused"),
+        }
+
+        let below_budget = session.invoke(&registration, size + 1).await;
+        assert!(
+            below_budget.result.is_ok(),
+            "and one byte of headroom is enough: {below_budget:?}"
+        );
+    }
+
+    /// The credential authorises establishing a session; the capability
+    /// authorises using it.
+    ///
+    /// The operations that follow a handshake used to be authorised by naming
+    /// the session, and a session's name is what an attach announces. This is
+    /// the case that closes that: a peer that knows the socket, the credential's
+    /// disposition and the session's identity still may not call the session's
+    /// operations.
+    #[tokio::test]
+    async fn an_operation_that_presents_no_capability_is_refused() {
+        let (service, config) = service();
+        let session_id = establish(&service, &config).await;
+        let inspection = |capability: Option<&str>| {
+            let message = v1::InspectRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                handle: None,
+            };
+            match capability {
+                Some(capability) => with_capability(message, capability),
+                None => Request::new(message),
+            }
+        };
+
+        // A request that presents nothing is refused, and refused as a result
+        // rather than as a channel failure: the kernel has to be able to read it.
+        let unnamed = service
+            .inspect(inspection(None))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&unnamed)
+            .expect("a converted inspection");
+        assert!(
+            outcome.into_result().is_err(),
+            "an operation that presents no capability is refused"
+        );
+
+        // Another session's capability is not this session's, and the length of
+        // the value is not what makes it one: a well-formed value from elsewhere
+        // is refused for being the wrong value.
+        let elsewhere = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let stranger = service
+            .inspect(inspection(Some(elsewhere)))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&stranger)
+            .expect("a converted inspection");
+        assert!(
+            outcome.into_result().is_err(),
+            "an operation presenting another capability is refused"
+        );
+
+        // And the session's own capability is what the operation wanted.
+        let admitted = service
+            .inspect(inspection(Some(TEST_CAPABILITY)))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&admitted)
+            .expect("a converted inspection");
+        let admitted = outcome.into_result();
+        assert!(
+            admitted.is_ok(),
+            "the session's own capability is admitted: {admitted:?}"
+        );
+    }
+
+    /// A session cannot be established on a capability the kernel did not mint.
+    ///
+    /// A host that accepted a handshake with no capability would open a session
+    /// that nobody could authorise calls on, which is the state this exists to
+    /// make impossible.
+    #[tokio::test]
+    async fn a_handshake_without_a_capability_establishes_nothing() {
+        let (service, config) = service();
+        let refused = service
+            .handshake(Request::new(handshake_request(&config)))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        let outcome = handshake_outcome_from_wire(&refused).expect("a converted handshake");
+        assert!(
+            outcome.into_result().is_err(),
+            "a handshake that presents no capability is refused"
+        );
+
+        // A value that is not the shape a capability is gets the same answer, so
+        // a peer cannot pick its own strength by sending a shorter value.
+        let short = service
+            .handshake(with_capability(handshake_request(&config), "0f"))
+            .await
+            .expect("a served handshake")
+            .into_inner();
+        let outcome = handshake_outcome_from_wire(&short).expect("a converted handshake");
+        assert!(outcome.into_result().is_err(), "a short value is refused");
+
+        // The host served no session, so nothing else can be asked of it either.
+        let after = service
+            .inspect(capable(v1::InspectRequest {
+                session_id: "session-1".into(),
+                context: Some(context()),
+                handle: None,
+            }))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let outcome = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&after)
+            .expect("a converted inspection")
+            .into_result();
+        assert!(outcome.is_err(), "{outcome:?}");
+    }
+
+    /// A second transport is authorised the way the first one was.
+    ///
+    /// The attach presents the credential, so it already has to come from
+    /// whoever started the host. It presents the capability too, because a
+    /// transport that could join a session with the credential alone would make
+    /// the capability a property of the handshake rather than of the session.
+    #[tokio::test]
+    async fn an_attach_that_presents_no_capability_is_refused() {
+        let (service, config) = service();
+        let session_id = establish(&service, &config).await;
+        let attach = |capability: Option<&str>| {
+            let message = attach_request(&config, &session_id);
+            match capability {
+                Some(capability) => with_capability(message, capability),
+                None => Request::new(message),
+            }
+        };
+
+        for capability in [
+            None,
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdff"),
+        ] {
+            let refused = service
+                .attach(attach(capability))
+                .await
+                .expect("a served attach")
+                .into_inner();
+            let outcome = nemo_relay_plugin_proto::convert::attach_outcome_from_wire(&refused)
+                .expect("a converted attach");
+            assert!(
+                outcome.into_result().is_err(),
+                "an attach presenting {capability:?} is refused"
+            );
+        }
+
+        let admitted = service
+            .attach(attach(Some(TEST_CAPABILITY)))
+            .await
+            .expect("a served attach")
+            .into_inner();
+        let attached = nemo_relay_plugin_proto::convert::attach_outcome_from_wire(&admitted)
+            .expect("a converted attach")
+            .into_result();
+        assert!(
+            attached.is_ok(),
+            "the session's own capability attaches: {attached:?}"
+        );
     }
 }

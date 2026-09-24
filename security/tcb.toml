@@ -119,7 +119,13 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 [limits.nemo-relay]
 max_direct_dependencies = 40
 max_transitive_packages = 265
-max_source_lines = 73640
+# Raised for the exact-registration entry points the process boundary calls —
+# `invoke_tool_execution_intercept_registration`,
+# `invoke_llm_execution_intercept_registration`, and the name-retaining registry
+# merge behind them, which are what let a hosted plugin's callback resume a chain
+# position that lives in this process. No `unsafe` moved with it, and no
+# dependency did either: the kernel gained API surface, not reach.
+max_source_lines = 73884
 max_unsafe_occurrences = 299
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
@@ -238,12 +244,26 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # why it now carries a gRPC stack: the transport client is on the kernel's side
 # of the boundary and the transport server on the host's, and both live here
 # until the host becomes its own package.
+#
+# Budget raise (native-plugin process boundary, hardening): the code that
+# implements the boundary grew, which is the direction the milestone expects —
+# this crate is the destination the loader moves to, not the kernel. The
+# continuation machinery is now shared by the tool and provider families, so the
+# second family cost a tagged position and an arm rather than a second mechanism. Four direct
+# dependencies arrived with it: `getrandom` for the 256-bit session capability,
+# `subtle` for the comparison that must not leak it, `rustix` for the resource
+# ceilings applied between `fork` and `exec`, and `futures-util` for catching a
+# panic in a resumed chain rather than letting the request disappear. The second
+# `unsafe` token is that `pre_exec`, which is unsafe by construction: it runs in
+# the forked child, allocates nothing, and takes no locks. The transitive set is
+# unchanged, so nothing new was pulled in behind them. Both counts leave the
+# kernel-process figure when the loader does.
 [limits.nemo-relay-plugin-host]
-max_direct_dependencies = 11
+max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 8561
-max_unsafe_occurrences = 1
-direct_dependency_digest = "e574bc35ea7d5125d68be653e523a40e40b76504458db28a90b94ccdfc786f0f"
+max_source_lines = 11436
+max_unsafe_occurrences = 2
+direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
 
 # The wire schema. Measured because it is shipped and because its transitive set
@@ -252,7 +272,11 @@ transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9e
 [limits.nemo-relay-plugin-proto]
 max_direct_dependencies = 4
 max_transitive_packages = 108
-max_source_lines = 4287
+# Raised for the two helpers that measure an answer against its operation's
+# budget — `invoke_outcome_encoded_len` and `check_invoke_outcome_budget` — which
+# both sides of the boundary call so a response budget is one measurement rather
+# than two that can disagree.
+max_source_lines = 4366
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"

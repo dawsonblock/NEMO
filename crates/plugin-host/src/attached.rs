@@ -52,6 +52,13 @@ pub struct ConnectionDescriptor {
     pub session_id: String,
     /// Frame limit the session negotiated.
     pub maximum_frame_bytes: u32,
+    /// What this session's operations have to present.
+    ///
+    /// The credential says which host this is; the capability says this
+    /// transport may use the session. Both travel together because a second
+    /// transport is not a lesser one: it is authorised the same way the first
+    /// one was.
+    pub capability: String,
 }
 
 impl ConnectionDescriptor {
@@ -63,6 +70,21 @@ impl ConnectionDescriptor {
         self.maximum_frame_bytes = MAX_FRAME_BYTES;
         self
     }
+}
+
+/// A request carrying the capability this session's operations have to present.
+///
+/// A second transport presents the same capability the first one did, in the
+/// same place: the header is read before the message, so a request that named a
+/// session in its body could not also claim one in its metadata.
+fn capable<T>(message: T, capability: &str) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        crate::capability::SESSION_CAPABILITY_HEADER,
+        tonic::metadata::MetadataValue::try_from(capability)
+            .expect("a capability is ASCII hex, and so is a valid header value"),
+    );
+    request
 }
 
 /// A transport attached to a session, and the invocations it can serve.
@@ -93,12 +115,15 @@ impl AttachedClient {
             .max_decoding_message_size(descriptor.maximum_frame_bytes as usize)
             .max_encoding_message_size(descriptor.maximum_frame_bytes as usize);
         let outcome = client
-            .attach(v1::AttachRequest {
-                session_id: descriptor.session_id.clone(),
-                session_credential: descriptor.session_credential.clone(),
-                runtime_binding_digest: descriptor.runtime_binding_digest.clone(),
-                protocol_version: u32::from(PROTOCOL_VERSION),
-            })
+            .attach(capable(
+                v1::AttachRequest {
+                    session_id: descriptor.session_id.clone(),
+                    session_credential: descriptor.session_credential.clone(),
+                    runtime_binding_digest: descriptor.runtime_binding_digest.clone(),
+                    protocol_version: u32::from(PROTOCOL_VERSION),
+                },
+                &descriptor.capability,
+            ))
             .await
             .map_err(|status| {
                 unavailable(format!("the off-path transport did not attach: {status}"))
@@ -167,7 +192,7 @@ impl AttachedClient {
         let mut client = self.client.clone();
         let sent = tokio::time::timeout(
             std::time::Duration::from_millis(budget),
-            client.invoke(wire),
+            client.invoke(capable(wire, &self.descriptor.capability)),
         )
         .await;
         match sent {

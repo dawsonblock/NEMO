@@ -15,8 +15,9 @@
 //! is being qualified is the path, not the callback.
 
 use nemo_relay_plugin::{
-    ConfigDiagnostic, Json, LlmRequestInterceptOutcome, NativePlugin, PluginContext, Result,
-    nemo_relay_plugin,
+    CategoryProfile, ConfigDiagnostic, EventCategory, Json, LlmRequestInterceptOutcome,
+    NativePlugin, PendingMarkSpec, PluginContext, Result, ToolExecutionInterceptOutcome,
+    ToolExecutionResult, nemo_relay_plugin,
 };
 use serde_json::{Map, json};
 
@@ -31,6 +32,21 @@ pub const SANITIZE_REQUEST_MARKER: &str = "native_tool_request_sanitize";
 
 /// Marker a sanitized response payload carries.
 pub const SANITIZE_RESPONSE_MARKER: &str = "native_tool_response_sanitize";
+
+/// Marker the execution intercept adds to the arguments it passes downstream.
+pub const EXECUTION_REQUEST_MARKER: &str = "native_intercept_execution_request";
+
+/// Marker the execution intercept adds to the result the call returned.
+pub const EXECUTION_MARKER: &str = "native_intercept_execution";
+
+/// Marker the LLM execution intercept adds to the request it passes downstream.
+pub const LLM_EXECUTION_REQUEST_MARKER: &str = "native_intercept_llm_execution_request";
+
+/// Marker the LLM execution intercept adds to the response the call returned.
+pub const LLM_EXECUTION_MARKER: &str = "native_intercept_llm_execution";
+
+/// The mark the execution intercept asks the call's owner to emit.
+pub const EXECUTION_PENDING_MARK: &str = "fixture.intercept.tool_execution.mark";
 
 struct InterceptPlugin;
 
@@ -148,6 +164,97 @@ impl NativePlugin for InterceptPlugin {
                 Ok(LlmRequestInterceptOutcome::new(request, annotated))
             },
         )?;
+        // The class that wraps the call rather than answering one. It marks the
+        // arguments it passes downstream and the result that comes back, so both
+        // halves of a continuation are visible from the caller: the request
+        // marker proves the rewritten arguments reached the downstream call, and
+        // the result marker proves the downstream answer came back to the plugin.
+        ctx.register_tool_execution_intercept("fixture_intercept_execution", 0, {
+            |_name, args, next| {
+                Box::pin(async move {
+                    let mut args = args;
+                    if let Json::Object(object) = &mut args {
+                        object.insert(EXECUTION_REQUEST_MARKER.into(), json!(true));
+                    }
+                    // Three shapes the boundary has to carry, chosen by the
+                    // caller rather than by the fixture: an intercept that
+                    // replaces the call, one that runs it twice, and one that
+                    // runs it and then fails.
+                    let replace = args
+                        .get("skip_next")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false);
+                    let concurrent = args
+                        .get("use_concurrent_next")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false);
+                    let fail_after = args
+                        .get("fail_after_next")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false);
+                    let mut result = if replace {
+                        // No continuation at all: the plugin decided the result
+                        // itself, and nothing downstream is entered.
+                        ToolExecutionResult::new(json!({ "replaced_by_plugin": true }))
+                    } else if concurrent {
+                        let first_next = next.clone();
+                        let (first, second) =
+                            tokio::join!(first_next.call(args.clone()), next.call(args));
+                        first?;
+                        second?
+                    } else {
+                        next.call(args).await?
+                    };
+                    if fail_after {
+                        return Err("the fixture fails after its continuation".into());
+                    }
+                    if let Json::Object(object) = &mut result.result {
+                        object.insert(EXECUTION_MARKER.into(), json!(true));
+                    }
+                    // A mark the intercept asks the *call's* owner to emit, rather
+                    // than one it emits itself: the call lives in the kernel, so
+                    // the request has to travel back with the outcome.
+                    Ok(ToolExecutionInterceptOutcome::from(result).with_pending_mark(
+                        PendingMarkSpec::builder()
+                            .name(EXECUTION_PENDING_MARK)
+                            .category(EventCategory::custom())
+                            .category_profile(CategoryProfile {
+                                subtype: Some("fixture.intercept.tool_execution".into()),
+                                ..CategoryProfile::default()
+                            })
+                            .data(json!({ "source": "fixture_intercept_execution" }))
+                            .build(),
+                    ))
+                })
+            }
+        })?;
+        // The provider half of the same class. What differs from the tool one is
+        // only the shape that travels — a request down, a response back — so it is
+        // the same continuation machinery on the other side.
+        ctx.register_llm_execution_intercept("fixture_intercept_llm_execution", 0, {
+            |_name, mut request, next| {
+                Box::pin(async move {
+                    if let Json::Object(content) = &mut request.content {
+                        content.insert(LLM_EXECUTION_REQUEST_MARKER.into(), json!(true));
+                    }
+                    let replace = request
+                        .content
+                        .get("skip_next")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false);
+                    let mut response = if replace {
+                        // No continuation: the plugin decided the answer itself.
+                        json!({ "replaced_by_plugin": true })
+                    } else {
+                        next.call(request).await?
+                    };
+                    if let Json::Object(object) = &mut response {
+                        object.insert(LLM_EXECUTION_MARKER.into(), json!(true));
+                    }
+                    Ok(response)
+                })
+            }
+        })?;
         ctx.register_tool_request_intercept(
             "fixture_intercept_rewrite",
             0,

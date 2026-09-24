@@ -1002,6 +1002,43 @@ pub fn load_response_from_wire(
     })
 }
 
+/// The size an invocation outcome will occupy on the wire.
+///
+/// A response budget is a budget only if something measures what crosses, so
+/// this is the measurement both sides use: the host before it answers, and the
+/// kernel before it accepts an answer. Measuring the message rather than the
+/// transport keeps the two counts identical, which is what makes a boundary in
+/// one place and a boundary in the other the same boundary.
+pub fn invoke_outcome_encoded_len(outcome: &v1::InvokeOutcome) -> usize {
+    prost::Message::encoded_len(outcome)
+}
+
+/// Refuse an answer larger than the operation's own response budget.
+///
+/// The protocol's frame limit bounds what the transport can carry; this bounds
+/// what one operation was allowed to return. A response that fits the frame
+/// limit and exceeds its budget is still an oversized response, and accepting it
+/// would leave the caller's budget as advice.
+pub fn check_invoke_outcome_budget(
+    outcome: &v1::InvokeOutcome,
+    max_response_bytes: u32,
+) -> Result<(), PluginProtocolError> {
+    let observed = invoke_outcome_encoded_len(outcome) as u64;
+    if observed > u64::from(max_response_bytes) {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::OversizedFrame {
+                observed,
+                limit: max_response_bytes,
+            },
+            format!(
+                "the invocation answered with {observed} bytes, above the \
+                 {max_response_bytes} bytes its operation was allowed"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Convert a domain outcome into its wire form.
 ///
 /// The previous form took a bare success value and manufactured `NotDispatched`
@@ -4216,5 +4253,47 @@ mod tests {
             code,
             message: "the consumer went away".into(),
         }
+    }
+
+    /// A response budget is a limit on what crosses, so the boundary cases are
+    /// the ones that decide whether it is enforced: the answer at the budget is
+    /// within it, and the answer one byte above it is not.
+    #[test]
+    fn an_invocation_answer_is_measured_against_its_operations_budget() {
+        let answer = v1::InvokeOutcome {
+            dispatch_state: v1::DispatchState::NotDispatched as i32,
+            outcome_certainty: v1::OutcomeCertainty::ConfirmedSuccess as i32,
+            result: Some(v1::invoke_outcome::Result::Output("a".repeat(1_000))),
+            operation_request_id: "operation-1".into(),
+        };
+        let size = invoke_outcome_encoded_len(&answer) as u32;
+        assert!(
+            size > 1_000,
+            "the measurement covers the message, not only its payload: {size}"
+        );
+
+        assert!(
+            check_invoke_outcome_budget(&answer, size).is_ok(),
+            "an answer exactly at the budget is within it"
+        );
+        assert!(
+            check_invoke_outcome_budget(&answer, size + 1).is_ok(),
+            "an answer under the budget is within it"
+        );
+
+        let refusal = check_invoke_outcome_budget(&answer, size - 1)
+            .expect_err("an answer one byte above the budget");
+        assert_eq!(
+            refusal.failure.code,
+            PluginFailureCode::OversizedFrame {
+                observed: u64::from(size),
+                limit: size - 1,
+            },
+            "the refusal carries what was measured and what it was measured against"
+        );
+
+        // A budget of one byte refuses every message, which is a limit and not a
+        // special case: the smallest outcome is still an outcome with a name.
+        assert!(check_invoke_outcome_budget(&answer, 1).is_err());
     }
 }

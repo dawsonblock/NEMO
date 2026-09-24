@@ -53,7 +53,7 @@ use crate::codec::request::AnnotatedLlmRequest;
 use crate::codec::response::AnnotatedLlmResponse;
 use crate::context::registries::{
     merge_event_metadata_injector_entries, merge_execution_intercept_callables,
-    merge_guardrail_entries, merge_intercept_entries,
+    merge_execution_intercept_entries, merge_guardrail_entries, merge_intercept_entries,
 };
 use crate::error::FlowError;
 use crate::json::{Json, merge_json};
@@ -1280,6 +1280,46 @@ impl NemoRelayContextState {
             &self.tool_request_intercepts,
             scope_locals,
             RuntimeRegistrationKind::ToolRequestIntercept,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    /// Snapshot the tool execution intercepts visible to the calling scope.
+    ///
+    /// Entries rather than callables, because the caller here runs exactly one
+    /// registration *by name*: the dynamic-plugin boundary holds registrations
+    /// that were made in another process, and the invocation it receives names
+    /// the one it means. A callable alone would not say which name it answers
+    /// for.
+    pub(crate) fn tool_execution_intercept_entries(
+        &self,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<ToolExecutionFn>>],
+    ) -> Vec<ExecutionIntercept<ToolExecutionFn>> {
+        merge_execution_intercept_entries(
+            &self.tool_execution_intercepts,
+            scope_locals,
+            RuntimeRegistrationKind::ToolExecutionIntercept,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    /// Snapshot the LLM execution intercepts visible to the calling scope.
+    ///
+    /// The tool entry point's twin, for the same reason: a hosted plugin runs
+    /// exactly one registration by name, and a callable does not know the name it
+    /// answers for.
+    pub(crate) fn llm_execution_intercept_entries(
+        &self,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmExecutionFn>>],
+    ) -> Vec<ExecutionIntercept<LlmExecutionFn>> {
+        merge_execution_intercept_entries(
+            &self.llm_execution_intercepts,
+            scope_locals,
+            RuntimeRegistrationKind::LlmExecutionIntercept,
         )
         .into_iter()
         .cloned()

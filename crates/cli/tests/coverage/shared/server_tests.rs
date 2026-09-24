@@ -5767,3 +5767,161 @@ async fn a_named_upstream_redirect_is_not_followed() {
 
     redirector.abort();
 }
+
+/// The native fixture the CLI can load through a host process.
+///
+/// `None` when the fixture or the host binary is not built, which is a run that
+/// says so rather than one that passes for the wrong reason — the same shape the
+/// plugin-host suite uses for its own fixture.
+fn native_intercept_fixture() -> Option<(std::path::PathBuf, String)> {
+    let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                "../../target/test-plugin-fixtures/debug/\
+                 libnemo_relay_native_intercept_fixture.dylib",
+            )
+        });
+    if !library.exists() {
+        eprintln!("the native intercept fixture is missing; skipping the CLI host case");
+        return None;
+    }
+    // The composition resolves this the same way in production; asking it here
+    // means the test skips for the same reason a deployment would fail, rather
+    // than asserting a path this file chose.
+    let supervisor =
+        nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig::beside_this_executable(
+            "cli-test-binding",
+        );
+    if !supervisor.executable.exists() {
+        eprintln!(
+            "the plugin host binary is missing at '{}'; skipping the CLI host case",
+            supervisor.executable.display()
+        );
+        return None;
+    }
+    let directory = tempfile::tempdir().expect("a manifest directory");
+    let manifest = directory.path().join("relay-plugin.toml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "manifest_version = 1\n\n[plugin]\nid = \"fixture_intercept\"\nkind = \
+             \"rust_dynamic\"\n\n[compat]\nrelay = \"={}\"\nnative_api = \
+             \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = \
+             [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \
+             \"nemo_relay_native_intercept_fixture\"\n",
+            env!("CARGO_PKG_VERSION"),
+            library.display()
+        ),
+    )
+    .expect("write the manifest");
+    let artifact = manifest.to_string_lossy().into_owned();
+    // The temporary directory is kept alive by the returned guard alongside the
+    // artifact it describes.
+    Some((directory.keep(), artifact))
+}
+
+/// A production consumer now uses the isolated backend.
+///
+/// This is the cutover asserted from the outside: the CLI activates a native
+/// plugin, the plugin's registration answers through the kernel's own chain, and
+/// the library that answered is **not** loaded into this process. The last fact
+/// is what the in-process path could not say — it registered the plugin's kind
+/// here, because here is where the callbacks were.
+#[tokio::test]
+async fn cli_activation_serves_a_native_plugin_from_another_process() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _ = nemo_relay::plugin::clear_plugin_configuration();
+    let Some((directory, artifact)) = native_intercept_fixture() else {
+        return;
+    };
+
+    let activation = PluginActivation::initialize(
+        None,
+        vec![ActiveDynamicPluginComponent {
+            plugin_id: "fixture_intercept".into(),
+            kind: DynamicPluginKind::RustDynamic,
+            lifecycle_generation: 1,
+            manifest_ref: Some(artifact),
+            environment_ref: None,
+            config: Map::new(),
+            activation_snapshot: None,
+        }],
+    )
+    .await
+    .expect("a native plugin the CLI can serve");
+    assert!(activation.active);
+
+    // The plugin is loaded somewhere, and that somewhere is not here: the
+    // in-process loader registers the plugin's kind in this process's registry,
+    // so a kind that is present would say the library is mapped into the CLI.
+    let kinds = nemo_relay::plugin::list_plugin_kinds();
+    assert!(
+        !kinds.iter().any(|kind| kind == "fixture_intercept"),
+        "the CLI process must not have loaded the plugin: {kinds:?}"
+    );
+    assert!(
+        activation
+            .native
+            .as_ref()
+            .and_then(|native| native.backend().process_id())
+            .is_some(),
+        "the plugin lives in a host process"
+    );
+    assert!(
+        !activation
+            .native
+            .as_ref()
+            .expect("a native composition")
+            .handles()
+            .is_empty(),
+        "and it is loaded there"
+    );
+
+    // The registration answers through this runtime's chain, which is what makes
+    // the composition a plugin the CLI serves rather than one it merely hosts.
+    let rewritten = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_request_intercepts(
+                "cli_native_tool",
+                json!({"input": true}),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("the chain reaches the child");
+    assert_eq!(
+        rewritten["native_intercept"], true,
+        "the rewrite came from the plugin process: {rewritten}"
+    );
+
+    // Dropping the composition takes its proxies with it: the chain is this
+    // runtime's again, and the host does not outlive it.
+    activation.clear().expect("a clean teardown");
+    let after = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_request_intercepts(
+                "cli_native_tool",
+                json!({"input": true}),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("the chain after teardown");
+    assert_eq!(
+        after["native_intercept"],
+        Value::Null,
+        "the remote registration left with the composition: {after}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}

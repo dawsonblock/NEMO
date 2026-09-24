@@ -191,6 +191,7 @@ version = "0.0.0"
 dependencies = [
  "nemo-relay-plugin",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

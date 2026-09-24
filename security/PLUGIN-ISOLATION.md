@@ -11,12 +11,23 @@ in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
 surface, and `just tcb-report` prints the number this milestone is judged on:
 
 ```
-kernel-process unsafe tokens: 621
+kernel-process unsafe tokens: 622
 ```
 
 `just tcb-report` checks that figure against the measurement rather than
 trusting this paragraph: a revision of this document said 617 here and 621 forty
 lines later, which is what a hand-maintained number does.
+
+The figure reads 622 rather than 621 because the boundary gained one `unsafe`
+block: the supervisor applies the host's resource ceilings between `fork` and
+`exec`, which is `pre_exec`, which is unsafe by construction. It is one call
+that allocates nothing and takes no locks, it lives in the crate that is the
+*east* side of the boundary rather than the kernel proper, and it is counted
+here because that crate is still linked into the kernel's process today — the
+same accounting that puts this crate in `[in_process]` and `[plugin_host]` at
+once. The measured line budget moved with it, and with the kernel-side entry
+point the boundary needs; both raises are recorded with their reasons in
+`security/tcb.toml`.
 
 Moving the loader into another Rust crate would improve the source layout and
 leave that number unchanged, because a memory-corruption bug in the loader would
@@ -143,6 +154,174 @@ backend rather than to a re-export, because it is the only external caller of
   conformance runs against both backends until the in-process one is removed.
 - `kernel-process unsafe tokens` falls. The milestone is judged on that number
   in `just tcb-report`, not on the tier total and not on crate relocation.
+
+## Current state
+
+This section is the authoritative statement of what the tree does today. The
+rest of this document is the engineering journal that produced it, and sections
+below that describe work as unfinished are describing the moment they were
+written, not this one. Where the two disagree, this section is right.
+
+**What crosses the boundary now.** Ten registration classes, listed in
+`ProcessPluginBackend::supported_registration_operations` and each paired with
+the kernel-side proxy that makes it true: tool request intercept, LLM request
+intercept, subscriber, event metadata injector, tool and LLM conditional
+execution guardrails, the tool sanitize request/response guardrails, and the tool
+and LLM execution intercepts. A plugin registering anything else is refused
+**whole** at activation, after the register callbacks have run and before the
+kernel is told anything was served. Not yet crossing: mark and scope sanitizers,
+the LLM sanitizers, and every streaming family.
+
+
+That list is the price of the cutover rather than a detail of it: a plugin that
+registered a class in the second group used to work in the CLI and no longer
+activates there, because serving half a plugin would be worse than refusing it.
+The two halves are pinned by a test so the gap cannot quietly become a claim.
+
+**The continuation, for the classes that wrap a call.** An execution intercept is
+the family whose answer is not the whole answer: the plugin decides *when* the
+rest of the chain runs, and the rest of the chain is the kernel's. The kernel therefore holds its position for the operation while the
+intercept runs (`crates/plugin-host/src/continuations.rs`) and resumes it when the
+host asks, over the `Continue` RPC the protocol already defined. What that buys:
+
+- the ABI's own rule for `next` — callable repeatedly and concurrently while the
+  intercept runs, refused once it settles — is enforced by the chain the kernel
+  parked, so a remote intercept sees exactly what an in-process one sees;
+- a continuation for an operation nothing is holding is refused rather than
+  resumed at the wrong position, which covers both "no such operation" and "the
+  intercept already returned";
+- what the plugin returns travels back whole: the result it decided on, plus the
+  marks it asked for, which the kernel emits with the ones the continuation
+  produced, in the order the in-process chain would have used.
+
+The tool and provider halves are deliberately the same mechanism rather than two:
+one parked position per operation, one unary resume, one set of budget, panic and
+lexical rules. What differs is the shape that travels — arguments and a result, or
+a request and a response — and which family a position belongs to travels in the
+entry rather than on the wire, so a resume shaped for the wrong family is refused
+by the position it addresses instead of by a discriminator a peer could set wrong.
+
+`a_tool_execution_intercept_wraps_a_call_across_the_boundary` and
+`an_llm_execution_intercept_wraps_a_call_across_the_boundary` drive the mechanism
+from both sides, `a_wrapped_call_can_be_replaced_run_twice_or_failed_after` covers
+the shapes the ABI allows — a plugin that answers without continuing, one that
+continues twice, one that fails after the call it wrapped — and
+`a_continuation_of_the_wrong_shape_is_refused` covers the mismatch the shared wire
+makes possible.
+
+**What a session is authorised by.** Two secrets, checked at different moments:
+a per-session credential passed out of band at spawn, which authorises
+establishing the session, and a 256-bit capability the kernel mints, which every
+session-bound operation after it has to present. The capability exists because
+the operations used to be authorised by naming the session, and a session's name
+is what an attach announces — a peer that could reach the socket and learn the
+session could call it. `crates/plugin-host/src/capability.rs` owns the minting
+and the constant-time comparison; `SESSION_CAPABILITY_HEADER` carries it on the
+handshake, the attach and every operation that reads or changes session state.
+Both refusals are structured outcomes rather than transport failures, so the
+kernel can tell "the host said no" from "the channel broke".
+
+**What keeps a host from outliving its kernel.** The supervisor kills the child when
+it drops, and that is not enough on its own: a reference to the composition can be
+released a moment after the drop, and a process that exits inside that window
+leaves a host holding a socket nobody reads. The supervisor therefore opens a pipe
+for the child and keeps the write end for the session's life, and the host exits
+when that pipe closes — so a kernel that exits, crashes or is killed ends its host
+whether or not any teardown ran. `a_host_exits_when_its_kernel_goes_away` starts a
+host the way the supervisor does and abandons it the way a dead kernel does.
+
+**What the host process is bounded by.** `PluginHostLimits`, applied between
+`fork` and `exec` so nothing the plugin does afterwards can raise them: an
+address-space ceiling and a descriptor ceiling, both soft and hard, plus
+`no_new_privs` where the platform has it. The shipped defaults are 8 GiB of
+address space and 4096 descriptors, and the address-space ceiling is asked for
+only on Linux: macOS rejects that value with `EINVAL` and accepts no smaller one,
+so a macOS deployment bounds memory some other way. A limit the platform refuses
+is a host that does not start rather than a host that runs unbounded. Process
+count is deliberately unset — `RLIMIT_NPROC` counts the *user's* processes, so a
+value chosen without knowing the machine can stop the host from creating its own
+threads.
+
+**What is enforced rather than declared.** A per-operation `max_response_bytes`
+is measured, as the encoded form of the answer, by the host before it sends and
+by the kernel before it accepts; an answer over budget is refused with
+`OversizedFrame` naming the operation. Frame limits are negotiated once and
+carried by every transport: the kernel offers what it is configured for, the
+host answers with the smaller of that and its own limit, and the session keeps
+`min(kernel, host, protocol ceiling)`. Discovery — asking what a plugin would
+register — activates under a guard that clears the configuration on every exit
+path, so inspection leaves the process as it found it. Forwards of plugin marks
+travel on a bounded queue whose capacity is host configuration, and a full queue
+fails the mark rather than growing the host's heap.
+
+**What is not true yet.** The three blockers, stated plainly:
+
+1. **Three consumers still select the in-process loader.** The CLI has cut over:
+   `crates/cli/src/server/mod.rs` composes `ProcessLoadedPlugins`, the native
+   plugin's register callbacks run in the host process, and
+   `cli_activation_serves_a_native_plugin_from_another_process` asserts both that
+   the registration answers through the CLI's chain and that the plugin's kind is
+   absent from the CLI's own registry — the fact the in-process path could not
+   state. FFI, Node and Python still call
+   `PluginHostActivation::activate_with_discovered_config`, so the TCB number has
+   not moved yet: the loader is still in the kernel's dependency graph until the
+   last of them stops reaching it.
+   Their cutover is blocked on **registration coverage**, not on their
+   composition: a plugin that registers any class the boundary cannot serve is
+   refused *whole*, and the fixture all three suites load — and the shape a real
+   plugin takes — registers all sixteen classes. The boundary serves ten:
+
+   | served | not served |
+   |---|---|
+   | tool request intercept | LLM stream execution intercept |
+   | LLM request intercept | mark sanitize guardrail |
+   | subscriber | scope sanitize start guardrail |
+   | event metadata injector | scope sanitize end guardrail |
+   | tool conditional execution guardrail | LLM sanitize request guardrail |
+   | LLM conditional execution guardrail | LLM sanitize response guardrail |
+   | tool sanitize request guardrail | — |
+   | tool sanitize response guardrail | — |
+   | tool execution intercept | — |
+   | LLM execution intercept | — |
+
+   `the_boundary_serves_a_named_subset_of_the_registration_surface` in
+   `crates/plugin-host/tests/architecture.rs` pins both halves. The tool execution
+   intercept was the first to move: it needed the kernel to hold a suspended
+   chain position and resume it when the host asked, which is what
+   `crates/plugin-host/src/continuations.rs` and the `Continue` RPC now do. The
+   LLM execution intercept should reuse that machinery; the streaming one needs
+   more (ordering, backpressure, half-close, cancellation, terminal states), and
+   the remaining five need shapes of their own plus a core entry point that runs
+   exactly one registration of that class.
+
+   **This is a consequence of the CLI cutover too, and it is deliberate rather
+   than incidental.** A plugin that registers one of the eight unserved classes
+   used to work in the CLI and is now refused at activation, with the refusal
+   naming the classes it could not serve. That is the trade the acceptance gates
+   chose — "unsupported registrations fail closed" — and it is the reason the
+   remaining families are now on the critical path rather than after it.
+
+   When coverage does reach the fixture's shape, the three consumers still need
+   one thing the CLI did not: a decision about where the host executable lives
+   for an installed wheel or npm package. `PluginHostSupervisorConfig` resolves it
+   from `NEMO_RELAY_PLUGIN_HOST`, then beside the running process, then one
+   directory above it (which is where a cargo test harness finds the binary it
+   exercises) — enough for source-first consumers, and not enough for a wheel,
+   which would have to ship the binary inside the package and point this at it.
+2. **The transport is Unix-only.** `crates/plugin-host`'s socket paths use
+   `tokio::net::UnixStream` and `UnixListener` directly, with no `cfg` boundary,
+   while `just test-rust` builds the workspace on Windows runners. A named-pipe
+   backend behind one transport seam is what closes this; it is not written.
+3. **There is no sandbox.** Address-space and descriptor limits bound what one
+   host takes from the machine. They do not bound what a plugin may read, write
+   or connect to, and there is no seccomp, Landlock, `no_new_privs`-plus-
+   filesystem profile, or network policy. The threat model this code supports is
+   *trusted native plugin, unreliable implementation*; a plugin that is assumed
+   hostile needs the platform mechanisms this document has not adopted.
+
+The measurements that decide the milestone live in `just tcb-report`; the
+evidence for the claims above lives in the tests named next to the code, which
+is the only version of a claim that cannot go stale without CI saying so.
 
 ## Status
 
@@ -415,7 +594,7 @@ archaeology, and so the ordering constraints are not rediscovered by breaking th
 **What holds the metric up.** `libloading` reaches the kernel through exactly one
 edge, declared in `crates/core/Cargo.toml`. Behind it, `crates/core/src/plugin/dynamic/native.rs`
 is 6,455 lines with 280 `unsafe` occurrences, and core depends on
-`nemo-relay-plugin` for the ABI structs (252 more). Those two are 595 of the 621,
+`nemo-relay-plugin` for the ABI structs (252 more). Those two are 595 of the 622,
 so the number falls by the loader leaving rather than by any reclassification.
 
 **Why it cannot be done in pieces.** The loader calls core's runtime APIs to
@@ -439,12 +618,13 @@ and — through `PluginHostActivation` — the CLI, FFI, Node and Python. The fa
 is what those consumers call instead, and a crate implementing a core-owned trait
 has to depend on core, which is why this cannot be folded into step one.
 
-**Step three: production selects the process backend.** The CLI stops composing
-`LoadedPlugins` and the three bindings stop calling
-`activate_with_discovered_config`. This is the step the metric waits on: until
-shipped runtimes stop linking the loader, moving it changes a crate diagram and
-not an attack surface. It is also the step with three language test suites
-attached, and the one the cross-process tool call now qualifies.
+**Step three: production selects the process backend.** The CLI now composes
+`ProcessLoadedPlugins` and no longer loads a native artifact in its own process;
+the three bindings still call `activate_with_discovered_config`. This is the step
+the metric waits on: until shipped runtimes stop linking the loader, moving it
+changes a crate diagram and not an attack surface. It is also the step with three
+language test suites attached, and the one the cross-process tool call now
+qualifies.
 
 **Step four: re-measure and record.** Remove the moved crates from
 `[in_process]`, update `security/tcb.toml` and `security/BASELINE.md` with the
@@ -456,17 +636,21 @@ Still open, in the order they need closing:
 1. **Serving the read capabilities.** Diagnostics and registration reads are
    negotiated in the handshake but nothing serves them yet; deciding what they
    may return is the kernel's authorization step, not a conversion step.
-2. **Invocation, and the session channel behind it.** Nothing asks a host to
-   invoke anything yet: a loaded plugin registers into the runtime's own
-   machinery, so the lifecycle operations are the whole of what crosses today.
-   When invocation arrives it needs the duplex session — the state machine is
-   written and waiting for a driver, and the host needs its own bookkeeping for
-   the same invariants from the other side, because a host that trusted the
-   kernel to pace it would be trusting the side the boundary exists to distrust.
-   Restarting is explicit rather than automatic: a host that exits is reported
-   as `HostCrashed`, the backend can replace it, and the kernel decides whether
-   to keep using the replacement, because only the kernel knows what the
-   previous session was holding.
+2. **Invocation, and the session channel behind it.** *Written when invocation
+   did not exist; it does now, for nine classes — see the current state above.*
+   What that paragraph was waiting for has partly arrived: unary invocation
+   crosses for the classes the kernel can proxy, each with its own proxy and a
+   response budget that is measured on both sides, and the tool execution
+   intercepts have the continuation mechanism they needed
+   (`crates/plugin-host/src/continuations.rs` plus the `Continue` RPC), and the
+   provider family reuses the tool family's rather than adding one. What is still
+   missing is the rest of the duplex session: the streaming family plus the
+   completion and pull-stream vocabulary in
+   `crates/plugin-host/src/session.rs` still need a driver. The reasoning about restarting still
+   holds and is still implemented: a host that exits is reported as
+   `HostCrashed`, the backend can replace it, and the kernel decides whether to
+   keep using the replacement, because only the kernel knows what the previous
+   session was holding.
 
    The work decomposes into four pieces, in this order, because each needs the
    one before it:
@@ -503,10 +687,13 @@ Still open, in the order they need closing:
 3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
    architecture guard currently grandfathers by crate name.
 4. **Resource limits beyond process separation and the deadline.** The child
-   gets a filtered environment, its own socket directory and a kill at expiry;
-   memory, file and child limits, platform sandboxing and destination network
-   policy are not applied yet, and capabilities do not declare the profile they
-   need.
+   gets a filtered environment, its own socket directory and a kill at expiry.
+   Address-space and descriptor ceilings and `no_new_privs` are now applied
+   between `fork` and `exec` (`crates/plugin-host/src/limits.rs`). Still not
+   applied: a process-count limit that is safe to default, platform sandboxing,
+   destination network policy, and the declaration of which profile a plugin
+   needs — a plugin cannot yet say "I need to connect to this host" and have the
+   runtime grant it.
 5. **A production composition that states the managed caps.** The runtime now
    publishes a trusted budget on the real managed paths, and resolves it from
    the smallest of the inherited deadline, the durable lease expiry and the
@@ -524,7 +711,7 @@ After invocation, the cutover milestones are what move the metric: production
 selects the process backend and refuses the in-process one, the bindings stop
 reaching the loader at all, and the native loader and its `unsafe` leave the
 kernel's dependency graph. Only then does `kernel-process unsafe tokens` fall
-from 621, by the loader's own weight rather than by reclassification.
+from 622, by the loader's own weight rather than by reclassification.
 
 ## The process boundary
 
@@ -971,15 +1158,22 @@ proves the absence of a side effect rather than a stream of them — two attache
 return the same session identity, a second *handshake* is still refused (so an
 attach creates no room for a second session), and the loaded set is unchanged.
 
-**One limitation is recorded rather than hidden.** Attach authenticates the
-client, but a Tonic service cannot track which connection a later request arrived
-on, so later session-bound operations are still authorised by the session identity
-and the context, not by the transport. A peer that can open the socket and knows
-the session identity can therefore skip the attach. Closing that needs a
-transport token minted by the attach and required in the metadata of every
-session-bound request — a change to the primary client too, since the primary
-transport would have to attach before it could issue anything. It is named here
-as the follow-up rather than left as an implication of "attach exists".
+**One limitation was recorded rather than hidden, and is now closed.** Attach
+authenticates the client, but a Tonic service cannot track which connection a
+later request arrived on, so session-bound operations *were* authorised by the
+session identity and the context alone. A peer that could open the socket and
+learn the session identity could therefore skip the attach.
+
+The fix is the one this section predicted, with one change of hands: instead of
+the attach minting a token for the transports that follow it, the **kernel** mints
+the capability before the handshake, and the session requires it on every
+operation that reads or changes session state — load, unload, activate, inspect,
+invoke, health, session close and attach. The handshake is where the host learns
+it, so the token is a property of the session rather than of the transport that
+introduced it, and the primary client is authorised the same way a second one is
+rather than being an exception. See `crates/plugin-host/src/capability.rs`, and
+`an_operation_that_presents_no_capability_is_refused` plus the capability case in
+the second-transport test for the evidence.
 
 What remains, in order, once the attach exists: a connection descriptor the
 supervisor can hand out (endpoint, credential, session identity, negotiated
@@ -1045,33 +1239,32 @@ repository ships, because they are the plugins it actually has.
 
 | | |
 |---|---|
-| registered classes | 9 (tool + LLM request intercept, subscriber, tool request/response sanitize, tool + LLM conditional, metadata injector, and the refusing guardrail) |
-| remotely supported | 9 |
+| registered classes | 11 (tool + LLM request intercept, subscriber, tool and LLM sanitize, tool + LLM conditional, metadata injector, the refusing guardrail, and the tool and provider execution intercepts) |
+| remotely supported | 11 |
 | remaining blockers | **0** — it is fully servable today |
 
 `fixture_native` — the sixteen-surface fixture the in-process tests use:
 
 | | |
 |---|---|
-| registered classes | tool + LLM request intercepts, subscriber, metadata injector, mark and scope-start/end sanitizers, tool and LLM request/response sanitizers, tool + LLM conditional, tool execution intercept, LLM execution intercept, LLM stream execution intercept |
-| remotely supported | the eleven that are not sanitizers-of-marks-or-scopes, execution intercepts or stream intercepts |
-| remaining blockers | mark sanitize, scope-start sanitize, scope-end sanitize, tool execution intercept, LLM execution intercept, LLM stream execution intercept |
+| registered classes | 16 — one of every class the ABI exposes |
+| remotely supported | 10 (everything except the six named next) |
+| remaining blockers | 6 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response, LLM stream execution intercept |
 
 `examples/rust-native-plugin` — the plugin a reader is pointed at first:
 
 | | |
 |---|---|
-| registered classes | metadata injector, tool + LLM request intercepts, subscriber, mark and scope-start/end sanitizers, tool and LLM sanitize request/response, tool + LLM conditional, LLM execution intercept, LLM stream execution intercept |
-| remotely supported | the same eleven that are not mark/scope sanitizers, execution intercepts or stream intercepts |
-| remaining blockers | mark sanitize, scope-start sanitize, scope-end sanitize, LLM execution intercept, LLM stream execution intercept |
+| registered classes | 15: metadata injector, tool + LLM request intercepts, subscriber, mark and scope-start/end sanitizers, tool and LLM sanitize request/response, tool + LLM conditional, tool and LLM execution intercepts, LLM stream execution intercept |
+| remotely supported | 10 (everything except the six named next) |
+| remaining blockers | 6 — mark sanitize, scope-start sanitize, scope-end sanitize, LLM sanitize request, LLM sanitize response, LLM stream execution intercept |
 
-That is the number worth watching, and it is five rather than six: the example
-registers the mark and scope sanitizer families that the next increment covers plus
-two execution intercepts, and it registers *no* tool execution intercept. The
-distinction matters because the execution-intercept count is what decides whether
-duplex is on the path for a given plugin: this one needs the LLM execution and
-stream intercepts, so it is not servable without duplex work — whereas a plugin that
-registers only the first four categories is servable today.
+That is the number worth watching, and for the example it is six: three
+mark/scope sanitizers, two LLM sanitizers, and the streaming intercept. Both of its
+execution intercepts are servable now — the tool one and the provider one — so what
+it waits on is the sanitizer shapes and streaming. A plugin that registers only the
+classes in the supported list is servable today, and this one is one class away from
+being servable whole.
 
 So the answer to "which real plugin is closest to 100%" is the first one, and it is
 already there — which is worth stating plainly, because it means the *coverage*
@@ -1229,16 +1422,22 @@ per unit of added complexity* rather than protocol completeness.
 | LLM request intercept | yes | yes | yes | 7 | — |
 | tool conditional guardrail | `(name, Json) -> Option<String>` | yes | yes | 6 | — |
 | LLM conditional guardrail | `(LlmRequest) -> Option<String>` | yes | yes | 6 | — |
-| subscriber | event | no | no | 27 | one shared decision: what an event is on the wire, and what a remote observer's failure means |
-| event metadata injector | event | no | no | 4 | that same decision |
+| subscriber | event | yes | yes | 27 | — (the wire decision was made: `PluginObservedEvent`, and a remote observer's failure is recorded, never allowed to change the call it watched) |
+| event metadata injector | event → metadata map | yes | yes | 4 | — |
+| tool sanitize request/response guardrail | `(name, Json) -> Json` | yes | yes | 6 + 6 | — (the off-path transport landed; see the section above on the off-path client) |
 | mark sanitize guardrail | event | no | no | 9 | that same decision |
 | scope sanitize start/end guardrail | event | no | no | 6 + 6 | that same decision |
-| tool sanitize request/response guardrail | `(name, Json) -> Json` | no (hangs) | no (hangs) | 6 + 6 | an off-path transport: see below |
 | mark / scope sanitize guardrail | `(Arc<Event>, EventSanitizeFields) -> EventSanitizeFields` | no | no | 9 + 6 + 6 | the same, plus one field shape |
 | LLM sanitize request/response guardrail | codec-bearing context | no | no | 6 + 6 | codec identity on the wire |
-| event metadata injector | event → metadata map | yes | yes | 4 | — |
-| tool execution intercept | continuation | no | no | 11 | the duplex session: it wraps the call, so the child has to call back |
-| LLM execution intercept, stream intercept, continuations, completions, pull streams | continuation | no | no | 6 + 6 | the duplex session |
+| tool execution intercept | continuation | yes | yes | 11 | — (the kernel holds the suspended chain position and the `Continue` RPC resumes it) |
+| LLM execution intercept | continuation | yes | yes | 6 | — (the same machinery, tagged by family; the request and response shapes are the only difference) |
+| LLM stream intercept, continuations, completions, pull streams | continuation | no | no | 6 | the duplex session: streaming needs ordering, backpressure, half-close, cancellation and terminal states, which a unary resume does not express |
+
+The "yes" rows are not a claim about prose: each one is a class in
+`ProcessPluginBackend::supported_registration_operations`, and a class appears
+there only next to a proxy that makes it true. Run
+`cargo test -p nemo-relay-plugin-host` to check the table against the code rather
+than the other way round.
 
 Two conclusions the counts support.
 
@@ -1286,11 +1485,13 @@ is blocked waiting for the sanitizer, so the reply has no thread to arrive on �
 work moved, the transport did not. Installing a sanitize proxy there is refused
 with that reason rather than degraded silently, and the next step is an off-path
 *client*: a second connection to the same host, opened on the off-path runtime, so
-the transport belongs to the runtime that awaits it. The host accepts it because
-the credential is checked at handshake and the session on every request.
+the transport belongs to the runtime that awaits it. The off-path client now
+exists (`crates/plugin-host/src/attached.rs`) and is created on the off-path
+runtime; the host accepts it because the attach presents the credential *and* the
+session's capability, and every operation after that presents the capability too.
 
 Nothing in this matrix changes the ordering that moves the metric: coverage, then
-the cutover, then the loader leaving, which is what finally drops the 621.
+the cutover, then the loader leaving, which is what finally drops the 622.
 
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process
@@ -1299,6 +1500,6 @@ contract exist first, so the step that moves the loader changes one
 implementation rather than discovering a protocol — and it is why the metric
 below has not moved.
 
-This increment does not move `kernel-process unsafe tokens`, which is 621. The
+This increment does not move `kernel-process unsafe tokens`, which is 622. The
 number falls when native loading physically crosses the process boundary, and a
 reduction achieved by reclassifying crates would not mean anything.

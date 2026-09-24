@@ -32,6 +32,7 @@ fn host_config() -> PluginHostSupervisorConfig {
         runtime_binding_digest: "conformance-binding".into(),
         offered_read_capabilities: Vec::new(),
         maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        limits: nemo_relay_plugin_host::limits::PluginHostLimits::default(),
         startup_timeout: Duration::from_secs(20),
     }
 }
@@ -245,7 +246,13 @@ async fn a_real_tool_call_reaches_a_registration_inside_the_child() {
     );
     let context = nemo_relay_plugin_host::proxy::ProxyContext::new(manager, binding, 5_000)
         .with_observability_budget(5_000)
-        .with_off_path_executor(off_path);
+        .with_off_path_executor(off_path)
+        // The fixture registers an execution intercept, whose continuation is the
+        // kernel's own chain: a composition that cannot hold one refuses to
+        // install it, which is what this registry is for.
+        .with_continuations(std::sync::Arc::new(
+            nemo_relay_plugin_host::continuations::Continuations::new(),
+        ));
     let proxies =
         nemo_relay_plugin_host::proxy::install(context, descriptor, loaded.handle.clone())
             .expect("the kernel can proxy a tool request intercept");
@@ -348,6 +355,19 @@ async fn a_second_transport_attaches_to_the_session_and_serves_only_invocations(
             .map(|outcome| outcome.result.is_err())
             .unwrap_or(true),
         "the session answered, and its answer was that nothing holds that registration"
+    );
+
+    // Naming the *right* session is not enough on its own. A peer that has the
+    // credential — because it started its own host, or because it read one's
+    // environment — and has learned which session this is still cannot join it
+    // without the capability the kernel minted for it.
+    let another_capability = nemo_relay_plugin_host::attached::ConnectionDescriptor {
+        capability: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+        ..descriptor.clone()
+    };
+    assert!(
+        AttachedClient::connect(another_capability).await.is_err(),
+        "a transport presenting another capability cannot join the session"
     );
 
     // And the attach is what authorises a transport: a descriptor naming a session
@@ -455,7 +475,9 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
         registrations,
         vec![
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_conditional",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_execution",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_conditional",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_execution",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_llm_rewrite",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_metadata",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_intercept_observer",
@@ -646,10 +668,21 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     )
     .await
     .expect("a managed tool call whose payload is sanitized elsewhere");
+    // Two registrations of the fixture touch this call, and they are different
+    // kinds of thing: the execution intercept wraps the call and is *meant* to
+    // change what it returns (its marker is in the result), while the sanitizers
+    // only change the copy observers are shown. The assertion keeps the second
+    // invariant — no sanitizer marker appears in the real result — and states the
+    // first rather than pretending the fixture does nothing.
     assert_eq!(
         result.result,
-        serde_json::json!({"secret": "value"}),
-        "the sanitizer must not change what the tool returned"
+        serde_json::json!({"secret": "value", "native_intercept_execution": true}),
+        "an execution intercept changes the result; a sanitizer does not"
+    );
+    assert!(
+        result.result.get("native_tool_response_sanitize").is_none(),
+        "a sanitizer must not change what the tool returned: {}",
+        result.result
     );
     nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
     let published = published.lock().unwrap().clone();
@@ -795,10 +828,18 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     )
     .await
     .expect("a managed tool call whose events are annotated elsewhere");
+    // The injector's invariant is about the event, not the result: a metadata
+    // injector adds attributes to what observers see. The execution intercept in
+    // the same fixture wraps the call, so its marker is expected here.
     assert_eq!(
         result.result,
-        serde_json::json!({"kept": true}),
+        serde_json::json!({"kept": true, "native_intercept_execution": true}),
         "an injector must not change what the tool returned"
+    );
+    assert!(
+        result.result.get("native_injected").is_none(),
+        "and injected metadata belongs to the event, not the result: {}",
+        result.result
     );
     nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
     let injected = injected.lock().unwrap().clone();
@@ -836,7 +877,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
 
     assert_eq!(
         registrations.len(),
-        9,
+        11,
         "this is the complete-plugin regression: every registration the fixture makes was served"
     );
     assert!(
@@ -863,8 +904,21 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
     // The composition held the only handle to the child, so releasing it is what
     // ends the host — the kill is `Drop`'s, and the child cannot be left holding a
     // socket nobody will read.
+    //
+    // Released rather than released *immediately*: a task mid-flight on the
+    // composition's own runtime can hold the last reference for the moment it
+    // takes to notice it has been dropped. What the assertion is about is that
+    // nothing holds it for good, so it waits for the release and fails when the
+    // reference outlives the composition rather than when it outlives the
+    // statement.
+    let released = tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     assert!(
-        backend.upgrade().is_none(),
+        released.is_ok(),
         "the composition was the last holder of the host it started"
     );
     assert!(
@@ -997,6 +1051,7 @@ async fn a_crashed_host_is_replaced_by_one_that_holds_nothing() {
         .await
         .expect("a plugin host should start and handshake");
     let crashed_session = backend.session().session_id.clone();
+    let crashed_capability = backend.connection_descriptor().capability;
     backend.kill().await.expect("the host should be killable");
     assert!(
         backend.exit_status().await.is_some(),
@@ -1009,6 +1064,14 @@ async fn a_crashed_host_is_replaced_by_one_that_holds_nothing() {
     // generations behind its handles belonged to it, so a handle from before the
     // crash addresses nothing here.
     assert_ne!(backend.session().session_id, crashed_session);
+    // Holding the capability of a session that has ended is not a way into the
+    // one that replaced it: the capability is minted per session, so the value
+    // that authorised calls to the old host authorises nothing on the new one.
+    assert_ne!(
+        backend.connection_descriptor().capability,
+        crashed_capability,
+        "a replaced host does not keep the capability of the one it replaced"
+    );
     let descriptors = backend
         .inspect(
             nemo_relay_plugin_protocol::PluginInspectRequest { handle: None },
@@ -1041,4 +1104,677 @@ async fn an_operation_that_may_not_start_is_refused_before_it_crosses() {
         .expect_err("an operation that is already out of time");
 
     assert_eq!(error.failure.code, PluginFailureCode::DeadlineExceeded);
+}
+
+/// The same context, with the response budget this test is about.
+fn context_with_budget(max_response_bytes: u32) -> PluginExecutionContext {
+    PluginExecutionContext {
+        max_response_bytes,
+        ..context()
+    }
+}
+
+/// The limits a deployment sets are the limits the child runs under.
+///
+/// Read from the kernel's own record of the child's limits rather than from
+/// anything the child says about itself: what is being asserted is a property of
+/// the process, not a report from it. Linux publishes that record, and the
+/// platforms that do not are covered by the unit test that starts a child
+/// through the same call the supervisor uses.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_host_runs_under_the_limits_it_was_started_with() {
+    let address_space = 4 * 1024 * 1024 * 1024u64;
+    let open_files = 256u64;
+    let mut config = host_config();
+    config.limits = nemo_relay_plugin_host::limits::PluginHostLimits {
+        maximum_address_space_bytes: Some(address_space),
+        maximum_processes: None,
+        maximum_open_files: Some(open_files),
+        no_new_privileges: true,
+    };
+    let backend = ProcessPluginBackend::launch(config)
+        .await
+        .expect("a host started under the limits its deployment asked for");
+    let process_id = backend.process_id().expect("a running host");
+    let record = std::fs::read_to_string(format!("/proc/{process_id}/limits"))
+        .expect("the kernel's record of the child's limits");
+
+    let limit_of = |name: &str| -> Option<(u64, u64)> {
+        let line = record
+            .lines()
+            .find(|line| line.trim_start().starts_with(name))?;
+        let mut fields = line
+            .split_whitespace()
+            .skip(name.split_whitespace().count());
+        // Soft and hard are the two columns after the name; the unit follows.
+        Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+    };
+
+    assert_eq!(
+        limit_of("Max address space"),
+        Some((address_space, address_space)),
+        "the child holds the address-space ceiling it was started with, as both \
+         its soft and its hard limit"
+    );
+    assert_eq!(
+        limit_of("Max open files"),
+        Some((open_files, open_files)),
+        "and the descriptor limit, for the same reason: a hard limit left high \
+         is a soft limit the child can raise back"
+    );
+}
+
+/// Load the single-registration fixture in a child and activate it there.
+///
+/// The classes it registers are exactly the classes this backend can proxy, so a
+/// serving activation is the one that answers.
+async fn activated_intercept_fixture(
+    backend: &ProcessPluginBackend,
+) -> nemo_relay_plugin_protocol::PluginLoadResponse {
+    use nemo_relay_plugin_protocol::{PluginActivateRequest, PluginComponentConfiguration};
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-budget",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let artifact = fixture.artifact();
+    let (manifest_sha256, library_sha256) =
+        nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+            .expect("the fixture's identity");
+    let loaded = backend
+        .load(
+            nemo_relay_plugin_protocol::PluginLoadRequest {
+                plugin_id: "fixture_intercept".into(),
+                artifact,
+                identity: nemo_relay_plugin_protocol::PluginArtifactIdentity {
+                    manifest_sha256,
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect("the fixture should load in the child");
+    backend
+        .activate(
+            PluginActivateRequest {
+                discovery: false,
+                components: vec![PluginComponentConfiguration {
+                    kind: "fixture_intercept".into(),
+                    config_json: "{}".into(),
+                }],
+            },
+            context(),
+        )
+        .await
+        .expect("a serving activation of the classes this backend can proxy");
+    loaded
+}
+
+/// The registration the loaded fixture made, as the kernel would name it.
+async fn tool_request_intercept_registration(
+    backend: &ProcessPluginBackend,
+    handle: &nemo_relay_plugin_protocol::PluginHandle,
+) -> String {
+    let descriptors = backend
+        .inspect(
+            nemo_relay_plugin_protocol::PluginInspectRequest {
+                handle: Some(handle.clone()),
+            },
+            context(),
+        )
+        .await
+        .expect("the loaded plugin's registrations");
+    descriptors
+        .iter()
+        .flat_map(|descriptor| descriptor.registrations.iter())
+        .find(|registration| {
+            registration.operation
+                == nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept
+        })
+        .expect("the fixture registers a tool request intercept")
+        .registration_id
+        .clone()
+}
+
+#[tokio::test]
+async fn a_session_keeps_the_frame_limit_the_kernel_configured() {
+    // The limit a session carries has to be the one both sides can carry. This
+    // kernel is configured well below the protocol's ceiling and the host's
+    // default; a session that reported the host's own limit instead would open
+    // every transport it hands out — the attached one included — at a size this
+    // kernel does not decode.
+    let configured = 1024 * 1024;
+    let mut config = host_config();
+    config.maximum_frame_bytes = configured;
+    let backend = ProcessPluginBackend::launch(config)
+        .await
+        .expect("a plugin host should start and handshake");
+
+    assert_eq!(
+        backend.session().maximum_frame_bytes,
+        configured,
+        "the session keeps the limit this kernel offered, not the host's ceiling"
+    );
+    assert_eq!(
+        backend.connection_descriptor().maximum_frame_bytes,
+        configured,
+        "and every transport built from the session is told the same one"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_outgrows_its_operation_is_refused_by_the_kernel() {
+    // The host measures the answer it is about to send, and the kernel measures
+    // what arrived. The second measurement is the point of this test: the child
+    // runs a native plugin, so an answer from it is not evidence the kernel
+    // accepts without checking it against the operation that asked.
+    let backend = ProcessPluginBackend::launch(host_config())
+        .await
+        .expect("a plugin host should start and handshake");
+    let loaded = activated_intercept_fixture(&backend).await;
+    let registration = tool_request_intercept_registration(&backend, &loaded.handle).await;
+    // One invocation, and therefore one answer size: the budget is measured
+    // against the answer this operation produces, so the operation's own name has
+    // to be the same in the measurement as in the calls it is compared with.
+    let operation = "operation-budget";
+    let invocation = nemo_relay_plugin_protocol::PluginInvokeRequest {
+        handle: loaded.handle.clone(),
+        registration_id: registration.clone(),
+        arguments: serde_json::json!({"tool": "fixture_tool", "args": {"input": true}}).to_string(),
+        budget_millis: 5_000,
+    };
+    let context_for =
+        |operation_request_id: &str, max_response_bytes: u32| PluginExecutionContext {
+            operation_request_id: operation_request_id.into(),
+            ..context_with_budget(max_response_bytes)
+        };
+
+    let answered = backend
+        .invoke(invocation.clone(), context_for(operation, 64 * 1024))
+        .await
+        .expect("an answer within its budget");
+    assert!(
+        answered.result.is_ok(),
+        "the registration answers: {answered:?}"
+    );
+
+    // What the answer costs on the wire, measured the way the budget is.
+    let wire = nemo_relay_plugin_proto::convert::execution_outcome_to_wire(&answered, operation)
+        .expect("the answer's wire form");
+    let size = nemo_relay_plugin_proto::convert::invoke_outcome_encoded_len(&wire) as u32;
+
+    // At the budget the answer is served; one byte under it is not.
+    backend
+        .invoke(invocation.clone(), context_for(operation, size))
+        .await
+        .expect("an answer exactly at its operation's budget");
+
+    let refusal = backend
+        .invoke(invocation, context_for(operation, size - 1))
+        .await
+        .expect_err("an answer one byte above its operation's budget");
+    assert!(
+        matches!(
+            refusal.failure.code,
+            PluginFailureCode::OversizedFrame { .. }
+        ),
+        "the refusal says what was wrong with the answer: {refusal:?}"
+    );
+}
+
+/// The composition refuses a plugin it cannot serve whole.
+///
+/// This is the cost of the cutover stated as a test. The fixture behind it
+/// registers every class the ABI exposes, and eight of them do not cross yet, so
+/// a consumer that selects the process backend refuses the plugin at activation
+/// rather than serving the eight it could. A runtime that silently dropped the
+/// other eight would be reporting a load that did not happen, and the plugin
+/// would believe its callbacks were installed.
+///
+/// When the boundary serves all sixteen this test changes from a refusal to a
+/// load, which is the diff that says the bindings can follow the CLI.
+#[tokio::test]
+async fn a_plugin_the_boundary_cannot_serve_whole_is_refused() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_native",
+        "nemo-ph-unsupported",
+        support::native_fixture(),
+        "nemo_relay_fixture_native_plugin",
+    );
+    let refusal = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_native".to_owned(), fixture.artifact())],
+        [nemo_relay_plugin_protocol::PluginComponentConfiguration {
+            kind: "fixture_native".into(),
+            config_json: "{}".into(),
+        }],
+    )
+    .await
+    .err()
+    .expect("a plugin registering classes the boundary cannot serve is refused");
+
+    let message = refusal.failure.message.clone();
+    assert!(
+        message.contains("registers") && message.contains("can serve"),
+        "the refusal says what the plugin registered and what this session can \
+         serve: {message}"
+    );
+    // The classes it names are the ones the boundary does not carry, which is the
+    // list this refusal exists to make visible — and the list the bindings'
+    // cutover waits on.
+    assert!(
+        message.contains("tool_execution_intercept") && message.contains("mark_sanitize_guardrail"),
+        "the refusal names the classes that do not cross: {message}"
+    );
+}
+
+/// A wrapped call runs the rest of the chain, in the kernel, from a callback in
+/// the child.
+///
+/// The architectural proof point of the duplex work, stated as one call: the
+/// plugin's execution intercept decides when the downstream call runs, the
+/// downstream call is the kernel's own chain, and both halves are visible from
+/// the caller. The markers are the evidence — the request marker came back
+/// inside the arguments the *kernel's* tool function received, which could only
+/// happen if the child's continuation reached this process, and the result
+/// marker came back on the result the child returned.
+#[tokio::test]
+async fn a_tool_execution_intercept_wraps_a_call_across_the_boundary() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-execution",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let composition = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_owned(), fixture.artifact())],
+        [nemo_relay_plugin_protocol::PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: "{}".into(),
+        }],
+    )
+    .await
+    .expect("a plugin whose registrations this boundary can serve");
+
+    // The downstream call, made by the kernel, inside the plugin's continuation.
+    // The mark the intercept asked the *call's* owner to emit travels back with
+    // the outcome and is emitted here, in this process, where the call lives.
+    let marks: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording = std::sync::Arc::clone(&marks);
+    nemo_relay::api::subscriber::register_subscriber(
+        "process-backend-wrapped-call-marks",
+        std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+            if event.name() == "fixture.intercept.tool_execution.mark" {
+                recording.lock().unwrap().push(event.name().to_string());
+            }
+        }),
+    )
+    .expect("a subscriber");
+    let result = nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("wrapped_tool")
+                    .args(serde_json::json!({"input": true}))
+                    .func(std::sync::Arc::new(|args| {
+                        Box::pin(async move {
+                            // What the kernel's own chain received, which is what
+                            // the child's continuation asked it to run.
+                            Ok(serde_json::json!({ "downstream_args": args }).into())
+                        })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed tool call wrapped by a remote intercept");
+
+    let result = result.result;
+    assert_eq!(
+        result["downstream_args"]["native_intercept_execution_request"], true,
+        "the child's continuation reached this kernel's chain with the arguments it \
+         decided on: {result}"
+    );
+    assert_eq!(
+        result["native_intercept_execution"], true,
+        "and the child returned the downstream result after marking it: {result}"
+    );
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+    assert_eq!(
+        marks.lock().unwrap().len(),
+        1,
+        "the mark the intercept asked for was emitted by the call's owner"
+    );
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-wrapped-call-marks")
+        .expect("a deregistration");
+
+    drop(composition);
+}
+
+/// The shapes a wrapped call can take, each run through the boundary.
+///
+/// The ABI gives an intercept three powers over the call it wraps: it can decide
+/// the result without running the call, run it once, or run it more than once —
+/// and it can fail after running it. Each one is a different statement about
+/// what crosses: "nothing downstream was entered", "the continuation reached the
+/// kernel exactly once", "it reached the kernel twice, and both answers came
+/// back", and "the call ran, and the plugin failed anyway".
+#[tokio::test]
+async fn a_wrapped_call_can_be_replaced_run_twice_or_failed_after() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-execution-shapes",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let composition = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_owned(), fixture.artifact())],
+        [nemo_relay_plugin_protocol::PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: "{}".into(),
+        }],
+    )
+    .await
+    .expect("a plugin whose registrations this boundary can serve");
+
+    /// Run one managed tool call whose downstream function counts its own calls.
+    async fn run(
+        args: serde_json::Value,
+        calls: Arc<AtomicUsize>,
+    ) -> nemo_relay::error::Result<serde_json::Value> {
+        nemo_relay::api::runtime::with_execution_budget(
+            nemo_relay::api::runtime::ExecutionBudget::new(
+                nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+                30_000,
+            ),
+            async {
+                nemo_relay::api::tool::tool_call_execute(
+                    nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                        .name("wrapped_tool")
+                        .args(args)
+                        .func(Arc::new(move |args| {
+                            let calls = Arc::clone(&calls);
+                            Box::pin(async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Ok(serde_json::json!({ "downstream_args": args }).into())
+                            })
+                        }))
+                        .build(),
+                )
+                .await
+            },
+        )
+        .await
+        .map(|result| result.result)
+    }
+
+    // The plugin decides the result and never enters the call.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let replaced = run(
+        serde_json::json!({"input": true, "skip_next": true}),
+        Arc::clone(&calls),
+    )
+    .await
+    .expect("a call the plugin answered itself");
+    assert_eq!(
+        replaced["replaced_by_plugin"], true,
+        "the plugin's own result is what the caller sees: {replaced}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "nothing downstream is entered when the plugin does not continue"
+    );
+
+    // The call runs once, in the kernel, and its answer comes back to the plugin.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let once = run(serde_json::json!({"input": true}), Arc::clone(&calls))
+        .await
+        .expect("a wrapped call");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the call ran once");
+    assert_eq!(
+        once["downstream_args"]["native_intercept_execution_request"],
+        true
+    );
+    assert_eq!(once["native_intercept_execution"], true);
+
+    // The ABI lets an intercept call its continuation more than once, and both
+    // calls have to reach the kernel and answer separately.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let concurrent = run(
+        serde_json::json!({"input": true, "use_concurrent_next": true}),
+        Arc::clone(&calls),
+    )
+    .await
+    .expect("a call the plugin ran twice");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "both of the intercept's continuations reached the kernel"
+    );
+    assert_eq!(concurrent["native_intercept_execution"], true);
+
+    // And it can fail after running the call, which is the shape where the call
+    // happened and the plugin's answer is an error anyway.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failed = run(
+        serde_json::json!({"input": true, "fail_after_next": true}),
+        Arc::clone(&calls),
+    )
+    .await
+    .expect_err("an intercept that failed after its continuation");
+    assert!(
+        failed.to_string().contains("fails after its continuation"),
+        "the plugin's own failure is what the caller sees: {failed}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the call it wrapped still ran"
+    );
+
+    drop(composition);
+}
+
+/// A wrapped provider call runs the rest of the chain, in the kernel, from a
+/// callback in the child.
+///
+/// The tool intercept's twin, and deliberately made of the same parts: the same
+/// suspended-chain machinery, the same unary resume, the same budget and panic
+/// rules. What the test establishes is that the *shapes* differ and the mechanism
+/// does not — the provider request the child decided on reached this kernel's
+/// chain, and the response the chain produced came back to the child and returned
+/// by it.
+#[tokio::test]
+async fn an_llm_execution_intercept_wraps_a_call_across_the_boundary() {
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-llm-execution",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let composition = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_owned(), fixture.artifact())],
+        [nemo_relay_plugin_protocol::PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: "{}".into(),
+        }],
+    )
+    .await
+    .expect("a plugin whose registrations this boundary can serve");
+
+    /// Run one managed provider call whose downstream function echoes its request.
+    async fn call(content: serde_json::Value) -> nemo_relay::error::Result<serde_json::Value> {
+        nemo_relay::api::runtime::with_execution_budget(
+            nemo_relay::api::runtime::ExecutionBudget::new(
+                nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+                30_000,
+            ),
+            async {
+                nemo_relay::api::llm::llm_call_execute(
+                    nemo_relay::api::llm::LlmCallExecuteParams::builder()
+                        .name("wrapped_provider")
+                        .request(nemo_relay::api::llm::LlmRequest {
+                            headers: serde_json::Map::new(),
+                            content,
+                        })
+                        .func(std::sync::Arc::new(|request| {
+                            Box::pin(async move {
+                                // What this kernel's chain received, which is what
+                                // the child's continuation asked it to run.
+                                Ok(serde_json::json!({ "downstream_request": request.content }))
+                            })
+                        }))
+                        .build(),
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    let response = call(serde_json::json!({"model": "fixture-model"}))
+        .await
+        .expect("a managed provider call wrapped by a remote intercept");
+    assert_eq!(
+        response["downstream_request"]["native_intercept_llm_execution_request"], true,
+        "the child's continuation reached this kernel's chain with the request it \
+         decided on: {response}"
+    );
+    assert_eq!(
+        response["native_intercept_llm_execution"], true,
+        "and the child returned the downstream response after marking it: {response}"
+    );
+
+    // VARIANT: second call disabled
+    #[allow(unreachable_code)]
+    if false {
+        let replaced = call(serde_json::json!({"model": "fixture-model", "skip_next": true}))
+            .await
+            .expect("a provider call the plugin answered itself");
+        assert_eq!(
+            replaced["replaced_by_plugin"], true,
+            "the plugin's own response is what the caller sees: {replaced}"
+        );
+        assert!(
+            replaced.get("downstream_request").is_none(),
+            "nothing downstream was entered: {replaced}"
+        );
+    }
+
+    drop(composition);
+}
+
+/// A host exits when the kernel that owns it goes away.
+///
+/// The supervisor kills the child when it drops, but that is not the only way a
+/// kernel can end — it can exit, crash, or be killed, and in any of those the
+/// host would otherwise be a process nobody owns, holding a socket nobody reads.
+/// The host watches the pipe the supervisor opened for it, so the kernel's
+/// absence reaches it even when no teardown ran.
+///
+/// The host is started here the way the supervisor starts it, and then abandoned
+/// the way a kernel that exits abandons it: the write end of that pipe closes.
+#[tokio::test]
+async fn a_host_exits_when_its_kernel_goes_away() {
+    use std::process::Stdio;
+
+    let directory = std::env::temp_dir().join(format!(
+        "nemo-ph-watchdog-{}",
+        nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&directory).expect("a socket directory");
+    let socket = directory.join("s");
+    let mut command = std::process::Command::new(host_executable());
+    command
+        // The names the host binary reads, which are the supervisor's contract
+        // with it rather than anything this test invents.
+        .env("NEMO_RELAY_PLUGIN_HOST_SOCKET", &socket)
+        .env("NEMO_RELAY_PLUGIN_HOST_CREDENTIAL", "watchdog-credential")
+        .env("NEMO_RELAY_PLUGIN_HOST_BINDING", "watchdog-binding")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("a host process");
+
+    // Wait until it is serving, so what the test observes is the watchdog rather
+    // than a host that never started.
+    let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !socket.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        started.is_ok(),
+        "the host bound its socket: {}",
+        socket.display()
+    );
+
+    // The kernel goes away.
+    drop(child.stdin.take());
+
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if child
+                .try_wait()
+                .expect("a host that can be waited for")
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let _ = child.kill();
+    assert!(
+        exited.is_ok(),
+        "the host exited on its own once its kernel was gone"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
 }

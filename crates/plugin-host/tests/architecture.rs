@@ -478,3 +478,71 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
 
     assert!(problems.is_empty(), "{problems:#?}");
 }
+
+/// The registration classes the boundary serves today, and the ones it does not.
+///
+/// This is the number that gates the rest of the migration. The CLI has cut
+/// over, and the three entries in [`INDIRECT_LOAD_CALLERS`] have not — not
+/// because their composition is different, but because of this list: a plugin
+/// that registers any class the boundary cannot serve is refused **whole**, and
+/// the bindings' plugin fixtures register all sixteen. Widening this set is what
+/// makes the last three consumers interchangeable with the CLI, and it is also
+/// what those grandfather entries wait on.
+///
+/// The test is written as an equality rather than a subset so that growth is a
+/// decision with a diff, and as two lists so that the gap is visible rather than
+/// implied. The first entry to move was the tool execution intercept: the class
+/// that wraps a call, which needed the kernel to hold a suspended chain position
+/// and resume it when the host asked.
+#[test]
+fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
+    use nemo_relay_plugin_host::supervisor::ProcessPluginBackend;
+    use nemo_relay_plugin_protocol::PluginRegistrationOperation as Operation;
+
+    let served = ProcessPluginBackend::supported_registration_operations();
+
+    let expected = [
+        Operation::ToolRequestIntercept,
+        Operation::LlmRequestIntercept,
+        Operation::Subscriber,
+        Operation::EventMetadataInjector,
+        Operation::ToolConditionalExecutionGuardrail,
+        Operation::LlmConditionalExecutionGuardrail,
+        Operation::ToolSanitizeRequestGuardrail,
+        Operation::ToolSanitizeResponseGuardrail,
+        Operation::ToolExecutionIntercept,
+        Operation::LlmExecutionIntercept,
+    ];
+    assert_eq!(
+        served, expected,
+        "the classes the boundary serves changed; each new entry needs a proxy, a \
+         host-side invocation path, and a core entry point that runs exactly that \
+         registration"
+    );
+
+    // The half that does not cross, named so the gap is a fact in the tree and
+    // not something to rediscover: three of them wrap the call they intercept
+    // (execution and streaming intercepts) and need the duplex session, and five
+    // are transforms with shapes of their own.
+    let not_served = [
+        Operation::MarkSanitizeGuardrail,
+        Operation::ScopeSanitizeStartGuardrail,
+        Operation::ScopeSanitizeEndGuardrail,
+        Operation::LlmSanitizeRequestGuardrail,
+        Operation::LlmSanitizeResponseGuardrail,
+        Operation::LlmStreamExecutionIntercept,
+    ];
+    for operation in not_served {
+        assert!(
+            !served.contains(&operation),
+            "{operation:?} is not served yet; if it has become servable, this list \
+             is what the bindings' cutover was waiting for"
+        );
+    }
+    assert_eq!(
+        served.len() + not_served.len(),
+        16,
+        "the registration surface is sixteen classes; a change here means the ABI \
+         grew and both lists need revisiting"
+    );
+}

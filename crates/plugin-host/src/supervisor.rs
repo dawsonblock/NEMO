@@ -59,26 +59,67 @@ pub struct PluginHostSupervisorConfig {
     /// handshake negotiates, rather than from a transport default that could
     /// disagree with the protocol.
     pub maximum_frame_bytes: u32,
+    /// What the host process is allowed to take from the machine.
+    ///
+    /// Applied to the child rather than to this process, and applied before it
+    /// runs any plugin code, so nothing a plugin does can raise it.
+    pub limits: crate::limits::PluginHostLimits,
     /// How long to wait for the host to start and handshake.
     pub startup_timeout: Duration,
 }
 
 impl PluginHostSupervisorConfig {
     /// Start from the executable that ships beside this process.
+    ///
+    /// Three places are tried, in order, because "beside this process" is not
+    /// one place in every build: a test harness runs from `deps/` while the
+    /// binary it exercises is one directory above, and a deployment that
+    /// installs the host somewhere else can say where. The first one that exists
+    /// is used; when none does, the path beside this process is returned so the
+    /// failure names the location the deployment was expected to fill.
     pub fn beside_this_executable(runtime_binding_digest: impl Into<String>) -> Self {
-        let executable = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .map(|dir| dir.join(executable_name()))
-            .unwrap_or_else(|| PathBuf::from(executable_name()));
+        let executable = resolve_executable();
         Self {
             executable,
             runtime_binding_digest: runtime_binding_digest.into(),
             offered_read_capabilities: Vec::new(),
             maximum_frame_bytes: MAX_FRAME_BYTES,
+            limits: crate::limits::PluginHostLimits::default(),
             startup_timeout: Duration::from_secs(10),
         }
     }
+}
+
+/// Environment variable naming the host executable, for deployments that do not
+/// install it beside the process that starts it.
+pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
+
+/// Where the host executable is, given where this process is.
+fn resolve_executable() -> PathBuf {
+    if let Some(configured) = std::env::var_os(EXECUTABLE_ENV) {
+        let configured = PathBuf::from(configured);
+        if configured.exists() {
+            return configured;
+        }
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let Some(beside) = beside else {
+        return PathBuf::from(executable_name());
+    };
+    for candidate in [
+        beside.join(executable_name()),
+        beside
+            .parent()
+            .map(|above| above.join(executable_name()))
+            .unwrap_or_default(),
+    ] {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    beside.join(executable_name())
 }
 
 fn executable_name() -> &'static str {
@@ -96,6 +137,12 @@ pub struct PluginHostSupervisor {
     child: Mutex<Child>,
     /// The child's process id, captured while it was running.
     process_id: Option<u32>,
+    /// The write end of the pipe the host watches for its kernel's absence.
+    ///
+    /// Dropped with the session, which is what tells the host that this kernel
+    /// is gone even when `Drop` never runs — a process that exits, or is killed,
+    /// closes it as surely as a clean teardown does.
+    child_pipe: Option<tokio::process::ChildStdin>,
     /// Removed when the supervisor drops, so nothing outlives the session.
     socket_dir: PathBuf,
     /// The socket this kernel serves for the child's own calls.
@@ -112,6 +159,12 @@ pub struct PluginHostSupervisor {
     /// registers an operation while it runs, and the service looks the operation
     /// up when the host forwards a mark a plugin raised during it.
     operation_scopes: Arc<OperationScopes>,
+    /// The continuations this session is holding for the plugins it runs.
+    ///
+    /// Owned by the supervisor because both halves need it: the proxy parks a
+    /// position while an intercept runs, and the kernel's own service resumes it
+    /// when the host asks.
+    continuations: Arc<crate::continuations::Continuations>,
     session: PluginSessionIdentity,
     /// Kept for a second transport: the host checks the credential at attach as
     /// it does at handshake, so a descriptor has to carry it.
@@ -119,6 +172,12 @@ pub struct PluginHostSupervisor {
     /// Kept for the same reason, and because the session's identity does not
     /// carry it: the binding is a property of the runtime, not of the handshake.
     runtime_binding_digest: String,
+    /// What this session's operations have to present.
+    ///
+    /// Minted here, before the handshake, because it is the kernel's to choose:
+    /// a host that minted its own capability would be handing out the thing that
+    /// authorises calls to it.
+    capability: crate::capability::SessionCapability,
     client: PluginHostClient<Channel>,
 }
 
@@ -128,6 +187,12 @@ impl PluginHostSupervisor {
         let socket_dir = create_runtime_dir()?;
         let socket = socket_dir.join("s");
         let credential = Uuid::now_v7().to_string();
+        // The capability every operation on this session has to present, minted
+        // before the host is told anything so that the session is established
+        // with it rather than asking for one afterwards.
+        let capability = crate::capability::SessionCapability::mint().map_err(|error| {
+            unavailable(format!("failed to mint a session capability: {error}"))
+        })?;
         // The kernel's own socket, in the same private directory. The child is
         // told about it and given a credential of its own: a call back into the
         // kernel is a different relationship than a call into the host, and each
@@ -136,6 +201,7 @@ impl PluginHostSupervisor {
         let kernel_endpoint = socket_dir.join("k");
         let kernel_credential = Uuid::now_v7().to_string();
         let operation_scopes = Arc::new(OperationScopes::new());
+        let continuations = Arc::new(crate::continuations::Continuations::new());
         // Bound before the child starts, so the path it is told about exists by
         // the time it could want it. Accepting begins once the session is
         // established, because the service is bound to that session.
@@ -147,6 +213,21 @@ impl PluginHostSupervisor {
                 ))
             })?;
         let mut command = Command::new(&config.executable);
+        // The bounds the child runs under, applied between `fork` and `exec`.
+        // This is the only point at which they can be applied and the only point
+        // at which they cannot be undone by what they are bounding: whatever the
+        // plugin does afterwards, these are the limits it does it under.
+        #[cfg(unix)]
+        {
+            let limits = config.limits;
+            // Safety: the closure runs in the forked child before `exec`, and
+            // calls `setrlimit` (and, on Linux, `prctl`) and nothing else: it
+            // allocates nothing, takes no locks, and returns only an error the
+            // spawn reports.
+            unsafe {
+                command.pre_exec(move || crate::limits::apply(&limits));
+            }
+        }
         // A filtered environment: the child gets what it needs to be this host
         // and nothing about the kernel's own environment that it has no business
         // reading.
@@ -168,7 +249,11 @@ impl PluginHostSupervisor {
                 "NEMO_RELAY_PLUGIN_HOST_PROTOCOL",
                 PROTOCOL_VERSION.to_string(),
             )
-            .stdin(Stdio::null())
+            // A pipe rather than null: the host watches it and exits when the
+            // kernel that owns it goes away, which is the one thing that still
+            // holds when a supervisor never gets to run its own teardown. The
+            // write end is kept in this struct, so a session that ends closes it.
+            .stdin(Stdio::piped())
             // Logs stay logs: the child's output goes to this process's streams
             // and is never a channel the protocol travels on.
             .stdout(Stdio::inherit())
@@ -176,12 +261,17 @@ impl PluginHostSupervisor {
             .kill_on_drop(true);
         let child = command.spawn().map_err(|error| {
             unavailable(format!(
-                "failed to start plugin host '{}': {error}",
-                config.executable.display()
+                "failed to start plugin host '{}': {error}; the limits the child was to run \
+                 under are applied here, so a limit this platform refuses is a host that does \
+                 not start rather than one that runs unbounded",
+                config.executable.display(),
             ))
         })?;
         let process_id = child.id();
         let mut child = child;
+        // Held, not used: the host reads it, and what it observes is the moment
+        // this handle goes away with the session.
+        let child_pipe = child.stdin.take();
 
         // One budget covers the whole startup: the socket appearing *and* the
         // handshake completing. A host that binds, accepts and then never
@@ -216,6 +306,8 @@ impl PluginHostSupervisor {
                 &config.runtime_binding_digest,
                 &config.offered_read_capabilities,
                 &ProcessPluginBackend::supported_registration_operations(),
+                config.maximum_frame_bytes,
+                &capability,
             )
             .await?;
             Ok::<_, PluginProtocolError>((client, session))
@@ -237,6 +329,20 @@ impl PluginHostSupervisor {
                 ));
             }
         };
+        // Every transport this session opens uses this one number, so it has to
+        // be the number both sides can carry rather than whichever one named it
+        // last. The host reports what it will accept and the kernel cannot be
+        // told a size larger than the one it configured itself for, so the
+        // session keeps the smaller of the two — including for the second,
+        // attached transport, which is handed this value and no other.
+        let negotiated_frame_limit = session
+            .maximum_frame_bytes
+            .min(config.maximum_frame_bytes)
+            .min(MAX_FRAME_BYTES);
+        let session = PluginSessionIdentity {
+            maximum_frame_bytes: negotiated_frame_limit,
+            ..session
+        };
 
         // The kernel's side of the boundary, serving the session that was just
         // established. It is spawned rather than awaited: nothing calls it until
@@ -251,6 +357,7 @@ impl PluginHostSupervisor {
                         protocol_version: PROTOCOL_VERSION,
                         runtime_binding_digest: config.runtime_binding_digest.clone(),
                         operation_scopes: Arc::clone(&operation_scopes),
+                        continuations: Arc::clone(&continuations),
                     },
                 )))
                 .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
@@ -261,12 +368,15 @@ impl PluginHostSupervisor {
         Ok(Self {
             child: Mutex::new(child),
             process_id,
+            child_pipe,
             socket_dir,
             kernel_endpoint,
             runtime_server,
             operation_scopes,
+            continuations,
             session,
             session_credential: credential,
+            capability,
             runtime_binding_digest: config.runtime_binding_digest.clone(),
             client,
         })
@@ -295,6 +405,7 @@ impl PluginHostSupervisor {
             runtime_binding_digest: self.runtime_binding_digest.clone(),
             session_id: self.session.session_id.clone(),
             maximum_frame_bytes: self.session.maximum_frame_bytes,
+            capability: self.capability.as_str().to_owned(),
         }
     }
 
@@ -304,6 +415,11 @@ impl PluginHostSupervisor {
     /// during an operation is attached to the call that raised it.
     pub fn operation_scopes(&self) -> Arc<OperationScopes> {
         Arc::clone(&self.operation_scopes)
+    }
+
+    /// The continuations this session holds for the plugins it runs.
+    pub fn continuations(&self) -> Arc<crate::continuations::Continuations> {
+        Arc::clone(&self.continuations)
     }
 
     /// The host's process id, as it was while the process was running.
@@ -371,6 +487,16 @@ impl Drop for PluginHostSupervisor {
     fn drop(&mut self) {
         // The server is this session's, and it goes when the session does.
         self.runtime_server.abort();
+        // The pipe closes here too, so a host whose kill somehow did not land
+        // still learns that this kernel is gone.
+        drop(self.child_pipe.take());
+        // And so does the host process. `kill_on_drop` is not enough on its own:
+        // it signals the child from a task on this process's runtime, and the
+        // last composition of a process is dropped exactly when that runtime is
+        // shutting down — so the task may never run, and the host outlives the
+        // session that started it. Signalling here is synchronous, and a signal
+        // cannot be lost to a scheduler that is going away.
+        let _ = self.child.get_mut().start_kill();
         // The directory holds the socket and nothing else, and it is removed
         // with the session it belonged to.
         let _ = std::fs::remove_dir_all(&self.socket_dir);
@@ -391,9 +517,9 @@ impl ProcessPluginBackend {
     /// Derived from what the backend implements rather than supplied by a
     /// caller: a caller that could declare support the backend does not have
     /// would break the guarantee that a load which cannot be served does not
-    /// happen. One entry today, next to the proxy that makes it true: a tool
-    /// request intercept is the class the kernel can install a proxy for and the
-    /// host can run.
+    /// happen. Each entry is next to the proxy that makes it true — a class
+    /// belongs here when the kernel can install a proxy for it and the host can
+    /// run it — and the list is the whole of what the boundary carries today.
     pub fn supported_registration_operations()
     -> Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation> {
         // The classes this kernel can install a proxy for and this host can run.
@@ -409,6 +535,8 @@ impl ProcessPluginBackend {
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmConditionalExecutionGuardrail,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolSanitizeRequestGuardrail,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolSanitizeResponseGuardrail,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolExecutionIntercept,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmExecutionIntercept,
         ]
     }
 
@@ -432,9 +560,10 @@ impl ProcessPluginBackend {
             &context,
         );
         let mut client = self.supervisor.client.clone();
+        let request = capable(wire, &self.supervisor.capability);
         let outcome = self
             .supervisor
-            .request(budget, async move { client.activate(wire).await })
+            .request(budget, async move { client.activate(request).await })
             .await?
             .into_inner();
         nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&outcome)?
@@ -480,6 +609,11 @@ impl ProcessPluginBackend {
     /// The registry that says which scope an in-flight operation belongs to.
     pub fn operation_scopes(&self) -> Arc<OperationScopes> {
         self.supervisor.operation_scopes()
+    }
+
+    /// The continuations this session holds for the plugins it runs.
+    pub fn continuations(&self) -> Arc<crate::continuations::Continuations> {
+        self.supervisor.continuations()
     }
 
     /// Everything a second transport needs to attach to this session.
@@ -544,9 +678,10 @@ impl PluginExecutionBackend for ProcessPluginBackend {
             let session_id = self.supervisor.session.session_id.clone();
             let wire = load_request_to_wire(&request, &session_id, &context);
             let mut client = self.supervisor.client.clone();
+            let request = capable(wire, &self.supervisor.capability);
             let outcome = self
                 .supervisor
-                .request(budget, async move { client.load(wire).await })
+                .request(budget, async move { client.load(request).await })
                 .await?
                 .into_inner();
             let outcome = load_outcome_from_wire(&outcome)?
@@ -566,9 +701,10 @@ impl PluginExecutionBackend for ProcessPluginBackend {
             let session_id = self.supervisor.session.session_id.clone();
             let wire = unload_request_to_wire(&request, &session_id, &context);
             let mut client = self.supervisor.client.clone();
+            let request = capable(wire, &self.supervisor.capability);
             let outcome = self
                 .supervisor
-                .request(budget, async move { client.unload(wire).await })
+                .request(budget, async move { client.unload(request).await })
                 .await?
                 .into_inner();
             unload_outcome_from_wire(&outcome)?
@@ -587,9 +723,10 @@ impl PluginExecutionBackend for ProcessPluginBackend {
             let session_id = self.supervisor.session.session_id.clone();
             let wire = inspect_request_to_wire(&request, &session_id, &context);
             let mut client = self.supervisor.client.clone();
+            let request = capable(wire, &self.supervisor.capability);
             let outcome = self
                 .supervisor
-                .request(budget, async move { client.inspect(wire).await })
+                .request(budget, async move { client.inspect(request).await })
                 .await?
                 .into_inner();
             inspect_outcome_from_wire(&outcome)?
@@ -612,11 +749,21 @@ impl PluginExecutionBackend for ProcessPluginBackend {
                 &context,
             );
             let mut client = self.supervisor.client.clone();
+            let request = capable(wire, &self.supervisor.capability);
             let outcome = self
                 .supervisor
-                .request(budget, async move { client.invoke(wire).await })
+                .request(budget, async move { client.invoke(request).await })
                 .await?
                 .into_inner();
+            // The same budget the host measured against, measured again here.
+            // This side does not take the host's word for it any more than it
+            // takes its word for anything else: the host runs a native plugin,
+            // and an answer that outgrew its operation is refused on arrival
+            // rather than handed to a caller that asked for a smaller one.
+            nemo_relay_plugin_proto::convert::check_invoke_outcome_budget(
+                &outcome,
+                context.max_response_bytes,
+            )?;
             // The outcome travels whole, because the distinction it carries is
             // the reason it exists: a plugin that may have dispatched before the
             // channel died produced no definite result, and collapsing that into
@@ -644,9 +791,10 @@ impl PluginExecutionBackend for ProcessPluginBackend {
                 context: Some(context_to_wire(&context)),
             };
             let mut client = self.supervisor.client.clone();
+            let request = capable(wire, &self.supervisor.capability);
             let outcome = self
                 .supervisor
-                .request(budget, async move { client.health(wire).await })
+                .request(budget, async move { client.health(request).await })
                 .await?
                 .into_inner();
             health_outcome_from_wire(&outcome)?
@@ -718,6 +866,22 @@ async fn connect(socket: &Path) -> Result<Channel, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A request carrying the capability this session's operations have to present.
+///
+/// Every call after the handshake presents it, and the host refuses a call that
+/// does not. The session's identity says which session a request means; this
+/// says the request may use it — and an identity is what an attach announces,
+/// so without this the two would be the same thing.
+fn capable<T>(message: T, capability: &crate::capability::SessionCapability) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        crate::capability::SESSION_CAPABILITY_HEADER,
+        tonic::metadata::MetadataValue::try_from(capability.as_str())
+            .expect("a minted capability is ASCII hex, and so is a valid header value"),
+    );
+    request
+}
+
 /// Establish the session this host will answer on.
 async fn handshake(
     client: &mut PluginHostClient<Channel>,
@@ -725,13 +889,18 @@ async fn handshake(
     runtime_binding_digest: &str,
     offered_read_capabilities: &[PluginHostReadCapability],
     supported_registration_operations: &[nemo_relay_plugin_protocol::PluginRegistrationOperation],
+    maximum_frame_bytes: u32,
+    capability: &crate::capability::SessionCapability,
 ) -> Result<PluginSessionIdentity, PluginProtocolError> {
     let request = v1::HandshakeRequest {
         protocol_version: u32::from(PROTOCOL_VERSION),
         runtime_binding_digest: runtime_binding_digest.to_string(),
         client_nonce: Uuid::now_v7().to_string(),
         session_credential: credential.to_string(),
-        maximum_frame_bytes: MAX_FRAME_BYTES,
+        // What this kernel is configured to carry, not the protocol's ceiling:
+        // advertising the ceiling while decoding at a smaller limit would open a
+        // session whose stated size nothing on this side honours.
+        maximum_frame_bytes,
         supported_features: Vec::new(),
         offered_read_capabilities: offered_read_capabilities
             .iter()
@@ -747,7 +916,7 @@ async fn handshake(
             .collect(),
     };
     let outcome = client
-        .handshake(request)
+        .handshake(capable(request, capability))
         .await
         .map_err(|status| unavailable(format!("the plugin host did not answer: {status}")))?
         .into_inner();

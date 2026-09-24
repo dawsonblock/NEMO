@@ -29,7 +29,8 @@ use nemo_relay::plugin::{
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
-use nemo_relay_plugin_host::LoadedPlugins;
+use nemo_relay_plugin_host::ProcessLoadedPlugins;
+use nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig;
 use reqwest::Client;
 use serde_json::Value;
 use subtle::ConstantTimeEq;
@@ -915,6 +916,48 @@ enum ServerPluginActivation {
     Dynamic(PluginActivation),
 }
 
+/// Longest one registration may take when it crosses the boundary.
+///
+/// A registration that has not answered in this long is a registration this
+/// runtime cannot wait for: the proxy gives up and the host is told, rather than
+/// letting a plugin's slowness become the runtime's.
+const NATIVE_REGISTRATION_CAP_MILLIS: u64 = 5_000;
+
+/// How many off-path plugin operations may be in flight at once.
+///
+/// Stated rather than left to whatever the machine can hold, because the point
+/// of the bound is that a plugin cannot choose it.
+const NATIVE_OFF_PATH_IN_FLIGHT: usize = 64;
+
+/// The identity this process's plugin sessions are bound to.
+///
+/// The host checks every operation's context against the binding it was started
+/// under, so this has to be one value per runtime rather than one per call, and
+/// it has to distinguish this runtime from another. It is derived from what
+/// identifies the runtime to a plugin — the implementation, its version, and the
+/// process that owns the session — the same way the kernel derives its own.
+fn plugin_runtime_binding() -> String {
+    use std::sync::OnceLock;
+
+    static BINDING: OnceLock<String> = OnceLock::new();
+    BINDING
+        .get_or_init(|| {
+            let binding = serde_json::json!({
+                "implementation": "nemo-relay-cli",
+                "version": env!("CARGO_PKG_VERSION"),
+                "process": std::process::id(),
+            });
+            let bytes = serde_json::to_vec(&binding)
+                .expect("a runtime binding this process owns must serialize");
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+        .clone()
+}
+
 const REMOVED_SWITCHYARD_MESSAGE: &str = "the built-in Switchyard service integration was removed in NeMo Relay >=0.8.0; remove this `[[components]]` entry and refer to the NeMo Relay migration guides for current Switchyard migration information: https://docs.nvidia.com/nemo/relay/reference/migration-guides";
 
 impl ServerPluginActivation {
@@ -1025,7 +1068,11 @@ async fn initialize_plugin_host(
 
 struct PluginActivation {
     active: bool,
-    native: Option<LoadedPlugins>,
+    /// The native plugins, held in a host process rather than in this one.
+    ///
+    /// Dropping this removes the proxies and ends the process, so a plugin's
+    /// callbacks cannot outlive the runtime that installed them.
+    native: Option<ProcessLoadedPlugins>,
     worker: Option<WorkerPluginActivation>,
     _snapshots: Vec<Arc<DynamicPluginActivationSnapshot>>,
 }
@@ -1062,13 +1109,21 @@ impl PluginActivation {
             return Err(CliError::Config(error.to_string()));
         }
         let static_plugin_config = plugin_config.clone();
-        plugin_config
-            .components
-            .extend(dynamic_plugins.iter().map(|plugin| PluginComponentSpec {
-                kind: plugin.plugin_id.clone(),
-                enabled: true,
-                config: plugin.config.clone(),
-            }));
+        // The components this process runs: everything the deployment configured
+        // plus the dynamic plugins whose code is not native. A native plugin's
+        // register callbacks run where its library is — in the host process — so
+        // activating it here would be activating a kind nothing in this process
+        // ever registered.
+        plugin_config.components.extend(
+            dynamic_plugins
+                .iter()
+                .filter(|plugin| plugin.kind != DynamicPluginKind::RustDynamic)
+                .map(|plugin| PluginComponentSpec {
+                    kind: plugin.plugin_id.clone(),
+                    enabled: true,
+                    config: plugin.config.clone(),
+                }),
+        );
         for plugin in &dynamic_plugins {
             if let Some(snapshot) = plugin.activation_snapshot.as_ref() {
                 snapshot.verify_current()?;
@@ -1143,14 +1198,59 @@ impl PluginActivation {
             let native = if native_specs.is_empty() {
                 None
             } else {
-                // The native loader is reached through the composed backend
-                // rather than called here, so which implementation serves it is
-                // a composition decision instead of a call site.
+                // The native loader is reached through a host process rather
+                // than called here, so which implementation serves it is a
+                // composition decision instead of a call site — and this process
+                // never maps a plugin's library.
+                // The configuration travels with the component: the host runs the
+                // plugin's register callbacks, and a component that arrived without
+                // the configuration the deployment wrote would register a different
+                // plugin than the one that was approved.
+                let components = native_specs
+                    .iter()
+                    .map(|spec| {
+                        let plugin = dynamic_plugins
+                            .iter()
+                            .find(|plugin| plugin.plugin_id == spec.plugin_id)
+                            .ok_or_else(|| {
+                                CliError::Config(format!(
+                                    "native plugin '{}' was approved without the component it \
+                                     came from",
+                                    spec.plugin_id
+                                ))
+                            })?;
+                        Ok(nemo_relay_plugin_protocol::PluginComponentConfiguration {
+                            kind: spec.plugin_id.clone(),
+                            config_json: serde_json::to_string(&plugin.config).map_err(
+                                |error| {
+                                    CliError::Config(format!(
+                                        "native plugin '{}' has a configuration that cannot be \
+                                     serialized: {error}",
+                                        spec.plugin_id
+                                    ))
+                                },
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CliError>>()?;
+                // Everything the supervisor needs beyond the executable and the
+                // binding is a default this composition accepts: the frame limit
+                // the protocol's ceiling stands for, the resource ceilings the
+                // host crate ships, and its startup budget.
+                let supervisor =
+                    PluginHostSupervisorConfig::beside_this_executable(plugin_runtime_binding());
                 Some(
-                    LoadedPlugins::load(
+                    ProcessLoadedPlugins::load(
+                        supervisor,
+                        NATIVE_REGISTRATION_CAP_MILLIS,
+                        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+                            budget_millis: NATIVE_REGISTRATION_CAP_MILLIS,
+                            max_in_flight: NATIVE_OFF_PATH_IN_FLIGHT,
+                        },
                         native_specs
                             .into_iter()
                             .map(|spec| (spec.plugin_id, spec.manifest_ref)),
+                        components,
                     )
                     .await
                     .map_err(|error| {

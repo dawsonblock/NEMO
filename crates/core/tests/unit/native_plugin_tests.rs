@@ -7103,12 +7103,196 @@ fn a_digest_mismatch_never_reaches_a_staging_directory() {
         .filter(|path| {
             path.file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with("nemo-native-artifacts-"))
-                && path.join(&approved[..32]).exists()
+                && path.join("library").exists()
+                && std::fs::read(path.join("library"))
+                    .is_ok_and(|bytes| bytes == b"not the approved bytes")
         })
         .collect();
     assert!(
         leftovers.is_empty(),
         "a refused artifact leaves no staging directory: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn two_loads_of_one_artifact_are_staged_separately() {
+    // Two loads of the *same* bytes used to land on the same path, because the
+    // path was derived from the digest and the process id: the second load
+    // truncated the file the first was running from. Each load gets its own
+    // directory now, so the copies are distinct objects that cannot disturb each
+    // other.
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    std::fs::write(&source, b"the approved bytes").expect("write the source");
+    let approved = super::sha256_hex(b"the approved bytes");
+
+    let (first_path, first_guard) =
+        super::stage_verified_library(&source, &approved).expect("the first load");
+    let (second_path, second_guard) =
+        super::stage_verified_library(&source, &approved).expect("the second load");
+    assert_ne!(
+        first_path, second_path,
+        "identical bytes are still two separately staged copies"
+    );
+    assert_ne!(
+        first_path.parent(),
+        second_path.parent(),
+        "each copy has its own directory: {} and {}",
+        first_path.parent().unwrap_or(&first_path).display(),
+        second_path.parent().unwrap_or(&second_path).display()
+    );
+    assert_eq!(
+        std::fs::read(&first_path).expect("read the first copy"),
+        b"the approved bytes"
+    );
+    assert_eq!(
+        std::fs::read(&second_path).expect("read the second copy"),
+        b"the approved bytes"
+    );
+
+    // Dropping one copy removes only its own directory: the other load's bytes
+    // are not the first load's to remove.
+    drop(first_guard);
+    assert!(!first_path.exists(), "the dropped copy is gone");
+    assert_eq!(
+        std::fs::read(&second_path).expect("the other copy is still there"),
+        b"the approved bytes"
+    );
+    drop(second_guard);
+    assert!(!second_path.exists());
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn concurrent_loads_of_one_artifact_each_get_their_own_copy() {
+    // The case the digest-derived name could not handle, run the way it would
+    // happen: several loads of one approved artifact at the same time. Every one
+    // of them has to receive its own object, because a loader given a path
+    // another load is also writing is being handed a file that is changing
+    // underneath it.
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    let bytes: Vec<u8> = (0..4096u32).map(|value| (value % 251) as u8).collect();
+    std::fs::write(&source, &bytes).expect("write the source");
+    let approved = super::sha256_hex(&bytes);
+
+    let loads: Vec<_> = (0..16)
+        .map(|_| {
+            let source = source.clone();
+            let approved = approved.clone();
+            std::thread::spawn(move || {
+                super::stage_verified_library(&source, &approved).expect("a staged copy")
+            })
+        })
+        .collect();
+    let staged: Vec<_> = loads
+        .into_iter()
+        .map(|load| load.join().expect("a load that finished"))
+        .collect();
+
+    let mut paths: Vec<_> = staged.iter().map(|(path, _)| path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(
+        paths.len(),
+        staged.len(),
+        "every concurrent load staged its own file"
+    );
+    for (path, _) in &staged {
+        assert_eq!(
+            std::fs::read(path).expect("read a staged copy"),
+            bytes,
+            "{} holds the approved bytes",
+            path.display()
+        );
+    }
+    drop(staged);
+    for path in paths {
+        assert!(
+            !path.exists(),
+            "{} was removed with its load",
+            path.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_staged_copy_lives_in_a_directory_only_its_load_can_reach() {
+    // The bytes are only as private as the directory that holds them: a copy in
+    // a world-readable directory is a copy another user can read, and one in a
+    // world-writable directory is a copy another user can replace.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("a test directory");
+        let source = directory.join("library");
+        std::fs::write(&source, b"the approved bytes").expect("write the source");
+        let approved = super::sha256_hex(b"the approved bytes");
+
+        let (staged, guard) = super::stage_verified_library(&source, &approved).expect("a copy");
+        let parent = staged.parent().expect("the copy's directory");
+        let mode = std::fs::metadata(parent)
+            .expect("the directory's metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "only this process may reach the staged copy: {parent:?} is {mode:o}"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+#[test]
+fn an_artifact_identity_describes_the_manifest_and_library_it_named() {
+    // The identity is the pair the runtime approves, so it has to come from one
+    // reading of the manifest: the digest of the bytes that were parsed, beside
+    // the digest of the library those bytes named.
+    let directory =
+        std::env::temp_dir().join(format!("nemo-identity-test-{}", uuid::Uuid::now_v7()));
+    let library_dir = directory.join("lib");
+    std::fs::create_dir_all(&library_dir).expect("a library directory");
+    let library = library_dir.join("library");
+    std::fs::write(&library, b"the library bytes").expect("write the library");
+    let manifest = directory.join("relay-plugin.toml");
+    let manifest_source = format!(
+        "manifest_version = 1\n\n[plugin]\nid = \"identity_fixture\"\nkind = \"rust_dynamic\"\n\n\
+         [compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n\
+         [capabilities]\nitems = [\"plugin_native\"]\n\n\
+         [load]\nlibrary = \"lib/library\"\nsymbol = \"nemo_relay_identity_fixture\"\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(&manifest, &manifest_source).expect("write the manifest");
+
+    let (manifest_sha256, library_sha256) =
+        super::plugin_artifact_identity(&manifest.to_string_lossy()).expect("an identity");
+    assert_eq!(
+        manifest_sha256,
+        super::sha256_hex(manifest_source.as_bytes()),
+        "the manifest digest is the digest of the bytes that were read"
+    );
+    assert_eq!(
+        library_sha256,
+        super::sha256_hex(b"the library bytes"),
+        "the library digest is the digest of the library the manifest named"
+    );
+
+    // A directory reference names the manifest inside it, as the loader does, so
+    // the same artifact has one identity however it is named.
+    let (from_directory, _) =
+        super::plugin_artifact_identity(&directory.to_string_lossy()).expect("an identity");
+    assert_eq!(
+        from_directory, manifest_sha256,
+        "naming the directory and naming the manifest are the same artifact"
     );
     let _ = std::fs::remove_dir_all(&directory);
 }

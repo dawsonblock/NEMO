@@ -52,6 +52,13 @@ pub struct ProxyContext {
     /// Optional because a kernel that forwards nothing has no use for it, and a
     /// proxy without one simply leaves the registry alone.
     operation_scopes: Option<Arc<OperationScopes>>,
+    /// Where the rest of a chain is held while a plugin decides when to run it.
+    ///
+    /// Required by the families that wrap a call rather than answer one: an
+    /// execution intercept's `next` is the kernel's own remainder of the chain,
+    /// and a plugin in another process can only reach it by asking this kernel to
+    /// resume it.
+    continuations: Option<Arc<crate::continuations::Continuations>>,
     /// How long an observer's delivery may take, when the runtime states one.
     ///
     /// Separate from the registration cap because an observer is not part of the
@@ -110,6 +117,7 @@ impl ProxyContext {
             runtime_binding_digest: runtime_binding_digest.into(),
             local_cap_millis,
             operation_scopes: None,
+            continuations: None,
             observability_budget_millis: None,
             off_path: None,
         }
@@ -139,6 +147,19 @@ impl ProxyContext {
         self.operation_scopes = Some(scopes);
         self
     }
+
+    /// Hold suspended chain positions in `continuations`.
+    ///
+    /// Not optional in spirit: a proxy for a class that wraps a call cannot serve
+    /// it without one, and installing one that could not reach a continuation
+    /// would be installing a callback whose `next` goes nowhere.
+    pub fn with_continuations(
+        mut self,
+        continuations: Arc<crate::continuations::Continuations>,
+    ) -> Self {
+        self.continuations = Some(continuations);
+        self
+    }
 }
 
 /// Proxies installed for one loaded plugin.
@@ -152,6 +173,8 @@ pub struct RegistrationProxies {
     subscribers: Vec<String>,
     metadata_injectors: Vec<String>,
     tool_sanitize_request: Vec<String>,
+    tool_execution_intercepts: Vec<String>,
+    llm_execution_intercepts: Vec<String>,
     tool_conditional: Vec<String>,
     llm_conditional: Vec<String>,
     tool_sanitize_response: Vec<String>,
@@ -168,6 +191,8 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("subscribers", &self.subscribers)
             .field("metadata_injectors", &self.metadata_injectors)
             .field("tool_sanitize_request", &self.tool_sanitize_request)
+            .field("tool_execution_intercepts", &self.tool_execution_intercepts)
+            .field("llm_execution_intercepts", &self.llm_execution_intercepts)
             .field("tool_conditional", &self.tool_conditional)
             .field("llm_conditional", &self.llm_conditional)
             .field("tool_sanitize_response", &self.tool_sanitize_response)
@@ -184,6 +209,8 @@ impl RegistrationProxies {
             .chain(self.subscribers.iter())
             .chain(self.metadata_injectors.iter())
             .chain(self.tool_sanitize_request.iter())
+            .chain(self.tool_execution_intercepts.iter())
+            .chain(self.llm_execution_intercepts.iter())
             .chain(self.tool_conditional.iter())
             .chain(self.llm_conditional.iter())
             .chain(self.tool_sanitize_response.iter())
@@ -225,6 +252,12 @@ impl Drop for RegistrationProxies {
                 registration,
             );
         }
+        for registration in &self.tool_execution_intercepts {
+            let _ = nemo_relay::api::registry::deregister_tool_execution_intercept(registration);
+        }
+        for registration in &self.llm_execution_intercepts {
+            let _ = nemo_relay::api::registry::deregister_llm_execution_intercept(registration);
+        }
     }
 }
 
@@ -240,6 +273,8 @@ pub fn install(
         subscribers: Vec::new(),
         metadata_injectors: Vec::new(),
         tool_sanitize_request: Vec::new(),
+        tool_execution_intercepts: Vec::new(),
+        llm_execution_intercepts: Vec::new(),
         tool_conditional: Vec::new(),
         llm_conditional: Vec::new(),
         tool_sanitize_response: Vec::new(),
@@ -296,6 +331,18 @@ pub fn install(
                 install_llm_request_intercept(&context, registration, &handle)?;
                 installed
                     .llm_request_intercepts
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::ToolExecutionIntercept => {
+                install_tool_execution_intercept(&context, registration, &handle)?;
+                installed
+                    .tool_execution_intercepts
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::LlmExecutionIntercept => {
+                install_llm_execution_intercept(&context, registration, &handle)?;
+                installed
+                    .llm_execution_intercepts
                     .push(registration.registration_id.clone());
             }
             other => {
@@ -611,6 +658,218 @@ fn install_tool_conditional(
         });
 
     nemo_relay::api::registry::register_tool_conditional_execution_guardrail(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// Install the proxy for one tool execution intercept.
+///
+/// The first family that *wraps* a call rather than answering one. The plugin
+/// decides when the rest of the chain runs, and the rest of the chain is this
+/// kernel's, so the kernel parks its own position for the operation and resumes
+/// it when the host asks. What the plugin returns — the result it decided on,
+/// plus the marks it asked for — comes back as one outcome, and the engine's own
+/// chain wrapper appends whatever the continuation produced, so the marks and
+/// their order are the ones an in-process intercept would have produced.
+///
+/// The continuation is held for exactly as long as this intercept runs. A
+/// continuation that arrives after it returns finds nothing to resume, and one
+/// still in flight when it returns is cancelled by the continuation's own lease
+/// — the same rule the engine applies to an in-process `next`.
+fn install_tool_execution_intercept(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    // A composition that cannot hold a continuation cannot serve this class: the
+    // plugin's `next` would have nowhere to go, and installing the proxy anyway
+    // would install a callback whose continuation silently did nothing.
+    let continuations = context.continuations.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' needs the composition to hold continuations: an execution \
+                 intercept's continuation is the kernel's own chain",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::ToolExecutionFn =
+        Arc::new(move |name: &str, args: serde_json::Value, next| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let continuations = Arc::clone(&continuations);
+            let name = name.to_owned();
+            Box::pin(async move {
+                let payload = serde_json::json!({ "tool": name, "args": args }).to_string();
+                let execution = context.execution_context()?;
+                let request = PluginInvokeRequest {
+                    handle,
+                    registration_id: registration_id.clone(),
+                    arguments: payload,
+                    budget_millis: execution.remaining_budget_millis,
+                };
+                let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                    scopes.enter(
+                        &execution.operation_request_id,
+                        nemo_relay::api::runtime::current_scope_stack(),
+                    )
+                });
+                let _held = continuations.hold_tool(
+                    &execution.operation_request_id,
+                    &registration_id,
+                    next,
+                );
+                let outcome =
+                    context
+                        .manager
+                        .invoke(request, execution)
+                        .await
+                        .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        })?;
+                match outcome.result {
+                    Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
+                        .map_err(|error| {
+                            nemo_relay::error::FlowError::Internal(format!(
+                                "a proxied execution intercept answered with something that is \
+                                 not an outcome: {error}"
+                            ))
+                        }),
+                    Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                        "a proxied execution intercept answered with {}",
+                        other_name(&other)
+                    ))),
+                    Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id.clone(),
+                        dispatch: outcome.dispatch,
+                        certainty: outcome.certainty,
+                        failure,
+                    }),
+                }
+            })
+        });
+
+    nemo_relay::api::registry::register_tool_execution_intercept(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// Install the proxy for one non-streaming LLM execution intercept.
+///
+/// The tool execution intercept's twin, one layer up: the plugin decides when the
+/// provider call runs, the call happens here, and the continuation between them
+/// is the same suspended-chain machinery. What differs is only the shape that
+/// travels — a provider request down, a provider response back — which is what
+/// the parked entry's family records.
+fn install_llm_execution_intercept(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    let continuations = context.continuations.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' needs the composition to hold continuations: an execution \
+                 intercept's continuation is the kernel's own chain",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::LlmExecutionFn =
+        Arc::new(move |name: &str, request: LlmRequest, next| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let continuations = Arc::clone(&continuations);
+            let name = name.to_owned();
+            Box::pin(async move {
+                let payload = serde_json::json!({ "name": name, "request": request });
+                let execution = context.execution_context()?;
+                let invocation = PluginInvokeRequest {
+                    handle,
+                    registration_id: registration_id.clone(),
+                    arguments: payload.to_string(),
+                    budget_millis: execution.remaining_budget_millis,
+                };
+                let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                    scopes.enter(
+                        &execution.operation_request_id,
+                        nemo_relay::api::runtime::current_scope_stack(),
+                    )
+                });
+                let _held =
+                    continuations.hold_llm(&execution.operation_request_id, &registration_id, next);
+                let outcome = context
+                    .manager
+                    .invoke(invocation, execution)
+                    .await
+                    .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id.clone(),
+                        dispatch: error.dispatch(),
+                        certainty: error.certainty(),
+                        failure: error.failure,
+                    })?;
+                match outcome.result {
+                    Ok(PluginSuccess::Invoked(response)) => serde_json::from_str(&response.output)
+                        .map_err(|error| {
+                            nemo_relay::error::FlowError::Internal(format!(
+                                "a proxied LLM execution intercept answered with something that \
+                                 is not a response: {error}"
+                            ))
+                        }),
+                    Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                        "a proxied LLM execution intercept answered with {}",
+                        other_name(&other)
+                    ))),
+                    Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id.clone(),
+                        dispatch: outcome.dispatch,
+                        certainty: outcome.certainty,
+                        failure,
+                    }),
+                }
+            })
+        });
+
+    nemo_relay::api::registry::register_llm_execution_intercept(
         &registration.registration_id,
         priority,
         callable,
