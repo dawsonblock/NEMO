@@ -274,6 +274,14 @@ pub fn sentinel_sanitize_call(
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
             }),
+            // The two read-only discriminators are named rather than planted: they are
+            // what a sanitizer decides *with*, so a value planted in one would be a
+            // decision the test invented, and a plugin that branched on it would be
+            // branching on the test rather than on the event. A category that exists
+            // (and no data schema, which is the ordinary case) is what a sanitizer is
+            // shown.
+            category: Some(nemo_relay::api::event::EventCategory::llm()),
+            data_schema: None,
             fields,
         },
         planting.finish(),

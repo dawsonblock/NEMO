@@ -16,8 +16,9 @@
 
 use nemo_relay_plugin::{
     CategoryProfile, ConfigDiagnostic, EventCategory, EventSanitizeFields, Json,
-    LlmRequestInterceptOutcome, NativePlugin, PendingMarkSpec, PluginContext, Result,
-    ToolExecutionInterceptOutcome, ToolExecutionResult, nemo_relay_plugin,
+    LlmRequestInterceptOutcome, METRIC_DATA_SCHEMA_NAME, METRIC_DATA_SCHEMA_VERSION, NativePlugin,
+    PendingMarkSpec, PluginContext, Result, ToolExecutionInterceptOutcome, ToolExecutionResult,
+    nemo_relay_plugin,
 };
 use serde_json::{Map, json};
 
@@ -67,6 +68,13 @@ pub const SCOPE_START_MARKER: &str = "fixture_scope_start_sanitize";
 
 /// The metadata key the scope-end sanitizer adds.
 pub const SCOPE_END_MARKER: &str = "fixture_scope_end_sanitize";
+
+/// The metadata key a routing sanitizer writes the path it took under.
+///
+/// A sanitizer that decides with the event's category and data schema, and says which
+/// way it decided, is what makes "those two values reached it" observable from outside
+/// the plugin: the marker is a *decision*, not a copy of the fields.
+pub const ROUTE_MARKER: &str = "fixture_route";
 
 /// How much padding the answer of the oversized sanitizer carries.
 ///
@@ -391,6 +399,35 @@ pub fn register_event_sanitizers(ctx: &mut PluginContext<'_>, log: Option<String
                 Ok(marked_fields(fields, SCOPE_END_MARKER))
             }
         }
+    })?;
+    // The two registrations that decide with the event rather than about it.
+    //
+    // This is deliberately the shape the PII redaction component uses — a metric mark
+    // recognized by its data schema, a scope sanitizer gated by the semantic category —
+    // because the property under test is that the values a sanitizer decides with reach
+    // it across the boundary. A fixture that only *carried* them could pass while a
+    // sanitizer that branched on them made the wrong decision.
+    ctx.register_mark_sanitize_guardrail("fixture_mark_route", 100, {
+        let log = log.clone();
+        move |event, fields| {
+            let log = log.clone();
+            async move {
+                let route = route_of(&event);
+                log_run(log.as_deref(), route);
+                Ok(routed_fields(fields, route))
+            }
+        }
+    })?;
+    ctx.register_scope_sanitize_start_guardrail("fixture_scope_start_route", 100, {
+        let log = log.clone();
+        move |event, fields| {
+            let log = log.clone();
+            async move {
+                let route = route_of(&event);
+                log_run(log.as_deref(), route);
+                Ok(routed_fields(fields, route))
+            }
+        }
     })
 }
 
@@ -492,6 +529,34 @@ fn log_run(log: Option<&str>, name: &str) {
 /// A sanitizer's job is to change what observers see, so what it adds is visible
 /// and what it was handed is carried through: a fixture that dropped the payload it
 /// was given could not tell a sanitizer that ran from one that published nothing.
+/// Which path a sanitizer takes, from the two values it is allowed to decide with.
+///
+/// Metric marks first, by their data schema, and everything else by semantic category —
+/// the same decision the PII redaction component makes, in the same order.
+fn route_of(event: &nemo_relay_plugin::Event) -> &'static str {
+    if event.data_schema().is_some_and(|schema| {
+        schema.name == METRIC_DATA_SCHEMA_NAME && schema.version == METRIC_DATA_SCHEMA_VERSION
+    }) {
+        return "metric";
+    }
+    match event.category().map(|category| category.as_str()) {
+        Some("llm") => "llm",
+        Some("tool") => "tool",
+        _ => "other",
+    }
+}
+
+/// Record the route taken, so a caller can see which decision the plugin made.
+fn routed_fields(mut fields: EventSanitizeFields, route: &str) -> EventSanitizeFields {
+    let mut metadata = match fields.metadata.take() {
+        Some(Json::Object(object)) => object,
+        _ => Map::new(),
+    };
+    metadata.insert(ROUTE_MARKER.to_string(), Json::String(route.to_string()));
+    fields.metadata = Some(Json::Object(metadata));
+    fields
+}
+
 fn marked_fields(mut fields: EventSanitizeFields, marker: &str) -> EventSanitizeFields {
     let mut metadata = match fields.metadata.take() {
         Some(Json::Object(object)) => object,

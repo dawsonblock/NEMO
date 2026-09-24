@@ -5828,6 +5828,99 @@ mod tests {
 
     /// Property H, the identities.
     ///
+    /// The two read-only discriminators are what a sanitizer decides *with*. They are
+    /// kernel-owned, so the host neither invents them nor checks them beyond carrying
+    /// them into the synthetic event — and a sanitizer that branches on them is the
+    /// reason they are in the projection at all. This is the same shape as the PII
+    /// redaction component's decision: a metric mark by its data schema, everything
+    /// else by category.
+    #[tokio::test]
+    async fn a_sanitizer_decides_with_the_category_and_data_schema_it_is_shown() {
+        use nemo_relay::api::event::{
+            DataSchema, EventCategory, METRIC_DATA_SCHEMA_NAME, METRIC_DATA_SCHEMA_VERSION,
+        };
+
+        // Core's plugin configuration is process-global, so a test that activates
+        // a real plugin takes its turn.
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((session, activated)) = event_sanitize_session().await else {
+            eprintln!("the intercept fixture is missing; skipping the discriminator case");
+            return;
+        };
+
+        let metric = DataSchema::builder()
+            .name(METRIC_DATA_SCHEMA_NAME)
+            .version(METRIC_DATA_SCHEMA_VERSION)
+            .build();
+        for (class, name, category, schema, expected) in [
+            (
+                PluginEventSanitizeClass::Mark,
+                "fixture_mark_route",
+                EventCategory::llm(),
+                None,
+                "llm",
+            ),
+            (
+                PluginEventSanitizeClass::Mark,
+                "fixture_mark_route",
+                EventCategory::tool(),
+                None,
+                "tool",
+            ),
+            (
+                PluginEventSanitizeClass::Mark,
+                "fixture_mark_route",
+                EventCategory::custom(),
+                None,
+                "other",
+            ),
+            (
+                PluginEventSanitizeClass::Mark,
+                "fixture_mark_route",
+                EventCategory::tool(),
+                Some(metric.clone()),
+                "metric",
+            ),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                "fixture_scope_start_route",
+                EventCategory::llm(),
+                None,
+                "llm",
+            ),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                "fixture_scope_start_route",
+                EventCategory::tool(),
+                Some(metric),
+                "metric",
+            ),
+        ] {
+            let registration = session.registration_named(&activated, name);
+            let (mut call, _sentinel) = confidentiality::sentinel_sanitize_call(class);
+            call.category = Some(category.clone());
+            call.data_schema = schema.clone();
+            let outcome = session
+                .invoke_arguments(&registration, &payload(&call), EVENT_SANITIZE_BUDGET)
+                .await;
+            let metadata = answered_metadata(&answered_fields(&outcome, name));
+            assert_eq!(
+                metadata.get("fixture_route").cloned(),
+                Some(serde_json::json!(expected)),
+                "a {class:?} sanitizer shown category {category:?} and schema {schema:?} took the \
+                 {expected} path: {metadata:?}"
+            );
+            // And the discriminators themselves are the kernel's: they are not in the
+            // answer, because the answer is the mutable fields.
+            assert!(
+                !metadata.contains_key("category") && !metadata.contains_key("data_schema"),
+                "an answer carries fields, not the values it decided with: {metadata:?}"
+            );
+        }
+    }
+
+    /// Property H, the identities.
+    ///
     /// The registration identity and the operation identity belong to the kernel, so
     /// the host is asked to run *that* registration under *that* operation. A call
     /// naming a registration this plugin does not have, a session this host did not

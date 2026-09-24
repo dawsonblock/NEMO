@@ -1662,26 +1662,43 @@ scope closes. The doors' remaining matrix is direct too: exact mark, exact scope
 exact scope-end, siblings that did not run, a name only another class holds, and a
 failure that clears the fields and reports why.
 
-**What the projection costs a first-party sanitizer, measured.** The projection was
-chosen over shipping the event, and the price of that choice had to be checked rather
-than assumed: *do any sanitizers the repository ships read what it leaves behind?* They
-do, in one place. `nemo-relay-pii-redaction`'s event sanitizers read two fields the
-projection does not carry — `event.category()` to gate the scope sanitizers by their
-`sanitize_llm` / `sanitize_tool` configuration, and `event.data_schema()` to recognize a
-Relay metric mark and apply the metric-envelope sanitizer. Every other first-party
-sanitizer ignores the event and works on the fields alone.
+**The projection was widened for compatibility, not convenience.** The projection was
+chosen over shipping the event, and the price of that choice was checked rather than
+assumed: *do any sanitizers the repository ships read what it leaves behind?* One does.
+`nemo-relay-pii-redaction`'s event sanitizers gate the scope sanitizers on
+`event.category()` (their `sanitize_llm` / `sanitize_tool` configuration) and recognize a
+Relay metric mark by `event.data_schema()`. Every other first-party sanitizer ignores
+the event and works on the fields alone.
 
-Nothing is broken by that today, and it must not be papered over either: the PII
-component is a *built-in* component, registered in the kernel's own process, so no
-projection is involved in what it does. It becomes a real gap the moment that component
-is hosted as a native plugin: a hosted sanitizer would be shown a synthetic event whose
-category is `custom` and whose data schema is absent, and the two branches would
-silently take their default paths. The disclosure ratchet is where the decision lands —
-adding `category` and `data_schema` to the projection means adding them to the approved
-list in the same change, which is the point of that test — and until then the honest
-statement is that process isolation narrows the sanitizer view to what
-`PluginEventSanitizeCall` declares, and a plugin that needs more is asking for
-capability the boundary has not granted.
+That is a semantic requirement rather than a hypothetical one, so the projection grew
+two fields rather than wait: `category` and `data_schema`, both kernel-authored and
+read-only. The distinction matters in both directions. They are *not* "kernel-only" —
+that phrase belongs to what a plugin may never mention — they are kernel-owned inputs to
+a decision a sanitizer is entitled to make. And they are not mutable: the response is
+still `EventSanitizeFields`, so there is nowhere for an answer to put a category, a
+schema, an identity, or anything else a sanitizer does not own. The boundary now reads:
+
+    PLUGIN MAY READ      class, name, scope category, event category, data schema
+    PLUGIN MAY MODIFY    EventSanitizeFields (data, category_profile, metadata)
+    PLUGIN NEVER COMES   uuid, timestamp, parent, propagation root, ATOF version,
+    NEAR                 event kind, operation identity, registration identity,
+                         publication decision
+
+Three tests make that more than a diagram. The disclosure ratchet's approved list
+includes the two fields, and its retained list — the names a projection must never
+carry — keeps uuid, timestamp, parent, propagation root, ATOF version and kind. A
+round-trip test carries a category and a data schema through projection and synthetic
+event for all three classes, and refuses a scope projection that states no category
+rather than fabricating one. And the semantic test is the one that matters: a fixture
+registration branches exactly as the PII component does — metric mark by its data
+schema first, otherwise by category — and the process suite drives it through a real
+child, requiring the llm path for a mark categorized `llm`, the metric path for a mark
+carrying the metric schema, and the tool path for a managed call's scope start. The
+published copies still carry the kernel's own category and schema afterwards, because
+what a sanitizer decides *with* is not something it can change.
+
+The contract is frozen again at that shape. A further field is added when another
+concrete sanitizer dependency demonstrates the need, not in anticipation of one.
 
 **Class coverage: 14 of 16.** The three that crossed together are the mark, scope-start
 and scope-end sanitizers: one shape, one projection, and one installer parameterised

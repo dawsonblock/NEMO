@@ -529,6 +529,155 @@ async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
     drop(loaded);
 }
 
+// The two read-only discriminators cross the boundary, and a sanitizer in the child
+// decides with them. This is the compatibility property the projection was widened for:
+// the PII redaction component branches on exactly these two values, so a projection
+// without them would have changed which path a hosted sanitizer takes while every
+// structural test still passed.
+#[tokio::test]
+async fn a_real_sanitizer_in_the_child_decides_with_the_events_category() {
+    use nemo_relay::api::event::{
+        DataSchema, EventCategory, METRIC_DATA_SCHEMA_NAME, METRIC_DATA_SCHEMA_VERSION,
+    };
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+    use nemo_relay_plugin_protocol::PluginComponentConfiguration;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-discriminators",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let loaded = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        [PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: "{}".into(),
+        }],
+    )
+    .await
+    .expect("a plugin served from another process");
+
+    let published: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let published = std::sync::Arc::clone(&published);
+        nemo_relay::api::subscriber::register_subscriber(
+            "process-backend-discriminators",
+            std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+                published.lock().unwrap().push(serde_json::json!({
+                    "name": event.name(),
+                    "kind": event.kind(),
+                    "phase": event.scope_category().map(|phase| format!("{phase:?}")),
+                    "category": event.category().map(|category| category.as_str().to_string()),
+                    "schema": event.data_schema().map(|schema| schema.name.clone()),
+                    "route": event
+                        .metadata()
+                        .and_then(|metadata| metadata.get("fixture_route"))
+                        .cloned(),
+                }));
+            }),
+        )
+        .expect("a subscriber");
+    }
+
+    let metric_schema = DataSchema::builder()
+        .name(METRIC_DATA_SCHEMA_NAME)
+        .version(METRIC_DATA_SCHEMA_VERSION)
+        .build();
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            // A mark the runtime raises with a category, and one carrying the metric
+            // schema: the two decisions a sanitizer makes about an event.
+            nemo_relay::api::scope::event(
+                nemo_relay::api::scope::EmitMarkEventParams::builder()
+                    .name("discriminator-llm-mark")
+                    .category(EventCategory::llm())
+                    .build(),
+            )
+            .expect("an emitted mark");
+            nemo_relay::api::scope::event(
+                nemo_relay::api::scope::EmitMarkEventParams::builder()
+                    .name("discriminator-metric-mark")
+                    .data(serde_json::json!({ "measurements": [] }))
+                    .data_schema(metric_schema)
+                    .build(),
+            )
+            .expect("an emitted metric mark");
+            // And a managed call, whose scope start carries the tool category.
+            nemo_relay::api::tool::tool_call_execute(
+                nemo_relay::api::tool::ToolCallExecuteParams::builder()
+                    .name("discriminator_tool")
+                    .args(serde_json::json!({ "input": true }))
+                    .func(std::sync::Arc::new(|args| {
+                        Box::pin(async move { Ok(args.into()) })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed call the child's scope sanitizer is shown");
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+
+    let published = published.lock().unwrap().clone();
+    let route_of = |name: &str| -> Option<serde_json::Value> {
+        published
+            .iter()
+            .find(|event| event["name"] == serde_json::json!(name))
+            .and_then(|event| event["route"].as_str().map(str::to_owned))
+            .map(serde_json::Value::String)
+    };
+    assert_eq!(
+        route_of("discriminator-llm-mark"),
+        Some(serde_json::json!("llm")),
+        "the child decided with the mark's category: {published:#?}"
+    );
+    assert_eq!(
+        route_of("discriminator-metric-mark"),
+        Some(serde_json::json!("metric")),
+        "and with the mark's data schema, before its category: {published:#?}"
+    );
+    let tool_start = published
+        .iter()
+        .find(|event| {
+            event["kind"] == serde_json::json!("scope")
+                && event["phase"] == serde_json::json!("Start")
+                && event["category"] == serde_json::json!("tool")
+        })
+        .unwrap_or_else(|| panic!("the tool scope start was published: {published:#?}"));
+    assert_eq!(
+        tool_start["route"],
+        serde_json::json!("tool"),
+        "the scope sanitizer decided with the scope's category: {published:#?}"
+    );
+    // And what the sanitizer decided with is not something it changed: the published
+    // copy still carries the kernel's own category and schema.
+    assert_eq!(
+        published
+            .iter()
+            .find(|event| event["name"] == serde_json::json!("discriminator-metric-mark"))
+            .map(|event| event["schema"].clone()),
+        Some(serde_json::json!(METRIC_DATA_SCHEMA_NAME)),
+        "the discriminators are the kernel's on the way out too"
+    );
+
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-discriminators")
+        .expect("a deregistration");
+    drop(loaded);
+}
+
 // The confidentiality property through a real child: a sanitizer that could not
 // answer must not become a path by which what it was shown reaches anything
 // publishable. The proxy's own test asserts this with a scripted peer; this asserts
@@ -835,8 +984,10 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_a",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_b",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_c",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_mark_route",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_end_sanitize",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_start_other",
+            "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_start_route",
             "nemo-relay-plugin.v1.fixture_intercept:1:fixture_scope_start_sanitize"
         ],
         "every registration the plugin made is proxied here, in the classes this kernel serves"
@@ -1230,7 +1381,7 @@ async fn the_composition_installs_a_plugin_from_another_process_into_this_chain(
 
     assert_eq!(
         registrations.len(),
-        17,
+        19,
         "this is the complete-plugin regression: every registration the fixture makes was served"
     );
     assert!(

@@ -24,7 +24,9 @@
 use nemo_relay_types::api::event::ScopeCategory;
 use serde::{Deserialize, Serialize};
 
-pub use nemo_relay_types::api::event::{DataSchema, EventSanitizeFields, LogSeverity};
+pub use nemo_relay_types::api::event::{
+    DataSchema, EventCategory, EventSanitizeFields, LogSeverity,
+};
 pub use nemo_relay_types::api::scope::ScopeType;
 pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
 pub use uuid::Uuid;
@@ -632,12 +634,22 @@ pub enum PluginEventSanitizeClass {
 /// plugin for the host's convenience: the uuid, the timestamps, the propagation
 /// root, and every field `Event` grows later.
 ///
-/// What crosses instead is the identity a sanitizer decides on — its name, and the
-/// scope phase when it is a scope event — plus the mutable observability fields it
-/// is allowed to change. The approved field set is enforced by a test rather than
-/// by this comment: a field added to `Event` does not reach a plugin until somebody
-/// deliberately adds it here, and a field added *here* fails that test until
-/// somebody deliberately approves it.
+/// What crosses instead is the identity a sanitizer decides on — its name, the scope
+/// phase when it is a scope event, the semantic category, and the schema that
+/// describes the payload — plus the mutable observability fields it is allowed to
+/// change. Every one of those is kernel-authored and read-only to the plugin: the
+/// boundary grants a sanitizer the right to *read* what it needs to decide, and the
+/// right to *write* only the fields an observer would see.
+///
+/// The category and the data schema are here because a sanitizer decides with them
+/// rather than about them: the PII redaction component, which the repository ships,
+/// gates its scope sanitizers on `category` and recognizes a Relay metric mark by its
+/// `data_schema`. A projection without them would not have narrowed that sanitizer —
+/// it would have silently changed which path it takes.
+///
+/// The approved field set is enforced by a test rather than by this comment: a field
+/// added to `Event` does not reach a plugin until somebody deliberately adds it here,
+/// and a field added *here* fails that test until somebody deliberately approves it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginEventSanitizeCall {
     /// Which sanitizer family this is for.
@@ -646,6 +658,18 @@ pub struct PluginEventSanitizeCall {
     pub name: String,
     /// The scope lifecycle phase, for a scope event.
     pub scope_category: Option<String>,
+    /// The event's semantic category, which a sanitizer may branch on.
+    ///
+    /// `None` is a mark that carries no category; a scope event always has one. Typed
+    /// rather than an open string so that a category a newer producer introduced keeps
+    /// its value instead of being flattened into whatever this side recognizes.
+    pub category: Option<EventCategory>,
+    /// The schema describing the payload, when the event declares one.
+    ///
+    /// A sanitizer that treats one kind of payload specially — a Relay metric mark, for
+    /// instance — decides with this, so it has to be the event's own value rather than
+    /// a summary of it.
+    pub data_schema: Option<DataSchema>,
     /// The mutable observability fields the sanitizer may change.
     pub fields: EventSanitizeFields,
 }
@@ -707,6 +731,10 @@ impl PluginEventSanitizeCall {
             class,
             name: event.name().to_owned(),
             scope_category: class.scope_category().map(phase_name).map(str::to_owned),
+            // Read from the event rather than rebuilt from the class: a sanitizer
+            // branches on what the event actually is, not on what its class implies.
+            category: event.category().cloned(),
+            data_schema: event.data_schema().cloned(),
             fields,
         })
     }
@@ -714,10 +742,11 @@ impl PluginEventSanitizeCall {
     /// The event this projection stands for.
     ///
     /// The synthetic event *is* what the sanitizer was told it would see: the name
-    /// it decides on, the phase of the class it is for, and the mutable fields. The
-    /// rest of the runtime's own event never crossed, so there is nothing else to
-    /// rebuild — the identity fields here are this process's own, which is why a
-    /// sanitizer cannot rename the event it is sanitizing.
+    /// it decides on, the phase of the class it is for, the category and data schema it
+    /// may branch on, and the mutable fields. The rest of the runtime's own event never
+    /// crossed, so there is nothing else to rebuild — the identity fields here are this
+    /// process's own, which is why a sanitizer cannot rename the event it is
+    /// sanitizing.
     pub fn into_event(self) -> Result<nemo_relay_types::api::event::Event, PluginProtocolError> {
         use nemo_relay_types::api::event::{
             BaseEvent, Event, EventCategory, MarkEvent, ScopeEvent,
@@ -734,6 +763,16 @@ impl PluginEventSanitizeCall {
                 ),
             ));
         }
+        // A scope event's category is required, so a scope projection that carries none
+        // is describing something the runtime cannot have produced. Refused rather than
+        // defaulted: a sanitizer that branches on the category must not be handed a
+        // fabricated one.
+        if expected.is_some() && self.category.is_none() {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "a scope projection states no category, which a scope event always has",
+            ));
+        }
         let EventSanitizeFields {
             data,
             category_profile,
@@ -742,15 +781,16 @@ impl PluginEventSanitizeCall {
         let base = BaseEvent::builder()
             .name(self.name)
             .data_opt(data)
+            .data_schema_opt(self.data_schema)
             .metadata_opt(metadata)
             .build();
         Ok(match expected {
-            None => Event::Mark(MarkEvent::new(base, None, category_profile)),
+            None => Event::Mark(MarkEvent::new(base, self.category, category_profile)),
             Some(category) => Event::Scope(ScopeEvent::new(
                 base,
                 category,
                 Vec::new(),
-                EventCategory::custom(),
+                self.category.unwrap_or_else(EventCategory::custom),
                 category_profile,
             )),
         })
@@ -1510,11 +1550,17 @@ mod tests {
         "class",
         "name",
         "scope_category",
+        "category",
+        "data_schema",
         "fields",
         "data",
         "category_profile",
         "metadata",
     ];
+
+    /// The names inside a `DataSchema`, which is one approved field carried as an
+    /// object rather than as a scalar.
+    const APPROVED_DATA_SCHEMA_FIELDS: &[&str] = &["name", "version"];
 
     /// Every key the projection serialises, at either level.
     fn serialized_projection_keys() -> std::collections::BTreeSet<String> {
@@ -1522,6 +1568,13 @@ mod tests {
             class: PluginEventSanitizeClass::Mark,
             name: "example.mark".into(),
             scope_category: Some("start".into()),
+            category: Some(EventCategory::tool()),
+            data_schema: Some(
+                DataSchema::builder()
+                    .name("example.schema")
+                    .version("1")
+                    .build(),
+            ),
             fields: EventSanitizeFields {
                 data: Some(serde_json::json!({"k": 1})),
                 category_profile: Some(nemo_relay_types::api::event::CategoryProfile {
@@ -1543,6 +1596,13 @@ mod tests {
                     keys.insert(field.clone());
                 }
             }
+            if key == "data_schema"
+                && let Some(schema) = value.as_object()
+            {
+                for field in schema.keys() {
+                    keys.insert(field.clone());
+                }
+            }
         }
         keys
     }
@@ -1551,23 +1611,26 @@ mod tests {
     /// the point of the projection is that disclosure is a decision: a field that
     /// crosses the boundary has to be added to the approved set deliberately, and one
     /// that is *not* on this list has to be shown not to cross.
-    const KERNEL_ONLY_FIELDS: &[&str] = &[
+    ///
+    /// `category` and `data_schema` used to be here and are not any more: they are
+    /// kernel-owned *inputs* now, read-only to a plugin and authoritative on this side.
+    /// The distinction is the reason this list is named for what the kernel retains
+    /// rather than for what a plugin may never mention.
+    const KERNEL_RETAINED_FIELDS: &[&str] = &[
         "uuid",
         "timestamp",
         "parent_uuid",
         "propagation_root_uuid",
         "atof_version",
         "kind",
-        "category",
-        "data_schema",
     ];
 
-    /// The runtime's own event shape does not cross, by key or by value.
+    /// What the kernel retains does not cross, by key or by value.
     ///
     /// The serialized-value check is what catches a field smuggled inside another one;
     /// the key check is what catches a field the projection grows.
     #[test]
-    fn a_projection_carries_no_kernel_only_field() {
+    fn a_projection_carries_no_kernel_retained_field() {
         for class in [
             PluginEventSanitizeClass::Mark,
             PluginEventSanitizeClass::ScopeStart,
@@ -1577,6 +1640,8 @@ mod tests {
                 class,
                 name: "example".into(),
                 scope_category: class.scope_category().map(|_| "start".to_string()),
+                category: Some(EventCategory::llm()),
+                data_schema: None,
                 fields: EventSanitizeFields::default(),
             };
             let serialized = serde_json::to_value(&call).expect("a serializable projection");
@@ -1586,10 +1651,10 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            for kernel_only in KERNEL_ONLY_FIELDS {
+            for retained in KERNEL_RETAINED_FIELDS {
                 assert!(
-                    !keys.contains(kernel_only),
-                    "{kernel_only} is the kernel's and crossed in this projection: {call:?}"
+                    !keys.contains(retained),
+                    "{retained} is the kernel's and crossed in this projection: {call:?}"
                 );
             }
         }
@@ -1607,6 +1672,7 @@ mod tests {
     fn the_sanitizer_projection_discloses_exactly_its_approved_fields() {
         let approved: std::collections::BTreeSet<String> = APPROVED_SANITIZER_FIELDS
             .iter()
+            .chain(APPROVED_DATA_SCHEMA_FIELDS.iter())
             .map(|field| (*field).to_owned())
             .collect();
         let serialized = serialized_projection_keys();
@@ -2011,6 +2077,147 @@ mod tests {
         assert!(
             started.into_event().is_err(),
             "a projection stating the other phase is refused rather than believed"
+        );
+    }
+
+    /// The two read-only discriminators make the round trip for every class.
+    ///
+    /// They are what a sanitizer decides with, so a projection that lost them — or a
+    /// synthetic event that dropped them — would change which path a sanitizer takes
+    /// while every other test still passed.
+    #[test]
+    fn the_category_and_data_schema_survive_every_class() {
+        use nemo_relay_types::api::event::{
+            BaseEvent, DataSchema, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
+        };
+
+        let schema = DataSchema::builder()
+            .name("nemo.relay.metric_measurements")
+            .version("1")
+            .build();
+        let mark = Event::Mark(MarkEvent::new(
+            BaseEvent::builder()
+                .name("example.mark")
+                .data_schema_opt(Some(schema.clone()))
+                .build(),
+            Some(EventCategory::tool()),
+            None,
+        ));
+        let scope = |category| {
+            Event::Scope(ScopeEvent::new(
+                BaseEvent::builder()
+                    .name("example.scope")
+                    .data_schema_opt(Some(schema.clone()))
+                    .build(),
+                category,
+                Vec::new(),
+                EventCategory::llm(),
+                None,
+            ))
+        };
+
+        for (class, event) in [
+            (PluginEventSanitizeClass::Mark, mark),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                scope(ScopeCategory::Start),
+            ),
+            (
+                PluginEventSanitizeClass::ScopeEnd,
+                scope(ScopeCategory::End),
+            ),
+        ] {
+            let expected_category = event.category().cloned();
+            let fields = event.sanitize_fields();
+            let call = PluginEventSanitizeCall::from_event(class, &event, fields)
+                .unwrap_or_else(|error| panic!("{class:?} should project: {error:?}"));
+            assert_eq!(call.category, expected_category, "{class:?}");
+            assert_eq!(call.data_schema, Some(schema.clone()), "{class:?}");
+
+            let synthetic = call
+                .into_event()
+                .unwrap_or_else(|error| panic!("{class:?} should rebuild: {error:?}"));
+            assert_eq!(
+                synthetic.category(),
+                expected_category.as_ref(),
+                "{class:?}"
+            );
+            assert_eq!(synthetic.data_schema(), Some(&schema), "{class:?}");
+        }
+
+        // And a scope projection without one is refused rather than defaulted: a
+        // sanitizer that branches on the category is not handed a fabricated one.
+        let scope_event = scope(ScopeCategory::Start);
+        let mut call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::ScopeStart,
+            &scope_event,
+            scope_event.sanitize_fields(),
+        )
+        .expect("a start projection");
+        call.category = None;
+        assert!(call.into_event().is_err());
+    }
+
+    /// The answer has nowhere to put either discriminator.
+    ///
+    /// This is the proof that "the response cannot alter them" is a property of the
+    /// type rather than of a check somebody remembered to write: what a sanitizer
+    /// returns is three mutable fields, and neither a category nor a data schema is
+    /// one of them.
+    #[test]
+    fn the_response_type_cannot_carry_a_discriminator() {
+        use nemo_relay_types::api::event::{BaseEvent, Event, ScopeCategory, ScopeEvent};
+
+        let serialized = serde_json::to_value(EventSanitizeFields {
+            data: Some(serde_json::json!({ "category": "llm", "data_schema": "forged" })),
+            category_profile: None,
+            metadata: None,
+        })
+        .expect("a serializable answer");
+        let keys: std::collections::BTreeSet<&str> = serialized
+            .as_object()
+            .expect("fields are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["category_profile", "data", "metadata"]
+                .into_iter()
+                .collect(),
+            "the answer is the mutable fields and nothing else"
+        );
+
+        // A payload that spells a category is still only a payload: what a sanitizer
+        // returns is applied to the fields, and the projection's own values are what
+        // the rebuilt event carries.
+        let scope_event = Event::Scope(ScopeEvent::new(
+            BaseEvent::builder().name("example.scope").build(),
+            ScopeCategory::Start,
+            Vec::new(),
+            EventCategory::llm(),
+            None,
+        ));
+        let call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::ScopeStart,
+            &scope_event,
+            EventSanitizeFields::default(),
+        )
+        .expect("a start projection");
+        let mut rebuilt = call.into_event().expect("a synthetic scope");
+        rebuilt.apply_sanitize_fields(EventSanitizeFields {
+            data: Some(serde_json::json!({ "category": "tool", "data_schema": "forged" })),
+            category_profile: None,
+            metadata: None,
+        });
+        assert_eq!(
+            rebuilt.category(),
+            Some(&EventCategory::llm()),
+            "a sanitizer's answer cannot move the category"
+        );
+        assert!(
+            rebuilt.data_schema().is_none(),
+            "and cannot invent one either"
         );
     }
 }

@@ -183,7 +183,13 @@ max_transitive_packages = 24
 # kernel keeps are written down as data, so a projection that grows a key fails a test
 # instead of passing silently, and the same list is asserted over every class. No
 # dependency moved and no `unsafe` did.
-max_source_lines = 2016
+#
+# Raised for the two read-only discriminators and the tests that keep them honest: the
+# fields themselves, the round trip that carries them through a synthetic event for all
+# three classes, the refusal of a scope projection that states no category, and the
+# proof that an answer has nowhere to put either one. No dependency moved and no
+# `unsafe` did.
+max_source_lines = 2223
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -398,10 +404,16 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # this runtime publishes, and a failing one unable to publish what it was shown. The
 # recursion the qualification found is fixed on the core side, not here. No dependency
 # moved and no `unsafe` did.
+#
+# Raised again for the semantic qualification: a fixture registration that decides the
+# way the PII redaction component does — metric mark by data schema, otherwise by
+# category — a host test that drives every branch, and a real-child test that requires
+# the decision to be made on the child's side of the boundary. No dependency moved and
+# no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 19520
+max_source_lines = 19621
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
