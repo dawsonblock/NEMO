@@ -1468,6 +1468,22 @@ replaces the other: a boundary that served sixteen classes nobody registers woul
 be complete and useless, and a fixture that happens to register only servable
 classes says nothing about the classes that do not cross.
 
+**Where Layer 2 of the event sanitizers starts, from the reconnaissance.** Two
+things the next session should not have to rediscover, both found by reading the one
+already-served class whose payload is an event:
+
+- The wire already carries an event. `PluginObservedEvent` is what the metadata
+  injector's path deserializes ([service.rs](/Users/dawsonblock/Downloads/NeMo-Relay-main/crates/plugin-host/src/service.rs:456)) and hands to
+  `invoke_event_metadata_injector_registration` as `observed.event`. The event
+  sanitizers take the same shape, so their payload is that type rather than anything
+  invented, and the answer is the sanitized event serialized back.
+- The proxy to model is therefore `install_event_metadata_injector`, not
+  `install_tool_sanitize`: the injector's class already carries an event across the
+  boundary, and its proxy shows where a returned event is applied. The tool pair
+  remains the model for the *refusal* rule — a payload that could not be sanitized is
+  not published unsanitized — and for the off-path submission the sanitizers need
+  because they run beside a call.
+
 **The five classes left, and the one question among them.** Four touch points per
 class, in this order: a core entry point that runs exactly one registration of the
 class (the shape of `invoke_tool_sanitize_request_registration`), a kernel proxy per
