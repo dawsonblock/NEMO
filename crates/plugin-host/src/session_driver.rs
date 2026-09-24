@@ -1193,6 +1193,29 @@ mod tests {
             dropped
         }
 
+        /// A producer that never yields, under a budget whose deadline is short
+        /// enough to fire while the stream is being pulled.
+        async fn park_gated_watched(&self, operation: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let producer = never(Arc::clone(&dropped));
+            let continuations = Arc::clone(&self.continuations);
+            let operation = operation.to_owned();
+            let millis = 50_u64;
+            let now = nemo_relay::api::runtime::budget_now_unix_ms();
+            nemo_relay::api::runtime::with_execution_budget(
+                nemo_relay::api::runtime::ExecutionBudget::new(now + millis, millis),
+                async move {
+                    std::mem::forget(continuations.hold_llm_stream(
+                        &operation,
+                        "registration-1",
+                        producer,
+                    ));
+                },
+            )
+            .await;
+            dropped
+        }
+
         /// A producer that produces `chunks` and then ends, with a sentinel of its
         /// own.
         fn park_watched(
@@ -2018,17 +2041,22 @@ mod tests {
 
     /// Streams that end every way at once, over and over, leave nothing behind.
     ///
-    /// Every other test here pins one state, deliberately. This is for the races
-    /// they cannot see: an actor being cancelled while its neighbours are
-    /// producing, a release landing between another stream's frames, an open
-    /// arriving while a terminal is in flight. Repeating the mixture is what makes
-    /// a missing cleanup show up as a count that does not return to where it
-    /// started, rather than as one unlucky interleaving nobody ran.
+    /// Every other test here pins one state, deliberately. This is for the races they
+    /// cannot see — an actor cancelled while its neighbours are producing, a release
+    /// landing between another stream's frames, a deadline firing while a pull is
+    /// outstanding, a session ending under all of it — run enough times that a
+    /// missing cleanup shows up as a count that does not return to where it started.
+    ///
+    /// The baseline is taken *per round* rather than once around the loop, because
+    /// leakage that accumulates one object at a time is exactly what a single
+    /// end-of-loop check would miss. Nothing here requires a particular order between
+    /// the streams: what is asserted is what each stream owes and the counts every
+    /// round has to give back.
     #[tokio::test]
     async fn streams_that_end_every_way_at_once_leave_nothing_behind() {
         for round in 0..25 {
             let mut session = Session::new();
-            let completing = session.park_watched(
+            let finishing = session.park_watched(
                 "operation-1",
                 vec![
                     serde_json::json!({"chunk": 1}),
@@ -2038,54 +2066,62 @@ mod tests {
             let cancelled = session.park_pending_watched("operation-2");
             let released =
                 session.park_watched("operation-3", vec![serde_json::json!({"chunk": 3})]);
-            let finishing = session.opened("call-1", "operation-1").await;
+            let expiring = session.park_gated_watched("operation-4").await;
+
+            let baseline = (session.driver.actors_alive(), 0);
+
+            let completed = session.opened("call-1", "operation-1").await;
             let never = session.opened("call-2", "operation-2").await;
             let let_go = session.opened("call-3", "operation-3").await;
+            let timed_out = session.opened("call-4", "operation-4").await;
             assert_eq!(
                 session.driver.actors_alive(),
-                3,
-                "round {round} is three streams, each with an actor of its own"
+                baseline.0 + 4,
+                "round {round} opened four streams, each with an actor of its own"
             );
 
-            // Three ways of ending, interleaved: one stream produces and finishes,
-            // one is cancelled while its pull is outstanding, and one is let go
-            // without ever being pulled.
-            session.pull("call-4", &finishing).expect("a pull");
+            // Four ways of ending, interleaved: one finishes, one is cancelled with a
+            // pull outstanding, one is let go unpulled, and one runs out of its
+            // call's time while a pull is outstanding.
+            session.pull("call-5", &completed).expect("a pull");
             assert!(matches!(
                 session.answer().await,
                 PluginSessionPayload::StreamItem(_)
             ));
-            session.pull("call-5", &never).expect("a pull");
+            session.pull("call-6", &never).expect("a pull");
             session.cancel("cancel-1", &never).expect("a cancellation");
             session.release("release-1", &let_go).expect("a release");
+            session.pull("call-7", &timed_out).expect("a pull");
 
-            session.pull("call-6", &finishing).expect("a pull");
-            assert!(
-                matches!(session.answer().await, PluginSessionPayload::StreamItem(_)),
-                "round {round} produces the second chunk"
-            );
-            session.pull("call-7", &finishing).expect("a pull");
-            assert!(
-                matches!(session.answer().await, PluginSessionPayload::StreamEnd(_)),
-                "round {round} ends the stream it was producing"
-            );
+            session.pull("call-8", &completed).expect("a pull");
+            assert!(matches!(
+                session.answer().await,
+                PluginSessionPayload::StreamItem(_)
+            ));
+            session.pull("call-9", &completed).expect("a pull");
+            assert!(matches!(
+                session.answer().await,
+                PluginSessionPayload::StreamEnd(_)
+            ));
 
+            // Everything settles, and every round gives the counts back.
+            session.actors_gone().await;
             for (stream, sentinel) in [
-                ("the stream that finished", &completing),
+                ("the stream that finished", &finishing),
                 ("the stream that was cancelled", &cancelled),
                 ("the stream that was released", &released),
+                ("the stream that ran out of time", &expiring),
             ] {
                 session.await_sentinel(sentinel, stream).await;
             }
-            session.actors_gone().await;
             assert_eq!(
                 session.driver.actors_alive(),
-                0,
+                baseline.0,
                 "round {round} left an actor behind"
             );
             assert_eq!(
                 session.driver.served_streams(),
-                0,
+                baseline.1,
                 "round {round} left a stream in the registry"
             );
         }

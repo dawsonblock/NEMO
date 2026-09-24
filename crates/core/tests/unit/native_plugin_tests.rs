@@ -1770,6 +1770,141 @@ fn assert_native_json_output_and_host_api() {
     );
 }
 
+/// A mark window captured for one call is refused once that call is over.
+///
+/// The security property, stated as a sequence rather than as cleanup: a plugin task
+/// that outlives its call still holds the window it captured, and the operation
+/// identity that window carries belongs to a call the kernel has already settled. A
+/// late mark through it must be refused — not attributed to whatever holds that
+/// identity now — and a later operation's window must be unaffected by it.
+#[test]
+fn a_captured_mark_window_is_refused_once_its_call_is_over() {
+    use crate::plugin::execution::{ForwardedMark, MarkForwarder};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The host's own end of one call's window.
+    struct Sink {
+        label: &'static str,
+        closed: AtomicBool,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MarkForwarder for Sink {
+        fn forward(&self, mark: &ForwardedMark) -> crate::error::Result<()> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(crate::error::FlowError::Internal(format!(
+                    "the invocation '{}' this mark belongs to has ended",
+                    self.label
+                )));
+            }
+            self.seen.lock().unwrap().push(mark.name.clone());
+            Ok(())
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let first = std::sync::Arc::new(Sink {
+            label: "operation-1",
+            closed: AtomicBool::new(false),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // The call is running: the window it opened is captured, and a mark through
+        // it belongs to this call.
+        let window = crate::plugin::execution::with_mark_forwarder(
+            std::sync::Arc::clone(&first) as std::sync::Arc<dyn MarkForwarder>,
+            async {
+                let mut window = ptr::null_mut();
+                let status = unsafe { native_capture_mark_window_thread(&mut window) };
+                assert_eq!(status, NemoRelayStatus::Ok);
+                assert!(!window.is_null(), "a running call has a window to capture");
+                window
+            },
+        )
+        .await;
+        assert_eq!(first.seen.lock().unwrap().len(), 0);
+
+        // The call ends. The window the plugin kept is a *stale* capability: the
+        // mark it raises now is refused rather than attributed to the next
+        // operation.
+        first.closed.store(true, Ordering::SeqCst);
+        let late = std::ffi::CString::new("late.mark").unwrap();
+        let emitted = unsafe {
+            native_emit_mark_in_window(
+                window,
+                native_string_from_str(late.to_str().unwrap()).expect("a name"),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        assert_ne!(
+            emitted,
+            NemoRelayStatus::Ok,
+            "a mark raised through a window whose call is over is refused"
+        );
+        assert_eq!(
+            first.seen.lock().unwrap().len(),
+            0,
+            "and it is not attributed to the operation the window named"
+        );
+
+        // Releasing the stale handle is safe, and a later operation's window is
+        // unaffected: the refusal was the window's, not the mechanism's.
+        unsafe { native_release_mark_window(window) };
+        let second = std::sync::Arc::new(Sink {
+            label: "operation-2",
+            closed: AtomicBool::new(false),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        crate::plugin::execution::with_mark_forwarder(
+            std::sync::Arc::clone(&second) as std::sync::Arc<dyn MarkForwarder>,
+            async {
+                let mut fresh = ptr::null_mut();
+                assert_eq!(
+                    unsafe { native_capture_mark_window_thread(&mut fresh) },
+                    NemoRelayStatus::Ok
+                );
+                let name = native_string_from_str("fresh.mark").expect("a name");
+                assert_eq!(
+                    unsafe {
+                        native_emit_mark_in_window(
+                            fresh,
+                            name,
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                        )
+                    },
+                    NemoRelayStatus::Ok
+                );
+                unsafe { native_release_mark_window(fresh) };
+            },
+        )
+        .await;
+        assert_eq!(
+            *second.seen.lock().unwrap(),
+            vec!["fresh.mark".to_string()],
+            "the later operation's own marks are the only ones it sees"
+        );
+        assert_eq!(
+            *first.seen.lock().unwrap(),
+            Vec::<String>::new(),
+            "and the late mark never became anyone's"
+        );
+    });
+}
+
 /// The negotiation a plugin's entry goes through.
 ///
 /// Every already-built plugin depends on this order: the current table first, then
