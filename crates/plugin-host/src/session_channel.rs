@@ -161,12 +161,16 @@ impl SessionChannel {
         let request_json =
             serde_json::to_string(request).map_err(|error| format!("unserializable: {error}"))?;
         let host_call_id = self.next_call();
+        // Registered before the message is sent, not after: an answer that
+        // arrives first has nowhere to go, and a call whose answer is dropped is
+        // a call that waits forever. The same rule the pulling task follows.
+        let answer = self.await_answer(&host_call_id)?;
         self.outbound
             .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
                 &PluginSessionMessage {
                     session_id: self.session_id.clone(),
                     message: PluginSessionPayload::StreamOpen(PluginStreamOpenRequest {
-                        host_call_id: host_call_id.clone(),
+                        host_call_id,
                         operation_request_id: operation_request_id.to_owned(),
                         request_json,
                     }),
@@ -175,7 +179,10 @@ impl SessionChannel {
             .await
             .map_err(|_| "the kernel is no longer reachable".to_string())?;
 
-        match self.await_answer(&host_call_id).await? {
+        let answered = answer
+            .await
+            .map_err(|_| "the session ended before the kernel answered".to_string())?;
+        match answered {
             PluginSessionPayload::StreamOpened(opened) => Ok(self.pull(opened.stream_id)),
             PluginSessionPayload::StreamOpenFailed(failed) => Err(failed.failure.message),
             // Anything else answering an open is a session that answered a call
@@ -193,16 +200,23 @@ impl SessionChannel {
         )
     }
 
-    /// Wait for the answer to one call.
-    async fn await_answer(&self, host_call_id: &str) -> Result<PluginSessionPayload, String> {
+    /// Register a place for the answer to one call, before it is sent.
+    fn await_answer(
+        &self,
+        host_call_id: &str,
+    ) -> Result<tokio::sync::oneshot::Receiver<PluginSessionPayload>, String> {
         let (sender, answer) = tokio::sync::oneshot::channel();
-        self.answers
+        let replaced = self
+            .answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(host_call_id.to_owned(), sender);
-        answer
-            .await
-            .map_err(|_| "the session ended before the kernel answered".to_string())
+        if replaced.is_some() {
+            // Two calls under one identity would make an answer ambiguous, which
+            // is the one thing this router exists to prevent.
+            return Err(format!("call identity '{host_call_id}' was reused"));
+        }
+        Ok(answer)
     }
 
     /// A stream that pulls `stream_id` from the kernel.

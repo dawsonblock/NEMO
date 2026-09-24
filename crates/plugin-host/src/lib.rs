@@ -607,6 +607,7 @@ impl ProcessLoadedPlugins {
         // the operation scopes are what attach a mark the plugin raises to the
         // call that raised it.
         let context = crate::proxy::ProxyContext::new(manager, binding, registration_cap_millis)
+            .with_streaming_backend(Arc::clone(&backend))
             .with_operation_scopes(backend.operation_scopes())
             .with_continuations(backend.continuations())
             .with_observability_budget(observability.budget_millis)

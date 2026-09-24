@@ -52,6 +52,11 @@ pub struct ProxyContext {
     /// Optional because a kernel that forwards nothing has no use for it, and a
     /// proxy without one simply leaves the registry alone.
     operation_scopes: Option<Arc<OperationScopes>>,
+    /// The backend a streaming invocation goes to, when this composition has one.
+    ///
+    /// Not the manager: that answers one request with one outcome, and a stream
+    /// is a different shape of call rather than a longer one.
+    streaming: Option<Arc<crate::supervisor::ProcessPluginBackend>>,
     /// Where the rest of a chain is held while a plugin decides when to run it.
     ///
     /// Required by the families that wrap a call rather than answer one: an
@@ -117,6 +122,7 @@ impl ProxyContext {
             runtime_binding_digest: runtime_binding_digest.into(),
             local_cap_millis,
             operation_scopes: None,
+            streaming: None,
             continuations: None,
             observability_budget_millis: None,
             off_path: None,
@@ -148,6 +154,15 @@ impl ProxyContext {
         self
     }
 
+    /// Reach the backend that can start a streaming invocation.
+    pub fn with_streaming_backend(
+        mut self,
+        backend: Arc<crate::supervisor::ProcessPluginBackend>,
+    ) -> Self {
+        self.streaming = Some(backend);
+        self
+    }
+
     /// Hold suspended chain positions in `continuations`.
     ///
     /// Not optional in spirit: a proxy for a class that wraps a call cannot serve
@@ -175,6 +190,7 @@ pub struct RegistrationProxies {
     tool_sanitize_request: Vec<String>,
     tool_execution_intercepts: Vec<String>,
     llm_execution_intercepts: Vec<String>,
+    llm_stream_execution_intercepts: Vec<String>,
     tool_conditional: Vec<String>,
     llm_conditional: Vec<String>,
     tool_sanitize_response: Vec<String>,
@@ -193,6 +209,10 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("tool_sanitize_request", &self.tool_sanitize_request)
             .field("tool_execution_intercepts", &self.tool_execution_intercepts)
             .field("llm_execution_intercepts", &self.llm_execution_intercepts)
+            .field(
+                "llm_stream_execution_intercepts",
+                &self.llm_stream_execution_intercepts,
+            )
             .field("tool_conditional", &self.tool_conditional)
             .field("llm_conditional", &self.llm_conditional)
             .field("tool_sanitize_response", &self.tool_sanitize_response)
@@ -211,6 +231,7 @@ impl RegistrationProxies {
             .chain(self.tool_sanitize_request.iter())
             .chain(self.tool_execution_intercepts.iter())
             .chain(self.llm_execution_intercepts.iter())
+            .chain(self.llm_stream_execution_intercepts.iter())
             .chain(self.tool_conditional.iter())
             .chain(self.llm_conditional.iter())
             .chain(self.tool_sanitize_response.iter())
@@ -258,6 +279,10 @@ impl Drop for RegistrationProxies {
         for registration in &self.llm_execution_intercepts {
             let _ = nemo_relay::api::registry::deregister_llm_execution_intercept(registration);
         }
+        for registration in &self.llm_stream_execution_intercepts {
+            let _ =
+                nemo_relay::api::registry::deregister_llm_stream_execution_intercept(registration);
+        }
     }
 }
 
@@ -275,6 +300,7 @@ pub fn install(
         tool_sanitize_request: Vec::new(),
         tool_execution_intercepts: Vec::new(),
         llm_execution_intercepts: Vec::new(),
+        llm_stream_execution_intercepts: Vec::new(),
         tool_conditional: Vec::new(),
         llm_conditional: Vec::new(),
         tool_sanitize_response: Vec::new(),
@@ -343,6 +369,12 @@ pub fn install(
                 install_llm_execution_intercept(&context, registration, &handle)?;
                 installed
                     .llm_execution_intercepts
+                    .push(registration.registration_id.clone());
+            }
+            PluginRegistrationOperation::LlmStreamExecutionIntercept => {
+                install_llm_stream_execution_intercept(&context, registration, &handle)?;
+                installed
+                    .llm_stream_execution_intercepts
                     .push(registration.registration_id.clone());
             }
             other => {
@@ -784,6 +816,175 @@ fn install_tool_execution_intercept(
             ),
         )
     })
+}
+
+/// Install the proxy for one streaming LLM execution intercept.
+///
+/// The third execution family, and the only one whose answer is a stream in both
+/// directions: the plugin pulls the downstream stream through the session channel
+/// while the kernel reads the stream the plugin returned. The kernel's part is to
+/// park the chain position the host will pull from, start the invocation, and hand
+/// the frames it produces to the caller as a managed stream.
+///
+/// The parked position is released when the stream ends or is dropped, in that
+/// order of importance: a stream the caller stopped reading has to stop the
+/// plugin, which needs the position to be gone rather than merely unused.
+fn install_llm_stream_execution_intercept(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    let continuations = context.continuations.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' needs the composition to hold continuations: a streaming \
+                 intercept's downstream stream is the kernel's own chain",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::LlmStreamExecutionFn =
+        Arc::new(move |name: &str, request: LlmRequest, next| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let continuations = Arc::clone(&continuations);
+            let name = name.to_owned();
+            Box::pin(async move {
+                let payload = serde_json::json!({ "name": name, "request": request });
+                let execution = context.execution_context()?;
+                let invocation = PluginInvokeRequest {
+                    handle,
+                    registration_id: registration_id.clone(),
+                    arguments: payload.to_string(),
+                    budget_millis: execution.remaining_budget_millis,
+                };
+                let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                    scopes.enter(
+                        &execution.operation_request_id,
+                        nemo_relay::api::runtime::current_scope_stack(),
+                    )
+                });
+                // Held for the life of the stream rather than the life of the
+                // call: the plugin pulls from this position while its own stream
+                // is being read, and a position released when the call returned
+                // would refuse the pull that comes later.
+                let held = continuations.hold_llm_stream(
+                    &execution.operation_request_id,
+                    &registration_id,
+                    next,
+                );
+                // The streaming call goes to the backend rather than through the
+                // manager: the manager's job is one request and one answer, and
+                // this answer is a stream.
+                let streaming = context.streaming.clone().ok_or_else(|| {
+                    nemo_relay::error::FlowError::Internal(
+                        "this composition reaches no streaming backend".to_string(),
+                    )
+                })?;
+                let frames = streaming
+                    .invoke_stream(invocation, execution.clone())
+                    .await
+                    .map_err(|error| nemo_relay::error::FlowError::PluginInvocation {
+                        registration: registration_id.clone(),
+                        // The call was handed to the host before anything could
+                        // fail here, and the plugin's callback is what runs
+                        // there: whether it produced anything is not something
+                        // this side can deny, so the failure says so.
+                        dispatch: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted,
+                        certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown,
+                        failure: error.failure,
+                    })?;
+                Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                    FramesAsChunks {
+                        frames,
+                        _held: held,
+                    },
+                ))
+            })
+        });
+
+    nemo_relay::api::registry::register_llm_stream_execution_intercept(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// The kernel's view of a streaming invocation's frames, as a plugin stream.
+///
+/// The frames are read one at a time, because reading is what asks the host for
+/// the next one. The parked chain position is held here so it outlives the call
+/// that started the stream and is released when the stream is finished with.
+struct FramesAsChunks {
+    frames: crate::supervisor::PluginStreamFrames,
+    _held: crate::continuations::ContinuationGuard,
+}
+
+impl tokio_stream::Stream for FramesAsChunks {
+    type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use nemo_relay_plugin_protocol::PluginStreamChunkKind;
+        use std::task::Poll;
+
+        let this = self.as_mut().get_mut();
+        let operation = this.frames.operation_request_id().to_owned();
+        match std::pin::Pin::new(&mut this.frames).poll_next(context) {
+            Poll::Ready(Some(Ok(frame))) => match frame.chunk {
+                PluginStreamChunkKind::Data(data) => match serde_json::from_str(&data) {
+                    Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
+                    Err(error) => Poll::Ready(Some(Err(nemo_relay::error::FlowError::Internal(
+                        format!("a streamed chunk is not JSON: {error}"),
+                    )))),
+                },
+                // The plugin said the stream was over; the caller's stream ends
+                // here rather than waiting for a frame that is not coming.
+                PluginStreamChunkKind::End => Poll::Ready(None),
+                PluginStreamChunkKind::Failed(failure) => {
+                    Poll::Ready(Some(Err(nemo_relay::error::FlowError::PluginInvocation {
+                        registration: operation,
+                        dispatch: frame.dispatch,
+                        certainty: frame.certainty,
+                        failure,
+                    })))
+                }
+            },
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(nemo_relay::error::FlowError::PluginInvocation {
+                    registration: operation,
+                    // The frames that arrived were produced by the plugin, so
+                    // whether the call happened is not this failure's to deny.
+                    dispatch: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted,
+                    certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown,
+                    failure: nemo_relay_plugin_protocol::PluginFailure {
+                        code: error.failure.code,
+                        message: error.failure.message,
+                    },
+                })))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Install the proxy for one non-streaming LLM execution intercept.
@@ -1779,9 +1980,13 @@ mod tests {
             "test-binding",
             5_000,
         );
+        // A class with no proxy at all. The streaming family used to be the
+        // example here and is not any more — it has a proxy, which is why this
+        // names a sanitizer: the classes that remain unproxied are the five whose
+        // shapes the boundary does not carry yet.
         let error = install(
             context,
-            &descriptor(PluginRegistrationOperation::LlmStreamExecutionIntercept),
+            &descriptor(PluginRegistrationOperation::MarkSanitizeGuardrail),
             PluginHandle {
                 plugin_id: "example".into(),
                 generation: 1,
@@ -1794,10 +1999,7 @@ mod tests {
         // installing what it can and forgetting the rest.
         assert_eq!(error.failure.code, PluginFailureCode::Rejected);
         assert!(
-            error
-                .failure
-                .message
-                .contains("llm_stream_execution_intercept"),
+            error.failure.message.contains("mark_sanitize_guardrail"),
             "{error:?}"
         );
     }

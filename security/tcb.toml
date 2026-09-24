@@ -128,7 +128,7 @@ max_transitive_packages = 265
 # is the loader recording the registrations an instance *has* rather than a log of
 # every one it ever made: a second activation against one instance used to double
 # its own description, which the conversion then refused.
-max_source_lines = 73905
+max_source_lines = 73980
 max_unsafe_occurrences = 299
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
@@ -256,7 +256,11 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # The duplex session's driver is the streaming family's first piece: the kernel's
 # side of the channel a plugin pulls a wrapped stream over, and — its other half —
 # the host's end of the same channel, where a callback's pull becomes a message and
-# a dropped stream becomes a cancellation. Four direct
+# a dropped stream becomes a cancellation. The upstream half is here too: the host
+# runs a streaming registration and answers with the frames its returned stream
+# produces, and the kernel reads them one at a time through the proxy for that
+# class. The streaming class is still not in the served set, so none of it runs in
+# production yet. Four direct
 # dependencies arrived with it: `getrandom` for the 256-bit session capability,
 # `subtle` for the comparison that must not leak it, `rustix` for the resource
 # ceilings applied between `fork` and `exec`, and `futures-util` for catching a
@@ -268,7 +272,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 13045
+max_source_lines = 13884
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

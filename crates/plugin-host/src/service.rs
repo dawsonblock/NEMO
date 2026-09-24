@@ -103,6 +103,12 @@ pub struct PluginHostService {
     /// kernel's remainder of the chain, so a plugin's `next` is a call this side
     /// makes.
     kernel: Option<crate::runtime_service::KernelCallbacks>,
+    /// The session channel this host pulls its plugins' downstream streams over.
+    ///
+    /// Created when the first streaming registration needs it, because a host
+    /// that never serves one has no reason to hold a channel open.
+    session_channel:
+        tokio::sync::Mutex<Option<std::sync::Arc<crate::session_channel::SessionChannel>>>,
 }
 
 /// This host's end of the channel its forwarded marks travel on.
@@ -207,6 +213,7 @@ impl PluginHostService {
             session: Mutex::new(HostSession::New),
             mark_forwarding: None,
             kernel: None,
+            session_channel: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -792,6 +799,73 @@ fn presented_capability<T>(request: &Request<T>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The frames one streaming invocation's returned stream produces.
+///
+/// One frame per poll, which is what keeps the upstream path lazy: the kernel
+/// reading a frame is what asks this process to produce the next one, so a plugin
+/// whose returned stream would produce without bound is bounded by its consumer
+/// rather than by a queue somewhere in between.
+struct PluginFrames {
+    stream: nemo_relay::api::runtime::LlmJsonStream,
+    operation_request_id: String,
+    /// Whether the terminal frame has been sent, so the stream ends once.
+    terminal: bool,
+}
+
+impl tokio_stream::Stream for PluginFrames {
+    type Item = Result<v1::StreamChunk, tonic::Status>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
+        let this = self.as_mut().get_mut();
+        if this.terminal {
+            return Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut this.stream).poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(v1::StreamChunk {
+                operation_request_id: this.operation_request_id.clone(),
+                chunk: Some(v1::stream_chunk::Chunk::Data(chunk.to_string())),
+                // A frame that is not terminal carries no certainty about the
+                // call; what it does carry is that the plugin produced it.
+                dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted as i32,
+                outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown as i32,
+            }))),
+            Poll::Ready(Some(Err(error))) => {
+                this.terminal = true;
+                Poll::Ready(Some(Ok(v1::StreamChunk {
+                    operation_request_id: this.operation_request_id.clone(),
+                    chunk: Some(v1::stream_chunk::Chunk::Failure(v1::PluginFailure {
+                        code: nemo_relay_plugin_proto::v1::FailureCode::Rejected as i32,
+                        message: error.to_string(),
+                        ..Default::default()
+                    })),
+                    // The plugin produced something before failing, so whether
+                    // the work happened is not this frame's to say.
+                    dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted
+                        as i32,
+                    outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::Unknown as i32,
+                })))
+            }
+            Poll::Ready(None) => {
+                this.terminal = true;
+                Poll::Ready(Some(Ok(v1::StreamChunk {
+                    operation_request_id: this.operation_request_id.clone(),
+                    chunk: Some(v1::stream_chunk::Chunk::End(true)),
+                    dispatch_state: nemo_relay_plugin_protocol::DispatchState::DispatchAttempted
+                        as i32,
+                    outcome_certainty:
+                        nemo_relay_plugin_protocol::OutcomeCertainty::ConfirmedSuccess as i32,
+                })))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// The lifetime of one activation's registrations.
 ///
 /// Activation runs a plugin's register callbacks, so the callbacks live in this
@@ -1375,33 +1449,163 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         &self,
         request: Request<v1::InvokeRequest>,
     ) -> Result<Response<Self::InvokeStreamStream>, Status> {
-        // No stream is produced, and the stream says so: a stream that simply
-        // stopped would be a truncation the kernel cannot distinguish from a
-        // host that died mid-answer.
-        //
-        // Like `cancel_operation`, this answer does not depend on the caller, so
-        // there is nothing here a capability would be protecting.
-        let refusal = v1::StreamChunk {
-            // Named when the caller named one, for the same reason a unary
-            // answer names its invocation: a terminal frame that belongs to no
-            // operation is not a terminal frame.
-            operation_request_id: request
-                .into_inner()
-                .context
-                .map(|context| context.operation_request_id)
-                .unwrap_or_default(),
-            chunk: Some(v1::stream_chunk::Chunk::Failure(v1::PluginFailure {
-                code: nemo_relay_plugin_proto::v1::FailureCode::Rejected as i32,
-                message: "this host does not serve streaming invocations".to_string(),
-                ..Default::default()
-            })),
-            dispatch_state: nemo_relay_plugin_protocol::DispatchState::NotDispatched as i32,
-            outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::ConfirmedFailure
-                as i32,
+        let refusal = |operation_request_id: String, message: String| -> Self::InvokeStreamStream {
+            // A refusal travels as a terminal frame rather than as a transport
+            // status, because a stream that simply stopped would be a truncation
+            // the kernel cannot distinguish from a host that died mid-answer.
+            Box::pin(tokio_stream::iter(vec![Ok(v1::StreamChunk {
+                // Named when the caller named one: a terminal frame that belongs
+                // to no operation is not a terminal frame.
+                operation_request_id,
+                chunk: Some(v1::stream_chunk::Chunk::Failure(v1::PluginFailure {
+                    code: nemo_relay_plugin_proto::v1::FailureCode::Rejected as i32,
+                    message,
+                    ..Default::default()
+                })),
+                dispatch_state: nemo_relay_plugin_protocol::DispatchState::NotDispatched as i32,
+                outcome_certainty: nemo_relay_plugin_protocol::OutcomeCertainty::ConfirmedFailure
+                    as i32,
+            })]))
         };
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
-            refusal,
-        )]))))
+
+        let capability = presented_capability(&request);
+        let wire = request.into_inner();
+        let operation_request_id = wire
+            .context
+            .as_ref()
+            .map(|context| context.operation_request_id.trim().to_owned())
+            .unwrap_or_default();
+        let context = match self.prepare(
+            &wire.session_id,
+            capability.as_deref(),
+            wire.context.as_ref(),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(Response::new(refusal(
+                    operation_request_id,
+                    error.failure.message,
+                )));
+            }
+        };
+        let invocation = match invoke_request_from_wire(&wire, &context) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                return Ok(Response::new(refusal(
+                    operation_request_id,
+                    error.failure.message,
+                )));
+            }
+        };
+        // The class this RPC carries is the one whose answer is a stream. A
+        // registration of another class is refused rather than run: its answer
+        // would be a value, and a value sent as the first frame of a stream is an
+        // answer nobody asked for in that shape.
+        match self.registration_operation(&invocation, &context).await {
+            Ok(nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmStreamExecutionIntercept) => {}
+            Ok(other) => {
+                return Ok(Response::new(refusal(
+                    operation_request_id,
+                    format!("this host serves streaming invocations for one class, not {}", other.as_str()),
+                )))
+            }
+            Err(error) => {
+                return Ok(Response::new(refusal(operation_request_id, error.failure.message)))
+            }
+        }
+
+        let Some(kernel) = self.kernel.clone() else {
+            return Ok(Response::new(refusal(
+                operation_request_id,
+                "this host has no kernel to pull a wrapped stream from, so a streaming intercept \
+                 cannot be served here"
+                    .to_string(),
+            )));
+        };
+        let session = match self.session(&kernel, &wire.session_id).await {
+            Ok(session) => session,
+            Err(message) => return Ok(Response::new(refusal(operation_request_id, message))),
+        };
+
+        let payload: serde_json::Value = match serde_json::from_str(&invocation.arguments) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Ok(Response::new(refusal(
+                    operation_request_id,
+                    format!("a streaming intercept payload must be JSON: {error}"),
+                )));
+            }
+        };
+        let Some(name) = payload.get("name").and_then(|value| value.as_str()) else {
+            return Ok(Response::new(refusal(
+                operation_request_id,
+                "a streaming intercept payload names no provider".to_string(),
+            )));
+        };
+        let name = name.to_owned();
+        let request_json = payload.get("request").cloned().unwrap_or_default();
+        let provider_request: nemo_relay::api::llm::LlmRequest = match serde_json::from_value(
+            request_json,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::new(refusal(
+                    operation_request_id,
+                    format!(
+                        "a streaming intercept payload carries something that is not a request: {error}"
+                    ),
+                )));
+            }
+        };
+
+        // The continuation the plugin pulls its downstream stream through. Each
+        // call opens the stream the kernel is producing for this operation, so a
+        // callback that pulls late — inside its own returned stream, which is
+        // what a lazy adapter does — still reaches the same chain position.
+        let operation = context.operation_request_id.clone();
+        let pulled = std::sync::Arc::clone(&session);
+        let next: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
+            std::sync::Arc::new(move |request| {
+                let session = std::sync::Arc::clone(&pulled);
+                let operation = operation.clone();
+                Box::pin(async move {
+                    session
+                        .open_stream(&operation, &request)
+                        .await
+                        // The managed stream the callback receives: the same
+                        // value an in-process plugin is handed, so a callback
+                        // written against the ABI does not know the difference.
+                        .map(crate::session_channel::PullStream::into_managed)
+                        .map_err(|error| {
+                            nemo_relay::error::FlowError::Internal(format!(
+                                "the wrapped stream could not be opened: {error}"
+                            ))
+                        })
+                })
+            });
+
+        let stream = match nemo_relay::api::llm::invoke_llm_stream_execution_intercept_registration(
+            &invocation.registration_id,
+            &name,
+            provider_request,
+            next,
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Ok(Response::new(refusal(
+                    operation_request_id,
+                    error.to_string(),
+                )));
+            }
+        };
+
+        Ok(Response::new(Box::pin(PluginFrames {
+            stream,
+            operation_request_id: context.operation_request_id.clone(),
+            terminal: false,
+        })))
     }
 
     async fn session_close(
@@ -1478,6 +1682,24 @@ impl PluginHostService {
                     descriptor.plugin_id, request.registration_id
                 ))
             })
+    }
+
+    /// The channel a streaming invocation pulls its downstream stream over.
+    ///
+    /// One per host, created on first use: the kernel serves one session, so a
+    /// second channel would be a second reader of the same session's answers.
+    async fn session(
+        &self,
+        kernel: &crate::runtime_service::KernelCallbacks,
+        session_id: &str,
+    ) -> Result<std::sync::Arc<crate::session_channel::SessionChannel>, String> {
+        let mut slot = self.session_channel.lock().await;
+        if let Some(session) = slot.as_ref() {
+            return Ok(std::sync::Arc::clone(session));
+        }
+        let session = std::sync::Arc::new(kernel.open_session(session_id).await?);
+        *slot = Some(std::sync::Arc::clone(&session));
+        Ok(session)
     }
 
     /// Validate the session and context of one operation.
@@ -1591,6 +1813,63 @@ mod tests {
     };
     use tonic::Request;
     use v1::plugin_host_server::PluginHost;
+
+    /// The credential the kernel half of the streaming test is started with.
+    const KERNEL_CREDENTIAL: &str = "stream-test-kernel-credential";
+
+    /// A kernel serving one session, with a downstream stream parked for
+    /// `operation-stream`.
+    ///
+    /// The host's half of the boundary is what is under test, so this is the
+    /// smallest kernel that can answer it: one stream for one operation, and the
+    /// session channel that carries the plugin's pulls.
+    async fn serve_kernel_with_stream(
+        session_id: &str,
+        chunks: Vec<serde_json::Value>,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
+        use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
+        use tonic::transport::Server;
+
+        let continuations = Arc::new(crate::continuations::Continuations::new());
+        let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
+            Arc::new(move |_request| {
+                let chunks = chunks.clone();
+                Box::pin(async move {
+                    Ok(nemo_relay::api::runtime::LlmJsonStream::new(
+                        tokio_stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>()),
+                    ))
+                })
+            });
+        // Held for the test's lifetime: the kernel's session outlives this call.
+        std::mem::forget(continuations.hold_llm_stream(
+            "operation-stream",
+            "registration-stream",
+            stream,
+        ));
+
+        let runtime = crate::runtime_service::RelayRuntimeService::new(
+            crate::runtime_service::RelayRuntimeConfig {
+                session_id: session_id.to_owned(),
+                session_credential: KERNEL_CREDENTIAL.into(),
+                protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+                runtime_binding_digest: "binding".into(),
+                operation_scopes: Arc::new(crate::operation_scopes::OperationScopes::new()),
+                continuations,
+            },
+        );
+        let directory =
+            std::env::temp_dir().join(format!("nemo-stream-kernel-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&directory).expect("a socket directory");
+        let endpoint = directory.join("k");
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("a kernel socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RelayRuntimeServer::new(runtime))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+        });
+        (endpoint, serving)
+    }
 
     fn service() -> (PluginHostService, PluginHostConfig) {
         let backend = Arc::new(crate::InProcessPluginBackend::new());
@@ -2908,6 +3187,201 @@ mod tests {
             "a refusal names the invocation it refuses, so the kernel can attribute it"
         );
 
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
+    /// The whole wrapped-call loop: the kernel's chain, the child's callback, the
+    /// downstream stream it pulls, and the upstream stream it returns.
+    ///
+    /// This is the streaming class end to end at the host: the kernel asked for a
+    /// registration whose answer is a stream, the plugin's callback pulled the
+    /// downstream stream the kernel is producing for that operation, marked each
+    /// chunk, and returned a stream of its own — which the kernel then read back
+    /// frame by frame. Both halves of the boundary are in this one call, which is
+    /// why it is the test the class is judged on.
+    #[tokio::test]
+    async fn a_streaming_intercept_pulls_downstream_and_answers_with_frames() {
+        let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
+        let Some((manifest_dir, artifact)) = nemo_relay_plugin_host_fixture() else {
+            eprintln!("the native fixture is missing; skipping the streaming case");
+            return;
+        };
+
+        let backend = Arc::new(crate::InProcessPluginBackend::new());
+        let config = PluginHostConfig {
+            protocol_version: PROTOCOL_VERSION,
+            runtime_binding_digest: "binding".into(),
+            session_credential: "credential".into(),
+            maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        };
+        // The session comes first, because the kernel that answers this host's
+        // pulls has to be serving *that* session: a host names the session it
+        // established in every message it sends, and a kernel serving another one
+        // ends the channel rather than answering it.
+        let service = PluginHostService::new(backend, config.clone());
+        // The session serves every class, because this is the fixture that
+        // registers every class: what is being tested is the streaming path, not
+        // the served set.
+        let mut handshake = handshake_request(&config);
+        handshake.supported_registration_operations = EVERY_REGISTRATION_OPERATION
+            .iter()
+            .map(|operation| {
+                nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
+            })
+            .collect();
+        let session_id = handshake_outcome_from_wire(
+            &service
+                .handshake(capable(handshake))
+                .await
+                .expect("a served handshake")
+                .into_inner(),
+        )
+        .expect("a converted handshake")
+        .into_result()
+        .expect("an established session")
+        .session_id;
+
+        // Now the kernel, serving the session the host established and holding
+        // one downstream stream for the operation the invocation will name.
+        let (endpoint, kernel) = serve_kernel_with_stream(
+            &session_id,
+            vec![
+                serde_json::json!({"chunk": 1}),
+                serde_json::json!({"chunk": 2}),
+            ],
+        )
+        .await;
+        let callbacks = crate::runtime_service::KernelCallbacks::new(
+            crate::runtime_service::connect_to_kernel(
+                &endpoint,
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("a kernel client"),
+            KERNEL_CREDENTIAL,
+        )
+        .expect("the kernel credential");
+        let service = service.with_kernel_callbacks(callbacks);
+
+        let (manifest_sha256, library_sha256) =
+            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
+                .expect("the fixture's identity");
+        service
+            .load(capable(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "fixture_native".into(),
+                artifact,
+                manifest_digest: manifest_sha256,
+                library_digest: library_sha256,
+            }))
+            .await
+            .expect("a served load");
+        let activated = service
+            .activate(capable(v1::ActivateRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                discovery: false,
+                components: vec![v1::ComponentConfiguration {
+                    kind: "fixture_native".into(),
+                    config_json: "{}".into(),
+                }],
+            }))
+            .await
+            .expect("a served activation")
+            .into_inner();
+        nemo_relay_plugin_proto::convert::activate_outcome_from_wire(&activated)
+            .expect("a converted activation")
+            .into_result()
+            .expect("the session serves every class this fixture registers");
+
+        // The registration the kernel would proxy, from what the host reported.
+        let descriptors = service
+            .inspect(capable(v1::InspectRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                handle: None,
+            }))
+            .await
+            .expect("a served inspection")
+            .into_inner();
+        let descriptors = nemo_relay_plugin_proto::convert::inspect_outcome_from_wire(&descriptors)
+            .expect("a converted inspection")
+            .into_result()
+            .expect("an inspection");
+        let registration = descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .find(|registration| {
+                registration.operation
+                    == nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmStreamExecutionIntercept
+            })
+            .expect("the fixture registers a streaming intercept")
+            .registration_id
+            .clone();
+
+        let mut streaming_context = context();
+        streaming_context.operation_request_id = "operation-stream".into();
+        let answer = service
+            .invoke_stream(capable(v1::InvokeRequest {
+                session_id: session_id.clone(),
+                context: Some(streaming_context),
+                handle: Some(nemo_relay_plugin_proto::convert::handle_to_wire(
+                    &nemo_relay_plugin_protocol::PluginHandle {
+                        plugin_id: "fixture_native".into(),
+                        generation: 1,
+                    },
+                )),
+                registration_id: registration,
+                arguments: serde_json::json!({
+                    "name": "fixture_provider",
+                    "request": {"headers": {}, "content": {"model": "fixture-model"}},
+                })
+                .to_string(),
+            }))
+            .await
+            .expect("a served streaming invocation")
+            .into_inner();
+
+        let frames: Vec<v1::StreamChunk> = {
+            use tokio_stream::StreamExt;
+            let mut frames = answer;
+            let mut collected = Vec::new();
+            while let Some(frame) = frames.next().await {
+                collected.push(frame.expect("a frame"));
+            }
+            collected
+        };
+
+        // Two chunks the kernel produced, each marked by the plugin on its way
+        // back, and then the terminal frame.
+        let data: Vec<serde_json::Value> = frames
+            .iter()
+            .filter_map(|frame| match &frame.chunk {
+                Some(v1::stream_chunk::Chunk::Data(data)) => {
+                    Some(serde_json::from_str(data).expect("JSON"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data.len(), 2, "both chunks crossed back: {frames:?}");
+        for (index, chunk) in data.iter().enumerate() {
+            assert_eq!(
+                chunk["native_plugin_llm_stream_execution"],
+                true,
+                "chunk {} was transformed by the plugin: {chunk}",
+                index + 1
+            );
+            assert_eq!(chunk["chunk"], index + 1, "{chunk}");
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame.chunk, Some(v1::stream_chunk::Chunk::End(true)))),
+            "the stream ends with a terminal frame rather than by stopping: {frames:?}"
+        );
+
+        kernel.abort();
         let _ = std::fs::remove_dir_all(&manifest_dir);
     }
 

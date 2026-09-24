@@ -571,6 +571,47 @@ impl ProcessPluginBackend {
             .map_err(error_to_protocol)
     }
 
+    /// Start a streaming invocation and read its frames.
+    ///
+    /// The one call whose answer is a stream rather than a value: the host runs
+    /// the registration and produces the frames the plugin's returned stream
+    /// yields, and this side reads them one at a time. Reading is what asks the
+    /// host for the next one, so a kernel that stops reading stops the plugin —
+    /// which is the same pacing the downstream direction has, in the other
+    /// direction.
+    ///
+    /// The deadline is not applied to the stream as a whole here: a stream's
+    /// budget is about when it *starts* and about the bytes it carries, and the
+    /// operation's deadline is enforced on the call the way it is for any other
+    /// — by the supervisor's kill when the host overruns.
+    pub async fn invoke_stream(
+        &self,
+        request: nemo_relay_plugin_protocol::PluginInvokeRequest,
+        context: PluginExecutionContext,
+    ) -> Result<PluginStreamFrames, PluginProtocolError> {
+        let budget = Self::budget(&context, now_unix_ms()?)?;
+        let session_id = self.supervisor.session.session_id.clone();
+        let wire = nemo_relay_plugin_proto::convert::invoke_request_to_wire(
+            &request,
+            &session_id,
+            &context,
+        );
+        let mut client = self.supervisor.client.clone();
+        let start = capable(wire, &self.supervisor.capability);
+        // The call itself is bounded by the operation's budget; the frames that
+        // follow are bounded by the reader, which is the backpressure the host
+        // is entitled to see.
+        let started = self
+            .supervisor
+            .request(budget, async move { client.invoke_stream(start).await })
+            .await?;
+        Ok(PluginStreamFrames {
+            frames: started.into_inner(),
+            operation_request_id: context.operation_request_id.clone(),
+            terminal: false,
+        })
+    }
+
     /// Take ownership of a running host.
     pub fn new(supervisor: PluginHostSupervisor, config: PluginHostSupervisorConfig) -> Self {
         Self { supervisor, config }
@@ -801,6 +842,107 @@ impl PluginExecutionBackend for ProcessPluginBackend {
                 .into_result()
                 .map_err(error_to_protocol)
         })
+    }
+}
+
+/// The frames one streaming invocation produces.
+///
+/// Read one at a time, because reading is what asks the host for the next one:
+/// a stream this side stops reading is one the plugin stops producing, which is
+/// the pacing the host's own pull has in the other direction.
+pub struct PluginStreamFrames {
+    frames: tonic::Streaming<v1::StreamChunk>,
+    /// The invocation these frames belong to.
+    operation_request_id: String,
+    /// Whether a terminal frame has been read, so a stream ends once.
+    terminal: bool,
+}
+
+impl std::fmt::Debug for PluginStreamFrames {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginStreamFrames")
+            .field("operation_request_id", &self.operation_request_id)
+            .field("terminal", &self.terminal)
+            .finish()
+    }
+}
+
+impl PluginStreamFrames {
+    /// The invocation these frames answer.
+    pub fn operation_request_id(&self) -> &str {
+        &self.operation_request_id
+    }
+}
+
+impl tokio_stream::Stream for PluginStreamFrames {
+    type Item = Result<nemo_relay_plugin_protocol::PluginStreamChunk, PluginProtocolError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
+        let this = self.as_mut().get_mut();
+        if this.terminal {
+            return Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut this.frames).poll_next(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let converted = nemo_relay_plugin_proto::convert::stream_chunk_from_wire(&frame);
+                match converted {
+                    Ok(chunk) => {
+                        // A frame naming another operation is refused rather than
+                        // attributed to this stream: the answer has to be the
+                        // answer to the invocation that asked.
+                        if chunk.operation_request_id != this.operation_request_id {
+                            this.terminal = true;
+                            return Poll::Ready(Some(Err(PluginProtocolError::new(
+                                PluginFailureCode::MalformedResponse,
+                                format!(
+                                    "a streaming answer names '{}' but arrived for '{}'",
+                                    chunk.operation_request_id, this.operation_request_id
+                                ),
+                            ))));
+                        }
+                        if !matches!(
+                            chunk.chunk,
+                            nemo_relay_plugin_protocol::PluginStreamChunkKind::Data(_)
+                        ) {
+                            this.terminal = true;
+                        }
+                        Poll::Ready(Some(Ok(chunk)))
+                    }
+                    Err(error) => {
+                        this.terminal = true;
+                        Poll::Ready(Some(Err(error)))
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(status))) => {
+                // The channel broke mid-stream. Whether the plugin had produced
+                // anything is known — the frames already read — but whether its
+                // work finished is not, and the failure says so rather than
+                // claiming either.
+                this.terminal = true;
+                Poll::Ready(Some(Err(PluginProtocolError::new(
+                    PluginFailureCode::Unavailable,
+                    format!("the plugin host's stream ended: {status}"),
+                ))))
+            }
+            // A stream that simply stopped is a truncation, not an end: the
+            // protocol ends a stream with a terminal frame, so this is a failure
+            // rather than something a caller may read as completion.
+            Poll::Ready(None) => {
+                this.terminal = true;
+                Poll::Ready(Some(Err(PluginProtocolError::new(
+                    PluginFailureCode::MalformedResponse,
+                    "the plugin host's stream ended without a terminal frame".to_string(),
+                ))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

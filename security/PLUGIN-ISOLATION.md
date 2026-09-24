@@ -259,11 +259,21 @@ cancellation rather than as a host that stopped asking without saying so.
 the producer is dropped — and `two_streams_on_one_channel_do_not_swap_answers`
 proves answers are routed by the call that asked rather than by stream.
 
-What it does not include yet, and what the streaming increment still owes: the proxy
-that parks a stream position and drives `InvokeStream`, the upstream direction where
-the plugin's *returned* stream crosses back, credit, and the rest of the acceptance
-gate above — deadlines, host death mid-stream, per-frame and cumulative budgets, and
-mark attribution during streaming. One limitation is written down rather than
+The upstream direction now exists as well. `PluginHost::InvokeStream` runs a
+streaming registration in the host and answers with the frames its *returned* stream
+produces — one frame per poll, so a kernel that stops reading stops the plugin
+rather than filling a queue — and the kernel's proxy parks the chain position the
+plugin will pull from, starts that invocation, and hands the frames to the caller as
+a managed stream. `a_streaming_intercept_pulls_downstream_and_answers_with_frames`
+drives the whole loop in one call: the kernel's chain, the plugin's callback pulling
+the downstream stream the kernel is producing for that operation, the chunks it
+marked on the way back, and the terminal frame — both halves of the boundary,
+end to end.
+
+What it does not include yet, and what the streaming increment still owes: credit
+(the return path is paced by the kernel's reading rather than by an explicit window),
+and the rest of the acceptance gate above — deadlines, host death mid-stream,
+per-frame and cumulative budgets, and mark attribution during streaming. One limitation is written down rather than
 implied: the kernel's driver reads and answers one message at a time, so a
 cancellation that arrives while it is producing is answered after the pull it
 interrupted. The class stays unlisted until those land, so a plugin registering it is

@@ -24,7 +24,7 @@
 //! could get wrong.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nemo_relay::api::runtime::{
     LlmExecutionNextFn, LlmStreamExecutionNextFn, MiddlewareContinuationContext,
@@ -113,11 +113,11 @@ impl Continuations {
     /// that outlived its interrupt would let a later request run a chain
     /// position the kernel has already left.
     pub fn hold(
-        &self,
+        self: &Arc<Self>,
         operation_request_id: &str,
         registration_id: &str,
         chain: ParkedChain,
-    ) -> ContinuationGuard<'_> {
+    ) -> ContinuationGuard {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -131,18 +131,18 @@ impl Continuations {
                 },
             );
         ContinuationGuard {
-            continuations: self,
+            continuations: Arc::clone(self),
             operation_request_id: operation_request_id.to_owned(),
         }
     }
 
     /// Hold the remainder of a tool call.
     pub fn hold_tool(
-        &self,
+        self: &Arc<Self>,
         operation_request_id: &str,
         registration_id: &str,
         next: ToolExecutionNextFn,
-    ) -> ContinuationGuard<'_> {
+    ) -> ContinuationGuard {
         self.hold(
             operation_request_id,
             registration_id,
@@ -152,11 +152,11 @@ impl Continuations {
 
     /// Hold the remainder of a non-streaming provider call.
     pub fn hold_llm(
-        &self,
+        self: &Arc<Self>,
         operation_request_id: &str,
         registration_id: &str,
         next: LlmExecutionNextFn,
-    ) -> ContinuationGuard<'_> {
+    ) -> ContinuationGuard {
         self.hold(
             operation_request_id,
             registration_id,
@@ -170,11 +170,11 @@ impl Continuations {
     /// answers with a stream instead of a value: what resumes it is a pull, and
     /// what finishes it is the plugin releasing the stream.
     pub fn hold_llm_stream(
-        &self,
+        self: &Arc<Self>,
         operation_request_id: &str,
         registration_id: &str,
         next: LlmStreamExecutionNextFn,
-    ) -> ContinuationGuard<'_> {
+    ) -> ContinuationGuard {
         self.hold(
             operation_request_id,
             registration_id,
@@ -201,12 +201,16 @@ impl Continuations {
 }
 
 /// Removes one parked continuation when the intercept that owns it settles.
-pub struct ContinuationGuard<'a> {
-    continuations: &'a Continuations,
+///
+/// Owns the registry rather than borrowing it, because what holds a position is
+/// not always a call that returns: a stream holds one for as long as its consumer
+/// keeps reading, which can outlive every frame of the call that started it.
+pub struct ContinuationGuard {
+    continuations: Arc<Continuations>,
     operation_request_id: String,
 }
 
-impl Drop for ContinuationGuard<'_> {
+impl Drop for ContinuationGuard {
     fn drop(&mut self) {
         if let Ok(mut entries) = self.continuations.entries.lock() {
             entries.remove(&self.operation_request_id);
@@ -229,7 +233,7 @@ mod tests {
     /// A continuation is held while its intercept runs and gone when it settles.
     #[tokio::test]
     async fn a_continuation_is_held_until_its_intercept_settles() {
-        let continuations = Continuations::new();
+        let continuations = Arc::new(Continuations::new());
         assert_eq!(continuations.in_flight(), 0);
 
         let guard = continuations.hold_tool("operation-1", "registration-1", next());
@@ -251,7 +255,7 @@ mod tests {
     /// promises an intercept: retries and fan-out are allowed while it runs.
     #[tokio::test]
     async fn a_held_continuation_can_be_run_more_than_once() {
-        let continuations = Continuations::new();
+        let continuations = Arc::new(Continuations::new());
         let _guard = continuations.hold_tool("operation-1", "registration-1", next());
         let parked = continuations
             .parked("operation-1")
@@ -278,7 +282,7 @@ mod tests {
     /// discriminator the peer could get wrong.
     #[tokio::test]
     async fn a_position_remembers_which_family_it_belongs_to() {
-        let continuations = Continuations::new();
+        let continuations = Arc::new(Continuations::new());
         let _tool = continuations.hold_tool("operation-tool", "registration-1", next());
         let llm: nemo_relay::api::runtime::LlmExecutionNextFn = Arc::new(|request| {
             Box::pin(
@@ -319,7 +323,7 @@ mod tests {
     /// a position in a chain it does not belong to.
     #[tokio::test]
     async fn continuations_are_kept_per_operation() {
-        let continuations = Continuations::new();
+        let continuations = Arc::new(Continuations::new());
         let _first = continuations.hold_tool("operation-1", "registration-1", next());
         let _second = continuations.hold_tool("operation-2", "registration-2", next());
         assert_eq!(continuations.in_flight(), 2);

@@ -2220,6 +2220,61 @@ pub async fn invoke_llm_execution_intercept_registration(
     (entry.payload)(name, request, next).await
 }
 
+/// Run exactly one streaming LLM execution intercept, by registration name.
+///
+/// The third of the execution families, and the one whose answer is not a value
+/// but a stream: the caller supplies the continuation because the rest of the
+/// chain is not always in this process, and what comes back is the stream the
+/// registration produced. A plugin hosted elsewhere runs its callback there, pulls
+/// the downstream stream it was given a continuation for, and returns its own.
+///
+/// The continuation carries the engine's own lease, so calling it after this
+/// registration settles is refused and a call still in flight when it settles is
+/// cancelled, exactly as for the unary families.
+///
+/// # Parameters
+/// - `registration`: Registration name to run, as registered.
+/// - `name`: Logical provider or model family name.
+/// - `request`: Current LLM request.
+/// - `next`: Continuation for the remaining streaming execution chain.
+///
+/// # Returns
+/// The stream the registration produced.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when nothing is registered under
+/// `registration`, and the registration's own error when it fails.
+pub async fn invoke_llm_stream_execution_intercept_registration(
+    registration: &str,
+    name: &str,
+    request: LlmRequest,
+    next: crate::api::runtime::LlmStreamExecutionNextFn,
+) -> Result<LlmJsonStream> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_stream_execution_intercepts
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_stream_execution_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no streaming LLM execution intercept is registered as '{registration}'"
+        )));
+    };
+    (entry.payload)(name, request, next).await
+}
+
 /// Run exactly one LLM conditional-execution guardrail, named by its registration.
 ///
 /// The decision direction of the LLM chain, and the same rule as the tool one:

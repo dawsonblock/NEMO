@@ -635,11 +635,11 @@ mod tests {
     }
 
     /// Park a continuation for one operation, with a chain that answers `result`.
-    fn park<'a>(
-        service: &'a RelayRuntimeService,
+    fn park(
+        service: &RelayRuntimeService,
         operation_request_id: &str,
         next: nemo_relay::api::runtime::ToolExecutionNextFn,
-    ) -> crate::continuations::ContinuationGuard<'a> {
+    ) -> crate::continuations::ContinuationGuard {
         service
             .config
             .continuations

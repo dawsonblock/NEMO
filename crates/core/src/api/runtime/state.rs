@@ -1307,6 +1307,26 @@ impl NemoRelayContextState {
         .collect()
     }
 
+    /// Snapshot the streaming LLM execution intercepts visible to the calling
+    /// scope.
+    ///
+    /// The third entry point's twin: a hosted plugin answers with a stream rather
+    /// than a value, so the caller runs exactly one registration *by name* and
+    /// receives the stream that registration produced.
+    pub(crate) fn llm_stream_execution_intercept_entries(
+        &self,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmStreamExecutionFn>>],
+    ) -> Vec<ExecutionIntercept<LlmStreamExecutionFn>> {
+        merge_execution_intercept_entries(
+            &self.llm_stream_execution_intercepts,
+            scope_locals,
+            RuntimeRegistrationKind::LlmStreamExecutionIntercept,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
     /// Snapshot the LLM execution intercepts visible to the calling scope.
     ///
     /// The tool entry point's twin, for the same reason: a hosted plugin runs
