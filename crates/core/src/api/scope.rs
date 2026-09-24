@@ -543,6 +543,73 @@ pub fn event(params: EmitMarkEventParams<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Publish a mark the runtime itself raises, without asking the event sanitizers
+/// about it.
+///
+/// The rule this states is the one observers already follow: a record of a failure
+/// is the runtime's own, and asking a family about its own failure records is how a
+/// sanitizer that cannot answer loops. The record of the first failure is itself a
+/// mark, the same sanitizer is shown it, it fails again, and the runtime records
+/// another — which is a stack that does not end. What these records carry is a
+/// registration name and a reason the runtime wrote, so there is nothing in them for
+/// a sanitizer to decide.
+///
+/// This is not a way to publish something a sanitizer should see. A plugin's own
+/// marks are forwarded and published through [`event`] like any other, and a call to
+/// this from a host process stays in that process — where the kernel has no
+/// subscribers — rather than travelling to the kernel as a mark does.
+///
+/// # Parameters
+/// The same shape [`event`] takes.
+///
+/// # Returns
+/// A [`Result`] that is `Ok(())` after the mark has been queued for publication.
+///
+/// # Errors
+/// Returns an error when the runtime owner check fails or when internal state cannot
+/// be read safely, and [`FlowError::InvalidArgument`] when a typed severity is
+/// provided with non-object metadata.
+pub fn runtime_mark(params: EmitMarkEventParams<'_>) -> Result<()> {
+    ensure_runtime_owner()?;
+    let parent_uuid = resolve_parent_uuid(params.parent);
+    let metadata = metadata_with_log_severity(params.metadata, params.severity)?;
+    let scope_stack = current_scope_stack();
+    let (event, subscribers, emission_scope_stack) = {
+        let subscribers = {
+            let scope_guard = scope_stack
+                .read()
+                .map_err(|error| scope_stack_lock_error(&error, "runtime mark"))?;
+            snapshot_event_subscribers(scope_guard.collect_scope_local_subscribers())?
+        };
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?;
+        let event = state.create_event(MarkEvent::new(
+            BaseEvent::builder()
+                .name(params.name)
+                .parent_uuid_opt(parent_uuid)
+                .timestamp(params.timestamp.unwrap_or_else(Utc::now))
+                .data_opt(params.data)
+                .data_schema_opt(params.data_schema)
+                .metadata_opt(metadata)
+                .build(),
+            params.category,
+            params.category_profile,
+        ));
+        (event, subscribers, scope_stack.clone())
+    };
+    // No sanitizers and no injectors: this event is the runtime's record, and the
+    // chain that would decide what observers see is what produced it.
+    let _ = subscriber_dispatcher::dispatch_sanitized_event(
+        event,
+        Vec::new(),
+        &subscribers,
+        emission_scope_stack,
+    );
+    Ok(())
+}
+
 /// Emit a Relay metric mark under the current or provided scope.
 ///
 /// The measurements are validated as one atomic envelope before the mark is

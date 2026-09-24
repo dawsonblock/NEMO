@@ -975,44 +975,79 @@ impl NemoRelayContextState {
         }
         event
     }
+    /// Apply one event sanitizer entry to an event.
+    ///
+    /// The event comes back as it should be published — the sanitizer's answer
+    /// applied, or the observability fields cleared when it did not answer — and the
+    /// second value is the sanitizer's own words in that case.
+    ///
+    /// Clearing is the fail-closed answer and it stays the family's rule. The reason
+    /// travels beside it because the log line that records it here is not a record a
+    /// caller running a registration for *someone else* can read: a host that
+    /// executes a plugin's callback has to be able to say the callback failed, or the
+    /// kernel it answers sees a sanitizer that cleared everything rather than one
+    /// that broke.
+    pub(crate) async fn event_sanitize_one(
+        mut event: Event,
+        entry: &Guardrail<EventSanitizeFn>,
+    ) -> (Event, Option<String>) {
+        let fields = event.sanitize_fields();
+        let callback = Arc::clone(&entry.payload);
+        let context = Arc::new(event);
+        let callback_context = Arc::clone(&context);
+        let outcome = AssertUnwindSafe(async move { callback(callback_context, fields).await })
+            .catch_unwind()
+            .await;
+        event = Arc::try_unwrap(context).unwrap_or_else(|context| (*context).clone());
+        match outcome {
+            Ok(Ok(fields)) => {
+                event.apply_sanitize_fields(fields);
+                (event, None)
+            }
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "event_sanitizer_failed",
+                    sanitizer = entry.name.as_str(),
+                    event_name = event.name();
+                    "Event sanitizer failed; clearing observability fields: {error}"
+                );
+                event.apply_sanitize_fields(EventSanitizeFields::default());
+                (event, Some(error.to_string()))
+            }
+            Err(_) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "event_sanitizer_panicked",
+                    sanitizer = entry.name.as_str(),
+                    event_name = event.name();
+                    "Event sanitizer panicked; clearing observability fields"
+                );
+                event.apply_sanitize_fields(EventSanitizeFields::default());
+                (
+                    event,
+                    Some("the event sanitizer panicked rather than answering".to_string()),
+                )
+            }
+        }
+    }
+
     /// Apply an event sanitizer snapshot to the mutable observability fields.
+    ///
+    /// The chain's rule is unchanged: an entry that does not answer clears the
+    /// observability fields and the entries after it do not run, because a payload
+    /// nobody could sanitize is not published unsanitized. What the entries say about
+    /// *why* is [`Self::event_sanitize_one`]'s second value, and this loop is not a
+    /// caller that can act on it.
     pub(crate) async fn event_sanitize_snapshot_chain(
         mut event: Event,
         entries: &[Guardrail<EventSanitizeFn>],
     ) -> Event {
         for entry in entries {
-            let fields = event.sanitize_fields();
-            let callback = Arc::clone(&entry.payload);
-            let context = Arc::new(event);
-            let callback_context = Arc::clone(&context);
-            let outcome = AssertUnwindSafe(async move { callback(callback_context, fields).await })
-                .catch_unwind()
-                .await;
-            event = Arc::try_unwrap(context).unwrap_or_else(|context| (*context).clone());
-            match outcome {
-                Ok(Ok(fields)) => event.apply_sanitize_fields(fields),
-                Ok(Err(_error)) => {
-                    log::error!(
-                        target: "nemo_relay.runtime",
-                        event = "event_sanitizer_failed",
-                        sanitizer = entry.name.as_str(),
-                        event_name = event.name();
-                        "Event sanitizer failed; clearing observability fields"
-                    );
-                    event.apply_sanitize_fields(EventSanitizeFields::default());
-                    break;
-                }
-                Err(_) => {
-                    log::error!(
-                        target: "nemo_relay.runtime",
-                        event = "event_sanitizer_panicked",
-                        sanitizer = entry.name.as_str(),
-                        event_name = event.name();
-                        "Event sanitizer panicked; clearing observability fields"
-                    );
-                    event.apply_sanitize_fields(EventSanitizeFields::default());
-                    break;
-                }
+            let (sanitized, failure) = Self::event_sanitize_one(event, entry).await;
+            event = sanitized;
+            if failure.is_some() {
+                break;
             }
         }
         event

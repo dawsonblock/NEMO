@@ -63,6 +63,29 @@ impl EventNormalizationExt for Event {
     }
 }
 
+/// What one exact event sanitize registration did.
+///
+/// The event is the one to publish: the sanitizer's answer applied when it answered,
+/// and the observability fields cleared when it did not. The failure is the
+/// sanitizer's own words in that second case, and it is reported rather than only
+/// logged because the caller is not always this process: a host that runs a plugin's
+/// callback has to be able to tell the runtime it answers that the callback broke,
+/// or a sanitizer that never worked and one that cleared everything look the same
+/// from there.
+#[derive(Debug, Clone)]
+pub struct EventSanitizeOutcome {
+    /// The event as it should be published.
+    pub event: Event,
+    /// Why the sanitizer did not answer, when it did not.
+    pub failure: Option<String>,
+}
+
+impl From<(Event, Option<String>)> for EventSanitizeOutcome {
+    fn from((event, failure): (Event, Option<String>)) -> Self {
+        Self { event, failure }
+    }
+}
+
 /// Run exactly one mark sanitize guardrail, named by its registration.
 ///
 /// A sanitize guardrail changes what observers see and never what the runtime does:
@@ -78,7 +101,7 @@ impl EventNormalizationExt for Event {
 pub async fn invoke_mark_sanitize_registration(
     registration: &str,
     event: Event,
-) -> crate::error::Result<Event> {
+) -> crate::error::Result<EventSanitizeOutcome> {
     invoke_event_sanitize_registration(
         registration,
         event,
@@ -91,7 +114,7 @@ pub async fn invoke_mark_sanitize_registration(
 pub async fn invoke_scope_sanitize_start_registration(
     registration: &str,
     event: Event,
-) -> crate::error::Result<Event> {
+) -> crate::error::Result<EventSanitizeOutcome> {
     invoke_event_sanitize_registration(
         registration,
         event,
@@ -104,7 +127,7 @@ pub async fn invoke_scope_sanitize_start_registration(
 pub async fn invoke_scope_sanitize_end_registration(
     registration: &str,
     event: Event,
-) -> crate::error::Result<Event> {
+) -> crate::error::Result<EventSanitizeOutcome> {
     invoke_event_sanitize_registration(
         registration,
         event,
@@ -123,7 +146,7 @@ async fn invoke_event_sanitize_registration(
     registration: &str,
     event: Event,
     kind: RuntimeRegistrationKind,
-) -> crate::error::Result<Event> {
+) -> crate::error::Result<EventSanitizeOutcome> {
     let scope_stack = crate::api::runtime::current_scope_stack();
     let locals = scope_stack
         .read()
@@ -166,11 +189,16 @@ async fn invoke_event_sanitize_registration(
                 "no event sanitize guardrail of this class is registered as '{registration}'"
             ))
         })?;
+    // One entry, and this door reports what it did rather than only the event it
+    // left behind: the chain's failure rule is to clear the fields, and a caller
+    // that has to account for the failure needs the reason beside them.
     Ok(
-        crate::api::runtime::state::NemoRelayContextState::event_sanitize_snapshot_chain(
-            event,
-            &[entry],
-        )
-        .await,
+        crate::api::runtime::state::NemoRelayContextState::event_sanitize_one(event, &entry)
+            .await
+            .into(),
     )
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/event_api_tests.rs"]
+mod event_api_tests;
