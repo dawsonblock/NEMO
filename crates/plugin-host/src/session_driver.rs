@@ -60,13 +60,23 @@
 //!    the session recorded them. Explicit frame sequence numbers would be needed
 //!    only if a stream ever had more than one producer, or if a transport could
 //!    deliver one stream's frames out of order — neither of which is true here.
+//! 9. **Demand is credit, and credit is granted by demand rather than ahead of it.**
+//!    A pull grants one frame's worth and never more, so a stream nobody has asked
+//!    about is not polled at all: a stream costs the session its consumer's
+//!    appetite, not its producer's willingness to run ahead. One pull at a time is
+//!    the strongest demand the protocol can express, which is why the grant is one.
+//! 10. **Every frame is measured, and the ceilings are the session's.** What a
+//!    stream sends is what it costs: the frame that opens it, its data, the failure
+//!    that ends it and the terminal frame are each measured against the session's
+//!    frame, byte and frame-count ceilings before they cross, and a frame that
+//!    would cross one is not sent — the stream is over instead, and so is the work
+//!    behind it.
 //!
-//! What the streaming increment still owes, in the order it has to be closed:
-//! credit, the three budgets (frame, cumulative bytes, frame count), stream
-//! deadlines, and the qualification matrix — deadlines before the first frame,
-//! during a pending pull and between frames, host death in each phase, marks
-//! during streaming, and the terminal-frame rule pinned as a test. The class is
-//! not served until those land, so nothing depends on the actor's shape yet.
+//! What the streaming increment still owes: stream deadlines, and the
+//! qualification matrix — deadlines before the first frame, during a pending pull
+//! and between frames, host death in each phase, marks during streaming, and the
+//! terminal-frame rule pinned as a test. The class is not served until those land,
+//! so nothing depends on the actor's shape yet.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -87,7 +97,7 @@ use crate::session::PluginSessionState;
 
 /// How much of one session's work may be in flight at once.
 ///
-/// Both numbers are ceilings rather than queues: a session that is at one refuses
+/// Every field is a ceiling rather than a queue: a session that is at one refuses
 /// the work rather than holding it, because holding it is what turns a plugin's
 /// appetite into this kernel's memory.
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +112,20 @@ pub struct SessionLimits {
     /// An open runs the chain a plugin is wrapping, which is work this session
     /// cannot bound by waiting for it: it bounds it by refusing more of it.
     pub max_pending_opens: usize,
+    /// The largest encoded frame this session will send for one stream.
+    ///
+    /// A frame above it is not sent: the stream settles with a failure instead,
+    /// which is the outcome that bounds the work rather than the message. The
+    /// default is the boundary's own frame limit, so a stream can never be the
+    /// thing that carries a frame the boundary would refuse.
+    pub max_frame_bytes: u32,
+    /// How many encoded bytes one stream's frames may add up to.
+    ///
+    /// Every frame counts, terminal ones included: a stream costs the session what
+    /// it sends, and the frame that ends it is one of the frames it sends.
+    pub max_stream_bytes: u64,
+    /// How many frames one stream may send, the terminal one included.
+    pub max_stream_frames: u64,
 }
 
 impl Default for SessionLimits {
@@ -109,6 +133,9 @@ impl Default for SessionLimits {
         Self {
             max_stream_actors: 64,
             max_pending_opens: 16,
+            max_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            max_stream_bytes: 16 * 1024 * 1024,
+            max_stream_frames: 16 * 1024,
         }
     }
 }
@@ -191,7 +218,7 @@ pub struct SessionDriver {
     /// pull per stream and a bounded number of streams means this holds at most
     /// one answer per stream, while the transport's own buffer still paces what
     /// reaches the plugin.
-    writes: tokio::sync::mpsc::UnboundedSender<PluginSessionMessage>,
+    writes: tokio::sync::mpsc::UnboundedSender<nemo_relay_plugin_proto::v1::PluginSessionMessage>,
     /// The actors this session has, by stream identity.
     actors: HashMap<String, StreamActorHandle>,
     /// How many actors are running right now.
@@ -210,7 +237,9 @@ impl SessionDriver {
     pub fn new(
         session_id: impl Into<String>,
         continuations: Arc<Continuations>,
-        writes: tokio::sync::mpsc::UnboundedSender<PluginSessionMessage>,
+        writes: tokio::sync::mpsc::UnboundedSender<
+            nemo_relay_plugin_proto::v1::PluginSessionMessage,
+        >,
     ) -> Self {
         Self::with_limits(session_id, continuations, writes, SessionLimits::default())
     }
@@ -219,7 +248,9 @@ impl SessionDriver {
     pub fn with_limits(
         session_id: impl Into<String>,
         continuations: Arc<Continuations>,
-        writes: tokio::sync::mpsc::UnboundedSender<PluginSessionMessage>,
+        writes: tokio::sync::mpsc::UnboundedSender<
+            nemo_relay_plugin_proto::v1::PluginSessionMessage,
+        >,
         limits: SessionLimits,
     ) -> Self {
         let session_id = session_id.into();
@@ -296,10 +327,17 @@ impl SessionDriver {
     /// A message the session decided to send is one the plugin is waiting for, so
     /// the only failure to answer is that there is no session left to send it to.
     fn answer(&self, payload: PluginSessionPayload) {
-        let _ = self.writes.send(PluginSessionMessage {
-            session_id: self.session_id.clone(),
-            message: payload,
-        });
+        // The dispatcher's own messages are not frames of a stream — they are the
+        // answers to opens — so they are converted here and measured nowhere: a
+        // stream's ceilings bound what a stream sends.
+        let _ = self
+            .writes
+            .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                &PluginSessionMessage {
+                    session_id: self.session_id.clone(),
+                    message: payload,
+                },
+            ));
     }
 
     /// Forget the actors that have finished.
@@ -389,6 +427,10 @@ impl SessionDriver {
             lifecycle: Lifecycle::Opening,
             active_pull: None,
             next_pull_id: 1,
+            credit: 0,
+            spent_bytes: 0,
+            spent_frames: 0,
+            limits: self.limits,
             alive: Arc::clone(&self.actors_alive),
         };
         self.actors.insert(stream_id, StreamActorHandle { pulls });
@@ -458,7 +500,9 @@ struct StreamActor {
     request: PluginStreamOpenRequest,
     continuations: Arc<Continuations>,
     state: Arc<Mutex<PluginSessionState>>,
-    writes: tokio::sync::mpsc::UnboundedSender<PluginSessionMessage>,
+    /// Where this stream's frames go, already in the form they cross in: a frame
+    /// is measured before it is sent, so it is converted where it is measured.
+    writes: tokio::sync::mpsc::UnboundedSender<nemo_relay_plugin_proto::v1::PluginSessionMessage>,
     /// The pulls the plugin has made, in the order the session accepted them.
     ///
     /// One at a time, because the session's record refuses a second pull while
@@ -472,6 +516,19 @@ struct StreamActor {
     active_pull: Option<ActivePull>,
     /// The identity the next pull this actor produces for will have.
     next_pull_id: u64,
+    /// How many frames the consumer has asked for and not been answered.
+    ///
+    /// This is the whole of this stream's demand accounting. A pull grants one
+    /// frame's worth and never more — the session's record refuses a second pull
+    /// while one is outstanding, so `initial_credit = 1` is the strongest demand
+    /// the protocol can express, and it is a grant rather than a head start: a
+    /// stream the plugin has not asked about has no credit and is not polled.
+    credit: u64,
+    /// What this stream's frames have cost, in encoded bytes and in frames.
+    spent_bytes: u64,
+    spent_frames: u64,
+    /// The ceilings this session holds the stream to.
+    limits: SessionLimits,
     /// The session's count of actors that are running.
     alive: Arc<AtomicUsize>,
 }
@@ -492,12 +549,63 @@ impl StreamActor {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Send one message to the plugin.
-    fn announce(&self, payload: PluginSessionPayload) {
-        let _ = self.writes.send(PluginSessionMessage {
-            session_id: self.session_id.clone(),
-            message: payload,
-        });
+    /// The frame one message becomes, if this session's ceilings will carry it.
+    ///
+    /// Everything a stream sends is measured here — the frame that opens it, its
+    /// data, the failure that ends it and the terminal frame alike — because a
+    /// stream costs the session what it sends and the frame that ends it is one of
+    /// the frames it sends. Nothing is charged here: a frame is charged when it is
+    /// sent, and a frame the session turns out not to owe is one it never sent.
+    fn measured(
+        &self,
+        payload: &PluginSessionPayload,
+    ) -> Result<(nemo_relay_plugin_proto::v1::PluginSessionMessage, u64), PluginFailure> {
+        let frame =
+            nemo_relay_plugin_proto::convert::session_message_to_wire(&PluginSessionMessage {
+                session_id: self.session_id.clone(),
+                message: payload.clone(),
+            });
+        let encoded = nemo_relay_plugin_proto::convert::session_message_encoded_len(&frame) as u64;
+        if encoded > u64::from(self.limits.max_frame_bytes) {
+            return Err(PluginFailure {
+                code: PluginFailureCode::OversizedFrame {
+                    observed: encoded,
+                    limit: self.limits.max_frame_bytes,
+                },
+                message: format!(
+                    "this stream produced a frame of {encoded} bytes, above the {} bytes this \
+                     session will send",
+                    self.limits.max_frame_bytes
+                ),
+            });
+        }
+        if self.spent_bytes + encoded > self.limits.max_stream_bytes {
+            return Err(PluginFailure {
+                code: PluginFailureCode::Rejected,
+                message: format!(
+                    "this stream has reached its {}-byte budget: the next frame would make it {}",
+                    self.limits.max_stream_bytes,
+                    self.spent_bytes + encoded
+                ),
+            });
+        }
+        if self.spent_frames + 1 > self.limits.max_stream_frames {
+            return Err(PluginFailure {
+                code: PluginFailureCode::Rejected,
+                message: format!(
+                    "this stream has reached its budget of {} frames",
+                    self.limits.max_stream_frames
+                ),
+            });
+        }
+        Ok((frame, encoded))
+    }
+
+    /// Charge a measured frame to the stream and send it.
+    fn dispatch(&mut self, frame: nemo_relay_plugin_proto::v1::PluginSessionMessage, cost: u64) {
+        self.spent_bytes += cost;
+        self.spent_frames += 1;
+        let _ = self.writes.send(frame);
     }
 
     /// Record what this session is sending, or report that its two halves
@@ -532,10 +640,25 @@ impl StreamActor {
                     host_call_id: self.request.host_call_id.clone(),
                     stream_id: self.stream_id.clone(),
                 };
+                let opening =
+                    match self.measured(&PluginSessionPayload::StreamOpened(opened.clone())) {
+                        Ok(measured) => measured,
+                        // The frame that opens the stream does not fit this
+                        // session's ceilings, so the stream can never be announced
+                        // and never be used: it is settled unopened, which is the
+                        // outcome that leaves nothing owing and nothing producing.
+                        Err(crossed) => {
+                            self.fail_open(PluginFailure {
+                                code: crossed.code,
+                                message: format!("the stream was not opened: {}", crossed.message),
+                            });
+                            return;
+                        }
+                    };
                 self.record(self.state().send_opened(&opened), "opening");
                 self.producer = Some(producer);
                 self.lifecycle = Lifecycle::Open;
-                self.announce(PluginSessionPayload::StreamOpened(opened));
+                self.dispatch(opening.0, opening.1);
             }
             Err(failure) => {
                 self.fail_open(failure);
@@ -544,13 +667,29 @@ impl StreamActor {
         }
 
         loop {
-            let Some(pull) = self.pulls.recv().await else {
-                // The session let this stream go without saying so — the handle
-                // closing is the same instruction as a cancellation, and the one
-                // that cannot be lost behind a queue.
-                return;
-            };
-            if !self.produce(pull).await {
+            // Credit is what says there is demand. A producer nobody has asked
+            // about is one the actor does not poll, so a stream's cost is bounded
+            // by its consumer's appetite rather than by its producer's — and a
+            // stream whose consumer has stopped asking waits here rather than
+            // running ahead of it.
+            if self.credit == 0 {
+                let Some(pull) = self.pulls.recv().await else {
+                    // The session let this stream go without saying so — the handle
+                    // closing is the same instruction as a cancellation, and the one
+                    // that cannot be lost behind a queue.
+                    return;
+                };
+                self.active_pull = Some(ActivePull {
+                    pull_id: self.next_pull_id,
+                    host_call_id: pull.host_call_id,
+                });
+                self.next_pull_id += 1;
+                // One pull is one frame's worth of demand, and the session's
+                // record refuses a second pull while one is outstanding: the
+                // grant is one, so N is one.
+                self.credit = 1;
+            }
+            if !self.produce().await {
                 return;
             }
         }
@@ -610,15 +749,22 @@ impl StreamActor {
             host_call_id: self.request.host_call_id.clone(),
             failure,
         };
+        let payload = PluginSessionPayload::StreamOpenFailed(failed.clone());
+        // Measured like every other frame: the failure is a frame this session
+        // sends, and one that does not fit its ceiling is one that cannot cross.
+        let measured = self.measured(&payload);
         // A stream that failed silently would be worse than a session whose
         // record disagrees with what it sent, so the message is what is owed and
-        // the record is attempted first.
+        // the record is made whether or not the frame can cross.
         self.record(self.state().send_open_failed(&failed), "open failure");
-        self.announce(PluginSessionPayload::StreamOpenFailed(failed));
+        if let Ok((frame, cost)) = measured {
+            self.dispatch(frame, cost);
+        }
         self.lifecycle = Lifecycle::Terminal;
     }
 
-    /// Produce the next item of `pull`, or settle the stream without one.
+    /// Produce the next frame of the pull the actor is holding, or settle without
+    /// one.
     ///
     /// The poll runs against the two things that take a stream away from it — the
     /// plugin stopping and the session ending — because a cancellation must not
@@ -628,16 +774,13 @@ impl StreamActor {
     /// happened to notice first cannot change whether the stream is cancelled.
     ///
     /// Answers whether the actor has more to serve.
-    async fn produce(&mut self, pull: PluginStreamPullRequest) -> bool {
+    async fn produce(&mut self) -> bool {
         let Some(producer) = self.producer.as_mut() else {
             return false;
         };
-        let pull_id = self.next_pull_id;
-        self.next_pull_id += 1;
-        self.active_pull = Some(ActivePull {
-            pull_id,
-            host_call_id: pull.host_call_id.clone(),
-        });
+        let Some(pull_id) = self.active_pull.as_ref().map(|pull| pull.pull_id) else {
+            return false;
+        };
         self.lifecycle = Lifecycle::PullPending;
 
         let produced = {
@@ -689,6 +832,36 @@ impl StreamActor {
             return false;
         }
         let terminal = !matches!(result, PullResult::Data(_));
+        let payload = match result {
+            PullResult::Data(chunk) => PluginSessionPayload::StreamItem(PluginStreamItem {
+                host_call_id: active.host_call_id.clone(),
+                stream_id: self.stream_id.clone(),
+                chunk_json: chunk.to_string(),
+            }),
+            PullResult::End => PluginSessionPayload::StreamEnd(PluginStreamEnd {
+                host_call_id: active.host_call_id.clone(),
+                stream_id: self.stream_id.clone(),
+            }),
+            PullResult::Failed(failure) => PluginSessionPayload::StreamFailed(PluginStreamFailed {
+                host_call_id: active.host_call_id.clone(),
+                stream_id: self.stream_id.clone(),
+                failure,
+            }),
+        };
+        // A frame this session's ceilings refuse ends the stream rather than
+        // crossing it: the ceiling is what the work is bounded by, so the work is
+        // what stops.
+        let measured = match self.measured(&payload) {
+            Ok(measured) => measured,
+            Err(refusal) => {
+                self.fail(active, refusal);
+                return false;
+            }
+        };
+        // The record and the send are one step, and the frame is charged only
+        // once the session has recorded the answer it is: a stream the session
+        // settled while its producer was finishing is owed nothing, and its last
+        // frame is stale rather than sent.
         if !self
             .state()
             .settle_pull(&self.stream_id, &active.host_call_id, terminal)
@@ -699,29 +872,50 @@ impl StreamActor {
             // stream without the session reading its last frame as a violation.
             return false;
         }
-        let payload = match result {
-            PullResult::Data(chunk) => PluginSessionPayload::StreamItem(PluginStreamItem {
-                host_call_id: active.host_call_id,
-                stream_id: self.stream_id.clone(),
-                chunk_json: chunk.to_string(),
-            }),
-            PullResult::End => PluginSessionPayload::StreamEnd(PluginStreamEnd {
-                host_call_id: active.host_call_id,
-                stream_id: self.stream_id.clone(),
-            }),
-            PullResult::Failed(failure) => PluginSessionPayload::StreamFailed(PluginStreamFailed {
-                host_call_id: active.host_call_id,
-                stream_id: self.stream_id.clone(),
-                failure,
-            }),
-        };
         self.lifecycle = if terminal {
             Lifecycle::Terminal
         } else {
             Lifecycle::Open
         };
-        self.announce(payload);
+        // A data frame spends the credit it was produced under; the terminal frame
+        // is what the pull was for, so it needs none.
+        if !terminal {
+            self.credit = self.credit.saturating_sub(1);
+        }
+        self.dispatch(measured.0, measured.1);
         !terminal
+    }
+
+    /// Settle a stream that crossed a ceiling of this session.
+    ///
+    /// The stream is over and its producer is dropped: a ceiling is what bounds the
+    /// work, so the work is what stops. The failure is a frame like any other —
+    /// measured, charged, and sent only if it fits — and the session's record is
+    /// settled even when that frame does not fit, because a session that owes an
+    /// answer it can never deliver is worse than one whose ceiling could not carry
+    /// the settlement.
+    fn fail(&mut self, pull: ActivePull, failure: PluginFailure) {
+        let failed = PluginStreamFailed {
+            host_call_id: pull.host_call_id.clone(),
+            stream_id: self.stream_id.clone(),
+            failure,
+        };
+        let payload = PluginSessionPayload::StreamFailed(failed.clone());
+        match self.measured(&payload) {
+            Ok((frame, cost)) => {
+                if self
+                    .state()
+                    .settle_pull(&self.stream_id, &pull.host_call_id, true)
+                {
+                    self.dispatch(frame, cost);
+                }
+            }
+            Err(_) => {
+                self.state()
+                    .settle_pull(&self.stream_id, &pull.host_call_id, true);
+            }
+        }
+        self.lifecycle = Lifecycle::Terminal;
     }
 
     /// Settle a stream whose actor panicked.
@@ -745,24 +939,34 @@ impl StreamActor {
                     host_call_id: self.request.host_call_id.clone(),
                     failure,
                 };
+                let payload = PluginSessionPayload::StreamOpenFailed(failed.clone());
+                let measured = self.measured(&payload);
                 // Best effort: a panic is already the case where the session's
                 // record and the actor may disagree, and the plugin is owed the
                 // failure either way.
                 let _ = self.state().send_open_failed(&failed);
-                self.announce(PluginSessionPayload::StreamOpenFailed(failed));
+                if let Ok((frame, cost)) = measured {
+                    self.dispatch(frame, cost);
+                }
             }
             Lifecycle::PullPending => {
                 let Some(pull) = self.active_pull.take() else {
                     return;
                 };
                 let failed = PluginStreamFailed {
-                    host_call_id: pull.host_call_id,
+                    host_call_id: pull.host_call_id.clone(),
                     stream_id: self.stream_id.clone(),
                     failure,
                 };
-                self.state()
-                    .settle_pull(&self.stream_id, &failed.host_call_id, true);
-                self.announce(PluginSessionPayload::StreamFailed(failed));
+                let payload = PluginSessionPayload::StreamFailed(failed.clone());
+                let measured = self.measured(&payload);
+                if self
+                    .state()
+                    .settle_pull(&self.stream_id, &pull.host_call_id, true)
+                    && let Ok((frame, cost)) = measured
+                {
+                    self.dispatch(frame, cost);
+                }
             }
             // Nothing is outstanding, so nothing is owed: the stream is dropped
             // and the session is none the wiser.
@@ -785,7 +989,8 @@ mod tests {
     struct Session {
         driver: SessionDriver,
         continuations: Arc<Continuations>,
-        written: tokio::sync::mpsc::UnboundedReceiver<PluginSessionMessage>,
+        written:
+            tokio::sync::mpsc::UnboundedReceiver<nemo_relay_plugin_proto::v1::PluginSessionMessage>,
         /// Set by a producer that says when it is dropped.
         dropped: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -843,6 +1048,21 @@ mod tests {
             self.park(operation, never(dropped));
         }
 
+        /// A producer that says how many times it was polled, and when it was
+        /// dropped.
+        fn park_counting(
+            &self,
+            operation: &str,
+            chunks: Vec<serde_json::Value>,
+        ) -> Arc<std::sync::atomic::AtomicUsize> {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            self.park(
+                operation,
+                counted(chunks, Arc::clone(&polls), Arc::clone(&self.dropped)),
+            );
+            polls
+        }
+
         fn handle(&mut self, payload: PluginSessionPayload) -> Result<(), String> {
             self.driver.handle(PluginSessionMessage {
                 session_id: "session-1".into(),
@@ -893,6 +1113,8 @@ mod tests {
                     .await
                     .expect("an answer within the time a session is allowed to take")
                     .expect("a message");
+            let answer = nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
+                .expect("a converted answer");
             assert_eq!(answer.session_id, "session-1");
             answer.message
         }
@@ -927,6 +1149,63 @@ mod tests {
                 self.dropped.load(std::sync::atomic::Ordering::SeqCst),
                 "the producer behind the stream was dropped"
             );
+        }
+
+        /// Whether the stream's actor has stopped.
+        fn stream_stopped(&self, stream_id: &str) -> bool {
+            match self.driver.actors.get(stream_id) {
+                Some(actor) => actor.pulls.is_closed(),
+                None => true,
+            }
+        }
+
+        /// Drive a stream with pulls until its actor stops, answering what crossed.
+        ///
+        /// Each pull is one frame's worth of demand, so a test that wants to see a
+        /// stream's frames asks for them. A stream that stops producing — because it
+        /// ended, or because a ceiling refused a frame it could not send — leaves an
+        /// actor that is gone rather than one that is waiting, which is how this
+        /// knows to stop asking.
+        async fn drive(&mut self, stream_id: &str, up_to: usize) -> Vec<PluginSessionPayload> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut crossed = Vec::new();
+            for index in 0..up_to {
+                if self.stream_stopped(stream_id) {
+                    break;
+                }
+                if self
+                    .pull(&format!("pull-{}", index + 1), stream_id)
+                    .is_err()
+                {
+                    break;
+                }
+                let answered = loop {
+                    if let Ok(answer) = self.written.try_recv() {
+                        break Some(answer);
+                    }
+                    if self.stream_stopped(stream_id) {
+                        break None;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the stream answers a pull or stops without one"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                };
+                let Some(answered) = answered else { break };
+                let answered =
+                    nemo_relay_plugin_proto::convert::session_message_from_wire(&answered)
+                        .expect("a converted answer");
+                let terminal = matches!(
+                    answered.message,
+                    PluginSessionPayload::StreamEnd(_) | PluginSessionPayload::StreamFailed(_)
+                );
+                crossed.push(answered.message);
+                if terminal {
+                    break;
+                }
+            }
+            crossed
         }
     }
 
@@ -998,6 +1277,90 @@ mod tests {
             let dropped = Arc::clone(&dropped);
             Box::pin(async move { Ok(LlmJsonStream::new(Never(dropped))) })
         })
+    }
+
+    /// A chain position whose stream produces `chunks` and then ends, counting the
+    /// polls it is asked for and saying when it is dropped.
+    fn counted(
+        chunks: Vec<serde_json::Value>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    ) -> LlmStreamExecutionNextFn {
+        /// A producer that counts what it is asked for.
+        struct Counted {
+            items: std::vec::IntoIter<serde_json::Value>,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl tokio_stream::Stream for Counted {
+            type Item = Result<nemo_relay::json::Json, nemo_relay::error::FlowError>;
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(self.items.next().map(Ok))
+            }
+        }
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Arc::new(move |_request| {
+            let chunks = chunks.clone();
+            let polls = Arc::clone(&polls);
+            let dropped = Arc::clone(&dropped);
+            Box::pin(async move {
+                Ok(LlmJsonStream::new(Counted {
+                    items: chunks.into_iter(),
+                    polls,
+                    dropped,
+                }))
+            })
+        })
+    }
+
+    /// What this session will send for one frame, measured the way the session
+    /// measures it.
+    fn measured(payload: PluginSessionPayload) -> u64 {
+        let wire =
+            nemo_relay_plugin_proto::convert::session_message_to_wire(&PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: payload,
+            });
+        nemo_relay_plugin_proto::convert::session_message_encoded_len(&wire) as u64
+    }
+
+    /// The frames a stream of one operation sends, in the order it sends them.
+    ///
+    /// The identities are the ones the session mints for the first stream of
+    /// `operation-1` and the pulls this suite makes — `call-1` for the open and
+    /// `pull-1`, `pull-2`, ... for the pulls — because a ceiling is a ceiling on
+    /// bytes, and bytes depend on the names.
+    fn stream_frames(chunks: &[serde_json::Value]) -> Vec<u64> {
+        let stream = "operation-1-1";
+        let mut frames = vec![measured(PluginSessionPayload::StreamOpened(
+            PluginStreamOpened {
+                host_call_id: "call-1".into(),
+                stream_id: stream.into(),
+            },
+        ))];
+        for (index, chunk) in chunks.iter().enumerate() {
+            frames.push(measured(PluginSessionPayload::StreamItem(
+                PluginStreamItem {
+                    host_call_id: format!("pull-{}", index + 1),
+                    stream_id: stream.into(),
+                    chunk_json: chunk.to_string(),
+                },
+            )));
+        }
+        frames.push(measured(PluginSessionPayload::StreamEnd(PluginStreamEnd {
+            host_call_id: format!("pull-{}", chunks.len() + 1),
+            stream_id: stream.into(),
+        })));
+        frames
     }
 
     /// A producer whose first poll panics.
@@ -1393,6 +1756,173 @@ mod tests {
         assert_eq!(item.chunk_json, serde_json::json!({"chunk": 1}).to_string());
     }
 
+    /// A stream nobody pulls is never polled.
+    ///
+    /// Credit is the whole of a stream's demand accounting, and it is granted by
+    /// demand rather than ahead of it: no pull, no credit, no poll. That is what
+    /// keeps a stream's cost bounded by its consumer's appetite rather than by its
+    /// producer's willingness to run ahead, and it holds whatever the transport
+    /// later does with buffers.
+    #[tokio::test]
+    async fn a_stream_nobody_pulls_is_never_polled() {
+        let mut session = Session::new();
+        let quiet = session.park_counting(
+            "operation-1",
+            vec![
+                serde_json::json!({"chunk": 1}),
+                serde_json::json!({"chunk": 2}),
+            ],
+        );
+        session.park_producing("operation-2", vec![serde_json::json!({"chunk": 1})]);
+        let never_asked = session.opened("call-1", "operation-1").await;
+        let serving = session.opened("call-2", "operation-2").await;
+
+        // The session is doing work — another stream is opened, served and
+        // released — and the stream nobody asked about is left alone throughout.
+        session.pull("call-3", &serving).expect("a pull");
+        assert!(matches!(
+            session.answer().await,
+            PluginSessionPayload::StreamItem(_)
+        ));
+        session.release("call-4", &serving).expect("a release");
+        assert_eq!(
+            quiet.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a producer nobody has asked about is not polled"
+        );
+
+        // One pull is one frame's worth of demand: the first poll is the first
+        // pull's, not the first of several.
+        session.pull("call-5", &never_asked).expect("a pull");
+        assert!(matches!(
+            session.answer().await,
+            PluginSessionPayload::StreamItem(_)
+        ));
+        assert_eq!(
+            quiet.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one pull is one poll"
+        );
+    }
+
+    /// The frame ceiling: a frame at the limit crosses, one byte over does not, and
+    /// the stream that produced it is over either way.
+    #[tokio::test]
+    async fn a_frame_one_byte_over_the_ceiling_ends_the_stream() {
+        // A chunk whose frame is much larger than the frame that reports the
+        // failure: what crosses the ceiling is the data, not the message about it.
+        let chunk = serde_json::json!({"chunk": "x".repeat(4096)});
+        let exact = measured(PluginSessionPayload::StreamItem(PluginStreamItem {
+            host_call_id: "pull-1".into(),
+            stream_id: "operation-1-1".into(),
+            chunk_json: chunk.to_string(),
+        }));
+
+        for (limit, crosses) in [(exact - 1, false), (exact, true), (exact + 1, true)] {
+            let mut session = Session::with_limits(SessionLimits {
+                max_frame_bytes: u32::try_from(limit).expect("a frame ceiling"),
+                ..SessionLimits::default()
+            });
+            session.park_producing("operation-1", vec![chunk.clone()]);
+            let stream_id = session.opened("call-1", "operation-1").await;
+            let crossed = session.drive(&stream_id, 4).await;
+            session.drained().await;
+
+            if crosses {
+                assert!(
+                    matches!(
+                        crossed.as_slice(),
+                        [
+                            PluginSessionPayload::StreamItem(_),
+                            PluginSessionPayload::StreamEnd(_)
+                        ]
+                    ),
+                    "a frame at or under {limit} bytes crosses: {crossed:?}"
+                );
+            } else {
+                // The frame that was refused is not sent, and the failure that
+                // replaces it is: a plugin learns which ceiling it met.
+                let Some(PluginSessionPayload::StreamFailed(failed)) = crossed.last() else {
+                    panic!("a stream whose frame was refused ends with a failure: {crossed:?}");
+                };
+                assert!(
+                    matches!(
+                        failed.failure.code,
+                        PluginFailureCode::OversizedFrame { .. }
+                    ),
+                    "the failure says which ceiling was crossed: {failure:?}",
+                    failure = failed.failure
+                );
+                assert!(
+                    !crossed
+                        .iter()
+                        .any(|frame| matches!(frame, PluginSessionPayload::StreamItem(_))),
+                    "the frame over the ceiling was not sent: {crossed:?}"
+                );
+            }
+        }
+    }
+
+    /// The cumulative byte ceiling counts every frame a stream sends, the terminal
+    /// one included.
+    #[tokio::test]
+    async fn the_stream_byte_ceiling_counts_every_frame() {
+        let chunks = vec![
+            serde_json::json!({"chunk": 1}),
+            serde_json::json!({"chunk": 2}),
+        ];
+        let total: u64 = stream_frames(&chunks).iter().sum();
+
+        for (limit, ends) in [(total - 1, false), (total, true), (total + 1, true)] {
+            let mut session = Session::with_limits(SessionLimits {
+                max_stream_bytes: limit,
+                ..SessionLimits::default()
+            });
+            session.park_producing("operation-1", chunks.clone());
+            let stream_id = session.opened("call-1", "operation-1").await;
+            let crossed = session.drive(&stream_id, 4).await;
+            session.drained().await;
+
+            let terminal = crossed
+                .iter()
+                .any(|frame| matches!(frame, PluginSessionPayload::StreamEnd(_)));
+            assert_eq!(
+                terminal, ends,
+                "a stream of {total} bytes ends within a {limit}-byte budget: {crossed:?}"
+            );
+        }
+    }
+
+    /// The frame-count ceiling counts every frame a stream sends, the terminal one
+    /// included.
+    #[tokio::test]
+    async fn the_stream_frame_ceiling_counts_every_frame() {
+        let chunks = vec![
+            serde_json::json!({"chunk": 1}),
+            serde_json::json!({"chunk": 2}),
+        ];
+        let total = stream_frames(&chunks).len() as u64;
+
+        for (limit, ends) in [(total - 1, false), (total, true), (total + 1, true)] {
+            let mut session = Session::with_limits(SessionLimits {
+                max_stream_frames: limit,
+                ..SessionLimits::default()
+            });
+            session.park_producing("operation-1", chunks.clone());
+            let stream_id = session.opened("call-1", "operation-1").await;
+            let crossed = session.drive(&stream_id, 4).await;
+            session.drained().await;
+
+            let terminal = crossed
+                .iter()
+                .any(|frame| matches!(frame, PluginSessionPayload::StreamEnd(_)));
+            assert_eq!(
+                terminal, ends,
+                "a stream of {total} frames ends within a budget of {limit}: {crossed:?}"
+            );
+        }
+    }
+
     /// A session refuses to take on more streams than its ceiling, and says so in
     /// the shape an open is answered in.
     #[tokio::test]
@@ -1400,6 +1930,7 @@ mod tests {
         let mut session = Session::with_limits(SessionLimits {
             max_stream_actors: 2,
             max_pending_opens: 2,
+            ..SessionLimits::default()
         });
         session.park_pending("operation-1");
         session.park_pending("operation-2");
@@ -1438,6 +1969,7 @@ mod tests {
         let mut session = Session::with_limits(SessionLimits {
             max_stream_actors: 8,
             max_pending_opens: 1,
+            ..SessionLimits::default()
         });
         session.park("operation-1", Arc::clone(&parked));
         session.park("operation-2", Arc::clone(&parked));

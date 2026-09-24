@@ -300,10 +300,20 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # stream is already settled, and the host releases a stream it is done with so the
 # kernel can forget it — three tests, and the prose that says which cancellation
 # is still refused.
+#
+# Budget raise (credit and the three ceilings): a stream's demand and its cost are
+# now counted rather than implied. Credit is granted by a pull and spent by a data
+# frame, so a stream nobody has asked about is not polled at all; the frame, byte
+# and frame-count ceilings are checked before every frame crosses, the frame that
+# opens a stream and the one that ends it included. The tests are more than half of
+# the growth — each ceiling runs limit−1, the limit and limit+1, and the laziness
+# test counts the polls a producer is asked for — and the rest is the measurement
+# and the prose that says which reading of "initial credit" this is. No dependency
+# moved and no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
 max_transitive_packages = 239
-max_source_lines = 15798
+max_source_lines = 16328
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -317,8 +327,10 @@ max_transitive_packages = 108
 # Raised for the two helpers that measure an answer against its operation's
 # budget — `invoke_outcome_encoded_len` and `check_invoke_outcome_budget` — which
 # both sides of the boundary call so a response budget is one measurement rather
-# than two that can disagree.
-max_source_lines = 4366
+# than two that can disagree. `session_message_encoded_len` is the same measurement
+# for a stream's frames: a stream's ceilings are ceilings on what it sends, so both
+# sides of the session measure a frame the one way.
+max_source_lines = 4377
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"

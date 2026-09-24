@@ -1013,6 +1013,17 @@ pub fn invoke_outcome_encoded_len(outcome: &v1::InvokeOutcome) -> usize {
     prost::Message::encoded_len(outcome)
 }
 
+/// The size one session message will occupy on the wire.
+///
+/// A stream's ceilings are ceilings on what it sends, and what it sends is this:
+/// the measurement is of the message rather than of the transport, so the frame a
+/// stream is refused for being too large is the frame it would have sent — a
+/// chunk's JSON and the envelope that names the stream and the call it answers
+/// are both bytes the session carries.
+pub fn session_message_encoded_len(message: &v1::PluginSessionMessage) -> usize {
+    prost::Message::encoded_len(message)
+}
+
 /// Refuse an answer larger than the operation's own response budget.
 ///
 /// The protocol's frame limit bounds what the transport can carry; this bounds

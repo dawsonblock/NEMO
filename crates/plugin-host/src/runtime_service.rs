@@ -456,12 +456,10 @@ impl RelayRuntime for RelayRuntimeService {
             // hold up the reception of its own messages — and the transport's own
             // buffer is still what paces a host that reads slowly.
             let (writes, mut written) = tokio::sync::mpsc::unbounded_channel::<
-                nemo_relay_plugin_protocol::PluginSessionMessage,
+                nemo_relay_plugin_proto::v1::PluginSessionMessage,
             >();
             let writing = tokio::spawn(async move {
                 while let Some(message) = written.recv().await {
-                    let message =
-                        nemo_relay_plugin_proto::convert::session_message_to_wire(&message);
                     if answers.send(message).await.is_err() {
                         return;
                     }

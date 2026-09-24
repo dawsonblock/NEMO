@@ -312,15 +312,35 @@ names a stream this session has no record of, where it cannot tell a stale messa
 from an invented one, and the host now releases a stream it is done with so the
 kernel can forget it rather than keeping a record of every stream it ever served.
 
+Demand and cost are two counters in that actor, and they are what the class owes
+the kernel's memory budget. Credit is granted by demand rather than ahead of it: a
+pull grants one frame's worth and never more, so a stream nobody has asked about
+is not polled at all — `a_stream_nobody_pulls_is_never_polled` counts the polls a
+producer is asked for and requires zero while another stream is served and one
+after the first pull. The three ceilings are the session's: `max_frame_bytes`,
+`max_stream_bytes` and `max_stream_frames`, each checked before a frame crosses,
+with the frame that opens a stream, its data, the failure that ends it and the
+terminal frame all measured the same way (the wire crate's
+`session_message_encoded_len`, the measurement the host already uses for its own
+answers). A frame that would cross a ceiling is not sent and not charged: the
+stream settles with a failure instead, the producer is dropped, and the actor is
+gone, which is what makes the ceiling a bound on work rather than on a message.
+`a_frame_one_byte_over_the_ceiling_ends_the_stream`,
+`the_stream_byte_ceiling_counts_every_frame` and
+`the_stream_frame_ceiling_counts_every_frame` each run limit−1, the limit and
+limit+1, and one of them requires the plugin to read the ceiling it met in the
+failure code. The credit reading is written down in the actor because it is a
+decision rather than an accident: `initial_credit = 1` is a grant, not a head
+start — a stream the plugin has not asked about has no credit and is not polled —
+and a terminal frame does not spend a credit because it is what the pull that
+asked for it was for.
+
 What it does not include yet, and what the streaming increment still owes, in the
 order they have to be closed:
 
-1. **Explicit credit**, scoped to the stream, starting at one.
-2. **Three budgets** — frame, cumulative bytes, and frame count — with every encoded
-   frame counted, terminal frames included.
-3. **Stream deadlines**, before the first frame, while a pull is pending, between
+1. **Stream deadlines**, before the first frame, while a pull is pending, between
    frames, and while the downstream work behind the stream is blocked.
-4. **Qualification**: host death and kernel death in every phase, marks before,
+2. **Qualification**: host death and kernel death in every phase, marks before,
    during and after streaming, and the terminal-frame rule pinned as a test, since
    it holds only while one stream has one producer. The class stays unlisted until
    those land, so a plugin registering it is refused whole rather than half-served.
