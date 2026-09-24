@@ -128,7 +128,10 @@ max_transitive_packages = 265
 # is the loader recording the registrations an instance *has* rather than a log of
 # every one it ever made: a second activation against one instance used to double
 # its own description, which the conversion then refused.
-max_source_lines = 74134
+max_source_lines = 74247
+# Raised for the three exact-registration entry points the event sanitize classes
+# need: one public entry per class over a private shared helper, which is how a host
+# is asked to run exactly the registration a proxy names rather than the family.
 max_unsafe_occurrences = 307
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
 transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
