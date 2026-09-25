@@ -20,9 +20,9 @@ tree carries **no** qualification certificate.
 | Field | Value |
 | --- | --- |
 | Workspace version | `0.9.1-rc.4` |
-| Workspace members | `core`, `types`, `plugin`, `worker-proto`, `worker`, `adaptive`, `pii-redaction`, `authority`, `ledger`, `executor`, `effect-qualification`, `effect-runtime`, `isolation`, `dlp`, `cli`, `python`, `ffi`, `node` |
+| Workspace members | `core`, `types`, `plugin`, `plugin-protocol`, `plugin-host`, `plugin-proto`, `worker-proto`, `worker`, `adaptive`, `pii-redaction`, `authority`, `ledger`, `executor`, `effect-qualification`, `effect-runtime`, `isolation`, `dlp`, `cli`, `python`, `ffi`, `node` |
 | EffectStore migration version | `1` (`crates/ledger/migrations/0001_effect_store.sql`) |
-| Native plugin ABI version | `4` (`NEMO_RELAY_NATIVE_ABI_VERSION`) |
+| Native plugin ABI version | `5` (`NEMO_RELAY_NATIVE_ABI_VERSION`) |
 | EffectStore contract version | unversioned; the executable contract is `crates/ledger/src/conformance.rs` |
 | Schema fingerprint algorithm | `1` (`crates/ledger/src/schema.rs`) |
 | Qualification status | `UNQUALIFIED` until a run produces evidence for this exact tree |

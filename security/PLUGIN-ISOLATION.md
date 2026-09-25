@@ -5,6 +5,21 @@ SPDX-License-Identifier: Apache-2.0
 
 # Milestone: native plugin isolation
 
+**Current status, as the tests enforce it** (the rest of this document is a
+chronological record, so numbers inside it may be the ones that were true when a
+section was written):
+
+- **Registration coverage: 14 of 16.** Pinned by
+  `the_boundary_serves_a_named_subset_of_the_registration_surface` in
+  `crates/plugin-host/tests/architecture.rs`; the unserved pair is the two LLM
+  sanitizers, and the codec capability protocol they need is in place and served,
+  with three steps left before the pair can be advertised.
+- **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
+- **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/plugin`).
+- **Plugin compatibility:** the CLI serves plugins from another process; FFI, Node
+  and Python still reach the in-process activation path, and that list is pinned by
+  the architecture test rather than recorded only here.
+
 Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
 in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
 `nemo-relay-plugin`. Together that is roughly 96% of the measured in-process
@@ -18,16 +33,15 @@ kernel-process unsafe tokens: 648
 trusting this paragraph: a revision of this document said 617 here and 621 forty
 lines later, which is what a hand-maintained number does.
 
-The figure reads 622 rather than 621 because the boundary gained one `unsafe`
-block: the supervisor applies the host's resource ceilings between `fork` and
-`exec`, which is `pre_exec`, which is unsafe by construction. It is one call
-that allocates nothing and takes no locks, it lives in the crate that is the
-*east* side of the boundary rather than the kernel proper, and it is counted
-here because that crate is still linked into the kernel's process today — the
-same accounting that puts this crate in `[in_process]` and `[plugin_host]` at
-once. The measured line budget moved with it, and with the kernel-side entry
-point the boundary needs; both raises are recorded with their reasons in
-`security/tcb.toml`.
+The figure has since read 622 rather than 621 for a while, and now reads 648: the
+boundary gained one `unsafe` block when the supervisor began applying the host's
+resource ceilings between `fork` and `exec`, which is `pre_exec`, which is unsafe by
+construction. It is one call that allocates nothing and takes no locks, and it lives
+in the crate that is the *east* side of the boundary rather than the kernel proper —
+counted here because that crate is still linked into the kernel's process today, the
+same accounting that puts it in `[in_process]` and `[plugin_host]` at once. The
+measured line budget moved with it, and with the kernel-side entry points the boundary
+needs; every raise is recorded with its reason in `security/tcb.toml`.
 
 Moving the loader into another Rust crate would improve the source layout and
 leave that number unchanged, because a memory-corruption bug in the loader would
@@ -490,7 +504,10 @@ fails the mark rather than growing the host's heap.
    Their cutover is blocked on **registration coverage**, not on their
    composition: a plugin that registers any class the boundary cannot serve is
    refused *whole*, and the fixture all three suites load — and the shape a real
-   plugin takes — registers all sixteen classes. The boundary serves ten:
+   plugin takes — registers all sixteen classes. *(The table below is the state this
+   section was written in; the current count is at the top of this document and the
+   current list is in the architecture test. It read ten served then and reads
+   fourteen now.)*
 
    | served | not served |
    |---|---|
