@@ -206,7 +206,13 @@ max_transitive_packages = 24
 # Raised for the codec reference: an opaque, bounded, shape-validated name for a
 # capability the runtime issued, with the direction it authorizes and the tests that pin
 # what is refused. No dependency moved and no `unsafe` did.
-max_source_lines = 2362
+# Raised for the host's build identity: the release a host was built from and the native
+# ABI revision its loader carries, as one value the handshake compares rather than as two
+# fields a caller compares by remembering to, plus the named disagreement that turns a
+# mismatch into a failure code and a message. The boundary's ABI ceiling is declared here
+# rather than imported from the ABI crate, because a shared constant is not a check. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 2476
 max_unsafe_occurrences = 3
 direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
 transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
@@ -471,7 +477,12 @@ max_transitive_packages = 239
 # by the failure that reports all of them — so a deployment that received a runtime without the
 # host is told which locations were expected rather than only that a spawn failed. The test that
 # pins the message is in this crate. No dependency moved and no `unsafe` did.
-max_source_lines = 22284
+# Raised for expecting a host build rather than accepting whichever one answers: the config
+# carries what this runtime expects, the handshake refuses a disagreement before the frame limit
+# and before any capability, and the values a kernel offers are gathered into one struct so a
+# parameter list of seven strings cannot have two of them passed in the wrong order. No dependency
+# moved and no `unsafe` did.
+max_source_lines = 22352
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -498,7 +509,11 @@ max_transitive_packages = 108
 # Raised for the reference a codec call presents, and the golden vector that records the
 # bytes: the field is additive, and the vector moved by the seven bytes of the reference
 # it now carries. No dependency moved and no `unsafe` did.
-max_source_lines = 4378
+# Raised for the host's build identity on the wire: two additive fields on the handshake
+# response, the conversion that requires them (a session whose host does not say what it
+# was built from cannot be compared against anything), and the recorded vector, which moved
+# by the fifteen bytes the two fields encode to. No dependency moved and no `unsafe` did.
+max_source_lines = 4438
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"

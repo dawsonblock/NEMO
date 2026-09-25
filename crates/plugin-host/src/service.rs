@@ -63,6 +63,9 @@ impl Default for PluginHostConfig {
 /// handshake on the same process would be a session nobody owns, and allowing it
 /// would make "which session is this?" a question with two answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // One session per process: the size is paid
+// once per host rather than per message, and
+// boxing would be paid on every operation.
 enum HostSession {
     /// Before the handshake.
     New,
@@ -1121,6 +1124,11 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
             .min(request.maximum_frame_bytes);
         let identity = PluginSessionIdentity {
             protocol_version: self.config.protocol_version,
+            // This host's own account of itself, filled from what it was built
+            // with rather than from anything a caller said: the kernel compares
+            // it against the release it is, so a value a caller could choose
+            // would be a value nobody checked.
+            host_build: crate::host_build(),
             session_id: session_id.clone(),
             host_instance_id: self.host_instance_id.clone(),
             host_nonce: Uuid::now_v7().to_string(),

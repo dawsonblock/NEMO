@@ -193,6 +193,8 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
                 result: Some(v1::handshake_outcome::Result::Established(
                     v1::HandshakeResponse {
                         protocol_version: 1,
+                        host_release_version: "0.9.1".into(),
+                        host_native_abi_version: 5,
                         session_id: "session-1".into(),
                         host_instance_id: "host-1".into(),
                         host_nonce: "host-nonce".into(),

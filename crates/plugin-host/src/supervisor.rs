@@ -30,9 +30,9 @@ use nemo_relay_plugin_proto::v1::plugin_host_client::PluginHostClient;
 use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
 use nemo_relay_plugin_protocol::{
     MAX_FRAME_BYTES, PROTOCOL_VERSION, PluginDescriptor, PluginExecutionContext, PluginFailure,
-    PluginFailureCode, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
-    PluginLoadRequest, PluginLoadResponse, PluginProtocolError, PluginSessionIdentity,
-    PluginUnloadRequest, Uuid, deadline_expired,
+    PluginFailureCode, PluginHostBuild, PluginHostHealth, PluginHostReadCapability,
+    PluginInspectRequest, PluginLoadRequest, PluginLoadResponse, PluginProtocolError,
+    PluginSessionIdentity, PluginUnloadRequest, Uuid, deadline_expired,
 };
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -49,6 +49,15 @@ use crate::runtime_service::{RelayRuntimeConfig, RelayRuntimeService};
 pub struct PluginHostSupervisorConfig {
     /// The `nemo-plugin-host` executable.
     pub executable: PathBuf,
+    /// The build this runtime expects the host beside it to have been made from.
+    ///
+    /// Compared against what the host reports during the handshake, before any
+    /// operation exists. A host and the runtime that starts it are packaged
+    /// together, so a disagreement means one of the two was replaced without the
+    /// other — an interrupted upgrade, a stale host left beside a new runtime, or
+    /// a hand-built binary pointed at by `NEMO_RELAY_PLUGIN_HOST` — and the way
+    /// to find that out is at startup rather than on the first plugin load.
+    pub expected_host_build: PluginHostBuild,
     /// Digest of the runtime identity the host is bound to.
     pub runtime_binding_digest: String,
     /// Kernel-held state the host may read, if any.
@@ -81,6 +90,7 @@ impl PluginHostSupervisorConfig {
         let executable = resolve_executable();
         Self {
             executable,
+            expected_host_build: PluginHostBuild::expected(env!("CARGO_PKG_VERSION")),
             runtime_binding_digest: runtime_binding_digest.into(),
             offered_read_capabilities: Vec::new(),
             maximum_frame_bytes: MAX_FRAME_BYTES,
@@ -369,11 +379,15 @@ impl PluginHostSupervisor {
             let mut client = client;
             let session = handshake(
                 &mut client,
-                &credential,
-                &config.runtime_binding_digest,
-                &config.offered_read_capabilities,
-                &ProcessPluginBackend::supported_registration_operations(),
-                config.maximum_frame_bytes,
+                &HandshakeOffer {
+                    credential: &credential,
+                    runtime_binding_digest: &config.runtime_binding_digest,
+                    expected_host_build: &config.expected_host_build,
+                    offered_read_capabilities: &config.offered_read_capabilities,
+                    supported_registration_operations:
+                        &ProcessPluginBackend::supported_registration_operations(),
+                    maximum_frame_bytes: config.maximum_frame_bytes,
+                },
                 &capability,
             )
             .await?;
@@ -1147,33 +1161,53 @@ fn capable<T>(message: T, capability: &crate::capability::SessionCapability) -> 
     request
 }
 
+/// What this kernel offers a host it is about to start.
+///
+/// Gathered rather than passed one argument at a time because these are one
+/// decision — what the kernel will carry, and what it expects in return — and a
+/// parameter list that is a bag of strings is one where two of them can be
+/// passed in the wrong order.
+struct HandshakeOffer<'a> {
+    /// What the host must present to prove it is this kernel's.
+    credential: &'a str,
+    /// Digest of the runtime identity this session is bound to.
+    runtime_binding_digest: &'a str,
+    /// What the host beside this runtime is expected to have been built from.
+    expected_host_build: &'a PluginHostBuild,
+    /// Kernel-held state this host is offered.
+    offered_read_capabilities: &'a [PluginHostReadCapability],
+    /// Registration classes this kernel can install a proxy for.
+    supported_registration_operations:
+        &'a [nemo_relay_plugin_protocol::PluginRegistrationOperation],
+    /// Largest frame this kernel is configured to carry.
+    maximum_frame_bytes: u32,
+}
+
 /// Establish the session this host will answer on.
 async fn handshake(
     client: &mut PluginHostClient<Channel>,
-    credential: &str,
-    runtime_binding_digest: &str,
-    offered_read_capabilities: &[PluginHostReadCapability],
-    supported_registration_operations: &[nemo_relay_plugin_protocol::PluginRegistrationOperation],
-    maximum_frame_bytes: u32,
+    offer: &HandshakeOffer<'_>,
     capability: &crate::capability::SessionCapability,
 ) -> Result<PluginSessionIdentity, PluginProtocolError> {
     let request = v1::HandshakeRequest {
         protocol_version: u32::from(PROTOCOL_VERSION),
-        runtime_binding_digest: runtime_binding_digest.to_string(),
+        runtime_binding_digest: offer.runtime_binding_digest.to_string(),
         client_nonce: Uuid::now_v7().to_string(),
-        session_credential: credential.to_string(),
+        session_credential: offer.credential.to_string(),
         // What this kernel is configured to carry, not the protocol's ceiling:
         // advertising the ceiling while decoding at a smaller limit would open a
         // session whose stated size nothing on this side honours.
-        maximum_frame_bytes,
+        maximum_frame_bytes: offer.maximum_frame_bytes,
         supported_features: Vec::new(),
-        offered_read_capabilities: offered_read_capabilities
+        offered_read_capabilities: offer
+            .offered_read_capabilities
             .iter()
             .map(|capability| {
                 nemo_relay_plugin_proto::convert::read_capability_to_wire(*capability)
             })
             .collect(),
-        supported_registration_operations: supported_registration_operations
+        supported_registration_operations: offer
+            .supported_registration_operations
             .iter()
             .map(|operation| {
                 nemo_relay_plugin_proto::convert::registration_operation_to_wire(*operation)
@@ -1200,6 +1234,16 @@ async fn handshake(
             ),
         ));
     }
+    // Before the frame limit and before any capability: a host from another
+    // build is not a host whose answers mean what this runtime thinks they mean,
+    // and everything below is a comparison against values this runtime chose.
+    if let Some(disagreement) = identity
+        .host_build
+        .disagreement_with(offer.expected_host_build)
+    {
+        let (code, message) = disagreement.into_failure();
+        return Err(PluginProtocolError::new(code, message));
+    }
     if identity.maximum_frame_bytes > MAX_FRAME_BYTES {
         return Err(PluginProtocolError::new(
             PluginFailureCode::OversizedFrame {
@@ -1212,7 +1256,7 @@ async fn handshake(
             ),
         ));
     }
-    if !identity.accepted_within(offered_read_capabilities) {
+    if !identity.accepted_within(offer.offered_read_capabilities) {
         // A host cannot read what it was not offered, so an acceptance that
         // names something else is refused rather than believed.
         return Err(PluginProtocolError::new(
@@ -1235,6 +1279,7 @@ mod tests {
         // else — rather than reporting only that a spawn failed.
         let config = PluginHostSupervisorConfig {
             executable: PathBuf::from("/nonexistent/nemo-plugin-host"),
+            expected_host_build: PluginHostBuild::expected(env!("CARGO_PKG_VERSION")),
             runtime_binding_digest: "binding".to_string(),
             offered_read_capabilities: Vec::new(),
             maximum_frame_bytes: MAX_FRAME_BYTES,

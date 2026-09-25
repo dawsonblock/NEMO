@@ -22,15 +22,16 @@ use nemo_relay_plugin_protocol::{
     PluginComponentConfiguration, PluginContinuationChunk, PluginContinuationDisposition,
     PluginContinuationRequest, PluginDescriptor, PluginExecutionContext, PluginExecutionOutcome,
     PluginExecutionShape, PluginFailure, PluginFailureCode, PluginHandle, PluginHandshakeRequest,
-    PluginHostCallOutcome, PluginHostHealth, PluginHostReadCapability, PluginInspectRequest,
-    PluginInvokeRequest, PluginInvokeResponse, PluginLoadRequest, PluginLoadResponse,
-    PluginMarkEmit, PluginOperationEnvelope, PluginOutputCredit, PluginProtocolError,
-    PluginRegistrationDescriptor, PluginRegistrationOperation, PluginRegistrationOrdering,
-    PluginResolveCodecRequest, PluginScopeOperation, PluginScopeReference, PluginScopeStackRequest,
-    PluginSessionIdentity, PluginSessionMessage, PluginSessionPayload, PluginStreamChunk,
-    PluginStreamChunkKind, PluginStreamControl, PluginStreamEnd, PluginStreamFailed,
-    PluginStreamItem, PluginStreamOpenFailed, PluginStreamOpenRequest, PluginStreamOpened,
-    PluginStreamPullRequest, PluginSuccess, PluginUnloadRequest, registration_shape,
+    PluginHostBuild, PluginHostCallOutcome, PluginHostHealth, PluginHostReadCapability,
+    PluginInspectRequest, PluginInvokeRequest, PluginInvokeResponse, PluginLoadRequest,
+    PluginLoadResponse, PluginMarkEmit, PluginOperationEnvelope, PluginOutputCredit,
+    PluginProtocolError, PluginRegistrationDescriptor, PluginRegistrationOperation,
+    PluginRegistrationOrdering, PluginResolveCodecRequest, PluginScopeOperation,
+    PluginScopeReference, PluginScopeStackRequest, PluginSessionIdentity, PluginSessionMessage,
+    PluginSessionPayload, PluginStreamChunk, PluginStreamChunkKind, PluginStreamControl,
+    PluginStreamEnd, PluginStreamFailed, PluginStreamItem, PluginStreamOpenFailed,
+    PluginStreamOpenRequest, PluginStreamOpened, PluginStreamPullRequest, PluginSuccess,
+    PluginUnloadRequest, registration_shape,
 };
 
 use crate::v1;
@@ -188,8 +189,25 @@ fn session_identity_from_wire(
     let protocol_version = u16::try_from(wire.protocol_version).map_err(|_| {
         malformed("a session at a protocol version outside the range this code speaks")
     })?;
+    // A host that does not say what it was built from, or that claims a loader
+    // carrying no ABI revision at all, is a host nothing can be compared
+    // against, and the comparison is the only reason these travel.
+    if wire.host_release_version.trim().is_empty() {
+        return Err(malformed(
+            "a session whose host does not say which release it is",
+        ));
+    }
+    if wire.host_native_abi_version == 0 {
+        return Err(malformed(
+            "a session whose host carries no native ABI version",
+        ));
+    }
     Ok(PluginSessionIdentity {
         protocol_version,
+        host_build: PluginHostBuild {
+            release_version: wire.host_release_version.clone(),
+            native_abi_version: wire.host_native_abi_version,
+        },
         session_id: wire.session_id.clone(),
         host_instance_id: wire.host_instance_id.clone(),
         host_nonce: wire.host_nonce.clone(),
@@ -624,6 +642,8 @@ pub fn health_to_wire(health: &PluginHostHealth) -> v1::HealthResponse {
 pub fn session_identity_to_wire(identity: &PluginSessionIdentity) -> v1::HandshakeResponse {
     v1::HandshakeResponse {
         protocol_version: u32::from(identity.protocol_version),
+        host_release_version: identity.host_build.release_version.clone(),
+        host_native_abi_version: identity.host_build.native_abi_version,
         session_id: identity.session_id.clone(),
         host_instance_id: identity.host_instance_id.clone(),
         host_nonce: identity.host_nonce.clone(),
@@ -3086,6 +3106,8 @@ mod tests {
     fn a_session_is_validated_rather_than_adopted() {
         let session = |session_id: &str, maximum_frame_bytes: u32| v1::HandshakeResponse {
             protocol_version: 1,
+            host_release_version: "0.9.1".into(),
+            host_native_abi_version: 5,
             session_id: session_id.into(),
             host_instance_id: "host-1".into(),
             host_nonce: "nonce".into(),
@@ -3126,6 +3148,40 @@ mod tests {
 
             assert_eq!(malformed_code(error), PluginFailureCode::MalformedResponse);
         }
+    }
+
+    #[test]
+    fn a_session_whose_host_does_not_say_what_it_was_built_from_is_refused() {
+        // The comparison is the only reason these travel, so a host that omits
+        // them is a host nothing can be compared against: an unnamed release and
+        // a loader carrying no ABI revision are both sessions that cannot be
+        // checked, which is the state the check exists to prevent.
+        let session = |release: &str, abi: u32| v1::HandshakeResponse {
+            protocol_version: 1,
+            host_release_version: release.into(),
+            host_native_abi_version: abi,
+            session_id: "session-1".into(),
+            host_instance_id: "host-1".into(),
+            host_nonce: "nonce".into(),
+            maximum_frame_bytes: 1024,
+            supported_features: Vec::new(),
+            accepted_read_capabilities: Vec::new(),
+        };
+
+        assert!(session_identity_from_wire(&session("", 5)).is_err());
+        assert!(session_identity_from_wire(&session("  ", 5)).is_err());
+        assert!(session_identity_from_wire(&session("0.9.1", 0)).is_err());
+
+        let identity =
+            session_identity_from_wire(&session("0.9.1", 5)).expect("a described session");
+        assert_eq!(identity.host_build.release_version, "0.9.1");
+        assert_eq!(identity.host_build.native_abi_version, 5);
+        assert_eq!(
+            identity.host_build.disagreement_with(
+                &nemo_relay_plugin_protocol::PluginHostBuild::expected("0.9.1")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3974,6 +4030,8 @@ mod tests {
             assert!(
                 session_identity_from_wire(&v1::HandshakeResponse {
                     protocol_version: 1,
+                    host_release_version: "0.9.1".into(),
+                    host_native_abi_version: 5,
                     session_id: "session-1".into(),
                     host_instance_id: "host-1".into(),
                     host_nonce: "nonce".into(),
@@ -3989,6 +4047,8 @@ mod tests {
         assert!(
             session_identity_from_wire(&v1::HandshakeResponse {
                 protocol_version: 1,
+                host_release_version: "0.9.1".into(),
+                host_native_abi_version: 5,
                 session_id: "session-1".into(),
                 host_instance_id: "host-1".into(),
                 host_nonce: "nonce".into(),

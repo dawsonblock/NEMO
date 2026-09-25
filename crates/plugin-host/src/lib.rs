@@ -34,6 +34,21 @@ use nemo_relay_plugin_protocol::{
     registration_shape,
 };
 
+/// What this host process was built from.
+///
+/// The release is this crate's, which is the crate the host binary is built
+/// from, and the ABI revision is the one its loader carries. Both describe
+/// *this* executable rather than the runtime that started it, which is what
+/// makes reporting them worth anything: the runtime compares them against its
+/// own expectation, so a host from another build fails the handshake instead of
+/// serving a session nobody can account for.
+pub fn host_build() -> nemo_relay_plugin_protocol::PluginHostBuild {
+    nemo_relay_plugin_protocol::PluginHostBuild {
+        release_version: env!("CARGO_PKG_VERSION").to_string(),
+        native_abi_version: nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION,
+    }
+}
+
 /// What the backend holds for one plugin identifier.
 ///
 /// The `Loading` arm is a reservation, not a status report. Loading happens

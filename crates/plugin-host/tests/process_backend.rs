@@ -13,8 +13,12 @@ use std::time::Duration;
 
 use nemo_relay::plugin::execution::PluginExecutionBackend;
 use nemo_relay_plugin_host::conformance;
-use nemo_relay_plugin_host::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
-use nemo_relay_plugin_protocol::{PROTOCOL_VERSION, PluginExecutionContext, PluginFailureCode};
+use nemo_relay_plugin_host::supervisor::{
+    PluginHostSupervisor, PluginHostSupervisorConfig, ProcessPluginBackend,
+};
+use nemo_relay_plugin_protocol::{
+    PROTOCOL_VERSION, PluginExecutionContext, PluginFailureCode, PluginHostBuild,
+};
 
 mod support;
 
@@ -26,6 +30,11 @@ fn host_executable() -> PathBuf {
 fn host_config() -> PluginHostSupervisorConfig {
     PluginHostSupervisorConfig {
         executable: host_executable(),
+        // The host this crate builds reports this crate's release; a suite that
+        // expected anything else would be testing its own expectation.
+        expected_host_build: nemo_relay_plugin_protocol::PluginHostBuild::expected(env!(
+            "CARGO_PKG_VERSION"
+        )),
         // The host is started with the runtime binding its operations must
         // claim: the suite's contexts are bound to this runtime, and the host now
         // refuses a context bound to another one.
@@ -1747,6 +1756,30 @@ async fn killing_the_host_does_not_kill_the_kernel() {
             .expect_err("a host that exited cannot be inspected");
         assert_eq!(error.failure.code, PluginFailureCode::HostCrashed);
     }
+}
+
+#[tokio::test]
+async fn a_host_from_another_release_is_refused_before_any_operation() {
+    // The host is a separate executable, and nothing in the process model makes
+    // a deployment replace it together with the runtime that starts it: an
+    // installer interrupted between two renames, a stale binary left by an
+    // upgrade, and a hand-built host named by `NEMO_RELAY_PLUGIN_HOST` are all
+    // real. Learning about the mismatch when a plugin loads would be learning
+    // about it after the decision to give that host work, so the session is
+    // never established: the real host binary is started, it answers the
+    // handshake truthfully about the release it is, and the kernel refuses it.
+    let mut config = host_config();
+    config.expected_host_build = PluginHostBuild::expected("0.0.0");
+
+    let message = match PluginHostSupervisor::spawn(config).await {
+        Ok(_) => panic!("a host from another release does not establish a session"),
+        Err(error) => {
+            assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+            error.failure.message
+        }
+    };
+    assert!(message.contains("was built from release"), "{message}");
+    assert!(message.contains("0.0.0"), "{message}");
 }
 
 #[tokio::test]

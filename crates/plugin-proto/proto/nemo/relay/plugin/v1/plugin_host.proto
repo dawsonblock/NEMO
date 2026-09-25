@@ -245,6 +245,14 @@ message HandshakeResponse {
   // What the host accepted. It must be a subset of what was offered, and the
   // kernel checks that rather than trusting the answer.
   repeated HostReadCapability accepted_read_capabilities = 7;
+  // What the host says it was built from: the release, and the newest native ABI
+  // revision its loader can load. The host is a separate executable and nothing
+  // in the process model makes a deployment replace it together with the runtime
+  // that starts it, so the pair is compared before any operation rather than
+  // assumed — a mismatch found when a plugin loads is a mismatch found after the
+  // decision to give that host work.
+  string host_release_version = 8;
+  uint32 host_native_abi_version = 9;
 }
 
 // Attach a second transport to a session this host has already established.

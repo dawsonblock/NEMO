@@ -55,6 +55,18 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// detail.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
 
+/// The newest native ABI revision this boundary can carry.
+///
+/// The boundary represents a fixed set of attachment classes, so a host whose
+/// loader can load a newer ABI than the kernel can proxy is a host that would
+/// hand the kernel a registration it has no representation for. The number is
+/// written here rather than imported from the ABI crate on purpose: importing it
+/// would make the kernel's expectation and the host's capability the same
+/// constant, and a shared constant is not a check. A future ABI bump therefore
+/// fails the handshake until someone decides what the boundary does with the new
+/// revision, which is the decision the current ABI's classes each needed.
+pub const SUPPORTED_NATIVE_ABI_VERSION: u32 = 5;
+
 /// Stable identity of one loaded plugin instance.
 ///
 /// `generation` exists for the same reason leases carry one: a handle from a
@@ -235,6 +247,16 @@ pub struct PluginHandshake {
 pub struct PluginSessionIdentity {
     /// Protocol version the session was established at.
     pub protocol_version: u16,
+    /// What the host says it was built from.
+    ///
+    /// The host is a separate executable, so "the runtime and the host are the
+    /// same release" is a claim rather than a fact: nothing in the process model
+    /// makes a deployment replace both at once, and an installer that is
+    /// interrupted between two renames is a mixed pair. The kernel compares this
+    /// against what it expects before any operation, because a mismatch found
+    /// when a plugin is loaded is a mismatch found after the decision to hand
+    /// that host work.
+    pub host_build: PluginHostBuild,
     /// The session every later operation names.
     pub session_id: String,
     /// Which host process this session belongs to.
@@ -252,6 +274,98 @@ pub struct PluginSessionIdentity {
     /// [`PluginSessionIdentity::accepted_within`] is how the kernel checks that
     /// rather than trusting the answer.
     pub accepted_read_capabilities: Vec<PluginHostReadCapability>,
+}
+
+/// What a host says it was built from.
+///
+/// Both halves are the host's own account of itself. They are compared rather
+/// than used, in the same way every other host-supplied value on this boundary
+/// is: the host that lies about its release is a host that fails the check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHostBuild {
+    /// The release the host was built from.
+    pub release_version: String,
+    /// The newest native ABI revision the host's loader can load.
+    pub native_abi_version: u32,
+}
+
+impl PluginHostBuild {
+    /// The build this runtime expects a host to have been made from.
+    ///
+    /// The release is the one the caller is part of — a binding passes its own,
+    /// because the host beside it is the host that release packaged — and the
+    /// ABI revision is the newest this boundary can carry.
+    pub fn expected(release_version: impl Into<String>) -> Self {
+        Self {
+            release_version: release_version.into(),
+            native_abi_version: SUPPORTED_NATIVE_ABI_VERSION,
+        }
+    }
+
+    /// What the host is that this build is not, if anything is.
+    pub fn disagreement_with(&self, expected: &Self) -> Option<PluginHostDisagreement> {
+        if self.release_version != expected.release_version {
+            return Some(PluginHostDisagreement::Release {
+                host: self.release_version.clone(),
+                runtime: expected.release_version.clone(),
+            });
+        }
+        if self.native_abi_version != expected.native_abi_version {
+            return Some(PluginHostDisagreement::NativeAbi {
+                host: self.native_abi_version,
+                runtime: expected.native_abi_version,
+            });
+        }
+        None
+    }
+}
+
+/// One way a host's build can disagree with what the runtime expects.
+///
+/// Named rather than reported as a message so the refusal carries a code a
+/// caller can act on: a release mismatch is "install the pair together", and an
+/// ABI mismatch is "this runtime does not speak to that host's loader at all".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginHostDisagreement {
+    /// The host came from a different release than this runtime.
+    Release {
+        /// Release the host was built from.
+        host: String,
+        /// Release this runtime is.
+        runtime: String,
+    },
+    /// The host's loader carries a native ABI this boundary does not.
+    NativeAbi {
+        /// Native ABI revision the host's loader carries.
+        host: u32,
+        /// Native ABI revision this boundary carries.
+        runtime: u32,
+    },
+}
+
+impl PluginHostDisagreement {
+    /// The failure code and message a refusal should carry.
+    pub fn into_failure(self) -> (PluginFailureCode, String) {
+        match self {
+            Self::Release { host, runtime } => (
+                PluginFailureCode::Rejected,
+                format!(
+                    "the plugin host was built from release {host}, and this runtime is {runtime}: \
+                     a host and the runtime that starts it belong to the same release"
+                ),
+            ),
+            Self::NativeAbi { host, runtime } => (
+                PluginFailureCode::AbiMismatch {
+                    supported: u16::try_from(runtime).unwrap_or(u16::MAX),
+                    reported: u16::try_from(host).unwrap_or(u16::MAX),
+                },
+                format!(
+                    "the plugin host's loader carries native ABI v{host}, and this boundary carries \
+                     v{runtime}"
+                ),
+            ),
+        }
+    }
 }
 
 impl PluginSessionIdentity {

@@ -1017,6 +1017,26 @@ holds the supervisor that starts it and the backend that reaches it.
   refused by another, and a host that accepted a read capability it was not
   offered is refused rather than believed: the offer is the kernel's decision,
   and the host can only accept or decline.
+- **And the host states what it was built from, because the pair is not one
+  process.** A host and the runtime that starts it are packaged together and
+  installed together, but nothing in the process model makes a deployment
+  replace both at once: an upgrade interrupted between the installer's two
+  renames, a stale binary left behind by an upgrade that skipped the host, and a
+  hand-built host named through `NEMO_RELAY_PLUGIN_HOST` are all reachable
+  states. The host therefore reports the release it was built from and the newest
+  native ABI revision its loader carries, and the kernel compares both against
+  what it expects — the release it is itself, and the revision this boundary can
+  carry — before the frame limit and before any capability, so a mismatch is
+  refused at startup rather than discovered when a plugin loads, which would be
+  after the decision to give that host work. The ABI ceiling is written down in
+  `nemo-relay-plugin-protocol` rather than imported from the ABI crate on
+  purpose: importing it would make the kernel's expectation and the host's
+  capability the same constant, and a shared constant is not a check. A future
+  ABI bump therefore fails the handshake until someone decides what the boundary
+  does with the new revision — the same decision each class of the current
+  revision needed. The refusal is tested through a real host: a session started
+  with the wrong expectation never establishes, and the real host answers
+  truthfully while the kernel declines it.
 - **Both sides validate the context.** The kernel refuses before it dispatches
   and the host refuses before it acts, through one shared validator: protocol
   version, request identity, runtime binding against the session's, response
