@@ -606,7 +606,20 @@ message ResolveCodecRequest {
   string operation_request_id = 2;
   string host_call_id = 3;
   CodecOperation operation = 4;
+  // The capability reference the kernel issued for this invocation, or empty when
+  // the caller has none. It is what makes the request a *use* of a capability
+  // rather than a request to name a codec: the kernel resolves the reference
+  // against the record it issued, and an empty or unknown reference is refused.
+  //
+  // `payload_json` carries the operation's own shape, and each shape states the
+  // codec the caller believes it is using, so the kernel can refuse a reference
+  // issued for one codec being used as another:
+  //   LLM_REQUEST_DECODE   {"codec_kind": .., "codec_id": .., "request": {..}}
+  //   LLM_REQUEST_ENCODE   {"codec_kind": .., "codec_id": .., "annotated": {..},
+  //                         "original": {..}}
+  //   LLM_RESPONSE_DECODE  {"codec_kind": .., "codec_id": .., "response": {..}}
   string payload_json = 5;
+  string codec_reference = 6;
 }
 
 message ResolveCodecResponse {

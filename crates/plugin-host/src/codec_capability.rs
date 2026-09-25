@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
 use nemo_relay_plugin_protocol::{CodecDirection, CodecRef, LlmCodecIdentity};
 
 /// Why a codec reference was refused.
@@ -73,11 +74,52 @@ impl CodecRefusal {
     }
 }
 
-/// What one issued reference authorizes.
+/// What one issued reference authorizes: the codec itself, and what it was issued for.
+///
+/// The object is held rather than named because the reference is only worth holding if
+/// the side that validates it can also *use* it: the work happens here, against the codec
+/// this record owns, so a plugin never needs the object and a reference is never a way to
+/// name a codec this side would otherwise refuse to load.
 struct IssuedCodec {
     operation: String,
     direction: CodecDirection,
     identity: LlmCodecIdentity,
+    codec: CodecHandle,
+}
+
+/// The codec an issued capability authorizes.
+///
+/// The two directions are different traits on this side, and carrying the object in the
+/// direction's own type is what makes "a request capability used as a response
+/// capability" impossible to express rather than something to check for at the point of
+/// use.
+#[derive(Clone)]
+pub enum CodecHandle {
+    /// A codec that reads and writes the request an LLM call makes.
+    Request(Arc<dyn LlmCodec>),
+    /// A codec that reads the response an LLM call returned.
+    Response(Arc<dyn LlmResponseCodec>),
+}
+
+impl CodecHandle {
+    /// Which direction this handle belongs to.
+    pub fn direction(&self) -> CodecDirection {
+        match self {
+            Self::Request(_) => CodecDirection::Request,
+            Self::Response(_) => CodecDirection::Response,
+        }
+    }
+}
+
+impl std::fmt::Debug for CodecHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The codec is not printed: it is a live object holding provider state, and what a
+        // reader needs from a log line is which direction it authorizes.
+        formatter
+            .debug_tuple("CodecHandle")
+            .field(&self.direction())
+            .finish()
+    }
 }
 
 /// The references this runtime has issued and not yet taken back.
@@ -90,6 +132,18 @@ pub struct CodecCapabilities {
     issued: Mutex<HashMap<String, IssuedCodec>>,
 }
 
+impl std::fmt::Debug for CodecCapabilities {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The references are not printed: what a reader of a log line needs is how many
+        // capabilities are outstanding, and printing the record would put a usable
+        // reference into the log.
+        formatter
+            .debug_struct("CodecCapabilities")
+            .field("outstanding", &self.outstanding())
+            .finish()
+    }
+}
+
 impl CodecCapabilities {
     /// An empty record.
     pub fn new() -> Self {
@@ -100,16 +154,45 @@ impl CodecCapabilities {
         self.issued.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Issue a capability for one invocation, direction and codec.
+    /// Issue a request-capability for one invocation.
     ///
     /// The guard is the lifetime: hold it for exactly as long as the invocation can use
     /// the codec, and drop it when the invocation ends. Nothing else revokes.
-    pub fn issue(
+    pub fn issue_request(
+        self: &Arc<Self>,
+        operation: impl Into<String>,
+        codec: Arc<dyn LlmCodec>,
+    ) -> (CodecRef, CodecCapabilityGuard) {
+        self.issue(
+            operation,
+            CodecDirection::Request,
+            codec.codec_identity(),
+            CodecHandle::Request(codec),
+        )
+    }
+
+    /// Issue a response-capability for one invocation.
+    pub fn issue_response(
+        self: &Arc<Self>,
+        operation: impl Into<String>,
+        codec: Arc<dyn LlmResponseCodec>,
+    ) -> (CodecRef, CodecCapabilityGuard) {
+        self.issue(
+            operation,
+            CodecDirection::Response,
+            codec.codec_identity(),
+            CodecHandle::Response(codec),
+        )
+    }
+
+    fn issue(
         self: &Arc<Self>,
         operation: impl Into<String>,
         direction: CodecDirection,
         identity: LlmCodecIdentity,
+        codec: CodecHandle,
     ) -> (CodecRef, CodecCapabilityGuard) {
+        debug_assert_eq!(codec.direction(), direction);
         let reference = CodecRef::issue();
         self.issued().insert(
             reference.as_str().to_string(),
@@ -117,6 +200,7 @@ impl CodecCapabilities {
                 operation: operation.into(),
                 direction,
                 identity,
+                codec,
             },
         );
         (
@@ -143,7 +227,7 @@ impl CodecCapabilities {
         operation: &str,
         direction: CodecDirection,
         expected: &LlmCodecIdentity,
-    ) -> Result<(), CodecRefusal> {
+    ) -> Result<CodecHandle, CodecRefusal> {
         let issued = self.issued();
         let Some(capability) = issued.get(reference.as_str()) else {
             return Err(CodecRefusal::Unknown);
@@ -160,7 +244,7 @@ impl CodecCapabilities {
         if capability.identity != *expected {
             return Err(CodecRefusal::WrongCodecIdentity);
         }
-        Ok(())
+        Ok(capability.codec.clone())
     }
 
     /// Forget one reference.
@@ -217,39 +301,98 @@ impl Drop for CodecCapabilityGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nemo_relay::api::llm::LlmRequest;
+    use nemo_relay::codec::request::AnnotatedLlmRequest;
+    use nemo_relay::codec::response::AnnotatedLlmResponse;
+    use nemo_relay::json::Json;
     use nemo_relay_plugin_protocol::BuiltinLlmCodec;
+
+    /// A request codec that answers with a fixed identity, so a test can tell which codec
+    /// a capability resolves to without a provider.
+    struct TestCodec {
+        identity: LlmCodecIdentity,
+    }
+
+    impl LlmCodec for TestCodec {
+        fn codec_identity(&self) -> LlmCodecIdentity {
+            self.identity.clone()
+        }
+
+        fn decode(&self, _request: &LlmRequest) -> nemo_relay::error::Result<AnnotatedLlmRequest> {
+            Ok(AnnotatedLlmRequest::default())
+        }
+
+        fn encode(
+            &self,
+            _annotated: &AnnotatedLlmRequest,
+            original: &LlmRequest,
+        ) -> nemo_relay::error::Result<LlmRequest> {
+            Ok(original.clone())
+        }
+    }
+
+    /// The response direction's twin.
+    struct TestResponseCodec {
+        identity: LlmCodecIdentity,
+    }
+
+    impl LlmResponseCodec for TestResponseCodec {
+        fn codec_identity(&self) -> LlmCodecIdentity {
+            self.identity.clone()
+        }
+
+        fn decode_response(
+            &self,
+            _response: &Json,
+        ) -> nemo_relay::error::Result<AnnotatedLlmResponse> {
+            Ok(AnnotatedLlmResponse::default())
+        }
+    }
+
+    fn request_codec(identity: LlmCodecIdentity) -> Arc<dyn LlmCodec> {
+        Arc::new(TestCodec { identity })
+    }
+
+    fn response_codec(identity: LlmCodecIdentity) -> Arc<dyn LlmResponseCodec> {
+        Arc::new(TestResponseCodec { identity })
+    }
 
     fn store() -> Arc<CodecCapabilities> {
         Arc::new(CodecCapabilities::new())
     }
 
     /// The case everything else is measured against: a reference issued for this
-    /// operation, this direction and this codec is the only one that resolves.
+    /// invocation, this direction and this codec is the only one that resolves.
     #[test]
     fn a_capability_resolves_for_the_invocation_it_was_issued_to() {
         let store = store();
         let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat);
         let (reference, guard) =
-            store.issue("operation-1", CodecDirection::Request, identity.clone());
+            store.issue_request("operation-1", request_codec(identity.clone()));
 
-        assert_eq!(
-            store.resolve(
+        let resolved = store
+            .resolve(
                 &reference,
                 "operation-1",
                 CodecDirection::Request,
-                &identity
-            ),
-            Ok(())
+                &identity,
+            )
+            .expect("the capability it was issued for");
+        assert_eq!(
+            resolved.direction(),
+            CodecDirection::Request,
+            "and what it resolves to is the codec of that direction"
         );
         // And it is still the same capability a moment later: resolving is not using up.
-        assert_eq!(
-            store.resolve(
-                &reference,
-                "operation-1",
-                CodecDirection::Request,
-                &identity
-            ),
-            Ok(())
+        assert!(
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity
+                )
+                .is_ok()
         );
         assert_eq!(store.outstanding(), 1);
         drop(guard);
@@ -269,17 +412,18 @@ mod tests {
 
         let never_issued = CodecRef::issue();
         assert_eq!(
-            store.resolve(
-                &never_issued,
-                "operation-1",
-                CodecDirection::Request,
-                &identity
-            ),
-            Err(CodecRefusal::Unknown)
+            store
+                .resolve(
+                    &never_issued,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity
+                )
+                .expect_err("nothing issued that"),
+            CodecRefusal::Unknown
         );
 
-        let (finished, guard) =
-            store.issue("operation-1", CodecDirection::Request, identity.clone());
+        let (finished, guard) = store.issue_request("operation-1", request_codec(identity.clone()));
         assert!(
             store
                 .resolve(&finished, "operation-1", CodecDirection::Request, &identity)
@@ -287,8 +431,10 @@ mod tests {
         );
         drop(guard);
         assert_eq!(
-            store.resolve(&finished, "operation-1", CodecDirection::Request, &identity),
-            Err(CodecRefusal::Unknown),
+            store
+                .resolve(&finished, "operation-1", CodecDirection::Request, &identity)
+                .expect_err("the invocation is over"),
+            CodecRefusal::Unknown,
             "a capability does not outlive the invocation that held it"
         );
     }
@@ -300,43 +446,48 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::Runtime("runtime-chat".into());
         let (capability_a, guard_a) =
-            store.issue("operation-a", CodecDirection::Request, identity.clone());
+            store.issue_request("operation-a", request_codec(identity.clone()));
 
         // Operation A has not finished, and B still cannot borrow its capability.
         assert_eq!(
-            store.resolve(
-                &capability_a,
-                "operation-b",
-                CodecDirection::Request,
-                &identity
-            ),
-            Err(CodecRefusal::WrongOperation)
+            store
+                .resolve(
+                    &capability_a,
+                    "operation-b",
+                    CodecDirection::Request,
+                    &identity
+                )
+                .expect_err("another call's capability"),
+            CodecRefusal::WrongOperation
         );
 
         // A finishes; B starts and tries A's reference.
         drop(guard_a);
         assert_eq!(
-            store.resolve(
-                &capability_a,
-                "operation-b",
-                CodecDirection::Request,
-                &identity
-            ),
-            Err(CodecRefusal::Unknown)
+            store
+                .resolve(
+                    &capability_a,
+                    "operation-b",
+                    CodecDirection::Request,
+                    &identity
+                )
+                .expect_err("the call that held it is over"),
+            CodecRefusal::Unknown
         );
 
         // Even handed the reference deliberately, B refuses it: this is the check that
         // makes it a capability rather than a token both calls can spend.
         let (capability_b, _guard_b) =
-            store.issue("operation-b", CodecDirection::Request, identity.clone());
-        assert_eq!(
-            store.resolve(
-                &capability_b,
-                "operation-b",
-                CodecDirection::Request,
-                &identity
-            ),
-            Ok(())
+            store.issue_request("operation-b", request_codec(identity.clone()));
+        assert!(
+            store
+                .resolve(
+                    &capability_b,
+                    "operation-b",
+                    CodecDirection::Request,
+                    &identity
+                )
+                .is_ok()
         );
         assert_ne!(capability_a, capability_b);
     }
@@ -348,9 +499,9 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages);
         let (capability_a, _guard_a) =
-            store.issue("operation-a", CodecDirection::Request, identity.clone());
+            store.issue_request("operation-a", request_codec(identity.clone()));
         let (capability_b, _guard_b) =
-            store.issue("operation-b", CodecDirection::Request, identity.clone());
+            store.issue_request("operation-b", request_codec(identity.clone()));
 
         let first = {
             let store = Arc::clone(&store);
@@ -369,13 +520,15 @@ mod tests {
                         .is_ok()
                 );
                 assert_eq!(
-                    store.resolve(
-                        &capability_b,
-                        "operation-a",
-                        CodecDirection::Request,
-                        &identity
-                    ),
-                    Err(CodecRefusal::WrongOperation)
+                    store
+                        .resolve(
+                            &capability_b,
+                            "operation-a",
+                            CodecDirection::Request,
+                            &identity
+                        )
+                        .expect_err("B's capability in A's call"),
+                    CodecRefusal::WrongOperation
                 );
             })
         };
@@ -396,13 +549,15 @@ mod tests {
                         .is_ok()
                 );
                 assert_eq!(
-                    store.resolve(
-                        &capability_a,
-                        "operation-b",
-                        CodecDirection::Request,
-                        &identity
-                    ),
-                    Err(CodecRefusal::WrongOperation)
+                    store
+                        .resolve(
+                            &capability_a,
+                            "operation-b",
+                            CodecDirection::Request,
+                            &identity
+                        )
+                        .expect_err("A's capability in B's call"),
+                    CodecRefusal::WrongOperation
                 );
             })
         };
@@ -417,25 +572,28 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiResponses);
         let (reference, _guard) =
-            store.issue("operation-1", CodecDirection::Response, identity.clone());
+            store.issue_response("operation-1", response_codec(identity.clone()));
 
         assert_eq!(
-            store.resolve(
-                &reference,
-                "operation-1",
-                CodecDirection::Request,
-                &identity
-            ),
-            Err(CodecRefusal::WrongDirection)
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity
+                )
+                .expect_err("a response capability"),
+            CodecRefusal::WrongDirection
         );
-        assert_eq!(
-            store.resolve(
-                &reference,
-                "operation-1",
-                CodecDirection::Response,
-                &identity
-            ),
-            Ok(())
+        assert!(
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Response,
+                    &identity
+                )
+                .is_ok()
         );
     }
 
@@ -444,40 +602,42 @@ mod tests {
     #[test]
     fn a_capability_is_bound_to_the_codec_it_was_issued_for() {
         let store = store();
-        let (reference, _guard) = store.issue(
+        let (reference, _guard) = store.issue_request(
             "operation-1",
-            CodecDirection::Request,
-            LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+            request_codec(LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat)),
         );
 
         assert_eq!(
-            store.resolve(
-                &reference,
-                "operation-1",
-                CodecDirection::Request,
-                &LlmCodecIdentity::Runtime("runtime-chat".into())
-            ),
-            Err(CodecRefusal::WrongCodecKind),
-            "a reference for a built-in is not a reference for a runtime codec"
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &LlmCodecIdentity::Runtime("runtime-chat".into())
+                )
+                .expect_err("a reference for a built-in is not one for a runtime codec"),
+            CodecRefusal::WrongCodecKind
         );
         assert_eq!(
-            store.resolve(
-                &reference,
-                "operation-1",
-                CodecDirection::Request,
-                &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages)
-            ),
-            Err(CodecRefusal::WrongCodecIdentity),
-            "and not one for a different codec of the same kind"
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages)
+                )
+                .expect_err("a different codec of the same kind"),
+            CodecRefusal::WrongCodecIdentity
         );
-        assert_eq!(
-            store.resolve(
-                &reference,
-                "operation-1",
-                CodecDirection::Request,
-                &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat)
-            ),
-            Ok(())
+        assert!(
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat)
+                )
+                .is_ok()
         );
     }
 
@@ -487,14 +647,16 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::Opaque;
         let (first, guard_first) =
-            store.issue("operation-1", CodecDirection::Request, identity.clone());
+            store.issue_request("operation-1", request_codec(identity.clone()));
         let (second, _guard_second) =
-            store.issue("operation-2", CodecDirection::Request, identity.clone());
+            store.issue_request("operation-2", request_codec(identity.clone()));
 
         drop(guard_first);
         assert_eq!(
-            store.resolve(&first, "operation-1", CodecDirection::Request, &identity),
-            Err(CodecRefusal::Unknown)
+            store
+                .resolve(&first, "operation-1", CodecDirection::Request, &identity)
+                .expect_err("the guard took it back"),
+            CodecRefusal::Unknown
         );
         assert!(
             store

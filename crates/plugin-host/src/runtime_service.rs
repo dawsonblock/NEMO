@@ -30,7 +30,7 @@ use nemo_relay::api::scope::EmitMarkEventParams;
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_proto::v1::relay_runtime_client::RelayRuntimeClient;
 use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntime;
-use nemo_relay_plugin_protocol::{PluginHostCallOutcome, PluginMarkEmit};
+use nemo_relay_plugin_protocol::{CodecRef, PluginHostCallOutcome, PluginMarkEmit};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
@@ -183,6 +183,13 @@ pub struct RelayRuntimeConfig {
     /// the chain; this is where the kernel keeps the position it is being asked
     /// to resume.
     pub continuations: Arc<crate::continuations::Continuations>,
+    /// The codec capabilities this kernel has issued and not yet taken back.
+    ///
+    /// A plugin's sanitizer is given a reference for the call's codec; the codec object
+    /// stays here, and this is the record that decides whether a reference means
+    /// anything. It is the same record the proxy issues into, because a capability issued
+    /// somewhere else would be a capability this side could not check.
+    pub codecs: Arc<crate::codec_capability::CodecCapabilities>,
 }
 
 /// Serves the calls a plugin's host makes back into the kernel.
@@ -277,11 +284,67 @@ impl RelayRuntime for RelayRuntimeService {
 
     async fn resolve_codec(
         &self,
-        _request: Request<v1::ResolveCodecRequest>,
+        request: Request<v1::ResolveCodecRequest>,
     ) -> Result<Response<v1::ResolveCodecResponse>, Status> {
-        Err(Status::unimplemented(
-            "this kernel does not serve codec resolution yet",
-        ))
+        self.authenticate(&request)?;
+        let wire = request.into_inner();
+        if wire.session_id != self.config.session_id {
+            return Err(Status::permission_denied(
+                "this kernel serves one session, and the codec call names another",
+            ));
+        }
+        // The operation is this side's vocabulary: an unknown one is refused rather than
+        // guessed, because the direction it implies is what a capability is checked
+        // against.
+        let operation = crate::codec_context::CodecOperation::from_wire(wire.operation)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        // Shape first, then the record. A reference that is not shaped like one was never
+        // issued by this side and is refused for what it is; a well-formed one is refused
+        // only if the record does not hold it.
+        let reference = CodecRef::from_opaque(wire.codec_reference)
+            .map_err(|error| Status::invalid_argument(error.failure.message))?;
+        let payload: nemo_relay::json::Json =
+            serde_json::from_str(&wire.payload_json).map_err(|error| {
+                Status::invalid_argument(format!("a codec operation payload must be JSON: {error}"))
+            })?;
+        let identity = crate::codec_context::identity_from_payload(&payload)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let direction = if operation.is_request() {
+            nemo_relay_plugin_protocol::CodecDirection::Request
+        } else {
+            nemo_relay_plugin_protocol::CodecDirection::Response
+        };
+        // Every refusal here is one fact: this kernel did not issue *this* capability for
+        // *this* call. The refusal's own name says which check found that out, and the
+        // caller is told no.
+        let handle = self
+            .config
+            .codecs
+            .resolve(&reference, &wire.operation_request_id, direction, &identity)
+            .map_err(|refusal| {
+                Status::permission_denied(format!(
+                    "this kernel did not issue that codec capability for this call ({})",
+                    refusal.as_str()
+                ))
+            })?;
+        // The work happens here, against the codec object this side holds: the plugin
+        // asked for a decode, not for the codec. A codec that cannot read what it was
+        // given is a failure the plugin sees as one, not a transport error.
+        match crate::codec_context::run_codec_operation(operation, &handle, &payload) {
+            Ok(output) => Ok(Response::new(v1::ResolveCodecResponse {
+                result: Some(v1::resolve_codec_response::Result::Output(output)),
+            })),
+            Err(error) => Ok(Response::new(v1::ResolveCodecResponse {
+                result: Some(v1::resolve_codec_response::Result::Failure(
+                    nemo_relay_plugin_proto::convert::failure_to_wire(
+                        &nemo_relay_plugin_protocol::PluginFailure {
+                            code: nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                            message: error.to_string(),
+                        },
+                    ),
+                )),
+            })),
+        }
     }
 
     async fn r#continue(
@@ -600,6 +663,7 @@ mod tests {
             runtime_binding_digest: "runtime-service-binding".into(),
             operation_scopes: Arc::clone(&scopes),
             continuations: Arc::new(crate::continuations::Continuations::new()),
+            codecs: Arc::new(crate::codec_capability::CodecCapabilities::new()),
         });
         (service, scopes)
     }
@@ -646,6 +710,231 @@ mod tests {
             MetadataValue::try_from(CREDENTIAL).expect("a header value"),
         );
         request
+    }
+
+    /// A request codec that answers with a recognizable annotation.
+    struct TestRequestCodec;
+
+    impl nemo_relay::codec::traits::LlmCodec for TestRequestCodec {
+        fn codec_identity(&self) -> nemo_relay_plugin_protocol::LlmCodecIdentity {
+            nemo_relay_plugin_protocol::LlmCodecIdentity::BuiltIn(
+                nemo_relay_plugin_protocol::BuiltinLlmCodec::OpenAiChat,
+            )
+        }
+
+        fn decode(
+            &self,
+            request: &nemo_relay::api::llm::LlmRequest,
+        ) -> nemo_relay::error::Result<nemo_relay::codec::request::AnnotatedLlmRequest> {
+            Ok(nemo_relay::codec::request::AnnotatedLlmRequest {
+                model: request
+                    .content
+                    .get("model")
+                    .and_then(nemo_relay::json::Json::as_str)
+                    .map(str::to_string),
+                ..Default::default()
+            })
+        }
+
+        fn encode(
+            &self,
+            _annotated: &nemo_relay::codec::request::AnnotatedLlmRequest,
+            original: &nemo_relay::api::llm::LlmRequest,
+        ) -> nemo_relay::error::Result<nemo_relay::api::llm::LlmRequest> {
+            Ok(original.clone())
+        }
+    }
+
+    /// A codec call with a reference this kernel issued for that invocation.
+    fn codec_call(
+        reference: &str,
+        operation_request_id: &str,
+        operation: v1::CodecOperation,
+    ) -> Request<v1::ResolveCodecRequest> {
+        let mut request = Request::new(v1::ResolveCodecRequest {
+            session_id: SESSION_ID.into(),
+            operation_request_id: operation_request_id.into(),
+            host_call_id: "host-call-1".into(),
+            operation: operation as i32,
+            payload_json: serde_json::json!({
+                "codec_kind": "builtin",
+                "codec_id": "openai_chat",
+                "request": { "headers": {}, "content": { "model": "example" } }
+            })
+            .to_string(),
+            codec_reference: reference.into(),
+        });
+        request.metadata_mut().insert(
+            SESSION_CREDENTIAL_HEADER,
+            MetadataValue::try_from(CREDENTIAL).expect("a header value"),
+        );
+        request
+    }
+
+    /// The kernel serves codec work for the invocation a capability was issued to, and for
+    /// nothing else.
+    ///
+    /// This is the RPC that was refused as unimplemented until the capability record
+    /// existed: what makes it safe to serve is not that the caller is the host — the host
+    /// is the untrusted side — but that the reference it presents is one this kernel issued
+    /// for the invocation it names.
+    #[tokio::test]
+    async fn a_codec_call_is_served_for_the_invocation_its_capability_was_issued_to() {
+        let (service, _scopes) = service();
+        let (reference, guard) = service
+            .config
+            .codecs
+            .issue_request("operation-1", Arc::new(TestRequestCodec));
+
+        let served = service
+            .resolve_codec(codec_call(
+                reference.as_str(),
+                "operation-1",
+                v1::CodecOperation::LlmRequestDecode,
+            ))
+            .await
+            .expect("a served codec call")
+            .into_inner();
+        match served.result {
+            Some(v1::resolve_codec_response::Result::Output(output)) => {
+                let annotated: serde_json::Value =
+                    serde_json::from_str(&output).expect("an annotated request");
+                assert_eq!(annotated["model"], serde_json::json!("example"));
+            }
+            other => panic!("the kernel answered with codec work: {other:?}"),
+        }
+
+        // Another invocation cannot borrow it, and neither can another direction.
+        let elsewhere = service
+            .resolve_codec(codec_call(
+                reference.as_str(),
+                "operation-2",
+                v1::CodecOperation::LlmRequestDecode,
+            ))
+            .await
+            .expect_err("another call's codec work");
+        assert_eq!(elsewhere.code(), tonic::Code::PermissionDenied);
+        assert!(
+            elsewhere.message().contains("wrong_operation"),
+            "the refusal says which check found it out: {}",
+            elsewhere.message()
+        );
+        let wrong_direction = service
+            .resolve_codec(codec_call(
+                reference.as_str(),
+                "operation-1",
+                v1::CodecOperation::LlmResponseDecode,
+            ))
+            .await
+            .expect_err("a response decode with a request capability");
+        assert_eq!(wrong_direction.code(), tonic::Code::PermissionDenied);
+        assert!(
+            wrong_direction.message().contains("wrong_direction"),
+            "{}",
+            wrong_direction.message()
+        );
+
+        // An identity the capability was not issued for is refused as what it is.
+        let mut wrong_codec = codec_call(
+            reference.as_str(),
+            "operation-1",
+            v1::CodecOperation::LlmRequestDecode,
+        );
+        wrong_codec.get_mut().payload_json = serde_json::json!({
+            "codec_kind": "runtime",
+            "codec_id": "runtime-chat",
+            "request": { "headers": {}, "content": {} }
+        })
+        .to_string();
+        let refused = service
+            .resolve_codec(wrong_codec)
+            .await
+            .expect_err("a capability used as another codec");
+        assert!(
+            refused.message().contains("wrong_kind"),
+            "{}",
+            refused.message()
+        );
+
+        // And the capability does not outlive its invocation.
+        drop(guard);
+        let after = service
+            .resolve_codec(codec_call(
+                reference.as_str(),
+                "operation-1",
+                v1::CodecOperation::LlmRequestDecode,
+            ))
+            .await
+            .expect_err("a capability whose invocation ended");
+        assert!(
+            after.message().contains("unknown"),
+            "a forgotten capability is unknown rather than expired: {}",
+            after.message()
+        );
+    }
+
+    /// A reference this side never issued, a session that is not this one, and a call with
+    /// no credential are each refused for what they are.
+    #[tokio::test]
+    async fn a_codec_call_this_kernel_cannot_authorize_is_refused() {
+        let (service, _scopes) = service();
+        let never_issued = nemo_relay_plugin_protocol::CodecRef::issue();
+
+        let unknown = service
+            .resolve_codec(codec_call(
+                never_issued.as_str(),
+                "operation-1",
+                v1::CodecOperation::LlmRequestDecode,
+            ))
+            .await
+            .expect_err("a reference nothing issued");
+        assert_eq!(unknown.code(), tonic::Code::PermissionDenied);
+        assert!(
+            unknown.message().contains("unknown"),
+            "{}",
+            unknown.message()
+        );
+
+        let mut another_session = codec_call(
+            never_issued.as_str(),
+            "operation-1",
+            v1::CodecOperation::LlmRequestDecode,
+        );
+        another_session.get_mut().session_id = "another-session".into();
+        let refused = service
+            .resolve_codec(another_session)
+            .await
+            .expect_err("a session this kernel did not establish");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+        let mut unauthenticated = Request::new(
+            codec_call(
+                never_issued.as_str(),
+                "operation-1",
+                v1::CodecOperation::LlmRequestDecode,
+            )
+            .into_inner(),
+        );
+        unauthenticated
+            .metadata_mut()
+            .remove(SESSION_CREDENTIAL_HEADER);
+        let refused = service
+            .resolve_codec(unauthenticated)
+            .await
+            .expect_err("a call with no credential");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+        // An operation this side does not define is refused rather than guessed, because
+        // the direction it implies is what the capability is checked against.
+        let refused = service
+            .resolve_codec(codec_call(
+                never_issued.as_str(),
+                "operation-1",
+                v1::CodecOperation::Unspecified,
+            ))
+            .await
+            .expect_err("an operation this side does not define");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
     }
 
     /// Park a continuation for one operation, with a chain that answers `result`.

@@ -165,6 +165,12 @@ pub struct PluginHostSupervisor {
     /// position while an intercept runs, and the kernel's own service resumes it
     /// when the host asks.
     continuations: Arc<crate::continuations::Continuations>,
+    /// The codec capabilities this session has issued and not yet taken back.
+    ///
+    /// Owned here for the same reason as the continuations: the proxy issues a reference
+    /// while a sanitize invocation runs and holds the guard for exactly that call, and the
+    /// kernel's own service is what checks a reference and executes the codec work.
+    codecs: Arc<crate::codec_capability::CodecCapabilities>,
     session: PluginSessionIdentity,
     /// Kept for a second transport: the host checks the credential at attach as
     /// it does at handshake, so a descriptor has to carry it.
@@ -202,6 +208,10 @@ impl PluginHostSupervisor {
         let kernel_credential = Uuid::now_v7().to_string();
         let operation_scopes = Arc::new(OperationScopes::new());
         let continuations = Arc::new(crate::continuations::Continuations::new());
+        // The codec capabilities this session will issue. One record for the session, held
+        // here rather than by the proxy, because the kernel's own callback service is what
+        // checks a reference and the object it authorizes has to be reachable from both.
+        let codecs = Arc::new(crate::codec_capability::CodecCapabilities::new());
         // Bound before the child starts, so the path it is told about exists by
         // the time it could want it. Accepting begins once the session is
         // established, because the service is bound to that session.
@@ -358,6 +368,7 @@ impl PluginHostSupervisor {
                         runtime_binding_digest: config.runtime_binding_digest.clone(),
                         operation_scopes: Arc::clone(&operation_scopes),
                         continuations: Arc::clone(&continuations),
+                        codecs: Arc::clone(&codecs),
                     },
                 )))
                 .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
@@ -374,6 +385,7 @@ impl PluginHostSupervisor {
             runtime_server,
             operation_scopes,
             continuations,
+            codecs,
             session,
             session_credential: credential,
             capability,
@@ -420,6 +432,11 @@ impl PluginHostSupervisor {
     /// The continuations this session holds for the plugins it runs.
     pub fn continuations(&self) -> Arc<crate::continuations::Continuations> {
         Arc::clone(&self.continuations)
+    }
+
+    /// The codec capabilities this session issues into.
+    pub fn codec_capabilities(&self) -> Arc<crate::codec_capability::CodecCapabilities> {
+        Arc::clone(&self.codecs)
     }
 
     /// The host's process id, as it was while the process was running.
@@ -659,6 +676,11 @@ impl ProcessPluginBackend {
     /// The continuations this session holds for the plugins it runs.
     pub fn continuations(&self) -> Arc<crate::continuations::Continuations> {
         self.supervisor.continuations()
+    }
+
+    /// The codec capabilities this session issues into.
+    pub fn codec_capabilities(&self) -> Arc<crate::codec_capability::CodecCapabilities> {
+        self.supervisor.codec_capabilities()
     }
 
     /// Everything a second transport needs to attach to this session.

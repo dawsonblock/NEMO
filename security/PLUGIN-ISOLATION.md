@@ -1747,18 +1747,23 @@ reporting (an omitted payload is an answer; the reason travels beside it), plus 
 property the codec work rests on: the door hands the sanitizer *the caller's* context
 rather than manufacturing one.
 
-What is deliberately not done yet is the transport that turns the protocol into service,
-and the order is fixed:
+The transport is being built in the order the protocol implies, and the first step is in:
+**the kernel serves `ResolveCodec`**, which it refused as unimplemented until the record
+existed. It resolves a reference against that record, requires the invocation, the
+direction and — from the caller's own payload — the codec to agree with what it issued,
+and executes the work with the codec object the record holds. What makes that safe to
+serve is not that the caller is the host: the host is the untrusted side. It is that the
+reference is one this kernel issued for the invocation the call names, and that the
+capability does not outlive it.
 
-1. the kernel serves the `ResolveCodec` RPC it already refuses as unimplemented, resolving
-   a reference against the capability record and executing decode/encode with the codec
-   object it holds;
-2. the host process answers a plugin's codec calls by asking the kernel over that RPC, so
+Three steps remain, in this order:
+
+1. the host process answers a plugin's codec calls by asking the kernel over that RPC, so
    the SDK's invocation-scoped codec handle works where the plugin runs;
-3. the kernel-side proxy per LLM sanitize class issues the capability for the sanitize
+2. the kernel-side proxy per LLM sanitize class issues the capability for the sanitize
    invocation, sends the reference with the payload and holds the guard for exactly the
    call;
-4. the host arms rebuild the context, run the door, and answer.
+3. the host arms rebuild the context, run the door, and answer.
 
 Only then can either class be advertised, because a class whose sanitizers cannot resolve
 the codec the call is using would have to either refuse calls that have one — most of them

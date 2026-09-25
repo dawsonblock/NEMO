@@ -2275,6 +2275,7 @@ mod tests {
                 runtime_binding_digest: "binding".into(),
                 operation_scopes: Arc::new(crate::operation_scopes::OperationScopes::new()),
                 continuations,
+                codecs: Arc::new(crate::codec_capability::CodecCapabilities::new()),
             },
         );
         let directory =

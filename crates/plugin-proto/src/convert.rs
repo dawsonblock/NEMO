@@ -3791,6 +3791,7 @@ mod tests {
             host_call_id: "call-1".into(),
             operation,
             payload_json: r#"{"model":"example"}"#.into(),
+            codec_reference: "codec-1".into(),
         };
         assert_eq!(
             resolve_codec_request_from_wire(&codec(v1::CodecOperation::LlmRequestDecode as i32))

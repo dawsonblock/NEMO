@@ -561,6 +561,7 @@ mod tests {
                     crate::operation_scopes::OperationScopes::new(),
                 ),
                 continuations,
+                codecs: std::sync::Arc::new(crate::codec_capability::CodecCapabilities::new()),
             },
         );
         let directory = std::env::temp_dir().join(format!(
@@ -1054,6 +1055,7 @@ mod tests {
                     crate::operation_scopes::OperationScopes::new(),
                 ),
                 continuations,
+                codecs: std::sync::Arc::new(crate::codec_capability::CodecCapabilities::new()),
             },
         );
         let directory = std::env::temp_dir().join(format!(

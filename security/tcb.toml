@@ -425,7 +425,12 @@ max_transitive_packages = 239
 # direction and a codec, with a guard whose drop is the revocation, and the refusal
 # matrix that keeps one call's capability from being another's. No dependency moved and
 # no `unsafe` did.
-max_source_lines = 20128
+# Raised for serving codec resolution: the kernel's own side resolves a capability against
+# the record it issued, checks the invocation, the direction and the codec the caller says
+# it is using, and executes the work with the codec object it holds. The store's entries
+# carry that object, because a capability the validator cannot use is a name rather than a
+# capability. No dependency moved and no `unsafe` did.
+max_source_lines = 20961
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -449,7 +454,10 @@ max_transitive_packages = 108
 # than two that can disagree. `session_message_encoded_len` is the same measurement
 # for a stream's frames: a stream's ceilings are ceilings on what it sends, so both
 # sides of the session measure a frame the one way.
-max_source_lines = 4377
+# Raised for the reference a codec call presents, and the golden vector that records the
+# bytes: the field is additive, and the vector moved by the seven bytes of the reference
+# it now carries. No dependency moved and no `unsafe` did.
+max_source_lines = 4378
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"
