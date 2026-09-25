@@ -1782,6 +1782,55 @@ Three steps remain, in this order:
    call;
 3. the host arms rebuild the context, run the door, and answer.
 
+**What the pair's qualification owes, before it is called done.** The three steps are the
+mechanism; these are the properties the mechanism has to hold to, and they are the
+acceptance criteria for the commit that advertises the pair:
+
+- **No lock that serves a host→kernel callback is held across the outbound sanitize RPC.**
+  The execution nests — kernel sends a sanitize invocation, the plugin calls back for
+  codec work, the kernel answers, the plugin continues — so a mutex, an operation-scope
+  lock, a continuation lock or a host permit held across that send is a deadlock, whether
+  or not the transport supports concurrent traffic. The tests have to run the nesting
+  itself: a normal nested resolution, several codec calls inside one sanitize operation,
+  concurrent sanitizers, cancellation while a callback is inside `ResolveCodec`, a host
+  crash during resolution, and a deliberately constrained executor.
+- **The reference is bound to everything that makes it mean something**: session, plugin
+  binding, invocation, sanitize call, direction, codec identity, the operations it
+  authorizes, and its lifetime. The guard revokes it on every exit — an answer, a
+  refusal, a codec failure, a timeout, a cancellation, a crashed host, a dropped
+  connection, a panic — and a reference meant for one sanitize invocation is enforced as
+  one, not documented as one.
+- **Replay is tested as replay.** Not "a wrong invocation is refused" but: capture a
+  legitimate reference from invocation A and present it during B, after A finished, after
+  a cancellation, after a host restart, from the other direction, and against a different
+  codec with the same human-readable id. Every one fails closed.
+- **The caller's claim stays evidence and never becomes authority.** `codec_kind` and
+  `codec_id` in a payload are checked against the capability record; the record is what
+  decides which codec executes. A refactor that turns the claim back into a lookup is the
+  one change that would quietly undo the protocol.
+- **Hostile operation selection is part of the same matrix**: a request capability must
+  not serve a response-only operation, unknown operation values are refused as unknown,
+  malformed and well-formed-but-unissued references are refused before any lookup, and a
+  stale credential or a reference from another invocation is refused for what it is.
+
+**The kernel's deadline is no longer a constant.** It used to be `now + 29_000` wherever
+the kernel needed one, which made every kernel operation run under a deadline no caller
+had agreed to: a caller with two seconds left was given twenty-nine, and so was one with
+a minute. It now comes from the trusted budget the caller published, narrowed by the
+kernel's own ceiling — the same arithmetic everywhere else in the runtime uses, where a
+cap can shorten a budget and nothing can lengthen it. The ceiling stays, because a store
+wait needs some bound when nobody above this layer stated one.
+
+**And the TCB budgets now have to come back down.** Every raise this migration needed is
+recorded as a *temporary* ceiling in `security/tcb.toml` with the milestone that removes
+it and the value it must fall to, and `scripts/tcb/report.py` refuses an entry that does
+not promise a decrease, one that describes a ceiling the policy does not have, and one
+whose target has already been reached while the raise is still in place. The three
+outstanding entries are all the loader's: the kernel's lines, its unsafe tokens (288 of
+the 307 are the loader's), and the ABI crate's place in the kernel's policy at all. The
+loader-removal milestone cannot pass the gate without taking them with it, which is the
+difference between a budget and a counter.
+
 Only then can either class be advertised, because a class whose sanitizers cannot resolve
 the codec the call is using would have to either refuse calls that have one — most of them
 — or let a sanitizer think it had resolved something it had not. Until all four land,

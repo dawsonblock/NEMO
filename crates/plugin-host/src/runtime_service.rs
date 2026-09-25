@@ -924,6 +924,35 @@ mod tests {
             .expect_err("a call with no credential");
         assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 
+        // A credential that is not this session's is refused the same way, before any
+        // lookup: the reference being unknown is not the interesting part of this call.
+        let mut wrong_credential = codec_call(
+            never_issued.as_str(),
+            "operation-1",
+            v1::CodecOperation::LlmRequestDecode,
+        );
+        wrong_credential.metadata_mut().insert(
+            SESSION_CREDENTIAL_HEADER,
+            MetadataValue::try_from("another-session-credential").expect("a header value"),
+        );
+        let refused = service
+            .resolve_codec(wrong_credential)
+            .await
+            .expect_err("a call with another session's credential");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+        // A reference that is not shaped like one was never issued here, and is refused
+        // for what it is rather than looked up.
+        let refused = service
+            .resolve_codec(codec_call(
+                "not-a-reference",
+                "operation-1",
+                v1::CodecOperation::LlmRequestDecode,
+            ))
+            .await
+            .expect_err("a value that is not a reference");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
         // An operation this side does not define is refused rather than guessed, because
         // the direction it implies is what the capability is checked against.
         let refused = service

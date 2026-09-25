@@ -264,6 +264,84 @@ def find_violations(metadata: dict, identities: dict[str, list[str]], policy: di
     return reports, problems
 
 
+def find_temporary_problems(policy: dict, reports: list[Metrics]) -> list[str]:
+    """Check the temporary ceilings: every one has to promise a decrease, and keep it.
+
+    A budget that only moves upward is a counter, not a ratchet. These entries are the
+    raises a migration needed and the milestones that have to give them back: each names a
+    ceiling, the milestone that removes it and the value it must fall to. Three rules make
+    that enforceable rather than aspirational.
+
+    - The promise is a *decrease*: a target at or above the raised ceiling is refused, so
+      an entry cannot exist without saying what it gives back.
+    - The entry describes the *current* ceiling: if the budget moved on, the entry is
+      stale and fails rather than quietly describing a ceiling nobody has.
+    - The entry is retired by satisfying it: once the measurement reaches the target, the
+      entry and the budget it raised have to go together, which is what stops a temporary
+      ceiling from becoming a permanent one.
+    """
+    problems: list[str] = []
+    measured = {
+        (report.crate, field): getattr(report, attribute)
+        for report in reports
+        for field, attribute in LIMIT_FIELDS.items()
+    }
+    required = ("crate", "field", "raised_to", "reason", "introduced", "must_fall_by", "target")
+    for index, entry in enumerate(policy.get("temporary", [])):
+        # Present and empty is missing: a milestone nobody named and a reason nobody
+        # wrote promise nothing, and a key that exists is not a statement.
+        missing = [name for name in required if not entry.get(name)]
+        if missing:
+            problems.append(
+                f"temporary ceiling #{index} is missing {', '.join(missing)}; a raise that "
+                "is meant to come back down has to say what takes it back"
+            )
+            continue
+        crate = entry["crate"]
+        field = entry["field"]
+        if field not in LIMIT_FIELDS:
+            problems.append(f"temporary ceiling #{index} names an unknown budget {field}")
+            continue
+        limits = policy.get("limits", {}).get(crate, {})
+        if limits.get(field) != entry["raised_to"]:
+            problems.append(
+                f"{crate}.{field} is recorded as a temporary ceiling of "
+                f"{entry['raised_to']}, and the budget is {limits.get(field)}; the entry "
+                "describes a ceiling this policy does not have"
+            )
+            continue
+        if entry["target"] >= entry["raised_to"]:
+            problems.append(
+                f"{crate}.{field}: a temporary ceiling must promise a decrease from "
+                f"{entry['raised_to']} to its target {entry['target']}"
+            )
+            continue
+        actual = measured.get((crate, field))
+        if actual is not None and actual <= entry["target"]:
+            problems.append(
+                f"{crate}.{field} has already fallen to {actual}, at or below the target "
+                f"{entry['target']} of the temporary ceiling introduced for "
+                f"{entry['must_fall_by']}; lower the budget, delete the entry, and let the "
+                "ratchet close"
+            )
+    return problems
+
+
+def render_temporary(policy: dict) -> str:
+    """Render the outstanding temporary ceilings, so every run shows what is owed."""
+    entries = policy.get("temporary", [])
+    if not entries:
+        return "temporary ceilings: none"
+    lines = ["temporary ceilings (raise -> target, removed by):"]
+    for entry in entries:
+        lines.append(
+            f"  {entry.get('crate')}.{entry.get('field')}: "
+            f"{entry.get('raised_to')} -> {entry.get('target')} "
+            f"by {entry.get('must_fall_by')} (introduced {entry.get('introduced')})"
+        )
+    return "\n".join(lines)
+
+
 def render(reports: list[Metrics]) -> str:
     """Render the report table."""
     header = f"{'crate':<22}{'files':>7}{'lines':>9}{'unsafe':>8}{'direct':>8}{'transitive':>12}"
@@ -369,11 +447,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     identities = {crate: dependency_identities(arguments.repo_root, crate) for crate in crates}
     reports, problems = find_violations(metadata, identities, policy)
+    problems.extend(find_temporary_problems(policy, reports))
 
     print(render(reports))
     print()
     surface = render_surface(metadata, identities, policy)
     print(surface)
+    print()
+    print(render_temporary(policy))
     if problems:
         print(file=sys.stderr)
         for problem in problems:

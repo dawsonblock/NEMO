@@ -150,7 +150,10 @@ max_transitive_packages = 265
 # event doors rather than restating it, and reporting a sanitizer that did not answer so
 # a host running the registration for another process can account for the omission. No
 # dependency moved and no `unsafe` did.
-max_source_lines = 74590
+#
+# Raised once more for the kernel's deadline test: the constant became a ceiling, and the
+# test that pins inheritance, shortening and capping is four lines of budget arithmetic.
+max_source_lines = 74657
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -461,3 +464,50 @@ max_source_lines = 4378
 max_unsafe_occurrences = 0
 direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
 transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"
+
+# Temporary ceilings: the raises a migration needed, and what gives them back.
+#
+# A budget that only moves upward is a counter. Each entry below is a raise that exists
+# because the tree is between two states, names the milestone that removes it, and states
+# the value the budget has to fall to. `scripts/tcb/report.py` refuses an entry that does
+# not promise a decrease, refuses one that describes a ceiling the policy does not have,
+# and refuses one whose target has already been reached but whose entry — and whose raised
+# budget — are still in place. The loader-removal milestone cannot pass this gate without
+# taking all three of these down with it.
+
+[[temporary]]
+crate = "nemo-relay"
+field = "max_source_lines"
+raised_to = 74657
+target = 67832
+reason = "the native loader and the ABI bridge are still compiled into the kernel"
+introduced = "2514f27..eb975ae"
+must_fall_by = "loader-removal"
+# The target is the current ceiling minus the 6825 lines of
+# crates/core/src/plugin/dynamic/native.rs, which is the file the milestone moves out of
+# the kernel's dependency closure. Measured at the time this entry was written; the
+# milestone should be measured again rather than trusted to this number.
+
+[[temporary]]
+crate = "nemo-relay"
+field = "max_unsafe_occurrences"
+raised_to = 307
+target = 19
+reason = "288 of the kernel's 307 textual unsafe tokens are the native loader's"
+introduced = "2514f27..eb975ae"
+must_fall_by = "loader-removal"
+# A memory-corruption bug in the loader corrupts the kernel today because the loader is
+# in the kernel's address space. This is the number the isolation milestone is judged on,
+# and it is the one that has to move.
+
+[[temporary]]
+crate = "nemo-relay-plugin"
+field = "max_source_lines"
+raised_to = 5463
+target = 0
+reason = "the ABI crate is in the kernel's process only while the loader is"
+introduced = "2514f27..eb975ae"
+must_fall_by = "loader-removal"
+# Zero rather than a smaller number: when the loader moves, this crate belongs to the
+# host's side of the boundary, and the kernel's policy should stop listing it at all
+# rather than listing a smaller amount of code that should not be there.

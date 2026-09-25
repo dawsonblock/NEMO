@@ -2439,12 +2439,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The kernel's own ceiling for one operation.
+///
+/// A ceiling rather than the policy. An operation's deadline is the smallest of what the
+/// caller published and what this kernel is willing to take, so a caller can shorten an
+/// operation and nothing can lengthen it. The ceiling exists because a store call needs
+/// *some* bound even when nobody above this layer stated one: an unbounded kernel
+/// operation is a transaction that can outlive the request that asked for it, and the
+/// store waits derived from this number are what the kernel's own `UNKNOWN` handling
+/// exists to cover.
+const KERNEL_OPERATION_CEILING_MILLIS: u64 = 29_000;
+
+/// The deadline one kernel operation runs under, as an absolute instant.
+///
+/// Inherited from the trusted budget the caller published, narrowed by the kernel's own
+/// ceiling. This used to be a local constant, which made every kernel operation run under
+/// a deadline the runtime had never agreed to: a caller that published two seconds got
+/// twenty-nine, and a caller that published a minute got twenty-nine as well. The
+/// arithmetic is [`ExecutionBudget::narrowed_to`]'s, because that is the only arithmetic
+/// a layer is allowed to do with a budget — a cap can shorten and cannot lengthen.
 fn kernel_deadline_unix_ms() -> u64 {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .saturating_add(29_000)
-        .try_into()
-        .unwrap_or(u64::MAX)
+    let now = crate::api::runtime::budget_now_unix_ms();
+    let budget = crate::api::runtime::current_execution_budget().map_or_else(
+        || {
+            crate::api::runtime::ExecutionBudget::new(
+                now.saturating_add(KERNEL_OPERATION_CEILING_MILLIS),
+                KERNEL_OPERATION_CEILING_MILLIS,
+            )
+        },
+        |inherited| inherited.narrowed_to(KERNEL_OPERATION_CEILING_MILLIS, now),
+    );
+    budget.deadline_unix_ms.unwrap_or(u64::MAX)
 }
 
 /// Remaining trusted action budget, or `None` once the deadline has passed.
@@ -2535,6 +2560,48 @@ mod tests {
         Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    /// A kernel operation runs under the budget its caller published, capped by the
+    /// kernel's own ceiling.
+    ///
+    /// This is the difference between a policy constant and a policy: a caller that has
+    /// two seconds left cannot be given twenty-nine, and a caller that has a minute cannot
+    /// extend the kernel's own bound either. The budget is a task-local, so the three
+    /// cases are three calls under three budgets.
+    #[tokio::test]
+    async fn a_kernel_operation_runs_under_the_budget_it_inherited() {
+        use crate::api::runtime::{ExecutionBudget, budget_now_unix_ms, with_execution_budget};
+
+        let now = budget_now_unix_ms();
+
+        // Nothing published: the kernel's ceiling is the whole policy.
+        let bare = kernel_deadline_unix_ms();
+        assert!(
+            bare >= now + KERNEL_OPERATION_CEILING_MILLIS - 100
+                && bare <= now + KERNEL_OPERATION_CEILING_MILLIS + 100,
+            "with nothing published the ceiling applies: {bare}"
+        );
+
+        // A shorter budget shortens it.
+        let inherited = with_execution_budget(ExecutionBudget::new(now + 2_000, 2_000), async {
+            kernel_deadline_unix_ms()
+        })
+        .await;
+        assert!(
+            inherited >= now + 1_900 && inherited <= now + 2_100,
+            "a shorter published deadline wins: {inherited}"
+        );
+
+        // A longer one cannot lengthen it.
+        let capped = with_execution_budget(ExecutionBudget::new(now + 120_000, 120_000), async {
+            kernel_deadline_unix_ms()
+        })
+        .await;
+        assert!(
+            capped <= now + KERNEL_OPERATION_CEILING_MILLIS + 100,
+            "a published budget cannot extend the kernel's own ceiling: {capped}"
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum Decision {

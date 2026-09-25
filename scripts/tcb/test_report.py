@@ -181,6 +181,83 @@ def test_a_crate_within_budget_passes(tmp_path: pathlib.Path) -> None:
     assert problems == []
 
 
+def metrics(source_lines: int) -> report.Metrics:
+    """A measurement for one crate, at the size a test wants it."""
+    return report.Metrics(
+        crate="nemo-relay",
+        source_files=1,
+        source_lines=source_lines,
+        unsafe_occurrences=0,
+        direct_dependencies=0,
+        transitive_packages=0,
+        direct_dependency_digest="",
+        transitive_dependency_digest="",
+    )
+
+
+def temporary_policy(**overrides: object) -> dict:
+    """A policy with one temporary ceiling, as the repository records them."""
+    entry: dict = {
+        "crate": "nemo-relay",
+        "field": "max_source_lines",
+        "raised_to": 120,
+        "target": 100,
+        "reason": "a migration is in flight",
+        "introduced": "abc1234",
+        "must_fall_by": "loader-removal",
+    }
+    entry.update(overrides)
+    return {
+        "limits": {"nemo-relay": {"max_source_lines": entry["raised_to"]}},
+        "temporary": [entry],
+    }
+
+
+def test_a_temporary_ceiling_has_to_promise_a_decrease() -> None:
+    # A raise that does not say what it gives back is a permanent one wearing a label.
+    for target in (120, 130):
+        problems = report.find_temporary_problems(temporary_policy(target=target), [metrics(110)])
+        assert problems, "a target at or above the ceiling must be refused"
+        assert "must promise a decrease" in problems[0]
+
+
+def test_a_temporary_ceiling_that_describes_no_current_budget_is_stale() -> None:
+    policy = temporary_policy()
+    policy["limits"]["nemo-relay"]["max_source_lines"] = 130
+
+    problems = report.find_temporary_problems(policy, [metrics(110)])
+
+    assert problems
+    assert "describes a ceiling this policy does not have" in problems[0]
+
+
+def test_a_satisfied_temporary_ceiling_has_to_be_retired() -> None:
+    # The ratchet closing: once the measurement reaches the target, keeping the raised
+    # budget and the entry means the ceiling was temporary in name only.
+    problems = report.find_temporary_problems(temporary_policy(), [metrics(100)])
+
+    assert problems
+    assert "already fallen to 100" in problems[0]
+    assert "delete the entry" in problems[0]
+
+
+def test_a_temporary_ceiling_without_its_reason_is_refused() -> None:
+    problems = report.find_temporary_problems(temporary_policy(must_fall_by=None), [metrics(110)])
+
+    assert problems
+    assert "is missing must_fall_by" in problems[0]
+
+
+def test_a_well_formed_temporary_ceiling_passes_and_is_rendered() -> None:
+    policy = temporary_policy()
+
+    assert report.find_temporary_problems(policy, [metrics(110)]) == []
+    rendered = report.render_temporary(policy)
+    assert "120 -> 100" in rendered
+    assert "loader-removal" in rendered
+    assert report.render_temporary({}) == "temporary ceilings: none"
+
+
 def test_repository_policy_measures_every_crate_it_trusts() -> None:
     policy = report.load_policy(report.DEFAULT_POLICY)
 
