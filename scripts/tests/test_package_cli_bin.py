@@ -76,6 +76,25 @@ class PackageCliBinTests(unittest.TestCase):
                 self.assertEqual(platform.executable, "nemo-relay.exe")
                 self.assertEqual(platform.host_executable, "nemo-plugin-host.exe")
 
+    def test_a_wheel_without_a_host_says_so_instead_of_promising_one(self) -> None:
+        # The one platform with no host to ship — the isolated runtime is not
+        # implemented on Windows yet — gets a wheel that carries the CLI alone and
+        # metadata that says which of the two it is.
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            binary = output / "nemo-relay.exe"
+            binary.write_bytes(b"test-binary")
+            platform = PACKAGE_CLI_BIN.PLATFORMS["x86_64-pc-windows-msvc"]
+
+            wheel = PACKAGE_CLI_BIN.build_wheel(binary, None, platform, "0.9.1-rc.4", output)
+
+            with zipfile.ZipFile(wheel) as archive:
+                names = archive.namelist()
+                self.assertFalse(any(name.endswith("nemo-plugin-host.exe") for name in names), names)
+                metadata = archive.read(next(name for name in names if name.endswith("/METADATA")))
+                self.assertIn(b"carries no plugin host", metadata)
+                self.assertNotIn(b"the `nemo-plugin-host` process", metadata)
+
     def test_rejects_unsupported_version(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported package version"):
             PACKAGE_CLI_BIN.wheel_version("dev-deadbeef")

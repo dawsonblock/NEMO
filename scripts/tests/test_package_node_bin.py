@@ -96,6 +96,41 @@ class PackageNodeBinTests(unittest.TestCase):
                     all(version == "0.7.0+deadbeef" for version in manifest["optionalDependencies"].values())
                 )
 
+    def test_a_package_without_a_host_does_not_list_one(self) -> None:
+        # The one platform with no host to carry: the isolated runtime is not
+        # implemented on Windows yet, so the package ships the addon alone and its
+        # manifest is the record of that rather than a claim it cannot keep.
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            node_dir = output / "node"
+            node_dir.mkdir()
+            (node_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "nemo-relay-node",
+                        "version": "0.7.0",
+                        "description": "Node bindings.",
+                        "main": "index.js",
+                        "types": "index.d.ts",
+                        "exports": {".": {"types": "./index.d.ts", "default": "./index.js"}},
+                        "engines": {"node": ">=24.0.0"},
+                        "license": "Apache-2.0",
+                    }
+                )
+            )
+            for filename in ("index.js", "index.d.ts", "README.md"):
+                (node_dir / filename).write_text(filename)
+            binary_name = "nemo-relay.win32-x64-msvc.node"
+            (node_dir / binary_name).write_bytes(b"native")
+
+            platform = PACKAGE_NODE_BIN.PLATFORMS["windows-amd64"]
+            native = PACKAGE_NODE_BIN.build_native_package(node_dir, platform, "0.7.0-rc.1", output, None)
+
+            with tarfile.open(native) as archive:
+                manifest = json.load(required_member(archive, "package/package.json"))
+                self.assertEqual(manifest["files"], [binary_name])
+                self.assertNotIn("package/bin/nemo-plugin-host.exe", archive.getnames())
+
 
 if __name__ == "__main__":
     unittest.main()

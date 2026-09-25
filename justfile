@@ -1989,7 +1989,17 @@ package-node:
     # runtime's process, and the addon resolves it from its own directory. Built
     # here, after the version was written, so the addon and the host inside one
     # package are the same release; built static on Linux, so it runs on the
-    # glibc floor the package is tagged for rather than on this machine's.
+    # glibc floor the package is tagged for rather than on this machine's. On
+    # Windows there is no host to ship yet — the isolated runtime is not
+    # implemented there — and this says so rather than shipping a package whose
+    # addon has nothing to start.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo "The isolated native plugin runtime is not implemented on Windows yet;" >&2
+            echo "this package carries the addon alone and native plugins cannot be hosted." >&2
+            host_binary=""
+            ;;
+        *)
     host_directory="target/release"
     host_build=(cargo build --release -p nemo-relay-plugin-host)
     if [[ "$(uname -s)" == "Linux" ]]; then
@@ -2021,13 +2031,18 @@ package-node:
     case "$node_platform" in
         windows-*) host_executable="nemo-plugin-host.exe" ;;
     esac
+    host_binary="${host_directory}/${host_executable}"
+            ;;
+    esac
     package_args=(
         --node-dir crates/node
         --platform "$node_platform"
         --version "$package_version"
         --output-dir "$package_dir"
-        --host-binary "${host_directory}/${host_executable}"
     )
+    if [[ -n "$host_binary" ]]; then
+        package_args+=(--host-binary "$host_binary")
+    fi
     if [[ "$node_platform" == "linux-amd64" ]]; then
         package_args+=(--metapackage)
     fi
@@ -2119,11 +2134,19 @@ package-python:
     # The host travels inside the wheel rather than beside it. It is not an
     # optional utility: it is the executable that performs the loading a binding
     # is not allowed to perform, so a wheel that installs without it installs a
-    # runtime whose native plugins cannot be isolated.
+    # runtime whose native plugins cannot be isolated. On Windows there is no
+    # host to ship yet — the isolated runtime is not implemented there — so the
+    # wheel carries the runtime alone and the metadata says so.
     #
     # Built here rather than expected from an earlier step, because the version
     # written above decides what the host reports about itself: a host built
     # before that line would be a host from another release inside this one.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo "The isolated native plugin runtime is not implemented on Windows yet;" >&2
+            echo "this wheel carries the runtime alone and native plugins cannot be hosted." >&2
+            ;;
+        *)
     host_binary="$NEMO_RELAY_REPO_ROOT/target/release/nemo-plugin-host"
     host_build=(cargo build --release -p nemo-relay-plugin-host)
     if [[ "$(uname -s)" == "Linux" ]]; then
@@ -2160,6 +2183,8 @@ package-python:
             --wheel "$wheel" \
             --host-binary "$host_binary"
     done
+            ;;
+    esac
 
 # --set [output_dir=<path>] [ref_name=<name>]
 package-python-sdist:

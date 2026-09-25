@@ -139,7 +139,7 @@ def build_native_package(
     platform: Platform,
     version: str,
     output: Path,
-    host_binary: Path,
+    host_binary: Path | None,
 ) -> Path:
     """Build one OS- and CPU-constrained native npm package.
 
@@ -148,6 +148,11 @@ def build_native_package(
     process, and the addon resolves it from its own directory rather than from
     `PATH` or from wherever `node` happens to be, because a binding that guessed
     would be a binding that could run a different host than the release it is.
+
+    The host is absent on the one platform that has none to carry: the isolated
+    runtime is not implemented on Windows yet, so the package ships the addon
+    alone and its manifest records that rather than listing a file nothing there
+    can start.
     """
     source_manifest = json.loads((node_dir / "package.json").read_text())
     manifest = {
@@ -155,7 +160,7 @@ def build_native_package(
         "version": version,
         **repository_metadata(source_manifest),
         "main": platform.binary,
-        "files": [platform.binary, platform.host_path],
+        "files": [platform.binary] + ([platform.host_path] if host_binary is not None else []),
         "os": [platform.npm_os],
         "cpu": [platform.npm_cpu],
     }
@@ -164,7 +169,7 @@ def build_native_package(
     binary = node_dir / platform.binary
     if not binary.is_file():
         raise FileNotFoundError(f"Node native binary does not exist: {binary}")
-    if not host_binary.is_file():
+    if host_binary is not None and not host_binary.is_file():
         raise FileNotFoundError(f"plugin host binary does not exist: {host_binary}")
     artifact_suffix = f"{platform.npm_os}-{platform.npm_cpu}"
     if platform.libc == "musl":
@@ -173,7 +178,8 @@ def build_native_package(
     with tarfile.open(destination, "w:gz") as archive:
         add_tar_bytes(archive, "package/package.json", json.dumps(manifest, indent=2).encode() + b"\n")
         add_tar_bytes(archive, f"package/{platform.binary}", binary.read_bytes(), mode=0o755)
-        add_tar_bytes(archive, f"package/{platform.host_path}", host_binary.read_bytes(), mode=0o755)
+        if host_binary is not None:
+            add_tar_bytes(archive, f"package/{platform.host_path}", host_binary.read_bytes(), mode=0o755)
         add_tar_bytes(archive, "package/LICENSE", (ROOT / "LICENSE").read_bytes())
     return destination
 
@@ -208,8 +214,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--host-binary",
         type=Path,
-        required=True,
-        help="the nemo-plugin-host executable built for the platform being packaged",
+        default=None,
+        help=(
+            "the nemo-plugin-host executable built for the platform being packaged; omit it only "
+            "where the isolated runtime is not implemented, which is Windows today"
+        ),
     )
     parser.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
     parser.add_argument("--version", required=True)

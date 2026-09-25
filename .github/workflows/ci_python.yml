@@ -475,6 +475,11 @@ jobs:
           uv pip install --python "$venv_python" --no-deps --no-index "$wheel"
           # SONAR_IGNORE_END
           "$venv_python" -c "import nemo_relay"
+          # Windows wheels carry the runtime alone: the isolated runtime is not
+          # implemented there, so there is no host to check for.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            exit 0
+          fi
           # The plugin host travels inside the wheel: it is the executable that
           # runs native plugins out of process, and a runtime installed without
           # it cannot isolate anything. It is checked where a binding looks for

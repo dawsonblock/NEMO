@@ -119,7 +119,7 @@ def add_zip_file(archive: zipfile.ZipFile, path: str, content: bytes, executable
 
 def build_wheel(
     binary: Path,
-    host_binary: Path,
+    host_binary: Path | None,
     platform: Platform,
     version: str,
     output: Path,
@@ -132,6 +132,11 @@ def build_wheel(
     wheel that omitted it would install cleanly and then fail the first time a
     deployment used a native plugin, which is the failure this packaging exists
     to make impossible.
+
+    The host is optional for the one platform where there is none to ship: the
+    isolated plugin runtime is not implemented on Windows yet, so a Windows wheel
+    carries the CLI alone and says so rather than promising a host that nothing
+    there can start.
     """
     pep440_version = wheel_version(version)
     normalized_name = PACKAGE_NAME.replace("-", "_")
@@ -141,6 +146,17 @@ def build_wheel(
     dist_info = f"{normalized_name}-{pep440_version}.dist-info"
     script_path = f"{normalized_name}-{pep440_version}.data/scripts/{platform.executable}"
     host_script_path = f"{normalized_name}-{pep440_version}.data/scripts/{platform.host_executable}"
+    description = (
+        "This platform wheel installs the prebuilt `nemo-relay` command-line interface.\n"
+        "\n"
+        "Native plugins cannot be hosted outside the runtime process on this platform\n"
+        "yet, so this wheel carries no plugin host.\n"
+        if host_binary is None
+        else (
+            "This platform wheel installs the prebuilt `nemo-relay` command-line interface and\n"
+            "the `nemo-plugin-host` process it starts to run native plugins out of process.\n"
+        )
+    )
     metadata = (
         "Metadata-Version: 2.4\n"
         f"Name: {PACKAGE_NAME}\n"
@@ -150,9 +166,7 @@ def build_wheel(
         "Requires-Python: >=3.11\n"
         f"Project-URL: Repository, {REPOSITORY}\n"
         "Description-Content-Type: text/markdown\n"
-        "\n"
-        "This platform wheel installs the prebuilt `nemo-relay` command-line interface and\n"
-        "the `nemo-plugin-host` process it starts to run native plugins out of process.\n"
+        "\n" + description
     ).encode()
     wheel = (
         "Wheel-Version: 1.0\n"
@@ -161,14 +175,14 @@ def build_wheel(
     ).encode()
     license_text = (ROOT / "LICENSE").read_bytes()
     binary_content = binary.read_bytes()
-    host_binary_content = host_binary.read_bytes()
     files = {
         script_path: binary_content,
-        host_script_path: host_binary_content,
         f"{dist_info}/METADATA": metadata,
         f"{dist_info}/WHEEL": wheel,
         f"{dist_info}/licenses/LICENSE": license_text,
     }
+    if host_binary is not None:
+        files[host_script_path] = host_binary.read_bytes()
     record_path = f"{dist_info}/RECORD"
     record = "\n".join(record_entry(path, content) for path, content in files.items())
     record += f"\n{record_path},,\n"
@@ -186,8 +200,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--host-binary",
         type=Path,
-        required=True,
-        help="the nemo-plugin-host executable built for the same target",
+        default=None,
+        help=(
+            "the nemo-plugin-host executable built for the same target; omit it only on a "
+            "platform where the isolated plugin runtime is not implemented, which is Windows today"
+        ),
     )
     parser.add_argument("--target", choices=sorted(PLATFORMS), required=True)
     parser.add_argument("--version", required=True)
@@ -200,7 +217,7 @@ def main() -> None:
     args = parse_args()
     if not args.binary.is_file():
         raise SystemExit(f"CLI binary does not exist: {args.binary}")
-    if not args.host_binary.is_file():
+    if args.host_binary is not None and not args.host_binary.is_file():
         raise SystemExit(f"Plugin host binary does not exist: {args.host_binary}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     platform = PLATFORMS[args.target]
