@@ -1797,13 +1797,26 @@ instrumented run prints the bridge's job and never the kernel's receipt — so t
 invocation runs out its budget and the family omits the payload, which is at least the
 fail-closed direction.
 
-The finding is bounded, and the evidence narrows it: it is not the caller's runtime flavour (a
-current-thread caller and a four-worker caller both hang), not the capability record (the
-kernel's own service-level tests resolve, refuse and execute against it), and not the codec
-(that path is executed in-process by the same tests). What remains is the transport under a
-*nested* call — a second connection made while an invocation it belongs to is in flight — and
-the next step is to instrument the kernel's accept path and the attached client's treatment of
-a call made from a service it is also serving. Until that is understood, **the class is not
+The finding is bounded, and a second experiment bounded it further. The host is not the
+problem and neither is the nesting: with no host in the picture at all — a plain kernel service
+on a socket, a capability issued for one operation, and a *blocking* caller on a thread of its
+own — the bridge still hangs. That experiment is in the tree, ignored, with that reason on it.
+What is ruled out by measurement: the caller's runtime flavour (current-thread and four-worker
+both hang in the host test), the capability record (the service-level tests resolve, refuse and
+execute against it), the codec (the same tests execute it), the second connection being refused
+(the bridge connects, and the kernel's server answers the host's first connection every day),
+and the host's arm (the isolated experiment has no host).
+
+What is left is the bridge's own call, and the control that came with the experiment says so
+precisely: the *same* socket, the *same* capability and the *same* call made from an async task
+instead of a bridge thread **passes**. So a second connection works, a client driven from an
+ordinary async context works, and the fault is in how the bridge drives its call — the one
+difference the control leaves. It is not the shape: the bridge has been changed twice (one
+`block_on` covering both the connection and the calls, and a multi-thread runtime in place of a
+current-thread one) and hangs either way. The next step is not another shape but a measurement
+*inside* the call — instrument the client's send and the server's accept rather than the code
+around them — because the remaining difference is between a task and a foreign thread, and
+guessing at it has already cost two attempts. Until that is understood, **the class is not
 served**: `supported_registration_operations` does not list it, the fixture registers its
 sanitizer only when a test asks for it (a plugin that registered it would be refused whole),
 and the real-child test that would qualify it is in the tree, ignored, with that reason on it.

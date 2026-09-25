@@ -208,7 +208,11 @@ fn write_failed(error: serde_json::Error) -> FlowError {
 /// kernel does to answer it needs the blocked thread. One bridge per host, because one
 /// client is enough and one thread is the bound.
 struct CodecBridge {
-    jobs: std::sync::mpsc::Sender<CodecJob>,
+    /// Unbounded and asynchronous on the receiving side: the caller is a synchronous thread
+    /// inside the plugin's code, and the thread that answers must never block the runtime it
+    /// drives. A blocking receive on a `current_thread` runtime would starve the very
+    /// connection the answer arrives on.
+    jobs: tokio::sync::mpsc::UnboundedSender<CodecJob>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -235,49 +239,51 @@ impl Drop for CodecBridge {
 impl CodecBridge {
     /// Start a bridge for one session's kernel client.
     fn start(client: crate::runtime_service::KernelCallbacks, session_id: String) -> Arc<Self> {
-        let (jobs, queue) = std::sync::mpsc::channel::<CodecJob>();
+        let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<CodecJob>();
         let thread = std::thread::Builder::new()
             .name("nemo-plugin-codec-bridge".to_string())
             .spawn(move || {
-                // A current-thread runtime is enough for a thread whose only work is to wait
-                // for a job and answer it, and it keeps the bridge's footprint to one thread
-                // the host already has.
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                // Two workers, and one `block_on` for the whole life of the bridge: the
+                // connection is opened *and* driven here, so the client's tasks live on the
+                // runtime that waits for them — the affinity rule this repository has paid for
+                // more than once — and nothing about the caller's thread can decide whether an
+                // answer arrives.
+                let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                 else {
                     return;
                 };
-                // The connection this thread waits on is opened *here*, on this runtime: a
-                // client's tasks belong to the runtime that opened them, so blocking on the
-                // host's client would mean waiting for an answer nothing on this thread could
-                // receive. A host that remembered no endpoint is one whose caller is already
-                // on the right runtime, and `connect_again` hands back the client it has.
-                let client = match runtime.block_on(client.connect_again()) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        // The refusal a plugin then sees says the bridge stopped, which is
-                        // what happened; the reason is this line, because a host has no
-                        // runtime of the kernel's to record it in.
-                        eprintln!(
-                            "the codec bridge could not open its own kernel connection, so \
-                             plugin codec calls will be refused: {error}"
-                        );
-                        return;
+                runtime.block_on(async move {
+                    let client = match client.connect_again().await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            // The refusal a plugin then sees says the bridge stopped, which is
+                            // what happened; the reason is this line, because a host has no
+                            // runtime of the kernel's to record it in.
+                            eprintln!(
+                                "the codec bridge could not open its own kernel connection, so \
+                                 plugin codec calls will be refused: {error}"
+                            );
+                            return;
+                        }
+                    };
+                    while let Some(job) = queue.recv().await {
+                        let answer = client
+                            .resolve_codec(
+                                &session_id,
+                                &job.operation_request_id,
+                                job.operation,
+                                &job.payload_json,
+                                &job.reference,
+                            )
+                            .await;
+                        // A caller that gave up is the plugin's business, not this task's: the
+                        // work was asked for and was done.
+                        let _ = job.answer.send(answer);
                     }
-                };
-                while let Ok(job) = queue.recv() {
-                    let answer = runtime.block_on(client.resolve_codec(
-                        &session_id,
-                        &job.operation_request_id,
-                        job.operation,
-                        &job.payload_json,
-                        &job.reference,
-                    ));
-                    // A caller that gave up is the plugin's business, not this thread's: the
-                    // work was asked for and was done.
-                    let _ = job.answer.send(answer);
-                }
+                });
             })
             .expect("a codec bridge thread");
         Arc::new(Self {
@@ -480,6 +486,174 @@ mod tests {
 
     fn response_handle(identity: LlmCodecIdentity) -> CodecHandle {
         CodecHandle::Response(Arc::new(RecordingResponseCodec { identity }))
+    }
+
+    /// The bridge reaches a kernel over the connection it opens itself.
+    ///
+    /// This is the host's nested call reduced to what it needs: a kernel service on a socket,
+    /// a capability issued for one operation, and a *blocking* caller on a thread of its own —
+    /// which is what a plugin's synchronous codec call is.
+    ///
+    /// It hangs, and that is the finding rather than a defect in the test. Its control — the
+    /// same socket, the same capability, the same call made from the async task instead of a
+    /// bridge thread — passes, which rules the connection and the service out: a *second
+    /// connection* works, and a client driven from an ordinary async context works. What does
+    /// not work is the same call driven from the bridge's own thread and runtime, and the shape
+    /// has been changed twice without helping (one `block_on` for the connection and the calls,
+    /// a multi-thread runtime instead of a current-thread one). The next thing to try is not
+    /// another shape: it is to find out what the bridge's thread does that a task does not, by
+    /// instrumenting the call itself rather than the code around it.
+    #[ignore = "hangs: a bridge thread's call over its own connection never returns; see \
+                security/PLUGIN-ISOLATION.md. Run with `-- --ignored` after the fix."]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_reaches_a_kernel_over_a_connection_it_opens_itself() {
+        use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
+        use tonic::transport::Server;
+
+        let codecs = Arc::new(super::super::codec_capability::CodecCapabilities::new());
+        let (reference, _guard) = codecs.issue_request(
+            "operation-bridge",
+            Arc::new(RecordingCodec {
+                identity: LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+            }),
+        );
+        let service = crate::runtime_service::RelayRuntimeService::new(
+            crate::runtime_service::RelayRuntimeConfig {
+                session_id: "bridge-session".into(),
+                session_credential: "bridge-credential".into(),
+                protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+                runtime_binding_digest: "bridge-binding".into(),
+                operation_scopes: Arc::new(crate::operation_scopes::OperationScopes::new()),
+                continuations: Arc::new(crate::continuations::Continuations::new()),
+                codecs,
+            },
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-bridge-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a socket directory");
+        let endpoint = directory.join("k");
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("a kernel socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RelayRuntimeServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+        });
+
+        let client = crate::runtime_service::connect_to_kernel(
+            &endpoint,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await
+        .expect("a client");
+        let callbacks = crate::runtime_service::KernelCallbacks::new(client, "bridge-credential")
+            .expect("the credential")
+            .with_reconnect(
+                endpoint.clone(),
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            );
+        let codec = KernelRequestCodec::new(
+            callbacks,
+            "bridge-session",
+            "operation-bridge",
+            LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+            reference.as_str(),
+        );
+
+        let decoded = tokio::task::spawn_blocking(move || {
+            codec.decode(&LlmRequest {
+                headers: serde_json::Map::new(),
+                content: serde_json::json!({ "model": "example" }),
+            })
+        })
+        .await
+        .expect("the blocking caller");
+        let decoded = decoded.expect("a decoded request");
+        assert_eq!(decoded.model.as_deref(), Some("example"));
+
+        serving.abort();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The same call, from the async task instead of a bridge thread.
+    ///
+    /// This splits the finding in two: if a *second connection*, called from an ordinary async
+    /// context, answers, then the bridge's own driving of the call is what does not; if it does
+    /// not answer either, the second connection is what does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_connection_can_call_the_kernel_service() {
+        use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
+        use tonic::transport::Server;
+
+        let codecs = Arc::new(super::super::codec_capability::CodecCapabilities::new());
+        let (reference, _guard) = codecs.issue_request(
+            "operation-bridge",
+            Arc::new(RecordingCodec {
+                identity: LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+            }),
+        );
+        let service = crate::runtime_service::RelayRuntimeService::new(
+            crate::runtime_service::RelayRuntimeConfig {
+                session_id: "bridge-session".into(),
+                session_credential: "bridge-credential".into(),
+                protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+                runtime_binding_digest: "bridge-binding".into(),
+                operation_scopes: Arc::new(crate::operation_scopes::OperationScopes::new()),
+                continuations: Arc::new(crate::continuations::Continuations::new()),
+                codecs,
+            },
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-second-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a socket directory");
+        let endpoint = directory.join("k");
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("a kernel socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RelayRuntimeServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+        });
+
+        let client = crate::runtime_service::connect_to_kernel(
+            &endpoint,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await
+        .expect("the first client");
+        let callbacks = crate::runtime_service::KernelCallbacks::new(client, "bridge-credential")
+            .expect("the credential")
+            .with_reconnect(
+                endpoint.clone(),
+                nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+            );
+        let second = callbacks
+            .connect_again()
+            .await
+            .expect("a second connection");
+        let answer = second
+            .resolve_codec(
+                "bridge-session",
+                "operation-bridge",
+                nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+                &serde_json::json!({
+                    "codec_kind": "builtin",
+                    "codec_id": "openai_chat",
+                    "request": { "headers": {}, "content": { "model": "example" } }
+                })
+                .to_string(),
+                reference.as_str(),
+            )
+            .await
+            .expect("a served codec call");
+        assert!(answer.contains("example"), "{answer}");
+
+        serving.abort();
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The identity a plugin is told survives the wire in both directions.
