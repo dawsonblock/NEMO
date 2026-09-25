@@ -2000,6 +2000,19 @@ package-node:
             echo "  rustup target add ${host_target:-<target>}" >&2
             exit 1
         fi
+        # Static linking needs a musl C compiler for the crates that build C: the
+        # Rust target brings the standard library, not the toolchain the C
+        # dependencies are compiled with, and a build that skipped this fails with
+        # a missing `*-linux-musl-gcc` rather than a package without a host.
+        host_cc_var="CC_$(printf '%s' "$host_target" | tr '-' '_')"
+        if [[ -z "${!host_cc_var:-}" ]]; then
+            if ! command -v musl-gcc >/dev/null 2>&1; then
+                echo "Error: musl-gcc is required to link ${host_target} statically; install it with:" >&2
+                echo "  apt-get install -y musl-tools   # or the equivalent for this distribution" >&2
+                exit 1
+            fi
+            export "$host_cc_var=musl-gcc"
+        fi
         host_directory="target/${host_target}/release"
         host_build=(cargo build --release -p nemo-relay-plugin-host --target "$host_target")
     fi
@@ -2124,6 +2137,19 @@ package-python:
             echo "Error: the static target ${host_target:-<unknown>} is not installed; add it with:" >&2
             echo "  rustup target add ${host_target:-<target>}" >&2
             exit 1
+        fi
+        # Static linking needs a musl C compiler for the crates that build C: the
+        # Rust target brings the standard library, not the toolchain the C
+        # dependencies are compiled with, and a build that skipped this fails with
+        # a missing `*-linux-musl-gcc` rather than a wheel without a host.
+        host_cc_var="CC_$(printf '%s' "$host_target" | tr '-' '_')"
+        if [[ -z "${!host_cc_var:-}" ]]; then
+            if ! command -v musl-gcc >/dev/null 2>&1; then
+                echo "Error: musl-gcc is required to link ${host_target} statically; install it with:" >&2
+                echo "  apt-get install -y musl-tools   # or the equivalent for this distribution" >&2
+                exit 1
+            fi
+            export "$host_cc_var=musl-gcc"
         fi
         host_build=(cargo build --release -p nemo-relay-plugin-host --target "$host_target")
         host_binary="$NEMO_RELAY_REPO_ROOT/target/${host_target}/release/nemo-plugin-host"

@@ -2320,6 +2320,38 @@ because none of them has cut over, so what is missing right now is the two
 artifacts rather than a running failure — the failure arrives with the cutover,
 which is exactly when this has to be finished.
 
+*(The two paragraphs above were true when they were written. Both artifacts now
+carry the host — the Node platform package at `bin/nemo-plugin-host`, the CLI
+wheel and its release assets beside the CLI — so what remains of this list is the
+binding cutover itself.)*
+
+**And the Linux host is built and checked on Linux, not merely compiled for it.**
+The Python and Node packages carry a *static* host on Linux, so it runs on the
+oldest glibc their tags promise rather than on the builder's. That claim was
+checked in an `ubuntu:24.04` container on arm64 rather than inferred from a
+successful build:
+
+```text
+nemo-plugin-host: ELF 64-bit LSB executable, ARM aarch64, statically linked
+ldd:              not a dynamic executable
+run:              exit 2 — "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set"
+```
+
+The second line is the one that matters: `ldd` reporting *not a dynamic
+executable* is the difference between a binary that avoids the glibc question
+and one that merely avoided mentioning it. Running it is the other half — a
+statically linked binary that cannot execute would still be statically linked.
+
+The same run found a defect in the recipes, which is why it was worth doing: the
+musl *target* brings Rust's standard library, not the C toolchain the C
+dependencies are compiled with, so the build fails looking for
+`aarch64-linux-musl-gcc`. Both packaging recipes now state the requirement, set
+`CC_<target>=musl-gcc` when the environment has not, and fail with the install
+command rather than with a compiler error; CI installs `musl-tools` before
+packaging. What has *not* been run on Linux is the whole wheel-and-tarball chain
+end to end — that is what the packaging jobs do, and it is the next thing to
+watch on a real runner.
+
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process
 implementation the kernel used before. That is deliberate — the boundary and its

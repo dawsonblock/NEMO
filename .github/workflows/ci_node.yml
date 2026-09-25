@@ -211,6 +211,16 @@ jobs:
           host_target="$(printf '%s\n' "${{ matrix.node_target }}" | sed 's/-gnu$/-musl/')"
           rustup target add "$host_target"
 
+      - name: Install the musl C toolchain for the plugin host
+        if: ${{ startsWith(matrix.platform, 'linux-') && !contains(matrix.platform, 'musl') }}
+        run: |
+          set -e
+          # The Rust target brings the standard library; the C dependencies are
+          # linked by a musl C compiler, which is what makes the bundled host
+          # statically linked rather than linked against this builder's glibc.
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y musl-tools
+
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: nemo-relay-rust-${{ matrix.platform }}-${{ steps.ci-config.outputs.rust_version }}-release
