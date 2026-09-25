@@ -152,7 +152,18 @@ pub struct PluginHostSupervisor {
     /// The handle keeps the task's own result rather than discarding it: a
     /// server that stopped serving says so where the session ends, instead of
     /// looking like a kernel whose socket merely went quiet.
-    runtime_server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    runtime_server: tokio::task::JoinHandle<Result<(), String>>,
+    /// The executor the kernel's own callback service runs on.
+    ///
+    /// Its own runtime rather than whichever runtime started this host, and that is a
+    /// structural property rather than a preference: a plugin's callback can call *back* into
+    /// the kernel — a codec resolution is the case that found it — so the call the kernel is
+    /// waiting on and the call that answers it must not need the same execution lane. On a
+    /// runtime with one lane the kernel would hold it while waiting for an answer that needs
+    /// it, and a deadlock is not something an embedding application should be able to choose
+    /// by picking a current-thread runtime. Two workers, because serving a callback while
+    /// answering another is the ordinary case for a busy session.
+    callback_runtime: Option<tokio::runtime::Runtime>,
     /// The scope stack each in-flight operation belongs to.
     ///
     /// Held here because both sides of the kernel need the same map: the proxy
@@ -215,8 +226,13 @@ impl PluginHostSupervisor {
         // Bound before the child starts, so the path it is told about exists by
         // the time it could want it. Accepting begins once the session is
         // established, because the service is bound to that session.
+        // Bound as an ordinary socket rather than a tokio one, because the executor that will
+        // *accept* on it is not the one that is running this function: a tokio listener belongs
+        // to the reactor that created it, so adopting it on another runtime would leave a socket
+        // that accepts at the operating-system level and never answers. The callback executor
+        // adopts this one from inside its own reactor below.
         let kernel_listener =
-            tokio::net::UnixListener::bind(&kernel_endpoint).map_err(|error| {
+            std::os::unix::net::UnixListener::bind(&kernel_endpoint).map_err(|error| {
                 unavailable(format!(
                     "failed to bind the kernel's socket at '{}': {error}",
                     kernel_endpoint.display()
@@ -354,27 +370,58 @@ impl PluginHostSupervisor {
             ..session
         };
 
-        // The kernel's side of the boundary, serving the session that was just
-        // established. It is spawned rather than awaited: nothing calls it until
-        // a plugin's host does, and holding `spawn` open for that would make
-        // starting a host depend on a call nobody has made.
-        let runtime_server = tokio::spawn(
+        // The kernel's side of the boundary, serving the session that was just established — on
+        // an executor of its own, because a plugin's callback can call back into the kernel and
+        // the two directions must not need the same lane.
+        let callback_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("nemo-plugin-callbacks")
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                PluginProtocolError::new(
+                    nemo_relay_plugin_protocol::PluginFailureCode::Rejected,
+                    format!(
+                        "the executor the kernel's callback service needs did not start: {error}"
+                    ),
+                )
+            })?;
+        // Spawned rather than awaited: nothing calls it until a plugin's host does, and
+        // holding `start` open for that would make starting a host depend on a call nobody
+        // has made.
+        let serving_session_id = session.session_id.clone();
+        let serving_binding_digest = config.runtime_binding_digest.clone();
+        let serving_operation_scopes = Arc::clone(&operation_scopes);
+        let serving_continuations = Arc::clone(&continuations);
+        let serving_codecs = Arc::clone(&codecs);
+        let runtime_server = callback_runtime.spawn(async move {
+            if let Err(error) = kernel_listener.set_nonblocking(true) {
+                return Err(format!(
+                    "the kernel's socket could not be made non-blocking: {error}"
+                ));
+            }
+            // Adopted here, inside the executor that will accept on it: this is the line that
+            // binds the socket's reactor to the runtime that serves the session.
+            let listener =
+                tokio::net::UnixListener::from_std(kernel_listener).map_err(|error| {
+                    format!("the kernel's socket could not be adopted by its executor: {error}")
+                })?;
             Server::builder()
                 .add_service(RelayRuntimeServer::new(RelayRuntimeService::new(
                     RelayRuntimeConfig {
-                        session_id: session.session_id.clone(),
+                        session_id: serving_session_id,
                         session_credential: kernel_credential,
                         protocol_version: PROTOCOL_VERSION,
-                        runtime_binding_digest: config.runtime_binding_digest.clone(),
-                        operation_scopes: Arc::clone(&operation_scopes),
-                        continuations: Arc::clone(&continuations),
-                        codecs: Arc::clone(&codecs),
+                        runtime_binding_digest: serving_binding_digest,
+                        operation_scopes: serving_operation_scopes,
+                        continuations: serving_continuations,
+                        codecs: serving_codecs,
                     },
                 )))
-                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
-                    kernel_listener,
-                )),
-        );
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await
+                .map_err(|error| error.to_string())
+        });
 
         Ok(Self {
             child: Mutex::new(child),
@@ -383,6 +430,7 @@ impl PluginHostSupervisor {
             socket_dir,
             kernel_endpoint,
             runtime_server,
+            callback_runtime: Some(callback_runtime),
             operation_scopes,
             continuations,
             codecs,
@@ -504,6 +552,12 @@ impl Drop for PluginHostSupervisor {
     fn drop(&mut self) {
         // The server is this session's, and it goes when the session does.
         self.runtime_server.abort();
+        // And the executor it ran on. Ended in the background for the same reason the off-path
+        // runtime is: a composition is usually torn down from inside an async context, and
+        // dropping a runtime there panics.
+        if let Some(runtime) = self.callback_runtime.take() {
+            runtime.shutdown_background();
+        }
         // The pipe closes here too, so a host whose kill somehow did not land
         // still learns that this kernel is gone.
         drop(self.child_pipe.take());

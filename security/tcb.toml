@@ -450,7 +450,13 @@ max_transitive_packages = 239
 # response half of the bridge, and the real-child qualification that resolves the call's response
 # codec through the kernel. With that the boundary serves sixteen of sixteen, which is why the
 # install match has no refusal arm left. No dependency moved and no `unsafe` did.
-max_source_lines = 22178
+# Raised for the kernel's callback executor: the supervisor starts a runtime of its own for the
+# service that answers a plugin's callbacks, and the session's socket is bound as an ordinary one
+# and adopted from inside that executor, because a tokio listener belongs to the reactor that made
+# it. That removes a structural re-entrancy dependency — a single-lane caller can no longer make a
+# plugin's codec call fail — and the two LLM qualifications now run on a current-thread caller to
+# keep it that way. No dependency moved and no `unsafe` did.
+max_source_lines = 22211
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

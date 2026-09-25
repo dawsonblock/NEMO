@@ -1776,7 +1776,8 @@ serve is not that the caller is the host: the host is the untrusted side. It is 
 reference is one this kernel issued for the invocation the call names, and that the
 capability does not outlive it.
 
-Three steps remain, in this order:
+Three steps were left at this point, and all three have since landed — the request direction is
+served, then the response, and the sections below are that history:
 
 1. the host process answers a plugin's codec calls by asking the kernel over that RPC, so
    the SDK's invocation-scoped codec handle works where the plugin runs;
@@ -1820,6 +1821,27 @@ class the kernel cannot proxy" from a runtime refusal into a compile error the d
 The runtime refusal it replaced still exists where it belongs — a plugin registering a class the
 *session* does not offer is refused whole at activation — so a future class stays a decision.
 
+**The re-entrancy the codeword path needs, and how it is provided rather than required.** A
+plugin's callback can call *back* into the kernel — resolving a codec is the case that found it —
+so the call the kernel is waiting on and the call that answers it must not need the same execution
+lane. The kernel's side of the boundary now runs on an executor of its own: the supervisor starts a
+small multi-thread runtime for the callback service, and the session's socket is bound as an
+ordinary socket and *adopted from inside that executor*, because a tokio listener belongs to the
+reactor that created it — adopting it elsewhere leaves a socket that accepts at the operating-system
+level and never answers, which is exactly how the first attempt at this failed.
+
+The property is asserted rather than documented: the two LLM sanitizer qualifications run on a
+**current-thread** caller, where the nested codec call completes instead of degrading to an omitted
+payload. They ran multi-threaded before this, with the constraint written down as a limitation;
+that constraint is gone, and the tests are the regression that keeps it gone. A single-lane caller
+can no longer make a plugin's codec call fail — by hanging or by quietly omitting — and no embedding
+application can choose a deadlock by picking its runtime flavour.
+
+*(The paragraph below was true when the class crossed and is not any more: the kernel's callback
+service has since been given an executor of its own, and the qualification tests now run on a
+single-lane caller. It is kept because the constraint it describes is what that executor was
+built to remove.)*
+
 **One constraint the class carries, named rather than hidden.** The kernel serves the plugin's
 codec call *while* the call that needs it is in flight, and a single-threaded kernel runtime does
 not get to serve it: the qualification test is multi-threaded for that reason, and the fixture
@@ -1827,14 +1849,8 @@ keeps its LLM sanitizer behind a configuration key so every other composition te
 out a budget. That is the same shape of problem the tool sanitizers had before the off-path
 transport, and it wants the same treatment on the kernel side of this path.
 
-Three steps remain, in this order:
-
-1. the host process answers a plugin's codec calls by asking the kernel over that RPC, so
-   the SDK's invocation-scoped codec handle works where the plugin runs;
-2. the kernel-side proxy per LLM sanitize class issues the capability for the sanitize
-   invocation, sends the reference with the payload and holds the guard for exactly the
-   call;
-3. the host arms rebuild the context, run the door, and answer.
+*(Historical: this is the finding as it stood, and the two sections before this one are how it
+was resolved — a drop order in the bridge, and then the callback executor.)*
 
 **The first step is built and the nested call does not complete — recorded, not advertised.**
 The host side of the request sanitizer is in: the arm builds the context the plugin's callback

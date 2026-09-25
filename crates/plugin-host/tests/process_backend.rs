@@ -532,7 +532,9 @@ async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
 // The response direction of the same class, through a real child: the sanitizer is shown the
 // response the runtime is about to record, resolves the call's *response* codec through the
 // kernel, and the copy this runtime publishes carries what that codec read.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread for the same reason as the request direction: the nested call is answered by
+// the kernel's own callback executor, so the caller's lane count is not part of the contract.
+#[tokio::test]
 async fn a_real_llm_response_sanitizer_resolves_the_calls_codec_through_the_kernel() {
     use nemo_relay::codec::response::AnnotatedLlmResponse;
     use nemo_relay::codec::traits::LlmResponseCodec;
@@ -662,12 +664,12 @@ async fn a_real_llm_response_sanitizer_resolves_the_calls_codec_through_the_kern
 // plugin's callback calls the codec, the host answers that call by asking the kernel, the
 // kernel runs the codec it holds against the reference it issued, and the sanitized request
 // comes back to be published here.
-// Multi-threaded, and that is a finding rather than a preference: the kernel serves the
-// plugin's codec call *while* the call that needs it is in flight, and a single-threaded kernel
-// runtime does not get to serve it — the sanitize invocation then runs out its budget and the
-// family omits the payload. The class is served under that constraint until the kernel's own
-// callback service gets the same treatment the off-path transport gave the tool sanitizers.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Current-thread, deliberately: the kernel serves the plugin's codec call *while* the call that
+// needs it is in flight, and it does so on the executor its callback service owns rather than on
+// whichever runtime made the call. This test is the property — a caller with one lane completes a
+// nested codec call instead of hanging or degrading to an omitted payload — and it ran the other
+// way (multi-threaded, because the kernel needed a second lane) until that executor existed.
+#[tokio::test]
 async fn a_real_llm_request_sanitizer_resolves_the_calls_codec_through_the_kernel() {
     use nemo_relay::api::llm::LlmRequest;
     use nemo_relay::codec::openai_chat::OpenAIChatCodec;
