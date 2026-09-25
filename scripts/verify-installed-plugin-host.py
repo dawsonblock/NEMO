@@ -90,8 +90,27 @@ def verify(binary: Path, host_binary: Path, target: str, version: str) -> None:
         workspace = Path(temporary)
         wheel = PACKAGE_CLI_BIN.build_wheel(binary, host_binary, platform_record, version, workspace)
         print(f"built {wheel.name}")
+        verify_wheel(wheel, cli_executable=platform_record.executable)
 
-        environment = workspace / "venv"
+
+def host_executable_for(wheel_name: str) -> str:
+    """Return the host's installed name for the platform the wheel targets."""
+    tags = Path(wheel_name).name.removesuffix(".whl").split("-")
+    if any(tag.startswith("win") for tag in tags[-3:]):
+        return "nemo-plugin-host.exe"
+    return "nemo-plugin-host"
+
+
+def verify_wheel(wheel: Path, cli_executable: str | None = None) -> None:
+    """Install one built wheel into a clean environment and exercise it.
+
+    The installation is what is under test: the wheel goes into a virtual
+    environment that has nothing else in it, and the executables are then looked
+    for where a binding looks for them — beside the interpreter the wheel was
+    installed for, which is where a wheel's `.data/scripts` entries land.
+    """
+    with tempfile.TemporaryDirectory() as temporary:
+        environment = Path(temporary) / "venv"
         venv.EnvBuilder(with_pip=True).create(environment)
         interpreter = scripts_directory(environment) / ("python.exe" if os.name == "nt" else "python")
 
@@ -114,24 +133,23 @@ def verify(binary: Path, host_binary: Path, target: str, version: str) -> None:
                 + installed.stderr.decode(errors="replace")
             )
 
-        # The executables land here because that is where the wheel's
-        # `.data/scripts` entries install, and it is the directory holding the
-        # executable that started the process — which is what the supervisor
-        # probes first when nothing names a host.
         scripts = scripts_directory(environment)
-        installed_cli = scripts / platform_record.executable
-        installed_host = scripts / platform_record.host_executable
+        installed_host = scripts / host_executable_for(wheel.name)
+        installed_cli = scripts / cli_executable if cli_executable else None
         for executable in (installed_cli, installed_host):
+            if executable is None:
+                continue
             if not executable.is_file():
                 raise SystemExit(f"the installed wheel is missing {executable.name}")
             if os.name != "nt" and not os.access(executable, os.X_OK):
                 raise SystemExit(f"the installed {executable.name} is not executable")
-        print(f"installed {installed_cli.name} and {installed_host.name} beside the interpreter")
+        delivered = [item.name for item in (installed_cli, installed_host) if item is not None]
+        print("installed " + ", ".join(delivered) + " beside the interpreter")
 
         # The host, run with nothing to serve, says what it is and exits rather
-        # than pretending to serve a session. A copy of the CLI under the host's
-        # name would answer differently, so this distinguishes delivery from
-        # delivery of the right thing.
+        # than pretending to serve a session. A copy of something else under the
+        # host's name would answer differently, so this distinguishes delivery
+        # from delivery of the right thing.
         identity = run([str(installed_host)], env=without_host_configuration())
         if identity.returncode != 2:
             raise SystemExit(
@@ -145,6 +163,8 @@ def verify(binary: Path, host_binary: Path, target: str, version: str) -> None:
             )
         print("the installed plugin host runs and identifies itself")
 
+        if installed_cli is None:
+            return
         version_run = run([str(installed_cli), "--version"])
         if version_run.returncode != 0:
             raise SystemExit(f"{installed_cli.name} --version failed: " + version_run.stderr.decode(errors="replace"))
@@ -154,23 +174,42 @@ def verify(binary: Path, host_binary: Path, target: str, version: str) -> None:
 def parse_args() -> argparse.Namespace:
     """Parse verification arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--host-binary", type=Path, required=True)
+    parser.add_argument("--binary", type=Path, default=None)
+    parser.add_argument("--host-binary", type=Path, default=None)
+    parser.add_argument(
+        "--wheel",
+        type=Path,
+        default=None,
+        help="an already-built wheel to install and check instead of building one",
+    )
+    parser.add_argument(
+        "--cli",
+        default=None,
+        help="the CLI's file name inside the wheel, when the wheel carries one",
+    )
     parser.add_argument("--target", default=None)
     parser.add_argument("--version", default="0.0.0")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Verify the wheel built from the named binaries."""
+    """Verify an installed wheel, either built here or named as one already built."""
     args = parse_args()
+    if shutil.which("python") is None and not Path(sys.executable).is_file():
+        raise SystemExit("no interpreter to build a virtual environment with")
+    if args.wheel is not None:
+        if not args.wheel.is_file():
+            raise SystemExit(f"wheel does not exist: {args.wheel}")
+        print(f"installing {args.wheel.name}")
+        verify_wheel(args.wheel, cli_executable=args.cli)
+        return
+    if args.binary is None or args.host_binary is None:
+        raise SystemExit("name either --wheel, or both --binary and --host-binary")
     if not args.binary.is_file():
         raise SystemExit(f"CLI binary does not exist: {args.binary}")
     if not args.host_binary.is_file():
         raise SystemExit(f"plugin host binary does not exist: {args.host_binary}")
     target = args.target or host_target()
-    if shutil.which("python") is None and not Path(sys.executable).is_file():
-        raise SystemExit("no interpreter to build a virtual environment with")
     verify(args.binary, args.host_binary, target, args.version)
 
 

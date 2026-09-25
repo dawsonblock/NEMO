@@ -2078,6 +2078,37 @@ package-python:
         echo "Error: No wheels found in $package_dir"
         exit 1
     fi
+    # The host travels inside the wheel rather than beside it. It is not an
+    # optional utility: it is the executable that performs the loading a binding
+    # is not allowed to perform, so a wheel that installs without it installs a
+    # runtime whose native plugins cannot be isolated.
+    #
+    # Built here rather than expected from an earlier step, because the version
+    # written above decides what the host reports about itself: a host built
+    # before that line would be a host from another release inside this one.
+    host_binary="$NEMO_RELAY_REPO_ROOT/target/release/nemo-plugin-host"
+    host_build=(cargo build --release -p nemo-relay-plugin-host)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        # Static, so the host runs on the oldest glibc this wheel's tag promises
+        # rather than on the one the build machine happens to have. The extension
+        # is linked for that floor by maturin; a host linked here would otherwise
+        # be the newer of the two, which is the tag the wheel would then be
+        # lying about.
+        host_target="$(rustc -vV | sed -n 's/^host: //p' | sed 's/-gnu$/-musl/')"
+        if [[ -z "$host_target" ]] || ! rustup target list --installed 2>/dev/null | grep -qx "$host_target"; then
+            echo "Error: the static target ${host_target:-<unknown>} is not installed; add it with:" >&2
+            echo "  rustup target add ${host_target:-<target>}" >&2
+            exit 1
+        fi
+        host_build=(cargo build --release -p nemo-relay-plugin-host --target "$host_target")
+        host_binary="$NEMO_RELAY_REPO_ROOT/target/${host_target}/release/nemo-plugin-host"
+    fi
+    "${host_build[@]}"
+    for wheel in "${wheels[@]}"; do
+        uv run --no-project python scripts/bundle-plugin-host.py \
+            --wheel "$wheel" \
+            --host-binary "$host_binary"
+    done
 
 # --set [output_dir=<path>] [ref_name=<name>]
 package-python-sdist:
@@ -2169,3 +2200,15 @@ verify-installed-host binary host_binary:
     uv run --no-project python scripts/verify-installed-plugin-host.py \
         --binary "{{ binary }}" \
         --host-binary "{{ host_binary }}"
+
+# Verify that a built wheel installs a plugin host beside the interpreter.
+# --set wheel=<path> cli=<name>
+verify-installed-wheel wheel cli="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    args=(--wheel "{{ wheel }}")
+    if [[ -n "{{ cli }}" ]]; then
+        args+=(--cli "{{ cli }}")
+    fi
+    uv run --no-project python scripts/verify-installed-plugin-host.py "${args[@]}"
