@@ -466,7 +466,12 @@ max_transitive_packages = 239
 # approval with `NativePluginLoadSpec::with_approved_identity` rather than filling a field, and
 # the one-line break that costs is the whole of the growth. No dependency moved and no `unsafe`
 # did.
-max_source_lines = 22212
+# Raised for resolving the host, and for saying where it looked when it is not there: the paths
+# beside the starting executable are built once and read twice — by the lookup that picks one and
+# by the failure that reports all of them — so a deployment that received a runtime without the
+# host is told which locations were expected rather than only that a spawn failed. The test that
+# pins the message is in this crate. No dependency moved and no `unsafe` did.
+max_source_lines = 22284
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

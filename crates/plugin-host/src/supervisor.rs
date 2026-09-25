@@ -102,24 +102,48 @@ fn resolve_executable() -> PathBuf {
             return configured;
         }
     }
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let Some(beside) = beside else {
-        return PathBuf::from(executable_name());
-    };
-    for candidate in [
-        beside.join(executable_name()),
-        beside
-            .parent()
-            .map(|above| above.join(executable_name()))
-            .unwrap_or_default(),
-    ] {
+    let beside = directory_holding_this_process();
+    for candidate in beside_this_process(&beside) {
         if candidate.exists() {
             return candidate;
         }
     }
     beside.join(executable_name())
+}
+
+/// The directory holding the executable that started this process.
+///
+/// It is the interpreter's own directory for a binding loaded into Python or
+/// Node rather than a plugin host's, which is what makes an installation beside
+/// the interpreter an installation beside the thing that starts the host.
+fn directory_holding_this_process() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+}
+
+/// The places a host is looked for once nothing has named one.
+fn beside_this_process(beside: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![beside.join(executable_name())];
+    if let Some(above) = beside.parent() {
+        candidates.push(above.join(executable_name()));
+    }
+    candidates
+}
+
+/// Where a host would have been found, in the order it was looked for.
+///
+/// Read by the failure below rather than by the resolution above, so a
+/// deployment that received a runtime without the host is told which locations
+/// it was expected to fill instead of only which file was missing.
+fn host_search_locations() -> Vec<PathBuf> {
+    let mut locations = Vec::new();
+    if let Some(configured) = std::env::var_os(EXECUTABLE_ENV) {
+        locations.push(PathBuf::from(configured));
+    }
+    locations.extend(beside_this_process(&directory_holding_this_process()));
+    locations
 }
 
 fn executable_name() -> &'static str {
@@ -286,6 +310,23 @@ impl PluginHostSupervisor {
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
         let child = command.spawn().map_err(|error| {
+            // A host that is not there is a deployment that received a runtime
+            // without the executable that makes isolation possible, so the
+            // failure names what was looked for rather than only that the spawn
+            // failed: a caller cannot repair a path it was never told.
+            if !config.executable.exists() {
+                let looked = host_search_locations()
+                    .into_iter()
+                    .map(|location| format!("'{}'", location.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return unavailable(format!(
+                    "the plugin host executable '{}' does not exist, and a runtime that starts a \
+                     host needs the host installed beside it; it was looked for at {looked}, and \
+                     {EXECUTABLE_ENV} names one somewhere else",
+                    config.executable.display(),
+                ));
+            }
             unavailable(format!(
                 "failed to start plugin host '{}': {error}; the limits the child was to run \
                  under are applied here, so a limit this platform refuses is a host that does \
@@ -1180,4 +1221,35 @@ async fn handshake(
         ));
     }
     Ok(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_missing_host_is_reported_with_the_places_it_was_looked_for() {
+        // A deployment that received a runtime without the host cannot repair a
+        // path it was never told, so the failure names the file, the locations
+        // the resolver tries in order, and the variable that names one somewhere
+        // else — rather than reporting only that a spawn failed.
+        let config = PluginHostSupervisorConfig {
+            executable: PathBuf::from("/nonexistent/nemo-plugin-host"),
+            runtime_binding_digest: "binding".to_string(),
+            offered_read_capabilities: Vec::new(),
+            maximum_frame_bytes: MAX_FRAME_BYTES,
+            limits: crate::limits::PluginHostLimits::default(),
+            startup_timeout: Duration::from_secs(1),
+        };
+        let message = match PluginHostSupervisor::spawn(config).await {
+            Ok(_) => panic!("a host that is not there does not start"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("/nonexistent/nemo-plugin-host"),
+            "{message}"
+        );
+        assert!(message.contains(EXECUTABLE_ENV), "{message}");
+        assert!(message.contains(executable_name()), "{message}");
+    }
 }
