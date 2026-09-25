@@ -166,9 +166,14 @@ max_transitive_packages = 265
 # them — the alternative is the composition reaching the in-process activation API, which is
 # what the cutover removes. No dependency moved and no `unsafe` did.
 #
+# Raised by eight lines for the documentation on the composition surface: the kernel's lease,
+# its owner-scoped clear and its exact initializer are public, and each says why a composition
+# outside the kernel needs it rather than leaving the next reader to infer it. No dependency
+# moved and no `unsafe` did.
+#
 # This is the last upward movement before the loader leaves: the next change to this number
 # is the deletion of the loader and the ABI bridge, and it moves down.
-max_source_lines = 74771
+max_source_lines = 74779
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -444,7 +449,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
-max_transitive_packages = 239
+max_transitive_packages = 240
 # Raised for the codec capability record: references bound to an invocation, a
 # direction and a codec, with a guard whose drop is the revocation, and the refusal
 # matrix that keeps one call's capability from being another's. No dependency moved and
@@ -498,10 +503,17 @@ max_transitive_packages = 239
 # security property this replaces is the drift between them. No dependency moved and no `unsafe`
 # did. Like the kernel's number above, this one moves down from here: the next change is the
 # loader leaving the kernel, not another stage arriving.
-max_source_lines = 22890
+# Raised again for the three things the shared path had to gain before a binding could adopt it,
+# all of them parity with what the old activation did rather than new capability: the worker lane
+# (whose feature brings one more transitive package, and whose kinds have to exist before the
+# component that names them is activated), configuration discovery, and an executor of its own
+# for the transaction — because a caller that stops waiting midway through an activation must
+# not be able to leave the process-owned half-applied. No direct dependency moved and no `unsafe`
+# did.
+max_source_lines = 23180
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
-transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
+transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"
 
 # The wire schema. Measured because it is shipped and because its transitive set
 # is dominated by the protobuf and gRPC toolchain, which is exactly the kind of
@@ -547,7 +559,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 74771
+raised_to = 74779
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"

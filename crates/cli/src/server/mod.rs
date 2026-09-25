@@ -19,10 +19,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use nemo_relay::plugin::dynamic::{
-    DynamicPluginActivationSpec, DynamicPluginKind, WorkerPluginActivation, WorkerPluginLoadSpec,
-    load_worker_plugins,
-};
+use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, DynamicPluginKind};
 use nemo_relay::plugin::{
     PluginConfig, clear_plugin_configuration, ensure_builtin_plugins_registered,
     initialize_plugins_exact,
@@ -1080,10 +1077,6 @@ struct PluginActivation {
     /// Dropping this removes the proxies and ends the host process, so a
     /// plugin's callbacks cannot outlive the runtime that installed them.
     runtime: Option<ActivatedPluginRuntime>,
-    /// The worker lane, which is still this composition's own: it needs a
-    /// feature the shared crate does not carry yet, so the half that runs
-    /// worker processes is here until it moves.
-    worker: Option<WorkerPluginActivation>,
     _snapshots: Vec<Arc<DynamicPluginActivationSnapshot>>,
 }
 
@@ -1099,7 +1092,6 @@ impl PluginActivation {
             // failure to invent.
             return Ok(Self {
                 runtime: None,
-                worker: None,
                 _snapshots: Vec::new(),
             });
         }
@@ -1151,29 +1143,9 @@ impl PluginActivation {
                     plugin_id: plugin.plugin_id.clone(),
                     kind: plugin.kind,
                     manifest_ref,
-                    environment_ref: plugin.environment_ref.clone(),
-                    config: plugin.config.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, CliError>>()?;
-        let worker_specs = dynamic_plugins
-            .iter()
-            .filter(|plugin| plugin.kind == DynamicPluginKind::Worker)
-            .map(|plugin| {
-                let manifest_ref = plugin
-                    .activation_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.activation_manifest_ref())
-                    .or_else(|| plugin.manifest_ref.clone())
-                    .ok_or_else(|| {
-                        CliError::Config(format!(
-                            "worker dynamic plugin '{}' has no manifest_ref in lifecycle state",
-                            plugin.plugin_id
-                        ))
-                    })?;
-                Ok(WorkerPluginLoadSpec {
-                    plugin_id: plugin.plugin_id.clone(),
-                    manifest_ref,
+                    // The snapshot is what the deployment last approved, so its
+                    // environment reference is the one that approval named; the
+                    // discovered value is the fallback for a plugin without one.
                     environment_ref: plugin
                         .activation_snapshot
                         .as_ref()
@@ -1226,42 +1198,19 @@ impl PluginActivation {
         .await
         .map_err(|error| CliError::Config(error.to_string()))?;
 
-        // Workers start after the process-hosted plugins, as they always have. A
-        // worker that cannot start takes the whole activation down with it rather
-        // than leaving the composition half-live.
-        let worker = if worker_specs.is_empty() {
-            None
-        } else {
-            match load_worker_plugins(worker_specs) {
-                Ok(worker) => Some(worker),
-                Err(error) => {
-                    let _ = runtime.clear();
-                    return Err(CliError::Config(format!(
-                        "worker plugin load failed: {error}"
-                    )));
-                }
-            }
-        };
         Ok(Self {
             runtime: Some(runtime),
-            worker,
             _snapshots: snapshots,
         })
     }
 
     fn clear(mut self) -> Result<(), CliError> {
-        let runtime = self.runtime.take();
-        let result = match runtime {
+        match self.runtime.take() {
             Some(runtime) => runtime
                 .clear()
                 .map_err(|error| CliError::Config(error.to_string())),
             None => Ok(()),
-        };
-        // The worker goes after the callbacks are gone: its kinds were registered
-        // through this process's registry, so its adapters must not be dropped
-        // while the registry can still point at them.
-        self.worker.take();
-        result
+        }
     }
 }
 

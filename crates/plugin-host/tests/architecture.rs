@@ -55,7 +55,7 @@ const LOADER_TOKENS: &[&str] = &["libloading", "dlopen", "LoadLibraryW", "Librar
 /// loads on their behalf. Naming the current callers makes the remaining
 /// migration visible instead of invisible, and stops a *new* consumer from
 /// adopting the same route while it is being replaced.
-const INDIRECT_LOAD_CALLERS: &[&str] = &["ffi", "node", "python"];
+const INDIRECT_LOAD_CALLERS: &[&str] = &["node", "python"];
 
 /// The token that identifies a call through that API.
 const INDIRECT_LOAD_TOKEN: &str = "PluginHostActivation::";

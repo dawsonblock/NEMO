@@ -1957,6 +1957,7 @@ dependencies = [
  "nemo-relay",
  "nemo-relay-adaptive",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
  "serde",
  "serde_json",
  "tempfile",

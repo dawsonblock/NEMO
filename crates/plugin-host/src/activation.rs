@@ -17,16 +17,23 @@
 //! the returned value, and `activate` returning `Err` means no partial
 //! activation survives.
 //!
-//! What this owns today is the static configuration, the process-hosted native
-//! plugins, the process-wide ownership and the rollback. Worker plugins are not
-//! here yet: their lane needs a feature this crate does not carry, so a caller
-//! that runs them — the CLI — keeps that half for now, and the next lane to move
-//! is that one rather than a new one.
+//! What this owns is every lane: the static configuration, the process-hosted
+//! native plugins, the worker plugins when this build carries that lane, the
+//! process-wide ownership, and the rollback. A caller adds the parts only it can
+//! know — where a host is, and what it wants checked once the native plugins are
+//! up — and nothing else.
 
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use nemo_relay::plugin::dynamic::{
     DynamicPluginActivationSpec, DynamicPluginKind, NativePluginLoadSpec,
+};
+#[cfg(feature = "worker-grpc")]
+use nemo_relay::plugin::dynamic::{
+    WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins,
 };
 use nemo_relay::plugin::{
     ConfigDiagnostic, ConfigReport, PluginComponentSpec, PluginConfig, PluginError,
@@ -67,16 +74,36 @@ pub struct IsolationPolicy {
 }
 
 impl IsolationPolicy {
-    /// A policy that starts hosts the way this process's neighbours do.
-    pub fn beside_this_executable(
-        runtime_binding_digest: impl Into<String>,
-        registration_cap_millis: u64,
-        observability: crate::off_path::ObservabilityPolicy,
-    ) -> Self {
+    /// Longest one registration may take when nothing says otherwise.
+    ///
+    /// A registration that has not answered in this long is one this runtime
+    /// cannot wait for: the proxy gives up and the host is told, rather than
+    /// letting a plugin's slowness become the runtime's.
+    pub const REGISTRATION_CAP_MILLIS: u64 = 5_000;
+
+    /// How many off-path plugin operations may be in flight at once.
+    ///
+    /// Stated rather than left to whatever the machine can hold, because the
+    /// point of the bound is that a plugin cannot choose it.
+    pub const OFF_PATH_IN_FLIGHT: usize = 64;
+
+    /// The policy a runtime gets when it has no reason to choose otherwise.
+    ///
+    /// The cap and the bound are the project's own numbers, stated once here so
+    /// that four consumers cannot state four — the same drift this module exists
+    /// to remove. The caller says which implementation it is, because that is
+    /// the part only the caller knows.
+    pub fn for_runtime(implementation: &str) -> Self {
+        let cap = Self::REGISTRATION_CAP_MILLIS;
         Self {
-            supervisor: PluginHostSupervisorConfig::beside_this_executable(runtime_binding_digest),
-            registration_cap_millis,
-            observability,
+            supervisor: PluginHostSupervisorConfig::beside_this_executable(
+                crate::supervisor::plugin_runtime_binding(implementation),
+            ),
+            registration_cap_millis: cap,
+            observability: crate::off_path::ObservabilityPolicy {
+                budget_millis: cap,
+                max_in_flight: Self::OFF_PATH_IN_FLIGHT,
+            },
             after_native_startup: None,
         }
     }
@@ -146,6 +173,10 @@ pub struct ActivatedPluginRuntime {
     claim: Option<PluginHostLease>,
     /// The native plugins, held in a host process rather than in this one.
     native: Option<ProcessLoadedPlugins>,
+    /// The worker plugins, held for the same reason in the other direction: a
+    /// worker's code is its own process, and its adapter is this one's.
+    #[cfg(feature = "worker-grpc")]
+    worker: Option<WorkerPluginActivation>,
     /// What activation reported about the configuration it activated.
     report: ConfigReport,
     /// Whether teardown has begun.
@@ -153,6 +184,31 @@ pub struct ActivatedPluginRuntime {
 }
 
 impl ActivatedPluginRuntime {
+    /// Activate after layering `config` over the discovered plugin files.
+    ///
+    /// This is the entry a binding uses: it was handed a configuration by
+    /// whoever embedded it, and the deployment's own `plugins.toml` files are
+    /// underneath it. Resolving here rather than in each binding is what keeps
+    /// "which configuration is active" one answer instead of four.
+    pub async fn activate_with_discovered_config<I>(
+        config: PluginConfig,
+        dynamic_plugins: I,
+        policy: IsolationPolicy,
+    ) -> Result<Self, PluginActivationError>
+    where
+        I: IntoIterator<Item = DynamicPluginActivationSpec>,
+    {
+        let dynamic_plugins = dynamic_plugins.into_iter().collect::<Vec<_>>();
+        // Asked before discovery, which is the order the bindings have always
+        // had: a call with nothing to activate is refused before a malformed
+        // discovered file can turn it into a different failure, and before any
+        // ownership is claimed.
+        validate_dynamic_plugin_specs(&dynamic_plugins)?;
+        let resolved = nemo_relay::plugin::resolve_plugin_config(config)
+            .map_err(PluginActivationError::Plugin)?;
+        Self::activate_resolved(resolved, dynamic_plugins, policy).await
+    }
+
     /// Activate everything the configuration and the dynamic plugins ask for.
     ///
     /// The order is the one this runtime has always had and the one its
@@ -169,17 +225,59 @@ impl ActivatedPluginRuntime {
     where
         I: IntoIterator<Item = DynamicPluginActivationSpec>,
     {
+        Self::activate_resolved(
+            nemo_relay::plugin::ResolvedPluginConfig {
+                config,
+                diagnostics: Vec::new(),
+            },
+            dynamic_plugins,
+            policy,
+        )
+        .await
+    }
+
+    /// Activate a configuration that has already been resolved.
+    async fn activate_resolved<I>(
+        resolved: nemo_relay::plugin::ResolvedPluginConfig,
+        dynamic_plugins: I,
+        policy: IsolationPolicy,
+    ) -> Result<Self, PluginActivationError>
+    where
+        I: IntoIterator<Item = DynamicPluginActivationSpec>,
+    {
         let dynamic_plugins = dynamic_plugins.into_iter().collect::<Vec<_>>();
+        // The transaction runs on an executor of its own rather than on the
+        // caller's task. An activation claims process-wide ownership, registers
+        // components and starts processes; a caller that stops waiting halfway
+        // through must not be able to leave that half-applied, and cancellation
+        // is a caller's decision rather than the runtime's. The task runs to
+        // completion — commit or rollback — and a caller that went away simply
+        // never receives the handle, whose drop then tears the result down.
+        run_owned(
+            async move { Self::activate_transaction(resolved, dynamic_plugins, policy).await },
+        )
+        .await
+    }
+
+    async fn activate_transaction(
+        resolved: nemo_relay::plugin::ResolvedPluginConfig,
+        dynamic_plugins: Vec<DynamicPluginActivationSpec>,
+        policy: IsolationPolicy,
+    ) -> Result<Self, PluginActivationError> {
+        let nemo_relay::plugin::ResolvedPluginConfig {
+            config,
+            diagnostics,
+        } = resolved;
         validate_dynamic_plugin_specs(&dynamic_plugins)?;
 
+        #[cfg(not(feature = "worker-grpc"))]
         if let Some(plugin) = dynamic_plugins
             .iter()
             .find(|plugin| plugin.kind == DynamicPluginKind::Worker)
         {
             return Err(PluginActivationError::Plugin(PluginError::InvalidConfig(
                 format!(
-                    "worker dynamic plugin '{}' is not part of this composition yet: the worker \
-                     lane is still the caller's",
+                    "worker dynamic plugin '{}' requires a build with the 'worker-grpc' feature",
                     plugin.plugin_id
                 ),
             )));
@@ -218,23 +316,39 @@ impl ActivatedPluginRuntime {
             .filter(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
             .map(|plugin| (plugin.plugin_id.clone(), plugin.manifest_ref.clone()))
             .collect::<Vec<_>>();
-        let mut config = config;
-        config.components.extend(
-            dynamic_plugins
-                .iter()
-                .filter(|plugin| plugin.kind != DynamicPluginKind::RustDynamic)
-                .map(|plugin| PluginComponentSpec {
-                    kind: plugin.plugin_id.clone(),
-                    enabled: true,
-                    config: plugin.config.clone(),
-                }),
-        );
+        // The components the configuration did not name: every dynamic plugin
+        // whose code this process runs. They are activated with the
+        // configuration, and only after the lane that registers them has been
+        // loaded — a worker's component cannot be activated before the worker
+        // that answers for it exists.
+        let dynamic_components = dynamic_plugins
+            .iter()
+            .filter(|plugin| plugin.kind != DynamicPluginKind::RustDynamic)
+            .map(|plugin| PluginComponentSpec {
+                kind: plugin.plugin_id.clone(),
+                enabled: true,
+                config: plugin.config.clone(),
+            })
+            .collect::<Vec<_>>();
 
         let rollback_failures = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "worker-grpc")]
+        let worker_specs = dynamic_plugins
+            .iter()
+            .filter(|plugin| plugin.kind == DynamicPluginKind::Worker)
+            .map(|plugin| WorkerPluginLoadSpec {
+                plugin_id: plugin.plugin_id.clone(),
+                manifest_ref: plugin.manifest_ref.clone(),
+                environment_ref: plugin.environment_ref.clone(),
+                config: plugin.config.clone(),
+            })
+            .collect::<Vec<_>>();
         let mut stage = ActivationStage {
             claim,
             owner_id,
             native: None,
+            #[cfg(feature = "worker-grpc")]
+            worker: None,
             rollback_failures: Arc::clone(&rollback_failures),
         };
 
@@ -243,6 +357,10 @@ impl ActivatedPluginRuntime {
             config,
             native_specs,
             components,
+            dynamic_components,
+            diagnostics,
+            #[cfg(feature = "worker-grpc")]
+            worker_specs,
             supervisor,
             registration_cap_millis,
             observability,
@@ -253,6 +371,8 @@ impl ActivatedPluginRuntime {
             Ok(report) => Ok(Self {
                 claim: Some(stage.claim),
                 native: stage.native,
+                #[cfg(feature = "worker-grpc")]
+                worker: stage.worker,
                 report,
                 active: true,
             }),
@@ -266,17 +386,45 @@ impl ActivatedPluginRuntime {
         config: PluginConfig,
         native_specs: Vec<(String, String)>,
         components: Vec<nemo_relay_plugin_protocol::PluginComponentConfiguration>,
+        dynamic_components: Vec<PluginComponentSpec>,
+        diagnostics: Vec<ConfigDiagnostic>,
+        #[cfg(feature = "worker-grpc")] worker_specs: Vec<WorkerPluginLoadSpec>,
         supervisor: PluginHostSupervisorConfig,
         registration_cap_millis: u64,
         observability: crate::off_path::ObservabilityPolicy,
         after_native_startup: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
     ) -> Result<ConfigReport, PluginActivationError> {
-        let diagnostics: Vec<ConfigDiagnostic> = Vec::new();
+        // The configuration's own components register first, and they are cleared
+        // again before the final activation. That is not bookkeeping: a native
+        // artifact that cannot be approved must fail *after* they registered —
+        // the order this runtime has always had, and the one its qualification
+        // pins — while a worker's component can only be activated once the worker
+        // that registers its kind has been loaded. So the first activation is
+        // what the deployment configured, and the last is that plus every dynamic
+        // component this process runs.
+        // Only when a lane's component has to be activated is the configuration
+        // activated a second time: a worker's kind does not exist until the
+        // worker is loaded, so its component cannot be in the first activation.
+        // The cost is that the deployment's own register callbacks run again in
+        // that case — the sequence this runtime has always had for a dynamic
+        // activation, kept rather than changed here. An additive activation that
+        // adds components without re-registering the configured ones is the way
+        // to remove that cost, and it is a change to the kernel's activation API
+        // rather than to this composition.
+        let needs_second_activation = !dynamic_components.is_empty();
+        // Discovery's diagnostics belong to whichever activation ends up active:
+        // reporting them twice, or reporting them for an activation that was
+        // replaced, would describe a configuration that is not the running one.
+        let (first_diagnostics, second_diagnostics) = if needs_second_activation {
+            (Vec::new(), diagnostics)
+        } else {
+            (diagnostics, Vec::new())
+        };
         let report = initialize_plugins_exact_for_host(
-            config,
+            config.clone(),
             stage.owner_id,
             Arc::clone(&stage.rollback_failures),
-            diagnostics,
+            first_diagnostics,
         )
         .await
         .map_err(PluginActivationError::Plugin)?;
@@ -314,7 +462,26 @@ impl ActivatedPluginRuntime {
             ));
         }
 
-        Ok(report)
+        #[cfg(feature = "worker-grpc")]
+        if !worker_specs.is_empty() {
+            stage.worker = Some(load_worker_plugins(worker_specs).map_err(|error| {
+                PluginActivationError::Plugin(context("worker plugin load failed", error))
+            })?);
+        }
+
+        if !needs_second_activation {
+            return Ok(report);
+        }
+        let mut full_config = config;
+        full_config.components.extend(dynamic_components);
+        initialize_plugins_exact_for_host(
+            full_config,
+            stage.owner_id,
+            Arc::clone(&stage.rollback_failures),
+            second_diagnostics,
+        )
+        .await
+        .map_err(PluginActivationError::Plugin)
     }
 
     /// What activation reported about the configuration it activated.
@@ -370,6 +537,8 @@ impl ActivatedPluginRuntime {
             // host's — killing it cannot leave a dangling call here, and leaving
             // it running would be a process nobody owns.
             self.native.take();
+            #[cfg(feature = "worker-grpc")]
+            self.worker.take();
             let retained = self.claim.take();
             std::mem::forget(retained);
             errors.push(
@@ -388,6 +557,8 @@ impl ActivatedPluginRuntime {
         // teardown was still outstanding would let the next activation start
         // over a configuration that has not finished ending.
         self.native.take();
+        #[cfg(feature = "worker-grpc")]
+        self.worker.take();
         self.claim.take();
         if errors.is_empty() {
             Ok(())
@@ -419,6 +590,8 @@ struct ActivationStage {
     claim: PluginHostLease,
     owner_id: u64,
     native: Option<ProcessLoadedPlugins>,
+    #[cfg(feature = "worker-grpc")]
+    worker: Option<WorkerPluginActivation>,
     rollback_failures: Arc<Mutex<Vec<String>>>,
 }
 
@@ -431,10 +604,12 @@ impl ActivationStage {
             .err()
             .map(|error| vec![error.to_string()])
             .unwrap_or_default();
-        // The host goes regardless of what clearing proved: its code is in
-        // another process, so ending it cannot leave a call in this process
-        // pointing at freed memory.
+        // The host and the workers go regardless of what clearing proved: their
+        // code is in their own processes, so ending them cannot leave a call in
+        // this process pointing at freed memory.
         drop(self.native);
+        #[cfg(feature = "worker-grpc")]
+        drop(self.worker);
 
         let incomplete = self
             .rollback_failures
@@ -459,6 +634,98 @@ impl ActivationStage {
                 errors.join("; ")
             }
         ))
+    }
+}
+
+/// How many activation transactions may be waiting to run.
+///
+/// One runs at a time — the process-wide ownership allows nothing else — so this
+/// is a queue of callers rather than of work, and a caller that has to wait
+/// behind four others is a caller that should be told so instead of growing a
+/// queue nobody chose.
+const ACTIVATION_QUEUE_CAPACITY: usize = 4;
+
+/// The executor activation transactions run on.
+static ACTIVATION_EXECUTOR: OnceLock<
+    Result<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>, String>,
+> = OnceLock::new();
+
+/// Run one activation transaction on an executor the caller cannot cancel.
+async fn run_owned<F>(operation: F) -> Result<ActivatedPluginRuntime, PluginActivationError>
+where
+    F: std::future::Future<Output = Result<ActivatedPluginRuntime, PluginActivationError>>
+        + Send
+        + 'static,
+{
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let job: BoxFuture<'static, ()> = Box::pin(async move {
+        let _ = result_tx.send(operation.await);
+    });
+    activation_executor()?
+        .try_send(job)
+        .map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                PluginActivationError::Plugin(PluginError::ResourceExhausted {
+                    resource: "plugin.activation_queue",
+                    limit: ACTIVATION_QUEUE_CAPACITY,
+                })
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => PluginActivationError::Plugin(
+                PluginError::Internal("the plugin activation executor stopped".to_string()),
+            ),
+        })?;
+    match result_rx.await {
+        Ok(result) => result,
+        Err(_) => Err(PluginActivationError::Plugin(PluginError::Internal(
+            "the plugin activation task stopped before returning a result".to_string(),
+        ))),
+    }
+}
+
+/// The executor, started on first use and kept for the life of the process.
+///
+/// A runtime of its own rather than whichever one the caller happens to be on: a
+/// caller's runtime can be dropped, and a transaction that must finish cannot
+/// live on a runtime that may not. Current-thread because transactions are one
+/// at a time — the ownership sees to that — and because a second lane would only
+/// let two of them race for the same claim.
+fn activation_executor()
+-> Result<&'static tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>, PluginActivationError> {
+    let executor = ACTIVATION_EXECUTOR.get_or_init(|| {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<BoxFuture<'static, ()>>(ACTIVATION_QUEUE_CAPACITY);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("nemo-relay-plugin-activation".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let _ = startup_tx.send(Ok(()));
+                runtime.block_on(async move {
+                    while let Some(job) = receiver.recv().await {
+                        job.await;
+                    }
+                });
+            })
+            .map_err(|error| format!("failed to start the plugin activation executor: {error}"))?;
+        startup_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|error| format!("the plugin activation executor did not start: {error}"))?
+            .map(|()| sender)
+    });
+    match executor {
+        Ok(sender) => Ok(sender),
+        Err(error) => Err(PluginActivationError::Plugin(PluginError::Internal(
+            error.clone(),
+        ))),
     }
 }
 

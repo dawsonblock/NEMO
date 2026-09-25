@@ -1982,9 +1982,13 @@ pub async fn initialize_plugins(config: PluginConfig) -> Result<ConfigReport> {
 
 /// Layers `config` over the default discovered `plugins.toml` files.
 ///
-/// This is crate-visible so owned dynamic-plugin activation can use the same
-/// one-time configuration resolution as regular harness-native initialization.
-pub(crate) fn resolve_plugin_config(config: PluginConfig) -> Result<ResolvedPluginConfig> {
+/// Public because the composition that owns a dynamic plugin activation resolves
+/// its configuration the same way regular harness-native initialization does: a
+/// binding hands over what its caller configured, and the files the deployment
+/// wrote are layered under it. A composition that resolved its own way would be a
+/// second answer to "which configuration is active", and the difference would
+/// show up as a plugin that activated differently depending on who asked.
+pub fn resolve_plugin_config(config: PluginConfig) -> Result<ResolvedPluginConfig> {
     let discovered = resolve_default_file_plugin_config()?;
     resolve_programmatic_plugin_config(discovered, config)
 }
@@ -2007,9 +2011,13 @@ fn resolve_programmatic_plugin_config(
     })
 }
 
-pub(crate) struct ResolvedPluginConfig {
-    pub(crate) config: PluginConfig,
-    pub(crate) diagnostics: Vec<ConfigDiagnostic>,
+/// A configuration with the discovered files already layered under it.
+#[derive(Debug)]
+pub struct ResolvedPluginConfig {
+    /// What is to be activated, after discovery.
+    pub config: PluginConfig,
+    /// What discovery noticed about the result, to be reported with it.
+    pub diagnostics: Vec<ConfigDiagnostic>,
 }
 
 /// Serializes a typed configuration as a discovery overlay.

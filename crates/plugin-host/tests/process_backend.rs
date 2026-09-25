@@ -9,6 +9,7 @@
 //! operations are answered by that process rather than by a library call.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nemo_relay::plugin::execution::PluginExecutionBackend;
@@ -1870,6 +1871,97 @@ async fn a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwa
     assert!(error.as_plugin_error().is_some(), "{error:?}");
     let _released = nemo_relay::plugin::acquire_plugin_host_lease()
         .expect("a failed activation releases the process-wide ownership");
+}
+
+#[tokio::test]
+async fn a_caller_that_stops_waiting_does_not_leave_a_half_applied_activation() {
+    use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+    use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
+
+    // The defect this pins: an activation claims process-wide ownership, registers
+    // components and starts a process, so a caller that gives up halfway through
+    // must not be able to leave it half-applied. Cancellation is the caller's
+    // decision, so the transaction runs on an executor of its own and finishes —
+    // commit or rollback — whether or not anyone is still waiting.
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-cancelled",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let reached_native = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+    let hook_flag = Arc::clone(&reached_native);
+    let activation = ActivatedPluginRuntime::activate(
+        nemo_relay::plugin::PluginConfig::default(),
+        [DynamicPluginActivationSpec {
+            plugin_id: "fixture_intercept".into(),
+            kind: nemo_relay::plugin::dynamic::DynamicPluginKind::RustDynamic,
+            manifest_ref: fixture.artifact(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }],
+        IsolationPolicy {
+            supervisor: host_config(),
+            registration_cap_millis: 5_000,
+            observability: nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+                budget_millis: 5_000,
+                max_in_flight: 8,
+            },
+            // Holds the transaction open inside the native stage, so the caller
+            // is cancelled at the point where the defect would show.
+            after_native_startup: Some(Box::new(move || {
+                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = unblock_rx.recv();
+                Ok(())
+            })),
+        },
+    );
+
+    let cancelled = tokio::time::timeout(Duration::from_millis(60), activation).await;
+    assert!(
+        cancelled.is_err(),
+        "the call has to be cancelled for this to test anything"
+    );
+
+    // The transaction kept going: the stage after the one the caller was waiting
+    // on is reached even though nobody is left to receive the result.
+    let waited = tokio::time::timeout(Duration::from_secs(30), async {
+        while !reached_native.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "the activation stopped when its caller did, leaving whatever it had claimed behind"
+    );
+
+    unblock_tx
+        .send(())
+        .expect("the activation is still running");
+    // And when it finished, it tore itself down: nobody holds the activation, so
+    // the handle was dropped, the callbacks are gone and the ownership is free.
+    let released = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(lease) = nemo_relay::plugin::acquire_plugin_host_lease() {
+                drop(lease);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "the process-wide ownership stayed claimed"
+    );
+    assert!(
+        !nemo_relay::plugin::list_plugin_kinds()
+            .iter()
+            .any(|kind| kind == "fixture_intercept"),
+        "a cancelled activation left a registration behind"
+    );
 }
 
 #[tokio::test]

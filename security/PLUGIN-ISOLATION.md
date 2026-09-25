@@ -1037,6 +1037,18 @@ holds the supervisor that starts it and the backend that reaches it.
   revision needed. The refusal is tested through a real host: a session started
   with the wrong expectation never establishes, and the real host answers
   truthfully while the kernel declines it.
+- **And the activation is a transaction, not a task the caller owns.** The shared
+  composition claims the process-wide ownership, registers components and starts a
+  process. If it ran on the caller's task, a caller that stopped waiting halfway
+  through would leave that half-applied — the ownership released, a registration
+  still arriving, and a process nobody would account for. So it runs on an
+  executor of its own: the transaction finishes, commit or rollback, whether or
+  not anyone is still waiting, and a caller that went away simply never receives
+  the handle whose drop then tears the result down. The regression test holds the
+  transaction open inside the native stage, cancels the caller there, and then
+  asserts the transaction reached the stage after it and released the ownership
+  when it was done — a test that fails with "the activation stopped when its
+  caller did" if the executor is removed.
 - **Both sides validate the context.** The kernel refuses before it dispatches
   and the host refuses before it acts, through one shared validator: protocol
   version, request identity, runtime binding against the session's, response
@@ -2351,6 +2363,30 @@ command rather than with a compiler error; CI installs `musl-tools` before
 packaging. What has *not* been run on Linux is the whole wheel-and-tarball chain
 end to end — that is what the packaging jobs do, and it is the next thing to
 watch on a real runner.
+
+**And the platform the runtime does not exist on says so.** The transport between
+kernel and host is a Unix-domain socket, and the kernel's side of it is
+`std::os::unix`: the crate that holds the supervisor does not compile on Windows
+at all. Packaging that offered `nemo-plugin-host.exe` and an installer that
+fetched one were therefore describing a runtime the implementation does not have,
+which is the worst kind of documentation — one a deployment can act on. The
+declaration is explicit now:
+
+- the packaging recipes state that the isolated runtime is not implemented on
+  Windows, skip the host, and carry the runtime or the addon alone;
+- a wheel or npm package built that way says in its own metadata that it carries
+  no plugin host, so the artifact and the docs agree;
+- the release job builds no Windows host and publishes no Windows host asset, and
+  the installers — which already report a release that does not publish one —
+  are what a Windows deployment sees;
+- the checks that look for an installed host on Windows are skipped by name
+  rather than passing vacuously.
+
+What this does not do is make Windows work. Native-plugin isolation on Windows
+needs a transport abstraction: named pipes or an equivalent, with the same
+session, credential and capability semantics the socket has. Until that exists,
+the honest statement is the narrow one the code now makes — a Windows runtime can
+run plugins in its own process, and cannot host a native plugin out of process.
 
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process

@@ -160,6 +160,25 @@ pub fn status_from_plugin_error(e: &PluginError) -> NemoRelayStatus {
     }
 }
 
+/// Report an activation failure in the status this ABI hands callers.
+///
+/// An activation failure that carries a plugin error keeps that error's status, so
+/// a foreign caller can still tell "the plugin was not found" from "the
+/// configuration was wrong": flattening every activation failure into one status
+/// would make the actionable half unreachable. A boundary or retained failure has
+/// no plugin-error equivalent and reports as internal, with its message set.
+pub fn status_from_activation_error(
+    error: &nemo_relay_plugin_host::activation::PluginActivationError,
+) -> NemoRelayStatus {
+    match error.as_plugin_error() {
+        Some(error) => status_from_plugin_error(error),
+        None => {
+            set_last_error(&error.to_string());
+            NemoRelayStatus::Internal
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/coverage/error_tests.rs"]
 mod tests;

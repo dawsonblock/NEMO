@@ -33,8 +33,8 @@ use crate::convert::{
     str_to_c_string, unix_micros_to_opt_timestamp,
 };
 use crate::error::{
-    NemoRelayStatus, clear_last_error, last_error_message, set_last_error, status_from_error,
-    status_from_plugin_error,
+    NemoRelayStatus, clear_last_error, last_error_message, set_last_error,
+    status_from_activation_error, status_from_error, status_from_plugin_error,
 };
 use crate::types::{
     FfiAtifExporter, FfiAtofExporter, FfiCodecHandle, FfiLLMHandle, FfiLLMRequest,
@@ -62,7 +62,7 @@ use nemo_relay::api::subscriber as core_subscriber_api;
 use nemo_relay::api::tool as core_tool_api;
 use nemo_relay::api::tool::ToolAttributes;
 use nemo_relay::error::{FlowError, Result as FlowResult};
-use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, PluginHostActivation};
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError,
     PluginRegistrationContext, active_plugin_report, clear_plugin_configuration, deregister_plugin,
@@ -105,6 +105,35 @@ fn tokio_runtime() -> &'static Runtime {
             .build()
             .expect("Failed to create tokio runtime")
     })
+}
+
+/// Milliseconds one managed FFI call may take.
+///
+/// Stated here because these entry points carry no deadline: a caller that needs
+/// a different one needs an entry point that takes one. What it is *for* is the
+/// budget the kernel hands a registration that runs in another process — the
+/// runtime decides how long a plugin's work may take, and a plugin reached with
+/// no budget at all is refused rather than trusted.
+///
+/// This value cannot lengthen anything: the kernel narrows an inherited budget to
+/// its own ceiling, and a call that publishes nothing already runs under that
+/// ceiling. What publishing changes is that plugin work now has a budget that
+/// came from the composition rather than none at all.
+pub const MANAGED_CALL_BUDGET_MILLIS: u64 = 30_000;
+
+/// Run one managed FFI operation under the budget this interface states.
+pub(crate) async fn with_managed_budget<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + MANAGED_CALL_BUDGET_MILLIS,
+            MANAGED_CALL_BUDGET_MILLIS,
+        ),
+        future,
+    )
+    .await
 }
 
 /// Prevents a closed Unix worker socket from terminating the embedding process.

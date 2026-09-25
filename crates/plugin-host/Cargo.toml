@@ -43,5 +43,11 @@ tower = { version = "0.5", features = ["util"] }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["process", "thread"] }
 
+[features]
+# The worker lane: a plugin whose code runs in a process the kernel starts and
+# whose adapter lives here. Off by default because most consumers do not run
+# worker plugins, and the error a consumer without it gets says so.
+worker-grpc = ["nemo-relay/worker-grpc"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

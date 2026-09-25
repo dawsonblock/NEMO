@@ -104,6 +104,29 @@ impl PluginHostSupervisorConfig {
 /// install it beside the process that starts it.
 pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
 
+/// The identity a runtime's plugin sessions are bound to.
+///
+/// Bound to the implementation that asked and to the process it asked from, so a
+/// host started for one runtime is refused by another and a host started by a
+/// process that has since exited cannot be adopted. Built here rather than in
+/// each consumer because the binding is the *host's* check: four consumers
+/// computing four spellings of it is four ways to get it wrong.
+///
+/// An identity rather than a hash: the value is compared and never parsed, the
+/// facts it carries are the whole of what a peer can check, and hashing them
+/// would add a digest dependency to a crate whose job is to hold no more than it
+/// needs. The separators are characters no field can contain, because the value
+/// has to be unambiguous as well as unique.
+pub fn plugin_runtime_binding(implementation: &str) -> String {
+    format!(
+        "{implementation}/{version}/{protocol}/{process}",
+        implementation = implementation,
+        version = env!("CARGO_PKG_VERSION"),
+        protocol = PROTOCOL_VERSION,
+        process = std::process::id(),
+    )
+}
+
 /// Where the host executable is, given where this process is.
 fn resolve_executable() -> PathBuf {
     if let Some(configured) = std::env::var_os(EXECUTABLE_ENV) {
