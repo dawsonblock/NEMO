@@ -43,8 +43,31 @@ pub mod py_types;
 mod test_support;
 
 /// The `_native` PyO3 module entry point. Registers all types and functions.
+///
+/// The stack a managed call's future needs, stated rather than inherited from
+/// the runtime's default: see the initialization below for why the default is
+/// not enough.
+const PYTHON_FUTURE_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // The runtime that drives every Python-facing future, sized before anything
+    // can be spawned on it.
+    //
+    // A managed call that reaches a plugin runs through a chain of wrappers this
+    // binding does not control — the caller's coroutine, the executor's future,
+    // the registry chain, a plugin proxy, and the host's client — and one of
+    // those frames is large. Tokio's default worker stack is 2 MiB, which the
+    // chain fits through in the shallow cases and overflows in the deep ones: a
+    // worker plugin invoked from Python walked off the end of its stack and took
+    // the interpreter with it (SIGILL on the stack probe, found under a debugger
+    // rather than guessed at). The size below is the same order the process's
+    // main thread gets, which is the budget a coroutine of this depth needs.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime
+        .enable_all()
+        .thread_stack_size(PYTHON_FUTURE_STACK_BYTES);
+    pyo3_async_runtimes::tokio::init(runtime);
     initialize_shared_runtime_binding("python").map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "failed to initialize NeMo Relay runtime ownership: {e}"

@@ -515,7 +515,7 @@ max_transitive_packages = 240
 # tell a rejected plugin from a crashed host, and the executor one worker rather than a
 # current-thread runtime so a lane that spawns onto the runtime driving it is not refused. No
 # dependency moved and no `unsafe` did.
-max_source_lines = 23214
+max_source_lines = 23215
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"

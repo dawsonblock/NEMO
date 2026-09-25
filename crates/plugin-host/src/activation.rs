@@ -704,6 +704,7 @@ fn activation_executor()
                 // thread turns that into a refusal the caller never asked for.
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
+                    .thread_name("nemo-plugin-activation-worker")
                     .enable_all()
                     .build()
                 {

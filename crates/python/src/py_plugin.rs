@@ -37,9 +37,12 @@ use nemo_relay::api::subscriber::{deregister_subscriber, register_subscriber};
 use nemo_relay::error::Result as FlowResult;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, DynamicPluginActivationSpec, Plugin, PluginConfig,
-    PluginError, PluginHostActivation, PluginRegistration, PluginRegistrationContext,
-    active_plugin_report, clear_plugin_configuration, deregister_plugin, initialize_plugins,
-    list_plugin_kinds, register_plugin, rollback_registrations, validate_plugin_config,
+    PluginError, PluginRegistration, PluginRegistrationContext, active_plugin_report,
+    clear_plugin_configuration, deregister_plugin, initialize_plugins, list_plugin_kinds,
+    register_plugin, rollback_registrations, validate_plugin_config,
+};
+use nemo_relay_plugin_host::activation::{
+    ActivatedPluginRuntime, IsolationPolicy, PluginActivationError,
 };
 
 use crate::convert::{json_to_py, py_to_json};
@@ -802,6 +805,7 @@ struct PluginTeardownError {
 }
 
 impl PluginTeardownError {
+    /// Report a plugin error as the Python exception it corresponds to.
     fn from_plugin_error(error: PluginError) -> Self {
         let message = error.to_string();
         let kind = match error {
@@ -815,6 +819,32 @@ impl PluginTeardownError {
             | PluginError::ResourceExhausted { .. } => PluginTeardownErrorKind::Runtime,
         };
         Self { kind, message }
+    }
+
+    /// Report an activation failure as the Python exception it corresponds to.
+    ///
+    /// A failure that carries a plugin error keeps that error's kind, so a caller
+    /// can still tell "not found" from "invalid configuration"; a boundary or
+    /// retained failure has no plugin-error equivalent and is a runtime error,
+    /// with its own message.
+    fn from_activation_error(error: PluginActivationError) -> Self {
+        match error.as_plugin_error() {
+            Some(error) => {
+                let message = error.to_string();
+                let kind = match error {
+                    PluginError::InvalidConfig(_) | PluginError::Serialization(_) => {
+                        PluginTeardownErrorKind::Value
+                    }
+                    PluginError::NotFound(_) => PluginTeardownErrorKind::NotFound,
+                    PluginError::Conflict(_)
+                    | PluginError::Internal(_)
+                    | PluginError::RegistrationFailed(_)
+                    | PluginError::ResourceExhausted { .. } => PluginTeardownErrorKind::Runtime,
+                };
+                Self { kind, message }
+            }
+            None => Self::runtime(error.to_string()),
+        }
     }
 
     fn runtime(message: impl Into<String>) -> Self {
@@ -871,7 +901,7 @@ impl PluginTeardownCompletion {
 }
 
 enum PluginHostCloseStatus {
-    Active(Option<PluginHostActivation>),
+    Active(Option<ActivatedPluginRuntime>),
     Closing,
     Closed,
 }
@@ -882,7 +912,7 @@ struct PluginHostCloseState {
 }
 
 impl PluginHostCloseState {
-    fn new(activation: PluginHostActivation) -> Self {
+    fn new(activation: ActivatedPluginRuntime) -> Self {
         Self {
             status: Mutex::new(PluginHostCloseStatus::Active(Some(activation))),
             completion: PluginTeardownCompletion::new(),
@@ -897,7 +927,7 @@ impl PluginHostCloseState {
         match &*status {
             PluginHostCloseStatus::Active(activation) => activation
                 .as_ref()
-                .is_some_and(PluginHostActivation::is_active),
+                .is_some_and(ActivatedPluginRuntime::is_active),
             PluginHostCloseStatus::Closing | PluginHostCloseStatus::Closed => false,
         }
     }
@@ -941,7 +971,9 @@ impl PluginHostCloseState {
                         .map_err(|_| {
                             PluginTeardownError::runtime("dynamic plugin teardown task panicked")
                         })
-                        .and_then(|result| result.map_err(PluginTeardownError::from_plugin_error))
+                        .and_then(|result| {
+                            result.map_err(PluginTeardownError::from_activation_error)
+                        })
                     }
                     None => Err(PluginTeardownError::runtime(
                         "dynamic plugin teardown task lost its activation",
@@ -1117,10 +1149,18 @@ fn initialize_with_dynamic_plugins_py<'py>(
         serde_json::from_value(dynamic_plugins_json)
             .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (activation, report) =
-            PluginHostActivation::activate_with_discovered_config(config, dynamic_plugins)
-                .await
-                .map_err(plugin_error_to_py_err)?;
+        // The one activation path, shared with the CLI and the other bindings:
+        // it resolves the discovered configuration, activates what this process
+        // runs, starts the native plugins in a host process, and rolls the whole
+        // thing back if any stage fails.
+        let activation = ActivatedPluginRuntime::activate_with_discovered_config(
+            config,
+            dynamic_plugins,
+            IsolationPolicy::for_runtime("nemo-relay-python"),
+        )
+        .await
+        .map_err(activation_error_to_py_err)?;
+        let report = activation.report().clone();
         reset_plugin_configuration_clear_state();
         Python::attach(|py| {
             Py::new(
@@ -1219,6 +1259,15 @@ fn to_py_err(err: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
 }
 
+fn activation_error_to_py_err(error: PluginActivationError) -> PyErr {
+    PluginTeardownError::from_activation_error(error).to_py_err()
+}
+
+/// Report a plugin error as the Python exception it corresponds to.
+///
+/// Kept beside the activation mapping because the two are the same question
+/// asked of two error types: the test that pins the mapping exercises both.
+#[cfg(test)]
 fn plugin_error_to_py_err(error: PluginError) -> PyErr {
     PluginTeardownError::from_plugin_error(error).to_py_err()
 }

@@ -2093,6 +2093,7 @@ dependencies = [
  "nemo-relay",
  "nemo-relay-adaptive",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
  "pyo3",
  "pyo3-async-runtimes",
  "pythonize",

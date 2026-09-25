@@ -1443,6 +1443,11 @@ test-python:
             prepare_llvm_cov_workspace
         fi
     fi
+    # The Rust tests drive the same managed calls Python does, and a test thread's
+    # default stack is smaller than the coroutine chain a plugin call reaches
+    # through. Sizing it here is the same decision the extension makes for its own
+    # runtime, stated where the tests are run.
+    export RUST_MIN_STACK=8388608
     cargo nextest run --locked -p nemo-relay-python --features __skip-implicit-config --lib --profile ci
     python_executable="$(uv_python_executable)"
     sync_args=(--inexact --all-packages --no-install-project --no-install-package nemo-relay)
@@ -1463,6 +1468,13 @@ test-python:
     use_project_python_source "$python_executable"
     "$python_executable" -m maturin develop --features __skip-implicit-config --skip-install
     prepare_test_plugin_fixtures
+    # The runtime starts the plugin host from beside the executable that started
+    # it, and a checkout has no installed host: this names the one the checkout
+    # builds. It is the same escape hatch a source deployment uses, used here for
+    # the same reason — and a native plugin activation without it still fails
+    # closed with the message that says where the host was looked for.
+    cargo build --locked -p nemo-relay-plugin-host
+    export NEMO_RELAY_PLUGIN_HOST="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-plugin-host"
     pytest_cmd+=(--durations=25)
     "$python_executable" -m "${pytest_cmd[@]}" --ignore=python/tests/integrations
     (cd examples/language-binding-plugin/python && uv run --locked --group test --reinstall-package nemo-relay pytest)
