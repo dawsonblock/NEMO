@@ -1782,6 +1782,33 @@ Three steps remain, in this order:
    call;
 3. the host arms rebuild the context, run the door, and answer.
 
+**The first step is built and the nested call does not complete — recorded, not advertised.**
+The host side of the request sanitizer is in: the arm builds the context the plugin's callback
+sees, and because a plugin reaches its codec through a *synchronous* ABI call while the work is
+an *asynchronous* call into the kernel, a bridge thread turns one into the other — it opens its
+own connection to the kernel on its own runtime (a client's tasks belong to the runtime that
+opened them, which is the affinity lesson this repository has learned twice already) and blocks
+the plugin's thread on the answer.
+
+What works is everything up to the boundary and the codec call leaving the host's side: the
+fixture's sanitizer resolves the codec, hands the request through, and the bridge receives the
+job. What does not is the return: the kernel's `ResolveCodec` handler is never entered — the
+instrumented run prints the bridge's job and never the kernel's receipt — so the sanitize
+invocation runs out its budget and the family omits the payload, which is at least the
+fail-closed direction.
+
+The finding is bounded, and the evidence narrows it: it is not the caller's runtime flavour (a
+current-thread caller and a four-worker caller both hang), not the capability record (the
+kernel's own service-level tests resolve, refuse and execute against it), and not the codec
+(that path is executed in-process by the same tests). What remains is the transport under a
+*nested* call — a second connection made while an invocation it belongs to is in flight — and
+the next step is to instrument the kernel's accept path and the attached client's treatment of
+a call made from a service it is also serving. Until that is understood, **the class is not
+served**: `supported_registration_operations` does not list it, the fixture registers its
+sanitizer only when a test asks for it (a plugin that registered it would be refused whole),
+and the real-child test that would qualify it is in the tree, ignored, with that reason on it.
+The count stays 14 of 16, and the implementation existing is not qualification.
+
 **What the pair's qualification owes, before it is called done.** The three steps are the
 mechanism; these are the properties the mechanism has to hold to, and they are the
 acceptance criteria for the commit that advertises the pair:

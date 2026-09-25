@@ -58,6 +58,13 @@ pub struct ProxyContext {
     /// Not the manager: that answers one request with one outcome, and a stream
     /// is a different shape of call rather than a longer one.
     streaming: Option<Arc<crate::supervisor::ProcessPluginBackend>>,
+    /// The codec capabilities this session issues, for the classes whose plugin is given a
+    /// codec it cannot hold.
+    ///
+    /// Required by the LLM sanitizers: the kernel resolves the call's codec, the plugin is
+    /// sent a reference, and the kernel's own callback service is what checks it — so the
+    /// record has to be the same one both halves see.
+    codec_capabilities: Option<Arc<crate::codec_capability::CodecCapabilities>>,
     /// Where the rest of a chain is held while a plugin decides when to run it.
     ///
     /// Required by the families that wrap a call rather than answer one: an
@@ -127,6 +134,7 @@ impl ProxyContext {
             continuations: None,
             observability_budget_millis: None,
             off_path: None,
+            codec_capabilities: None,
         }
     }
 
@@ -136,6 +144,15 @@ impl ProxyContext {
         executor: Arc<crate::off_path::OffPathPluginExecutor>,
     ) -> Self {
         self.off_path = Some(executor);
+        self
+    }
+
+    /// Give the composition's codec capability record to the classes that need it.
+    pub fn with_codec_capabilities(
+        mut self,
+        capabilities: Arc<crate::codec_capability::CodecCapabilities>,
+    ) -> Self {
+        self.codec_capabilities = Some(capabilities);
         self
     }
 
@@ -191,6 +208,7 @@ pub struct RegistrationProxies {
     mark_sanitize: Vec<String>,
     scope_sanitize_start: Vec<String>,
     scope_sanitize_end: Vec<String>,
+    llm_sanitize_request: Vec<String>,
     tool_sanitize_request: Vec<String>,
     tool_execution_intercepts: Vec<String>,
     llm_execution_intercepts: Vec<String>,
@@ -213,6 +231,7 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("mark_sanitize", &self.mark_sanitize)
             .field("scope_sanitize_start", &self.scope_sanitize_start)
             .field("scope_sanitize_end", &self.scope_sanitize_end)
+            .field("llm_sanitize_request", &self.llm_sanitize_request)
             .field("tool_sanitize_request", &self.tool_sanitize_request)
             .field("tool_execution_intercepts", &self.tool_execution_intercepts)
             .field("llm_execution_intercepts", &self.llm_execution_intercepts)
@@ -238,6 +257,7 @@ impl RegistrationProxies {
             .chain(self.mark_sanitize.iter())
             .chain(self.scope_sanitize_start.iter())
             .chain(self.scope_sanitize_end.iter())
+            .chain(self.llm_sanitize_request.iter())
             .chain(self.tool_sanitize_request.iter())
             .chain(self.tool_execution_intercepts.iter())
             .chain(self.llm_execution_intercepts.iter())
@@ -285,6 +305,10 @@ impl Drop for RegistrationProxies {
                 registration,
             );
         }
+        for registration in &self.llm_sanitize_request {
+            let _ =
+                nemo_relay::api::registry::deregister_llm_sanitize_request_guardrail(registration);
+        }
         for registration in &self.tool_sanitize_request {
             let _ =
                 nemo_relay::api::registry::deregister_tool_sanitize_request_guardrail(registration);
@@ -321,6 +345,7 @@ pub fn install(
         mark_sanitize: Vec::new(),
         scope_sanitize_start: Vec::new(),
         scope_sanitize_end: Vec::new(),
+        llm_sanitize_request: Vec::new(),
         tool_sanitize_request: Vec::new(),
         tool_execution_intercepts: Vec::new(),
         llm_execution_intercepts: Vec::new(),
@@ -361,6 +386,15 @@ pub fn install(
                 install_metadata_injector(&context, registration, &handle)?;
                 installed
                     .metadata_injectors
+                    .push(registration.registration_id.clone());
+            }
+            // The class whose sanitizer is given the call's codec, which is why it is
+            // the last to cross: the codec cannot, so the plugin is given an identity to
+            // decide with and a reference the kernel checks.
+            PluginRegistrationOperation::LlmSanitizeRequestGuardrail => {
+                install_llm_sanitize_request(&context, registration, &handle)?;
+                installed
+                    .llm_sanitize_request
                     .push(registration.registration_id.clone());
             }
             // The three event sanitize families. One installer parameterised by
@@ -1403,6 +1437,181 @@ fn install_tool_sanitize(
         )
     };
     installed.map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// Install the proxy for one LLM request sanitize registration.
+///
+/// This is the class the codec capability protocol exists for. A request sanitizer is given
+/// the call's codec beside the payload, and a codec is a live object this process holds —
+/// so what the plugin is sent is the codec's *identity*, which it decides with, and a
+/// *reference*, which it may spend on exactly this invocation. The work happens here,
+/// against the codec the call is using, and the plugin never holds the object.
+///
+/// The reference is issued for the invocation and dropped when it ends, whether that is an
+/// answer, a refusal, a failure, saturation or a cancellation: the guard lives in the future
+/// this callback returns, so every way out of the call takes the capability with it.
+///
+/// Failure follows the family's rule: a payload nobody could sanitize is omitted. The chain
+/// omits it when this returns an error, and the record says why, because a sanitizer that
+/// never worked and one that omitted everything look the same from the event alone.
+fn install_llm_sanitize_request(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    let off_path = context.off_path.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is an LLM request sanitizer and this runtime started no runtime for work \
+                 beside a call, so its answer could never arrive",
+                registration.registration_id
+            ),
+        )
+    })?;
+    let codecs = context.codec_capabilities.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is an LLM request sanitizer and this runtime has no codec capability \
+                 record, so a sanitizer could not use the codec the call is running under",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::LlmSanitizeRequestFn = Arc::new(
+        move |request: nemo_relay::api::llm::LlmRequest,
+              sanitize: nemo_relay::api::runtime::LlmSanitizeRequestContext| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let off_path = Arc::clone(&off_path);
+            let codecs = Arc::clone(&codecs);
+            Box::pin(async move {
+                let recording = registration_id.clone();
+                // The identity the plugin is told, and the reference it may use. Both are
+                // the kernel's: a plugin has no say in which codec its call is running under.
+                let operation_request_id = nemo_relay_plugin_protocol::Uuid::now_v7().to_string();
+                let identity = sanitize.codec().clone();
+                let issued = sanitize
+                    .resolve_codec()
+                    .map(|codec| codecs.issue_request(&operation_request_id, codec));
+                let (reference, _capability) = match issued {
+                    Some((reference, guard)) => (Some(reference), Some(guard)),
+                    None => (None, None),
+                };
+                let (kind, id) = crate::codec_context::identity_to_wire(&identity);
+                let mut call_context = serde_json::json!({ "codec_kind": kind });
+                if let Some(id) = id {
+                    call_context["codec_id"] = serde_json::Value::String(id);
+                }
+                if let Some(reference) = reference.as_ref() {
+                    call_context["codec_reference"] =
+                        serde_json::Value::String(reference.as_str().to_string());
+                }
+                let payload = serde_json::json!({
+                    "request": request,
+                    "context": call_context,
+                })
+                .to_string();
+                let submitted = Arc::clone(&off_path).submit(async move {
+                    let execution = context.passive_execution_context(operation_request_id)?;
+                    let invoke = PluginInvokeRequest {
+                        handle,
+                        registration_id: registration_id.clone(),
+                        arguments: payload,
+                        budget_millis: execution.remaining_budget_millis,
+                    };
+                    let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                        scopes.enter(
+                            &execution.operation_request_id,
+                            nemo_relay::api::runtime::current_scope_stack(),
+                        )
+                    });
+                    let outcome = off_path.invoke(invoke, execution).await.map_err(|error| {
+                        nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        }
+                    })?;
+                    match outcome.result {
+                        Ok(PluginSuccess::Invoked(response)) => {
+                            serde_json::from_str::<nemo_relay::api::llm::LlmRequest>(
+                                &response.output,
+                            )
+                            .map(Some)
+                            .map_err(|error| {
+                                nemo_relay::error::FlowError::Internal(format!(
+                                    "a proxied LLM request sanitizer answered with something that \
+                                     is not a request: {error}"
+                                ))
+                            })
+                        }
+                        Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                            "a proxied LLM request sanitizer answered with {}",
+                            other_name(&other)
+                        ))),
+                        // A refusal is the family's omission: the payload is not published,
+                        // and the plugin's own words are what the record carries.
+                        Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id,
+                            dispatch: outcome.dispatch,
+                            certainty: outcome.certainty,
+                            failure,
+                        }),
+                    }
+                });
+                let Some(answer) = submitted else {
+                    let error = nemo_relay::error::FlowError::ResourceExhausted {
+                        resource: "plugin_observability_in_flight",
+                        limit: 0,
+                    };
+                    crate::off_path::record_failure(
+                        crate::off_path::SANITIZE_FAILURE_MARK,
+                        &recording,
+                        &error.to_string(),
+                    );
+                    return Err(error);
+                };
+                match crate::off_path::OffPathPluginExecutor::answer(answer)
+                    .await
+                    .and_then(|inner| inner)
+                {
+                    Ok(request) => Ok(request),
+                    Err(error) => {
+                        crate::off_path::record_failure(
+                            crate::off_path::SANITIZE_FAILURE_MARK,
+                            &recording,
+                            &error.to_string(),
+                        );
+                        Err(error)
+                    }
+                }
+            })
+        },
+    );
+
+    nemo_relay::api::registry::register_llm_sanitize_request_guardrail(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
         PluginProtocolError::new(
             PluginFailureCode::Rejected,
             format!(
@@ -2466,14 +2675,13 @@ mod tests {
             "test-binding",
             5_000,
         );
-        // A class with no proxy at all. The streaming family and then the three
-        // event sanitizers used to be the examples here and are not any more — both
-        // have proxies, which is why this names the pair whose shape the boundary
-        // does not carry yet: an LLM sanitize call is given a codec capability, and
-        // a unary invocation across the boundary has no completion to hang one on.
+        // A class with no proxy at all. Every class but this one has been given a proxy,
+        // including the LLM request sanitizer whose codec capability protocol landed last —
+        // so this names the last one whose shape the boundary does not carry yet, and it
+        // will need a new example when that lands too.
         let error = install(
             context,
-            &descriptor(PluginRegistrationOperation::LlmSanitizeRequestGuardrail),
+            &descriptor(PluginRegistrationOperation::LlmSanitizeResponseGuardrail),
             PluginHandle {
                 plugin_id: "example".into(),
                 generation: 1,
@@ -2489,7 +2697,7 @@ mod tests {
             error
                 .failure
                 .message
-                .contains("llm_sanitize_request_guardrail"),
+                .contains("llm_sanitize_response_guardrail"),
             "{error:?}"
         );
     }

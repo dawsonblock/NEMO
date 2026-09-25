@@ -506,6 +506,12 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
 /// the event's identity stay the kernel's. What each one needed was a proxy, a
 /// host-side runner and a core door that runs exactly the registration the kernel
 /// names, and all three were qualified through a real child before this list grew.
+///
+/// The one after them is the LLM request sanitizer, and it is the class the codec
+/// capability protocol exists for: a sanitizer is given the call's codec, a codec is a live
+/// object this side holds, so the plugin is sent the identity it decides with and a
+/// reference the kernel checks, and the work happens where the object is. It joined this
+/// list after a real child resolved the kernel's codec through that reference.
 #[test]
 fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     use nemo_relay_plugin_host::supervisor::ProcessPluginBackend;

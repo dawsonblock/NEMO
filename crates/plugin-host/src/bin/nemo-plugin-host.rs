@@ -181,6 +181,10 @@ fn main() -> ExitCode {
                             client.clone(),
                             &kernel_credential,
                         )
+                        // Remembering the endpoint is what lets a caller on another runtime
+                        // — the codec bridge, whose thread blocks on the answer — open its
+                        // own connection there instead of waiting on this runtime's tasks.
+                        .map(|callbacks| callbacks.with_reconnect(endpoint.clone(), config.maximum_frame_bytes))
                         .map_err(|error| {
                             eprintln!("{KERNEL_CREDENTIAL} is unusable: {error}");
                             ExitCode::from(2)

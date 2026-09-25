@@ -49,6 +49,16 @@ pub const LLM_EXECUTION_MARKER: &str = "native_intercept_llm_execution";
 /// The mark the execution intercept asks the call's owner to emit.
 pub const EXECUTION_PENDING_MARK: &str = "fixture.intercept.tool_execution.mark";
 
+/// The key an LLM request sanitizer adds to the copy a start event carries.
+pub const LLM_SANITIZE_REQUEST_MARKER: &str = "fixture_llm_sanitize_request";
+
+/// The key that records which codec the LLM request sanitizer resolved.
+///
+/// The value is what the *codec* read rather than what the sanitizer was told: a sanitizer
+/// that reached the kernel's codec records the model the codec found, and one that was
+/// handed an identity it could not use records why.
+pub const LLM_SANITIZE_CODEC_MARKER: &str = "fixture_llm_sanitize_codec";
+
 /// The metadata key the first mark sanitizer adds.
 ///
 /// Three mark sanitizers rather than one because the property these fixtures exist
@@ -192,11 +202,24 @@ impl NativePlugin for InterceptPlugin {
             "fixture_intercept_llm_rewrite",
             0,
             false,
-            |_name, mut request, annotated| async move {
-                if let Json::Object(content) = &mut request.content {
-                    content.insert(LLM_MARKER.into(), json!(true));
+            |_name, request, annotated| async move {
+                // A request intercept changes the call, and a call that is running under a
+                // codec has to be changed through the codec's own view: writing into the
+                // opaque content behind a codec's back is what the runtime refuses, and the
+                // codec is what puts an annotated change back into the content.
+                match annotated {
+                    Some(mut annotated) => {
+                        annotated.extra.insert(LLM_MARKER.into(), json!(true));
+                        Ok(LlmRequestInterceptOutcome::new(request, Some(annotated)))
+                    }
+                    None => {
+                        let mut request = request;
+                        if let Json::Object(content) = &mut request.content {
+                            content.insert(LLM_MARKER.into(), json!(true));
+                        }
+                        Ok(LlmRequestInterceptOutcome::new(request, None))
+                    }
                 }
-                Ok(LlmRequestInterceptOutcome::new(request, annotated))
             },
         )?;
         // The class that wraps the call rather than answering one. It marks the
@@ -294,6 +317,37 @@ impl NativePlugin for InterceptPlugin {
         // part of this fixture's default set — the set that exists to be exactly what
         // a kernel can serve.
         register_event_sanitizers(ctx, sanitizer_log(config))?;
+        // The class that is given the call's codec. It resolves the codec, reads the
+        // request with it, and records what the codec read: the same callback in process
+        // holds the codec directly, and across the boundary it reaches the kernel's copy
+        // through the capability it was handed.
+        //
+        // Gated, because the class is not served yet: a plugin that registers it is refused
+        // whole, and every composition test would become a test about that refusal.
+        if config
+            .get("llm_sanitizer")
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+        {
+            ctx.register_llm_sanitize_request_guardrail(
+            "fixture_llm_sanitize_request",
+            0,
+            |mut request, context| async move {
+                let resolved = match context.resolve_codec() {
+                    Some(codec) => match codec.decode(&request) {
+                        Ok(annotated) => annotated.model.unwrap_or_else(|| "decoded".to_string()),
+                        Err(error) => format!("codec failed: {error}"),
+                    },
+                    None => "no codec".to_string(),
+                };
+                if let Json::Object(content) = &mut request.content {
+                    content.insert(LLM_SANITIZE_REQUEST_MARKER.into(), json!(true));
+                    content.insert(LLM_SANITIZE_CODEC_MARKER.into(), json!(resolved));
+                }
+                Ok(Some(request))
+            },
+            )?;
+        }
         // The failure shapes are behaviours rather than classes, so a test asks for
         // them: a registration that refuses on every mark would clear the fields of
         // every mark event the other composition tests publish.

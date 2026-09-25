@@ -614,7 +614,11 @@ impl ProcessLoadedPlugins {
             .with_operation_scopes(backend.operation_scopes())
             .with_continuations(backend.continuations())
             .with_observability_budget(observability.budget_millis)
-            .with_off_path_executor(Arc::clone(&off_path));
+            .with_off_path_executor(Arc::clone(&off_path))
+            // The codec capabilities this session issues: the LLM sanitizers are given a
+            // codec they cannot hold, so the record has to be the one the kernel's own
+            // callback service checks.
+            .with_codec_capabilities(backend.codec_capabilities());
         let mut proxies = Vec::new();
         for descriptor in &descriptors {
             let handle = handles

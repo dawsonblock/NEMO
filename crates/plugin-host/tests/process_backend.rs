@@ -529,6 +529,122 @@ async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
     drop(loaded);
 }
 
+// The class that is given the call's codec, through a real child. This is the nested path
+// the codec capability protocol exists for: the kernel sends a sanitize invocation, the
+// plugin's callback calls the codec, the host answers that call by asking the kernel, the
+// kernel runs the codec it holds against the reference it issued, and the sanitized request
+// comes back to be published here.
+#[tokio::test]
+#[ignore = "the codec bridge's nested call does not reach the kernel yet: the sanitize \
+            invocation runs out its budget with the bridge holding a job the kernel never \
+            answers. Recorded as a finding rather than advertised; see \
+            security/PLUGIN-ISOLATION.md. Run with `-- --ignored` after the fix."]
+async fn a_real_llm_request_sanitizer_resolves_the_calls_codec_through_the_kernel() {
+    use nemo_relay::api::llm::LlmRequest;
+    use nemo_relay::codec::openai_chat::OpenAIChatCodec;
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+    use nemo_relay_plugin_protocol::PluginComponentConfiguration;
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-llm-sanitize",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let loaded = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        [PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: serde_json::json!({ "llm_sanitizer": true }).to_string(),
+        }],
+    )
+    .await
+    .expect("a plugin served from another process");
+
+    let published: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let published = std::sync::Arc::clone(&published);
+        nemo_relay::api::subscriber::register_subscriber(
+            "process-backend-llm-sanitize",
+            std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+                published.lock().unwrap().push(serde_json::json!({
+                    "name": event.name(),
+                    "kind": event.kind(),
+                    "data": event.data().cloned(),
+                }));
+            }),
+        )
+        .expect("a subscriber");
+    }
+
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::llm::llm_call_execute(
+                nemo_relay::api::llm::LlmCallExecuteParams::builder()
+                    .name("sanitize-codec-model")
+                    .request(LlmRequest {
+                        headers: serde_json::Map::new(),
+                        content: serde_json::json!({
+                            "model": "gpt-4o",
+                            "messages": [{ "role": "user", "content": "hello" }]
+                        }),
+                    })
+                    // A codec in the kernel: the sanitizer in the child is given the
+                    // identity, and reaches the object through the capability.
+                    .codec(std::sync::Arc::new(OpenAIChatCodec))
+                    .func(std::sync::Arc::new(|request| {
+                        Box::pin(async move {
+                            Ok(nemo_relay::json::Json::Object(
+                                request.content.as_object().cloned().unwrap_or_default(),
+                            ))
+                        })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed LLM call whose request the child sanitizes");
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+
+    let published = published.lock().unwrap().clone();
+    let start = published
+        .iter()
+        .find(|event| {
+            event["name"] == serde_json::json!("sanitize-codec-model")
+                && event["kind"] == serde_json::json!("scope")
+        })
+        .unwrap_or_else(|| panic!("the LLM start event was published: {published:#?}"));
+    let content = &start["data"]["content"];
+    assert_eq!(
+        content["fixture_llm_sanitize_request"],
+        serde_json::json!(true),
+        "the sanitizer in the child changed the copy this runtime published: {start:#?}"
+    );
+    assert_eq!(
+        content["fixture_llm_sanitize_codec"],
+        serde_json::json!("gpt-4o"),
+        "and it read the request with the kernel's own codec, through the capability it was \
+         given: {start:#?}"
+    );
+
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-llm-sanitize")
+        .expect("a deregistration");
+    drop(loaded);
+}
+
 // The two read-only discriminators cross the boundary, and a sanitizer in the child
 // decides with them. This is the compatibility property the projection was widened for:
 // the PII redaction component branches on exactly these two values, so a projection

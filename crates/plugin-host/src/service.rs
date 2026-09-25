@@ -487,6 +487,18 @@ impl PluginHostService {
                 | nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeEndGuardrail => {
                     sanitized_event_fields(&request, operation).await
                 }
+                // The class whose sanitizer is given the call's codec. What crosses is a
+                // request, the codec's identity, and a reference: the codec itself stays in
+                // the kernel, and the plugin's callback reaches it through this host.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeRequestGuardrail => {
+                    sanitized_llm_request(
+                        &request,
+                        self.kernel.clone(),
+                        &wire.session_id,
+                        &context.operation_request_id,
+                    )
+                    .await
+                }
                 // The first class that wraps a call rather than answering one.
                 // The plugin's callback decides *when* the rest of the chain
                 // runs, and the rest of the chain is the kernel's, so the
@@ -1963,6 +1975,114 @@ async fn sanitized_tool_payload(
         Ok(None) => Ok(refusal(
             "the guardrail omitted the payload rather than publishing it unsanitized",
         )),
+        Err(error) => Ok(refusal(error.to_string())),
+    }
+}
+
+/// Run one LLM request sanitize registration over the payload a call would publish.
+///
+/// Three things cross: the request, the codec's *identity* — which is what a sanitizer
+/// decides with — and a *reference* it may spend on this invocation. The codec itself does
+/// not cross, because it cannot: it is a live object the kernel holds, and the reference is
+/// how the plugin asks for work to be done with it. The host's part is to build the context
+/// the plugin's callback sees, which is the same context it would see in process — an
+/// identity it can read, and a handle that reaches the object where the object lives.
+///
+/// A payload that names a codec without a reference, or a call that names a codec when this
+/// host has no kernel to resolve it with, is refused rather than served with a context whose
+/// handle would fail later: a sanitizer that cannot use the codec its call is running under
+/// is a sanitizer that has been misled about what it is sanitizing.
+async fn sanitized_llm_request(
+    request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
+    kernel: Option<crate::runtime_service::KernelCallbacks>,
+    session_id: &str,
+    operation_request_id: &str,
+) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
+    let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
+        refused(format!(
+            "an LLM request sanitize payload must be JSON: {error}"
+        ))
+    })?;
+    let sanitize_request: nemo_relay::api::llm::LlmRequest = serde_json::from_value(
+        payload
+            .get("request")
+            .cloned()
+            .ok_or_else(|| refused("an LLM request sanitize payload carries no request"))?,
+    )
+    .map_err(|error| refused(format!("the request to sanitize is not a request: {error}")))?;
+    let call_context = payload
+        .get("context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let kind = call_context
+        .get("codec_kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    let id = call_context
+        .get("codec_id")
+        .and_then(serde_json::Value::as_str);
+    let identity = crate::codec_context::identity_from_wire(kind, id)
+        .map_err(|error| refused(error.to_string()))?;
+
+    let sanitize_context = match identity {
+        // No codec was active for this call, and the sanitizer is told exactly that: its
+        // handle resolves nothing, which is what the identity says.
+        nemo_relay_plugin_protocol::LlmCodecIdentity::None => {
+            nemo_relay::api::runtime::LlmSanitizeRequestContext::with_identity(
+                nemo_relay_plugin_protocol::LlmCodecIdentity::None,
+            )
+        }
+        identity => {
+            let Some(kernel) = kernel else {
+                return Err(refused(
+                    "this host has no kernel to resolve the call's codec with, so an LLM \
+                     request sanitizer cannot be served the codec its call is running under",
+                ));
+            };
+            let Some(reference) = call_context
+                .get("codec_reference")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Err(refused(
+                    "an LLM request sanitize payload names a codec without the capability \
+                     reference that would let a sanitizer use it",
+                ));
+            };
+            nemo_relay::api::runtime::LlmSanitizeRequestContext::for_request_codec(Some(
+                std::sync::Arc::new(crate::codec_context::KernelRequestCodec::new(
+                    kernel,
+                    session_id,
+                    operation_request_id,
+                    identity,
+                    reference,
+                )),
+            ))
+        }
+    };
+
+    match nemo_relay::api::llm::invoke_llm_sanitize_request_registration(
+        &request.registration_id,
+        sanitize_request,
+        sanitize_context,
+    )
+    .await
+    {
+        Ok(outcome) => match (outcome.request, outcome.failure) {
+            (Some(request), _) => Ok(success(serde_json::to_string(&request).map_err(
+                |error| {
+                    refused(format!(
+                        "the sanitized request could not be serialized: {error}"
+                    ))
+                },
+            )?)),
+            // A sanitizer that did not answer, and one that answered with nothing, are the
+            // family's omission either way: the payload is not published, and a refusal is
+            // what tells the kernel to omit it too.
+            (None, Some(reason)) => Ok(refusal(format!("the sanitizer did not answer: {reason}"))),
+            (None, None) => Ok(refusal(
+                "the sanitizer omitted the payload rather than publishing it unsanitized",
+            )),
+        },
         Err(error) => Ok(refusal(error.to_string())),
     }
 }

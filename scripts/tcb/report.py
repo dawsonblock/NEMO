@@ -288,9 +288,14 @@ def find_temporary_problems(policy: dict, reports: list[Metrics]) -> list[str]:
     }
     required = ("crate", "field", "raised_to", "reason", "introduced", "must_fall_by", "target")
     for index, entry in enumerate(policy.get("temporary", [])):
-        # Present and empty is missing: a milestone nobody named and a reason nobody
-        # wrote promise nothing, and a key that exists is not a statement.
-        missing = [name for name in required if not entry.get(name)]
+        # Present and empty is missing: a milestone nobody named and a reason nobody wrote
+        # promise nothing, and a key that exists is not a statement. Zero is not empty — a
+        # target of zero is how an entry says the crate leaves the tier entirely.
+        missing = [
+            name
+            for name in required
+            if name not in entry or entry[name] is None or (isinstance(entry[name], str) and not entry[name].strip())
+        ]
         if missing:
             problems.append(
                 f"temporary ceiling #{index} is missing {', '.join(missing)}; a raise that "

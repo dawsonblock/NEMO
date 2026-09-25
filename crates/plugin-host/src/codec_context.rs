@@ -15,6 +15,8 @@
 //! spelling of the same fact is a second place for it to be wrong.
 
 use nemo_relay::api::llm::LlmRequest;
+use std::sync::Arc;
+
 use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::error::FlowError;
 use nemo_relay::json::Json;
@@ -191,6 +193,222 @@ fn invalid_field(field: &str, error: serde_json::Error) -> FlowError {
 
 fn write_failed(error: serde_json::Error) -> FlowError {
     FlowError::Internal(format!("a codec result could not be written: {error}"))
+}
+
+/// The thread a plugin's synchronous codec call is answered on.
+///
+/// A plugin reaches its codec through a synchronous ABI call, and the codec object lives in
+/// the kernel, so something has to turn a synchronous call into an asynchronous one. Doing
+/// it on the thread that made the call is what deadlocks: that thread is inside the host's
+/// runtime, and blocking it on a call the kernel answers through this same host is the
+/// cycle the whole protocol exists to avoid.
+///
+/// So the call is handed to a thread of its own, which owns a runtime and owns the kernel
+/// client. The caller blocks on the answer and holds nothing while it waits; nothing the
+/// kernel does to answer it needs the blocked thread. One bridge per host, because one
+/// client is enough and one thread is the bound.
+struct CodecBridge {
+    jobs: std::sync::mpsc::Sender<CodecJob>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct CodecJob {
+    operation: nemo_relay_plugin_proto::v1::CodecOperation,
+    operation_request_id: String,
+    payload_json: String,
+    reference: String,
+    answer: std::sync::mpsc::Sender<Result<String, String>>,
+}
+
+impl Drop for CodecBridge {
+    fn drop(&mut self) {
+        // The sender drops with the struct, which ends the loop; joining here keeps a
+        // bridge from outliving its host by a thread.
+        if let Ok(mut thread) = self.thread.lock()
+            && let Some(thread) = thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl CodecBridge {
+    /// Start a bridge for one session's kernel client.
+    fn start(client: crate::runtime_service::KernelCallbacks, session_id: String) -> Arc<Self> {
+        let (jobs, queue) = std::sync::mpsc::channel::<CodecJob>();
+        let thread = std::thread::Builder::new()
+            .name("nemo-plugin-codec-bridge".to_string())
+            .spawn(move || {
+                // A current-thread runtime is enough for a thread whose only work is to wait
+                // for a job and answer it, and it keeps the bridge's footprint to one thread
+                // the host already has.
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                // The connection this thread waits on is opened *here*, on this runtime: a
+                // client's tasks belong to the runtime that opened them, so blocking on the
+                // host's client would mean waiting for an answer nothing on this thread could
+                // receive. A host that remembered no endpoint is one whose caller is already
+                // on the right runtime, and `connect_again` hands back the client it has.
+                let client = match runtime.block_on(client.connect_again()) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        // The refusal a plugin then sees says the bridge stopped, which is
+                        // what happened; the reason is this line, because a host has no
+                        // runtime of the kernel's to record it in.
+                        eprintln!(
+                            "the codec bridge could not open its own kernel connection, so \
+                             plugin codec calls will be refused: {error}"
+                        );
+                        return;
+                    }
+                };
+                while let Ok(job) = queue.recv() {
+                    let answer = runtime.block_on(client.resolve_codec(
+                        &session_id,
+                        &job.operation_request_id,
+                        job.operation,
+                        &job.payload_json,
+                        &job.reference,
+                    ));
+                    // A caller that gave up is the plugin's business, not this thread's: the
+                    // work was asked for and was done.
+                    let _ = job.answer.send(answer);
+                }
+            })
+            .expect("a codec bridge thread");
+        Arc::new(Self {
+            jobs,
+            thread: std::sync::Mutex::new(Some(thread)),
+        })
+    }
+
+    /// Run one codec operation on the bridge, blocking the calling thread for the answer.
+    fn resolve(
+        &self,
+        operation: nemo_relay_plugin_proto::v1::CodecOperation,
+        operation_request_id: &str,
+        payload_json: String,
+        reference: &str,
+    ) -> Result<String, String> {
+        let (answer, received) = std::sync::mpsc::channel();
+        self.jobs
+            .send(CodecJob {
+                operation,
+                operation_request_id: operation_request_id.to_string(),
+                payload_json,
+                reference: reference.to_string(),
+                answer,
+            })
+            .map_err(|_| "this host's codec bridge has stopped".to_string())?;
+        received
+            .recv()
+            .map_err(|_| "this host's codec bridge stopped before answering".to_string())?
+    }
+}
+
+/// The codec a plugin's callback resolves in a host that does not hold one.
+///
+/// It implements the runtime's own codec trait, so the plugin's callback sees exactly what
+/// it would see in process — an identity it can read and a handle it can use — and the work
+/// behind that handle happens in the kernel, against the codec the kernel holds and the
+/// capability it issued for this invocation.
+pub struct KernelRequestCodec {
+    bridge: Arc<CodecBridge>,
+    operation_request_id: String,
+    identity: LlmCodecIdentity,
+    reference: String,
+}
+
+impl KernelRequestCodec {
+    /// A request codec for one sanitize invocation.
+    pub fn new(
+        client: crate::runtime_service::KernelCallbacks,
+        session_id: &str,
+        operation_request_id: &str,
+        identity: LlmCodecIdentity,
+        reference: &str,
+    ) -> Self {
+        Self {
+            bridge: CodecBridge::start(client, session_id.to_string()),
+            operation_request_id: operation_request_id.to_string(),
+            identity,
+            reference: reference.to_string(),
+        }
+    }
+
+    fn payload(&self, value: nemo_relay::json::Json) -> Result<String, FlowError> {
+        let (kind, id) = identity_to_wire(&self.identity);
+        let mut context = serde_json::json!({ "codec_kind": kind });
+        if let Some(id) = id {
+            context["codec_id"] = serde_json::Value::String(id);
+        }
+        let mut payload = value;
+        payload["codec_kind"] = context["codec_kind"].clone();
+        if let Some(id) = context.get("codec_id") {
+            payload["codec_id"] = id.clone();
+        }
+        serde_json::to_string(&payload).map_err(|error| {
+            FlowError::Internal(format!(
+                "a codec call payload could not be written: {error}"
+            ))
+        })
+    }
+
+    fn call(
+        &self,
+        operation: nemo_relay_plugin_proto::v1::CodecOperation,
+        payload: nemo_relay::json::Json,
+    ) -> Result<String, FlowError> {
+        let payload = self.payload(payload)?;
+        self.bridge
+            .resolve(
+                operation,
+                &self.operation_request_id,
+                payload,
+                &self.reference,
+            )
+            .map_err(FlowError::Internal)
+    }
+}
+
+impl nemo_relay::codec::traits::LlmCodec for KernelRequestCodec {
+    fn codec_identity(&self) -> LlmCodecIdentity {
+        self.identity.clone()
+    }
+
+    fn decode(&self, request: &LlmRequest) -> Result<AnnotatedLlmRequest, FlowError> {
+        let output = self.call(
+            nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+            serde_json::json!({ "request": request }),
+        )?;
+        serde_json::from_str(&output).map_err(|error| {
+            FlowError::Internal(format!(
+                "the kernel answered a request decode with something that is not an \
+                 annotated request: {error}"
+            ))
+        })
+    }
+
+    fn encode(
+        &self,
+        annotated: &AnnotatedLlmRequest,
+        original: &LlmRequest,
+    ) -> Result<LlmRequest, FlowError> {
+        let output = self.call(
+            nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestEncode,
+            serde_json::json!({ "annotated": annotated, "original": original }),
+        )?;
+        serde_json::from_str(&output).map_err(|error| {
+            FlowError::Internal(format!(
+                "the kernel answered a request encode with something that is not a request: \
+                 {error}"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

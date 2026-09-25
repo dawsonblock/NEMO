@@ -433,7 +433,13 @@ max_transitive_packages = 239
 # it is using, and executes the work with the codec object it holds. The store's entries
 # carry that object, because a capability the validator cannot use is a name rather than a
 # capability. No dependency moved and no `unsafe` did.
-max_source_lines = 20961
+# Raised for the LLM request sanitizer's kernel-side half and the host's: the proxy that
+# issues a capability per sanitize invocation and drops it when the call ends, the arm that
+# builds the context a plugin's callback sees, the bridge that turns a plugin's synchronous
+# codec call into the kernel's asynchronous one, and the client method it calls. The class is
+# not served yet — see security/PLUGIN-ISOLATION.md — so this is implementation, not
+# qualification. No dependency moved and no `unsafe` did.
+max_source_lines = 21645
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"

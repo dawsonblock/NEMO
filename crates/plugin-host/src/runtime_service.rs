@@ -94,6 +94,14 @@ pub async fn connect_to_kernel(
 pub struct KernelCallbacks {
     client: RelayRuntimeClient<Channel>,
     credential: MetadataValue<Ascii>,
+    /// How to reach the kernel again, when a caller needs a connection of its own.
+    ///
+    /// A client's connection tasks belong to the runtime that opened them, so a *second*
+    /// caller — the bridge a plugin's synchronous codec call goes through, which runs on a
+    /// thread of its own — cannot block on this client: the answer would have to arrive on a
+    /// runtime no thread of the caller's owns. Remembering the endpoint is what lets that
+    /// caller open its own connection on the runtime that will wait for it.
+    reconnect: Option<(std::path::PathBuf, u32)>,
 }
 
 impl std::fmt::Debug for KernelCallbacks {
@@ -116,7 +124,46 @@ impl KernelCallbacks {
         let credential = credential
             .parse()
             .map_err(|error| format!("the kernel credential is not a header value: {error}"))?;
-        Ok(Self { client, credential })
+        Ok(Self {
+            client,
+            credential,
+            reconnect: None,
+        })
+    }
+
+    /// Remember how to reach the kernel, so a caller on another runtime can connect again.
+    pub fn with_reconnect(
+        mut self,
+        endpoint: std::path::PathBuf,
+        maximum_frame_bytes: u32,
+    ) -> Self {
+        self.reconnect = Some((endpoint, maximum_frame_bytes));
+        self
+    }
+
+    /// A connection to the same kernel, opened on the runtime that calls this.
+    ///
+    /// A caller that has to wait for the answer on a runtime of its own needs this rather
+    /// than the client it was handed: the handed client's tasks live where it was built.
+    /// A host that never remembered an endpoint serves the caller with the client it has,
+    /// which is right for a caller that *is* on that runtime.
+    ///
+    /// # Errors
+    /// Returns the transport's words when the kernel cannot be reached again.
+    pub async fn connect_again(&self) -> Result<Self, String> {
+        let Some((endpoint, maximum_frame_bytes)) = self.reconnect.as_ref() else {
+            return Ok(Self {
+                client: self.client.clone(),
+                credential: self.credential.clone(),
+                reconnect: None,
+            });
+        };
+        let client = connect_to_kernel(endpoint, *maximum_frame_bytes).await?;
+        Ok(Self {
+            client,
+            credential: self.credential.clone(),
+            reconnect: self.reconnect.clone(),
+        })
     }
 
     /// The client these calls travel on.
@@ -161,6 +208,59 @@ impl KernelCallbacks {
             .into_inner();
         nemo_relay_plugin_proto::convert::continuation_outcome_from_wire(&outcome)
             .map_err(|error| error.failure.message)
+    }
+
+    /// Ask the kernel to run one codec operation for a capability it issued.
+    ///
+    /// The host does not hold a codec and never will: what it holds is the reference the
+    /// kernel issued for the sanitize invocation it is serving, and the work happens on
+    /// the side that holds the object. A refusal is the kernel's own words — the reference
+    /// is not for this call, the direction is wrong, the codec is not the one it issued —
+    /// and it reaches the plugin as the codec call's failure rather than as a transport
+    /// error, because that is what it is.
+    ///
+    /// # Errors
+    /// Returns the kernel's refusal, or the transport's when the kernel cannot be reached.
+    pub async fn resolve_codec(
+        &self,
+        session_id: &str,
+        operation_request_id: &str,
+        operation: nemo_relay_plugin_proto::v1::CodecOperation,
+        payload_json: &str,
+        codec_reference: &str,
+    ) -> Result<String, String> {
+        let wire = nemo_relay_plugin_proto::v1::ResolveCodecRequest {
+            session_id: session_id.to_owned(),
+            operation_request_id: operation_request_id.to_owned(),
+            host_call_id: nemo_relay_plugin_protocol::Uuid::now_v7().to_string(),
+            operation: operation as i32,
+            payload_json: payload_json.to_owned(),
+            codec_reference: codec_reference.to_owned(),
+        };
+        let mut request = Request::new(wire);
+        request
+            .metadata_mut()
+            .insert(SESSION_CREDENTIAL_HEADER, self.credential.clone());
+        let answer = self
+            .client
+            .clone()
+            .resolve_codec(request)
+            .await
+            .map_err(|status| status.to_string())?
+            .into_inner();
+        match answer.result {
+            Some(nemo_relay_plugin_proto::v1::resolve_codec_response::Result::Output(output)) => {
+                Ok(output)
+            }
+            Some(nemo_relay_plugin_proto::v1::resolve_codec_response::Result::Failure(failure)) => {
+                Err(failure.message)
+            }
+            // Neither arm is not an answer: a kernel that says nothing has not said the
+            // codec work was done, and reading it as one would be this side's guess.
+            None => Err(
+                "the kernel answered a codec call with neither a result nor a refusal".to_string(),
+            ),
+        }
     }
 }
 
