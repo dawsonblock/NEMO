@@ -1729,7 +1729,13 @@ fn plugin_mutation_executor() -> Result<&'static PluginMutationSender> {
     Ok(PLUGIN_MUTATION_EXECUTOR.get_or_init(|| sender))
 }
 
-pub(crate) async fn initialize_plugins_exact_for_host(
+/// Activate a configuration on behalf of the host lease that owns it.
+///
+/// `rollback_failures` collects what a failed activation could not undo, so the
+/// caller can tell "this failed and nothing is left" from "this failed and
+/// something may still be registered" — the difference between unloading and
+/// retaining code that may still be reachable.
+pub async fn initialize_plugins_exact_for_host(
     config: PluginConfig,
     owner_id: u64,
     rollback_failures: Arc<Mutex<Vec<String>>>,
@@ -2420,7 +2426,15 @@ pub fn clear_plugin_configuration() -> Result<()> {
     outcome.result
 }
 
-pub(crate) fn clear_plugin_configuration_for_host(owner_id: u64) -> PluginHostClearOutcome {
+/// Clear the configuration an activation owns, on behalf of its owner.
+///
+/// Public for the composition that owns a dynamic plugin activation: it claims
+/// the host lease, activates, and rolls back through this call, and the whole
+/// point of the composition living outside the kernel is that the kernel does
+/// not decide when that happens. The owner identifier is what makes the call
+/// this activation's rather than any activation's, so a stale owner is refused
+/// rather than allowed to clear somebody else's configuration.
+pub fn clear_plugin_configuration_for_host(owner_id: u64) -> PluginHostClearOutcome {
     if let Err(error) = verify_plugin_host_owner(owner_id) {
         return PluginHostClearOutcome {
             result: Err(error),
@@ -2430,9 +2444,18 @@ pub(crate) fn clear_plugin_configuration_for_host(owner_id: u64) -> PluginHostCl
     clear_plugin_configuration_inner()
 }
 
-pub(crate) struct PluginHostClearOutcome {
-    pub(crate) result: Result<()>,
-    pub(crate) callbacks_cleared: bool,
+/// What clearing a host-owned configuration produced.
+///
+/// `callbacks_cleared` is the half a caller must not ignore: a clear that
+/// reported success while a callback remained registered leaves code that is
+/// still reachable, so a composition that cannot prove removal retains its
+/// runtimes rather than unloading them.
+#[derive(Debug)]
+pub struct PluginHostClearOutcome {
+    /// The result of clearing, with any teardown failure in it.
+    pub result: Result<()>,
+    /// Whether every callback registered by this configuration was removed.
+    pub callbacks_cleared: bool,
 }
 
 fn clear_plugin_configuration_inner() -> PluginHostClearOutcome {
@@ -2511,12 +2534,20 @@ pub(crate) fn plugin_configuration_is_active() -> Result<bool> {
         })
 }
 
-pub(crate) struct PluginHostLease {
+/// The process-wide right to own a dynamic plugin configuration.
+///
+/// Claimed by whoever composes an activation, held for as long as the
+/// activation lives, and released when it drops. One activation per process is
+/// the invariant: a second one would register into the same registries and
+/// could not say which of them a callback came from.
+#[must_use = "dropping the lease releases the process-wide plugin ownership it claimed"]
+pub struct PluginHostLease {
     owner_id: u64,
 }
 
 impl PluginHostLease {
-    pub(crate) fn owner_id(&self) -> u64 {
+    /// The identifier this lease's owner clears its configuration with.
+    pub fn owner_id(&self) -> u64 {
         self.owner_id
     }
 }
@@ -2531,7 +2562,13 @@ impl Drop for PluginHostLease {
     }
 }
 
-pub(crate) fn acquire_plugin_host_lease() -> Result<PluginHostLease> {
+/// Claim the process-wide right to own a dynamic plugin configuration.
+///
+/// Public for the composition that owns an activation, for the same reason
+/// [`clear_plugin_configuration_for_host`] is: deciding when this process may
+/// hold plugin configuration is the composition's job, and the kernel's job is
+/// to say whether the claim is free.
+pub fn acquire_plugin_host_lease() -> Result<PluginHostLease> {
     let mut owner = PLUGIN_MUTATION_OWNER.lock().map_err(|err| {
         PluginError::Internal(format!("plugin mutation owner lock poisoned: {err}"))
     })?;

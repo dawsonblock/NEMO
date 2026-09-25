@@ -17,6 +17,8 @@
 //! anything is moved across a process boundary, and it is the implementation
 //! that the process backend will replace.
 
+pub mod activation;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};

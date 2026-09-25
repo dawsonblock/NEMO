@@ -1759,6 +1759,120 @@ async fn killing_the_host_does_not_kill_the_kernel() {
 }
 
 #[tokio::test]
+async fn the_shared_composition_runs_a_native_plugin_in_another_process() {
+    use nemo_relay::plugin::ConfigReport;
+    use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+    use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
+
+    // The composition every binding and the CLI share. What a binding needs to
+    // know is only this: `activate` returning `Ok` means the plugin is live, and
+    // the plugin is live *somewhere else* — which is the property the isolation
+    // milestone exists for and the one a caller cannot infer from a successful
+    // call.
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-shared",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let activation = ActivatedPluginRuntime::activate(
+        nemo_relay::plugin::PluginConfig::default(),
+        [DynamicPluginActivationSpec {
+            plugin_id: "fixture_intercept".into(),
+            kind: nemo_relay::plugin::dynamic::DynamicPluginKind::RustDynamic,
+            manifest_ref: fixture.artifact(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }],
+        IsolationPolicy {
+            supervisor: host_config(),
+            registration_cap_millis: 5_000,
+            observability: nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+                budget_millis: 5_000,
+                max_in_flight: 8,
+            },
+            after_native_startup: None,
+        },
+    )
+    .await
+    .expect("the shared composition activates a plugin from another process");
+
+    let child = activation
+        .native_process_id()
+        .expect("a native plugin runs in a host process");
+    assert_ne!(
+        child,
+        std::process::id(),
+        "the plugin must not run in the process that asked for it"
+    );
+    assert!(
+        !activation.native().expect("native plugins").is_empty(),
+        "the composition reports the plugin it loaded"
+    );
+    assert_eq!(activation.report().diagnostics.len(), 0);
+    assert!(matches!(activation.report(), ConfigReport { .. }));
+
+    // Clearing ends the host and releases the process-wide ownership, so the
+    // next activation in this process can claim it — which is also how the test
+    // tells "torn down" from "still owned".
+    let native = activation.native().expect("native plugins");
+    assert!(!native.registrations().is_empty());
+    activation.clear().expect("the composition clears");
+    let _released = nemo_relay::plugin::acquire_plugin_host_lease()
+        .expect("clearing releases the process-wide ownership");
+}
+
+#[tokio::test]
+async fn a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwards() {
+    use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+    use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-missing-host",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let mut supervisor = host_config();
+    supervisor.executable = PathBuf::from("/nonexistent/nemo-plugin-host");
+
+    let error = match ActivatedPluginRuntime::activate(
+        nemo_relay::plugin::PluginConfig::default(),
+        [DynamicPluginActivationSpec {
+            plugin_id: "fixture_intercept".into(),
+            kind: nemo_relay::plugin::dynamic::DynamicPluginKind::RustDynamic,
+            manifest_ref: fixture.artifact(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }],
+        IsolationPolicy {
+            supervisor,
+            registration_cap_millis: 5_000,
+            observability: nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+                budget_millis: 5_000,
+                max_in_flight: 8,
+            },
+            after_native_startup: None,
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("a host that is not installed cannot be started"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    // The failure is the actionable one rather than a fallback: an installation
+    // without a host is told where the host was expected, and the plugin is
+    // never loaded in this process to compensate.
+    assert!(message.contains("does not exist"), "{message}");
+    assert!(message.contains("NEMO_RELAY_PLUGIN_HOST"), "{message}");
+    assert!(error.as_plugin_error().is_some(), "{error:?}");
+    let _released = nemo_relay::plugin::acquire_plugin_host_lease()
+        .expect("a failed activation releases the process-wide ownership");
+}
+
+#[tokio::test]
 async fn a_host_from_another_release_is_refused_before_any_operation() {
     // The host is a separate executable, and nothing in the process model makes
     // a deployment replace it together with the runtime that starts it: an

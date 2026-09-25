@@ -159,7 +159,16 @@ max_transitive_packages = 265
 # type and its documentation rather than new reach — the digests were already checked, and
 # no dependency moved and no `unsafe` did — and it is here because the next milestone makes
 # the bindings use this API rather than remember the convention.
-max_source_lines = 74734
+# Raised for the composition surface: the plugin ownership lease, the owner-scoped clear, and
+# the exact initializer are now public, with the documentation that says why a composition
+# outside the kernel needs each one. Nothing moved: the kernel still owns the registry, the
+# lease and the teardown, and this is the narrower of the two ways to let a composition drive
+# them — the alternative is the composition reaching the in-process activation API, which is
+# what the cutover removes. No dependency moved and no `unsafe` did.
+#
+# This is the last upward movement before the loader leaves: the next change to this number
+# is the deletion of the loader and the ABI bridge, and it moves down.
+max_source_lines = 74771
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -482,7 +491,14 @@ max_transitive_packages = 239
 # and before any capability, and the values a kernel offers are gathered into one struct so a
 # parameter list of seven strings cannot have two of them passed in the wrong order. No dependency
 # moved and no `unsafe` did.
-max_source_lines = 22352
+# Raised for the shared activation path: one module that claims the kernel's ownership, activates
+# the configuration's own components, starts the process-hosted plugins, rolls the whole thing
+# back if any stage fails, and refuses a worker plugin it cannot run rather than half-serving it.
+# It exists so the CLI and the bindings stop being four compositions with four lifecycles — the
+# security property this replaces is the drift between them. No dependency moved and no `unsafe`
+# did. Like the kernel's number above, this one moves down from here: the next change is the
+# loader leaving the kernel, not another stage arriving.
+max_source_lines = 22890
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -531,7 +547,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 74734
+raised_to = 74771
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"
