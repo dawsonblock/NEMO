@@ -303,6 +303,7 @@ jobs:
           set -e
           # SONAR_IGNORE_START: dependencies were fetched from Cargo.lock before dynamic package metadata is applied.
           cargo build --locked --offline --release --target "${{ matrix.target }}" -p nemo-relay-cli
+          cargo build --locked --offline --release --target "${{ matrix.target }}" -p nemo-relay-plugin-host
           # SONAR_IGNORE_END
 
       - name: Build CLI release binary in manylinux
@@ -320,6 +321,7 @@ jobs:
                 sh -s -- -y --profile minimal --default-toolchain "$NEMO_RELAY_RUST_VERSION"
               export PATH="$HOME/.cargo/bin:$PATH"
               cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-cli
+              cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-plugin-host
             '
 
       - name: Stage CLI binary artifact
@@ -332,19 +334,32 @@ jobs:
             version="dev-${GIT_COMMIT::8}"
           fi
           binary="nemo-relay"
+          host_binary="nemo-plugin-host"
           asset="nemo-relay-cli-${target}-${version}"
+          host_asset="nemo-plugin-host-${target}-${version}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             binary="${binary}.exe"
+            host_binary="${host_binary}.exe"
             asset="${asset}.exe"
+            host_asset="${host_asset}.exe"
           fi
           source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${binary}"
+          host_source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${host_binary}"
           if [ ! -f "$source" ]; then
             echo "Error: expected CLI binary at ${source}" >&2
+            exit 1
+          fi
+          if [ ! -f "$host_source" ]; then
+            echo "Error: expected plugin host binary at ${host_source}" >&2
             exit 1
           fi
           rm -rf "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli"
           mkdir -p "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli"
           cp "$source" "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli/${asset}"
+          # The host is a release asset of its own as well as a file inside the
+          # CLI wheel: install.sh and install.ps1 install both executables beside
+          # each other, and the CLI looks for the host beside itself.
+          cp "$host_source" "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli/${host_asset}"
 
       - name: Package CLI binary for PyPI
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}

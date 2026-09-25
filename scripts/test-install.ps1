@@ -181,6 +181,20 @@ try {
     Assert-Contains $pinnedVersion 'nemo-relay 0.3.0'
     Assert-NoTemporaryFiles $InstallDir
 
+    # 0.3.0 was published before the plugin host existed, so it is the case a
+    # release that predates the host still answers: the CLI installs and the
+    # installer says the installation cannot host a plugin rather than looking
+    # complete. The published-host case is covered by the mock installer tests on
+    # the shell side and by the live latest release once one publishes a host.
+    $TestsRun++
+    $env:NEMO_RELAY_VERSION = '0.3.0'
+    $hostDestination = Join-Path $InstallDir 'nemo-plugin-host.exe'
+    Invoke-Installer -Arguments @('-InstallDir', $InstallDir)
+    Assert-Success
+    Assert-Contains $RunOutput 'does not publish'
+    Assert-True (-not (Test-Path -LiteralPath $hostDestination)) 'the installer installed a host the release does not publish'
+    Assert-NoTemporaryFiles $InstallDir
+
     $TestsRun++
     $env:NEMO_RELAY_VERSION = '999.999.999'
     Invoke-Installer -Arguments @('-InstallDir', $InstallDir)

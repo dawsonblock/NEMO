@@ -232,7 +232,10 @@ jobs:
       # runner happens to have.
       - name: Add the static plugin host target
         if: ${{ !contains(matrix.platform, 'musl') && runner.os == 'Linux' }}
-        run: rustup target add "$(rustc -vV | sed -n 's/^host: //p' | sed 's/-gnu$/-musl/')"
+        run: |
+          set -e
+          host_target="$(rustc -vV | sed -n 's/^host: //p' | sed 's/-gnu$/-musl/')"
+          rustup target add "$host_target"
 
       - name: Derive Python package version
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}

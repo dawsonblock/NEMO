@@ -15,7 +15,10 @@ $GitHubApiUrl = "https://api.github.com/repos/$Repository"
 
 function Show-Usage {
     @'
-Install the NeMo Relay CLI from GitHub Releases.
+Install the NeMo Relay CLI and its plugin host from GitHub Releases.
+
+Both executables are installed into the same directory: the CLI starts the host
+to run native plugins outside its own process, and looks for it beside itself.
 
 Usage:
   irm https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.ps1 | iex
@@ -96,6 +99,38 @@ function Download-File([string]$Uri, [string]$Path) {
     }
 }
 
+function Try-Download-File([string]$Uri, [string]$Path) {
+    # Used for the host's checksum, where a release that predates the host
+    # answers 404 and that is a state to report rather than a failure to raise.
+    try {
+        Invoke-WebRequest -Uri $Uri -OutFile $Path -UseBasicParsing -TimeoutSec 300
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Assert-Checksum([string]$ChecksumFile, [string]$DownloadedFile, [string]$AssetName) {
+    $expectedChecksum = ((Get-Content -LiteralPath $ChecksumFile -TotalCount 1).Trim() -split '\s+')[0].ToLowerInvariant()
+    if ($expectedChecksum -notmatch '^[0-9a-f]{64}$') {
+        Fail "invalid checksum file for $AssetName"
+    }
+    $actualChecksum = (Get-FileHash -LiteralPath $DownloadedFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualChecksum -ne $expectedChecksum) {
+        Fail "checksum verification failed for $AssetName"
+    }
+}
+
+function Promote-File([string]$Staged, [string]$Destination, [string]$Backup) {
+    if (Test-Path -LiteralPath $Destination) {
+        [System.IO.File]::Replace($Staged, $Destination, $Backup)
+    }
+    else {
+        [System.IO.File]::Move($Staged, $Destination)
+    }
+}
+
 function Add-ToPath([string]$Value, [string]$Directory) {
     foreach ($entry in ($Value -split ';')) {
         if ($entry -and [string]::Equals($entry.Trim().TrimEnd('\'), $Directory, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -161,6 +196,15 @@ try {
     $asset = "nemo-relay-cli-$target-$version.exe"
     $assetUrl = "$GitHubUrl/releases/download/$version/$asset"
     $checksumUrl = "$assetUrl.sha256"
+    # The host is the executable that runs a native plugin outside this process,
+    # so an installation without one is an installation whose native plugins
+    # cannot be isolated. It travels with the CLI from the release that publishes
+    # it; a release that predates the host publishes nine assets and not ten, and
+    # installing the CLI alone is then the most this installer can do — loudly,
+    # because the runtime refuses to fall back to loading in process.
+    $hostAsset = "nemo-plugin-host-$target-$version.exe"
+    $hostAssetUrl = "$GitHubUrl/releases/download/$version/$hostAsset"
+    $hostChecksumUrl = "$hostAssetUrl.sha256"
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     if (-not (Test-Path -LiteralPath $InstallDir -PathType Container)) {
@@ -169,36 +213,50 @@ try {
     $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
     $downloadFile = Join-Path $InstallDir ".nemo-relay.download.$([guid]::NewGuid().ToString('N'))"
     $checksumFile = Join-Path $InstallDir ".nemo-relay.checksum.$([guid]::NewGuid().ToString('N'))"
+    $hostDownloadFile = Join-Path $InstallDir ".nemo-relay.host.$([guid]::NewGuid().ToString('N'))"
+    $hostChecksumFile = Join-Path $InstallDir ".nemo-relay.host-checksum.$([guid]::NewGuid().ToString('N'))"
     $backupFile = Join-Path $InstallDir ".nemo-relay.backup.$([guid]::NewGuid().ToString('N'))"
+    $hostBackupFile = Join-Path $InstallDir ".nemo-relay.host-backup.$([guid]::NewGuid().ToString('N'))"
     $destination = Join-Path $InstallDir 'nemo-relay.exe'
+    $hostDestination = Join-Path $InstallDir 'nemo-plugin-host.exe'
+    $hostAvailable = $false
 
     try {
         Write-Output "Downloading NeMo Relay CLI $version for $target..."
         Download-File $assetUrl $downloadFile
         Download-File $checksumUrl $checksumFile
+        Assert-Checksum $checksumFile $downloadFile $asset
 
-        $expectedChecksum = ((Get-Content -LiteralPath $checksumFile -TotalCount 1).Trim() -split '\s+')[0].ToLowerInvariant()
-        if ($expectedChecksum -notmatch '^[0-9a-f]{64}$') {
-            Fail "invalid checksum file for $asset"
-        }
-        $actualChecksum = (Get-FileHash -LiteralPath $downloadFile -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualChecksum -ne $expectedChecksum) {
-            Fail "checksum verification failed for $asset"
+        if (Try-Download-File $hostChecksumUrl $hostChecksumFile) {
+            Download-File $hostAssetUrl $hostDownloadFile
+            Assert-Checksum $hostChecksumFile $hostDownloadFile $hostAsset
+            $hostAvailable = $true
         }
 
-        if (Test-Path -LiteralPath $destination) {
-            [System.IO.File]::Replace($downloadFile, $destination, $backupFile)
+        # Everything is on disk and verified before either file is promoted, and
+        # the host is promoted first: the CLI is the executable that decides
+        # whether a host is started, so an upgrade interrupted between the two
+        # moves leaves the old decider beside a new dependency rather than a new
+        # decider beside an old one. Neither order can produce a silently
+        # mismatched pair, because the handshake compares the release each was
+        # built from before any plugin code loads.
+        if ($hostAvailable) {
+            Promote-File $hostDownloadFile $hostDestination $hostBackupFile
         }
-        else {
-            [System.IO.File]::Move($downloadFile, $destination)
-        }
+        Promote-File $downloadFile $destination $backupFile
     }
     finally {
-        Remove-Item -LiteralPath $downloadFile, $checksumFile, $backupFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $downloadFile, $checksumFile, $hostDownloadFile, $hostChecksumFile, $backupFile, $hostBackupFile -Force -ErrorAction SilentlyContinue
     }
 
     Add-InstallDirectoryToPath $InstallDir
     Write-Output "Installed NeMo Relay CLI $version to $destination"
+    if ($hostAvailable) {
+        Write-Output "Installed the plugin host to $hostDestination"
+    }
+    else {
+        Write-Warning "release $version does not publish $hostAsset (or it could not be fetched), so native plugins cannot be hosted outside this installation. Install a release that publishes the host, or set NEMO_RELAY_PLUGIN_HOST to a host built from this release."
+    }
     Write-Output "Added $InstallDir to the Windows user PATH. Newly opened shells inherit this change."
 }
 catch {
