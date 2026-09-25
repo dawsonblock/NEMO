@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import venv
 from pathlib import Path
@@ -68,9 +70,11 @@ def scripts_directory(environment: Path) -> Path:
     return environment / "bin"
 
 
-def run(command: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+def run(
+    command: list[str], env: dict[str, str] | None = None, cwd: str | None = None
+) -> subprocess.CompletedProcess[bytes]:
     """Run one command, returning its completed process without raising."""
-    return subprocess.run(command, capture_output=True, check=False, env=env)  # noqa: S603
+    return subprocess.run(command, capture_output=True, check=False, env=env, cwd=cwd)  # noqa: S603
 
 
 def without_host_configuration() -> dict[str, str]:
@@ -171,6 +175,65 @@ def verify_wheel(wheel: Path, cli_executable: str | None = None) -> None:
         print("the installed CLI runs: " + version_run.stdout.decode(errors="replace").strip())
 
 
+def verify_npm_package(tarball: Path) -> None:
+    """Install one built Node platform package and run the host it carries.
+
+    npm is asked to install the tarball into an empty project, which is the only
+    way to learn what a deployment receives: the package's own manifest decides
+    what npm unpacks, so a host the packer forgot is a host this cannot find
+    either. The addon resolves the executable from this same directory rather
+    than from `PATH`, which is why the check is about the installed tree and not
+    about whatever happens to be beside `node`.
+    """
+    if shutil.which("npm") is None:
+        raise SystemExit("npm is not on PATH, and a Node package cannot be installed without it")
+    with tarfile.open(tarball) as archive:
+        member = archive.extractfile("package/package.json")
+        if member is None:
+            raise SystemExit(f"{tarball.name} has no package/package.json")
+        manifest = json.load(member)
+    name = manifest["name"]
+    host_path = (
+        "bin/nemo-plugin-host.exe"
+        if any(os_name == "win32" for os_name in manifest.get("os", []))
+        else "bin/nemo-plugin-host"
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        project = Path(temporary)
+        (project / "package.json").write_text(
+            json.dumps({"name": "verify-installed-plugin-host", "private": True}) + "\n"
+        )
+        installed = run(
+            ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error", str(tarball)],
+            cwd=str(project),
+        )
+        if installed.returncode != 0:
+            raise SystemExit(
+                "installing the npm package failed:\n"
+                + installed.stdout.decode(errors="replace")
+                + installed.stderr.decode(errors="replace")
+            )
+
+        installed_host = project / "node_modules" / name / host_path
+        if not installed_host.is_file():
+            raise SystemExit(f"{name} installed without {host_path}")
+        if os.name != "nt" and not os.access(installed_host, os.X_OK):
+            raise SystemExit(f"{installed_host} is not executable")
+        print(f"installed {name} with a plugin host at {host_path}")
+
+        identity = run([str(installed_host)], env=without_host_configuration())
+        if identity.returncode != 2:
+            raise SystemExit(
+                f"{host_path} exited {identity.returncode} with no socket: " + identity.stderr.decode(errors="replace")
+            )
+        if HOST_IDENTITY_MESSAGE not in identity.stderr.decode(errors="replace"):
+            raise SystemExit(
+                f"{host_path} did not identify itself as the plugin host: " + identity.stderr.decode(errors="replace")
+            )
+        print("the installed plugin host runs and identifies itself")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse verification arguments."""
     parser = argparse.ArgumentParser()
@@ -181,6 +244,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="an already-built wheel to install and check instead of building one",
+    )
+    parser.add_argument(
+        "--npm-package",
+        type=Path,
+        default=None,
+        help="an already-built Node platform package to install and check",
     )
     parser.add_argument(
         "--cli",
@@ -197,6 +266,12 @@ def main() -> None:
     args = parse_args()
     if shutil.which("python") is None and not Path(sys.executable).is_file():
         raise SystemExit("no interpreter to build a virtual environment with")
+    if args.npm_package is not None:
+        if not args.npm_package.is_file():
+            raise SystemExit(f"npm package does not exist: {args.npm_package}")
+        print(f"installing {args.npm_package.name}")
+        verify_npm_package(args.npm_package)
+        return
     if args.wheel is not None:
         if not args.wheel.is_file():
             raise SystemExit(f"wheel does not exist: {args.wheel}")

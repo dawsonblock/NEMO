@@ -26,6 +26,7 @@ class Platform:
     npm_os: str
     npm_cpu: str
     binary: str
+    host_executable: str
     libc: str | None = None
 
     @property
@@ -33,17 +34,75 @@ class Platform:
         """Return the public npm package name."""
         return f"{PACKAGE_NAME}-{self.package_suffix}"
 
+    @property
+    def host_path(self) -> str:
+        """Return the host's path inside the package."""
+        return f"bin/{self.host_executable}"
+
 
 PLATFORMS = {
     platform.key: platform
     for platform in (
-        Platform("linux-amd64", "linux-x64-gnu", "linux", "x64", "nemo-relay.linux-x64-gnu.node", "glibc"),
-        Platform("linux-arm64", "linux-arm64-gnu", "linux", "arm64", "nemo-relay.linux-arm64-gnu.node", "glibc"),
-        Platform("linux-musl-amd64", "linux-x64-musl", "linux", "x64", "nemo-relay.linux-x64-musl.node", "musl"),
-        Platform("linux-musl-arm64", "linux-arm64-musl", "linux", "arm64", "nemo-relay.linux-arm64-musl.node", "musl"),
-        Platform("macos-arm64", "darwin-arm64", "darwin", "arm64", "nemo-relay.darwin-arm64.node"),
-        Platform("windows-amd64", "win32-x64-msvc", "win32", "x64", "nemo-relay.win32-x64-msvc.node"),
-        Platform("windows-arm64", "win32-arm64-msvc", "win32", "arm64", "nemo-relay.win32-arm64-msvc.node"),
+        Platform(
+            "linux-amd64",
+            "linux-x64-gnu",
+            "linux",
+            "x64",
+            "nemo-relay.linux-x64-gnu.node",
+            "nemo-plugin-host",
+            "glibc",
+        ),
+        Platform(
+            "linux-arm64",
+            "linux-arm64-gnu",
+            "linux",
+            "arm64",
+            "nemo-relay.linux-arm64-gnu.node",
+            "nemo-plugin-host",
+            "glibc",
+        ),
+        Platform(
+            "linux-musl-amd64",
+            "linux-x64-musl",
+            "linux",
+            "x64",
+            "nemo-relay.linux-x64-musl.node",
+            "nemo-plugin-host",
+            "musl",
+        ),
+        Platform(
+            "linux-musl-arm64",
+            "linux-arm64-musl",
+            "linux",
+            "arm64",
+            "nemo-relay.linux-arm64-musl.node",
+            "nemo-plugin-host",
+            "musl",
+        ),
+        Platform(
+            "macos-arm64",
+            "darwin-arm64",
+            "darwin",
+            "arm64",
+            "nemo-relay.darwin-arm64.node",
+            "nemo-plugin-host",
+        ),
+        Platform(
+            "windows-amd64",
+            "win32-x64-msvc",
+            "win32",
+            "x64",
+            "nemo-relay.win32-x64-msvc.node",
+            "nemo-plugin-host.exe",
+        ),
+        Platform(
+            "windows-arm64",
+            "win32-arm64-msvc",
+            "win32",
+            "arm64",
+            "nemo-relay.win32-arm64-msvc.node",
+            "nemo-plugin-host.exe",
+        ),
     )
 }
 
@@ -75,15 +134,28 @@ def metapackage_files(manifest: dict[str, object]) -> list[str]:
     return sorted(files)
 
 
-def build_native_package(node_dir: Path, platform: Platform, version: str, output: Path) -> Path:
-    """Build one OS- and CPU-constrained native npm package."""
+def build_native_package(
+    node_dir: Path,
+    platform: Platform,
+    version: str,
+    output: Path,
+    host_binary: Path,
+) -> Path:
+    """Build one OS- and CPU-constrained native npm package.
+
+    The platform package carries `nemo-plugin-host` as well as the addon. The
+    host is the executable that runs a native plugin outside the runtime's
+    process, and the addon resolves it from its own directory rather than from
+    `PATH` or from wherever `node` happens to be, because a binding that guessed
+    would be a binding that could run a different host than the release it is.
+    """
     source_manifest = json.loads((node_dir / "package.json").read_text())
     manifest = {
         "name": platform.package_name,
         "version": version,
         **repository_metadata(source_manifest),
         "main": platform.binary,
-        "files": [platform.binary],
+        "files": [platform.binary, platform.host_path],
         "os": [platform.npm_os],
         "cpu": [platform.npm_cpu],
     }
@@ -92,6 +164,8 @@ def build_native_package(node_dir: Path, platform: Platform, version: str, outpu
     binary = node_dir / platform.binary
     if not binary.is_file():
         raise FileNotFoundError(f"Node native binary does not exist: {binary}")
+    if not host_binary.is_file():
+        raise FileNotFoundError(f"plugin host binary does not exist: {host_binary}")
     artifact_suffix = f"{platform.npm_os}-{platform.npm_cpu}"
     if platform.libc == "musl":
         artifact_suffix += "-musl"
@@ -99,6 +173,7 @@ def build_native_package(node_dir: Path, platform: Platform, version: str, outpu
     with tarfile.open(destination, "w:gz") as archive:
         add_tar_bytes(archive, "package/package.json", json.dumps(manifest, indent=2).encode() + b"\n")
         add_tar_bytes(archive, f"package/{platform.binary}", binary.read_bytes(), mode=0o755)
+        add_tar_bytes(archive, f"package/{platform.host_path}", host_binary.read_bytes(), mode=0o755)
         add_tar_bytes(archive, "package/LICENSE", (ROOT / "LICENSE").read_bytes())
     return destination
 
@@ -130,6 +205,12 @@ def parse_args() -> argparse.Namespace:
     """Parse Node package assembly arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--node-dir", type=Path, default=ROOT / "crates" / "node")
+    parser.add_argument(
+        "--host-binary",
+        type=Path,
+        required=True,
+        help="the nemo-plugin-host executable built for the platform being packaged",
+    )
     parser.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -142,7 +223,13 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     artifacts = [
-        build_native_package(args.node_dir, PLATFORMS[args.platform], args.version, args.output_dir),
+        build_native_package(
+            args.node_dir,
+            PLATFORMS[args.platform],
+            args.version,
+            args.output_dir,
+            args.host_binary,
+        ),
     ]
     if args.metapackage:
         artifacts.append(build_metapackage(args.node_dir, args.version, args.output_dir))

@@ -54,9 +54,11 @@ class PackageNodeBinTests(unittest.TestCase):
                 (node_dir / filename).write_text(filename)
             binary_name = "nemo-relay.linux-x64-gnu.node"
             (node_dir / binary_name).write_bytes(b"native")
+            host_binary = output / "nemo-plugin-host"
+            host_binary.write_bytes(b"host")
 
             platform = PACKAGE_NODE_BIN.PLATFORMS["linux-amd64"]
-            native = PACKAGE_NODE_BIN.build_native_package(node_dir, platform, "0.7.0-rc.1", output)
+            native = PACKAGE_NODE_BIN.build_native_package(node_dir, platform, "0.7.0-rc.1", output, host_binary)
             metapackage = PACKAGE_NODE_BIN.build_metapackage(node_dir, "0.7.0-rc.1", output)
 
             self.assertEqual(native.name, "nemo-relay-node-npm-linux-x64-0.7.0-rc.1.tgz")
@@ -68,6 +70,12 @@ class PackageNodeBinTests(unittest.TestCase):
                 self.assertEqual(manifest["libc"], ["glibc"])
                 self.assertEqual(manifest["main"], binary_name)
                 self.assertEqual(required_member(archive, f"package/{binary_name}").read(), b"native")
+                # The host travels inside the platform package, executable, at
+                # the path the addon resolves it from.
+                self.assertIn("bin/nemo-plugin-host", manifest["files"])
+                host = archive.getmember("package/bin/nemo-plugin-host")
+                self.assertEqual(host.mode, 0o755)
+                self.assertEqual(required_member(archive, "package/bin/nemo-plugin-host").read(), b"host")
                 self.assertNotIn("package/index.js", archive.getnames())
 
             self.assertEqual(metapackage.name, "nemo-relay-node-npm-0.7.0-rc.1.tgz")

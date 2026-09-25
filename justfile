@@ -1984,11 +1984,36 @@ package-node:
                 ;;
         esac
     fi
+    # The host travels inside the platform package rather than beside the
+    # checkout: it is the executable that runs a native plugin outside the
+    # runtime's process, and the addon resolves it from its own directory. Built
+    # here, after the version was written, so the addon and the host inside one
+    # package are the same release; built static on Linux, so it runs on the
+    # glibc floor the package is tagged for rather than on this machine's.
+    host_directory="target/release"
+    host_build=(cargo build --release -p nemo-relay-plugin-host)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        host_target="${node_target:-$(rustc -vV | sed -n 's/^host: //p')}"
+        host_target="$(printf '%s\n' "$host_target" | sed 's/-gnu$/-musl/')"
+        if [[ -z "$host_target" ]] || ! rustup target list --installed 2>/dev/null | grep -qx "$host_target"; then
+            echo "Error: the static target ${host_target:-<unknown>} is not installed; add it with:" >&2
+            echo "  rustup target add ${host_target:-<target>}" >&2
+            exit 1
+        fi
+        host_directory="target/${host_target}/release"
+        host_build=(cargo build --release -p nemo-relay-plugin-host --target "$host_target")
+    fi
+    "${host_build[@]}"
+    host_executable="nemo-plugin-host"
+    case "$node_platform" in
+        windows-*) host_executable="nemo-plugin-host.exe" ;;
+    esac
     package_args=(
         --node-dir crates/node
         --platform "$node_platform"
         --version "$package_version"
         --output-dir "$package_dir"
+        --host-binary "${host_directory}/${host_executable}"
     )
     if [[ "$node_platform" == "linux-amd64" ]]; then
         package_args+=(--metapackage)
@@ -2212,3 +2237,12 @@ verify-installed-wheel wheel cli="":
         args+=(--cli "{{ cli }}")
     fi
     uv run --no-project python scripts/verify-installed-plugin-host.py "${args[@]}"
+
+# Verify that a built Node platform package installs a runnable plugin host.
+# --set npm_package=<path>
+verify-installed-npm-package npm_package:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv run --no-project python scripts/verify-installed-plugin-host.py \
+        --npm-package "{{ npm_package }}"

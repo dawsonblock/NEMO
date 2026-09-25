@@ -202,7 +202,14 @@ jobs:
 
       - name: Install Node Rust target
         if: ${{ startsWith(matrix.platform, 'linux-') }}
-        run: rustup target add ${{ matrix.node_target }}
+        run: |
+          set -e
+          rustup target add ${{ matrix.node_target }}
+          # The platform package carries the plugin host as well as the addon,
+          # and it is built static so it runs on the glibc floor the package is
+          # tagged for rather than on this builder's.
+          host_target="$(printf '%s\n' "${{ matrix.node_target }}" | sed 's/-gnu$/-musl/')"
+          rustup target add "$host_target"
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
