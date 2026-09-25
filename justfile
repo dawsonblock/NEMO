@@ -2309,3 +2309,25 @@ verify-installed-npm-package npm_package:
     cd "$NEMO_RELAY_REPO_ROOT"
     uv run --no-project python scripts/verify-installed-plugin-host.py \
         --npm-package "{{ npm_package }}"
+
+# Run a native plugin against an installed Python runtime, or require its refusal.
+# --set python=<interpreter> expect=runs|refused [host=<path>]
+verify-installed-python-plugin python expect host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    fixture_name="libnemo_relay_plugin_fixture.so"
+    case "$(uname -s)" in
+        Darwin) fixture_name="libnemo_relay_plugin_fixture.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) fixture_name="nemo_relay_plugin_fixture.dll" ;;
+    esac
+    fixture="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures/debug/$fixture_name"
+    args=(
+        --python "{{ python }}"
+        --fixture "$fixture"
+        --expect "{{ expect }}"
+    )
+    if [[ -n "{{ host }}" ]]; then
+        args+=(--host "{{ host }}")
+    fi
+    uv run --no-project python scripts/verify-installed-python-plugin.py "${args[@]}"
