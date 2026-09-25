@@ -27,8 +27,8 @@ use nemo_relay::api::registry::{
 use nemo_relay::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use nemo_relay::plugin::dynamic::DynamicPluginKind;
 use nemo_relay::plugin::{
-    ConfigDiagnostic, Plugin, PluginRegistration, PluginRegistrationContext, deregister_plugin,
-    ensure_builtin_plugins_registered, register_plugin,
+    ConfigDiagnostic, Plugin, PluginComponentSpec, PluginRegistration, PluginRegistrationContext,
+    deregister_plugin, ensure_builtin_plugins_registered, register_plugin,
 };
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
@@ -2117,7 +2117,7 @@ async fn plugin_activation_covers_empty_invalid_and_missing_manifest_paths() {
     let inactive = PluginActivation::initialize(None, Vec::new())
         .await
         .unwrap();
-    assert!(!inactive.active);
+    assert!(inactive.runtime.is_none());
     inactive.clear().unwrap();
 
     let invalid = PluginActivation::initialize(
@@ -2143,7 +2143,19 @@ async fn plugin_activation_covers_empty_invalid_and_missing_manifest_paths() {
     .err()
     .expect("dynamic Switchyard plugin without a manifest should reach dynamic activation");
     let dynamic_switchyard = dynamic_switchyard.to_string();
-    assert!(dynamic_switchyard.contains("native dynamic plugin"));
+    // The lane is no longer named in this message: the manifest is resolved once
+    // for every dynamic plugin on the way into the shared activation, which
+    // partitions them afterwards. What has to stay true is that a dynamic
+    // Switchyard plugin reaches dynamic activation rather than being mistaken for
+    // the removed built-in one.
+    assert!(
+        dynamic_switchyard.contains("dynamic plugin"),
+        "{dynamic_switchyard}"
+    );
+    assert!(
+        dynamic_switchyard.contains("switchyard"),
+        "{dynamic_switchyard}"
+    );
     assert!(!dynamic_switchyard.contains("removed in NeMo Relay 0.8"));
 
     let worker = PluginActivation::initialize(
@@ -5850,7 +5862,8 @@ async fn cli_activation_serves_a_native_plugin_from_another_process() {
     )
     .await
     .expect("a native plugin the CLI can serve");
-    assert!(activation.active);
+    let runtime = activation.runtime.as_ref().expect("a native composition");
+    assert!(runtime.is_active());
 
     // The plugin is loaded somewhere, and that somewhere is not here: the
     // in-process loader registers the plugin's kind in this process's registry,
@@ -5861,17 +5874,12 @@ async fn cli_activation_serves_a_native_plugin_from_another_process() {
         "the CLI process must not have loaded the plugin: {kinds:?}"
     );
     assert!(
-        activation
-            .native
-            .as_ref()
-            .and_then(|native| native.backend().process_id())
-            .is_some(),
+        runtime.native_process_id().is_some(),
         "the plugin lives in a host process"
     );
     assert!(
-        !activation
-            .native
-            .as_ref()
+        !runtime
+            .native()
             .expect("a native composition")
             .handles()
             .is_empty(),
