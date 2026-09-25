@@ -32,7 +32,7 @@ use nemo_relay::api::tool::{
 use nemo_relay::codec::response::AnnotatedLlmResponse;
 use nemo_relay::plugin::dynamic::{
     DynamicPluginActivationSpec, DynamicPluginKind, NativePluginLoadSpec, PluginHostActivation,
-    load_native_plugins,
+    load_native_plugins, plugin_artifact_identity,
 };
 use nemo_relay::plugin::{
     ConfigDiagnostic, Plugin, PluginComponentSpec, PluginConfig, PluginRegistrationContext,
@@ -227,12 +227,8 @@ async fn the_tool_sanitize_runner_returns_the_sanitized_copy_in_process() {
 
     // Held for the test's duration: dropping it unloads the library, and the
     // runner below needs the guardrail it registered.
-    let _activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        approved_identity: None,
-    }])
-    .expect("native plugin should load");
+    let _activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native plugin should load");
     let mut cleanup = NativePluginTestCleanup::new();
 
     let mut plugin_config = PluginConfig::default();
@@ -273,15 +269,8 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
     let fixture = build_fixture_plugin();
     let manifest_ref = write_manifest(&fixture);
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }])
-    .expect("native plugin should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native plugin should load");
     let mut cleanup = NativePluginTestCleanup::new();
 
     let mut plugin_config = PluginConfig::default();
@@ -775,15 +764,8 @@ async fn native_v3_async_registration_supports_all_middleware_kinds() {
         "nemo_relay_fixture_async_entry",
     );
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_async".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }])
-    .expect("v3 async native fixture should load");
+    let activation = load_native_plugins([load_spec("fixture_async", &manifest_ref)])
+        .expect("v3 async native fixture should load");
     let fixture_library = unsafe { libloading::Library::new(&fixture.library_path) }
         .expect("loaded v3 async native fixture should open for synchronization");
     let pending_entered = unsafe {
@@ -955,15 +937,8 @@ async fn native_validation_diagnostics_prevent_initialization() {
     let fixture = build_fixture_plugin();
     let manifest_ref = write_manifest(&fixture);
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }])
-    .expect("native plugin should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native plugin should load");
 
     let mut plugin_config = PluginConfig::default();
     plugin_config.components.push(PluginComponentSpec {
@@ -1147,14 +1122,7 @@ fn native_loader_rejects_missing_library() {
     });
 
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native", &manifest_ref),
         "missing library should fail",
     );
     assert!(error.contains("does not exist"), "{error}");
@@ -1226,15 +1194,9 @@ fn native_loader_resolves_manifest_directory_and_relative_library_paths() {
         integrity: None,
     });
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: fixture.manifest_dir.path().to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }])
-    .expect("native plugin should load from manifest directory");
+    let activation =
+        load_native_plugins([load_spec("fixture_native", fixture.manifest_dir.path())])
+            .expect("native plugin should load from manifest directory");
     activation.clear();
 }
 
@@ -1326,14 +1288,7 @@ fn native_loader_rejects_unsupported_relay_requirement_before_loading() {
     });
 
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native", &manifest_ref),
         "unsupported relay requirement should fail",
     );
     assert!(error.contains("requires relay"), "{error}");
@@ -1355,14 +1310,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         ),
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_expected_id".into(),
-            manifest_ref: mismatched_id.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_expected_id", &mismatched_id),
         "manifest id mismatch should fail",
     );
     assert!(error.contains("does not match expected id"), "{error}");
@@ -1378,14 +1326,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         ),
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: invalid_relay.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native", &invalid_relay),
         "invalid relay requirement should fail",
     );
     assert!(
@@ -1404,14 +1345,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         ),
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: unsupported_native_api.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native", &unsupported_native_api),
         "unsupported native API should fail",
     );
     assert!(error.contains("compat.native_api = \"1\""), "{error}");
@@ -1441,14 +1375,7 @@ entrypoint = "fixture.worker:create_plugin"
 "#,
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_worker".into(),
-            manifest_ref: worker_manifest.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_worker", &worker_manifest),
         "worker manifest should fail native loading",
     );
     assert!(error.contains("only supports rust_dynamic"), "{error}");
@@ -1465,15 +1392,8 @@ async fn native_loader_records_where_every_registration_attaches() {
     let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
     let fixture = build_fixture_plugin();
     let manifest_ref = write_manifest(&fixture);
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }])
-    .expect("fixture should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("fixture should load");
     let mut cleanup = NativePluginTestCleanup::new();
 
     // Native registration is config-driven, so a freshly loaded plugin has
@@ -1705,57 +1625,93 @@ fn native_loader_rejects_missing_symbol_digest_mismatch_and_kind_mismatch() {
 
     let missing_symbol = write_manifest_with_symbol(&fixture, "missing_native_symbol");
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: missing_symbol.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native", &missing_symbol),
         "missing symbol should fail",
     );
     assert!(error.contains("symbol"), "{error}");
 
     let digest_match = write_manifest_with_integrity(&fixture, &sha256(&fixture.library_path));
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: digest_match.to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }])
-    .expect("matching digest should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &digest_match)])
+        .expect("matching digest should load");
     activation.clear();
 
     let digest_mismatch = write_manifest_with_integrity(&fixture, "sha256:deadbeef");
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: digest_mismatch.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native", &digest_mismatch),
         "digest mismatch should fail",
     );
     assert!(error.contains("sha256 mismatch"), "{error}");
 
     let wrong_kind = write_manifest_with_plugin_id(&fixture, "fixture_native_mismatch");
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native_mismatch".into(),
-            manifest_ref: wrong_kind.to_string_lossy().into_owned(),
-            // The loader's own tests load without an approval: they
-            // exercise what the loader does with an artifact, not what
-            // a runtime approved.
-            approved_identity: None,
-        },
+        load_spec("fixture_native_mismatch", &wrong_kind),
         "plugin kind mismatch should fail",
     );
     assert!(error.contains("returned kind"), "{error}");
+}
+
+/// The approval that arrives from another side is confirmed, not believed.
+///
+/// The side that performs a load is not always the side that approved it: over
+/// the process boundary the digests travel with the request, and the loader here
+/// is the one that has to hold them against the artifact it is about to open.
+/// Every refusal names which half disagreed, so "the digests were checked" is
+/// something the message says rather than something the reader assumes.
+#[test]
+fn a_load_confirms_an_approval_that_arrived_from_elsewhere() {
+    use nemo_relay_plugin_protocol::PluginArtifactIdentity;
+
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.blocking_lock();
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture).to_string_lossy().into_owned();
+    let (manifest_sha256, library_sha256) =
+        plugin_artifact_identity(&manifest_ref).expect("the fixture's identity");
+
+    // Another manifest's digest: the approval does not describe what is here.
+    let wrong_manifest = expect_native_load_error(
+        NativePluginLoadSpec::with_approved_identity(
+            "fixture_native",
+            manifest_ref.clone(),
+            PluginArtifactIdentity {
+                manifest_sha256: "0".repeat(64),
+                library_sha256: library_sha256.clone(),
+            },
+        ),
+        "an approval naming another manifest should fail",
+    );
+    assert!(
+        wrong_manifest.contains("not the approved artifact"),
+        "{wrong_manifest}"
+    );
+
+    // Another library's digest: the manifest is the approved one and the bytes
+    // it names are not, which is the half a manifest check on its own misses.
+    let wrong_library = expect_native_load_error(
+        NativePluginLoadSpec::with_approved_identity(
+            "fixture_native",
+            manifest_ref.clone(),
+            PluginArtifactIdentity {
+                manifest_sha256: manifest_sha256.clone(),
+                library_sha256: "0".repeat(64),
+            },
+        ),
+        "an approval naming another library should fail",
+    );
+    assert!(wrong_library.contains("was approved"), "{wrong_library}");
+
+    // And the identity that describes this artifact loads, which is what makes
+    // the two refusals above about the disagreement rather than about the
+    // constructor being unusable.
+    let activation = load_native_plugins([NativePluginLoadSpec::with_approved_identity(
+        "fixture_native",
+        manifest_ref,
+        PluginArtifactIdentity {
+            manifest_sha256,
+            library_sha256,
+        },
+    )])
+    .expect("the artifact the approval names should load");
+    activation.clear();
 }
 
 #[test]
@@ -2595,14 +2551,11 @@ where
 }
 
 fn load_spec(plugin_id: &str, manifest_ref: &Path) -> NativePluginLoadSpec {
-    NativePluginLoadSpec {
-        plugin_id: plugin_id.into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        // The loader's own tests load without an approval: they
-        // exercise what the loader does with an artifact, not what
-        // a runtime approved.
-        approved_identity: None,
-    }
+    // The loader's own tests load without an approval: they exercise what the
+    // loader does with an artifact, not what a runtime approved. The spec's
+    // approval field is private so that this is a thing a caller has to write,
+    // and the constructor that says it is the one used here.
+    NativePluginLoadSpec::development(plugin_id, manifest_ref.to_string_lossy().into_owned())
 }
 
 fn host_spec(plugin_id: &str, manifest_ref: &Path) -> DynamicPluginActivationSpec {

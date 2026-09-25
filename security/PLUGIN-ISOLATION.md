@@ -995,6 +995,23 @@ holds the supervisor that starts it and the backend that reaches it.
   would change `@loader_path` for plugins that resolve resources relative to
   themselves. That is a decision about the plugin-loading contract rather than a
   hardening detail, so it is written down here instead of taken silently.
+- **And a load cannot be built without saying which artifact it was approved
+  for.** The loader used to take an `Option<PluginArtifactIdentity>` in a struct
+  with public fields, so "load this path with nothing approved" was expressible
+  by omitting a field — a weaker guarantee that a caller could reach by
+  accident. The approval is now a type of its own, `ApprovedPluginArtifact`, and
+  it is the *only* thing the load accepts: `ApprovedPluginArtifact::approve`
+  hashes an artifact, `from_identity` records an approval made elsewhere, and a
+  spec is built by `NativePluginLoadSpec::approved` (approve here),
+  `with_approved_identity` (an approval that travelled with a request, which the
+  loader still confirms), or `development` (nothing approved — the weaker
+  guarantee, named so that choosing it is a deliberate act). The spec's approval
+  field is private, so the three constructors are the whole way in and no
+  shipped path takes the third. What this buys is legibility rather than
+  strength — the digests were already checked — and it buys it at the place the
+  next milestone needs it: when the bindings cut over, "which artifact was
+  approved and by whom" is part of the API they have to use rather than a
+  convention they have to remember.
 - **What the handshake binds.** Protocol version, runtime binding and frame
   limit are all checked on both sides. A host started under one runtime is
   refused by another, and a host that accepted a read capability it was not

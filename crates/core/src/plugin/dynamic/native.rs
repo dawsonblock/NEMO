@@ -91,21 +91,59 @@ use super::{
 };
 use nemo_relay_plugin_protocol::PluginArtifactIdentity;
 
+/// An artifact whose bytes this side has approved.
+///
+/// The loader takes one of these rather than a reference plus a pair of digests
+/// it may or may not have: what a load is allowed to open is decided by hashing
+/// the artifact, and this value is where that decision lives. Approving is the
+/// only way to make one, and the production load accepts nothing weaker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPluginArtifact {
+    identity: PluginArtifactIdentity,
+}
+
+impl ApprovedPluginArtifact {
+    /// Approve the artifact at `manifest_ref` by hashing it now.
+    pub fn approve(manifest_ref: &str) -> crate::plugin::Result<Self> {
+        let (manifest_sha256, library_sha256) = plugin_artifact_identity(manifest_ref)?;
+        Ok(Self {
+            identity: PluginArtifactIdentity {
+                manifest_sha256,
+                library_sha256,
+            },
+        })
+    }
+
+    /// Record an approval that was made elsewhere and travelled here.
+    ///
+    /// Recording is not trusting: the loader still confirms these digests
+    /// against the bytes of the manifest and of an open handle to the library
+    /// immediately before either is used, so an approval that does not describe
+    /// this artifact is a refused load rather than a load without a guarantee.
+    pub fn from_identity(identity: PluginArtifactIdentity) -> Self {
+        Self { identity }
+    }
+
+    /// What was approved.
+    pub fn identity(&self) -> &PluginArtifactIdentity {
+        &self.identity
+    }
+}
+
 /// Native plugin load request derived from host dynamic-plugin state.
+///
+/// Built through one of the constructors below and nowhere else, so that a load
+/// says out loud which kind of load it is. The approval is private for that
+/// reason: a caller cannot assemble a spec out of parts and leave the approval
+/// out, because leaving it out is a thing one has to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativePluginLoadSpec {
     /// Expected plugin kind.
     pub plugin_id: String,
     /// Path to the authored `relay-plugin.toml`.
     pub manifest_ref: String,
-    /// The identity the runtime approved, when it approved one.
-    ///
-    /// `None` means the caller has no approved identity to confirm, and the
-    /// loader falls back to whatever integrity the manifest itself declares.
-    /// Every shipped path passes `Some`: the approval is the reason the digests
-    /// exist, and a load that cannot say what it was told to load cannot confirm
-    /// anything.
-    pub approved_identity: Option<PluginArtifactIdentity>,
+    /// The artifact this load is allowed to open, when anything was approved.
+    approval: Option<ApprovedPluginArtifact>,
 }
 
 impl NativePluginLoadSpec {
@@ -120,15 +158,54 @@ impl NativePluginLoadSpec {
         manifest_ref: impl Into<String>,
     ) -> crate::plugin::Result<Self> {
         let manifest_ref = manifest_ref.into();
-        let (manifest_sha256, library_sha256) = plugin_artifact_identity(&manifest_ref)?;
+        let artifact = ApprovedPluginArtifact::approve(&manifest_ref)?;
         Ok(Self {
             plugin_id: plugin_id.into(),
             manifest_ref,
-            approved_identity: Some(PluginArtifactIdentity {
-                manifest_sha256,
-                library_sha256,
-            }),
+            approval: Some(artifact),
         })
+    }
+
+    /// Build a spec around an approval another side made and sent here.
+    ///
+    /// This is the process boundary's constructor: the side that loads is not
+    /// the side that approved, so the digests arrive with the request and the
+    /// loader confirms them. It is a production constructor for that reason —
+    /// there is nothing weaker about an approval made in the kernel and checked
+    /// in the host than one made in the host — and it is separate from
+    /// `approved` so that "who decided this artifact was the right one" is not
+    /// hidden behind a boolean.
+    pub fn with_approved_identity(
+        plugin_id: impl Into<String>,
+        manifest_ref: impl Into<String>,
+        identity: PluginArtifactIdentity,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref: manifest_ref.into(),
+            approval: Some(ApprovedPluginArtifact::from_identity(identity)),
+        }
+    }
+
+    /// Build a spec for an artifact nobody approved.
+    ///
+    /// The loader then falls back to whatever integrity the manifest itself
+    /// declares, and to loading the library where it sits rather than from a
+    /// staged copy. That is a weaker guarantee and it is meant to read as one:
+    /// the loader's own tests use this to exercise what a load does with an
+    /// artifact, and no shipped path does. Naming it is deliberate — the field
+    /// it fills is private so that omitting approval is always written down.
+    pub fn development(plugin_id: impl Into<String>, manifest_ref: impl Into<String>) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref: manifest_ref.into(),
+            approval: None,
+        }
+    }
+
+    /// What this load is allowed to open, when anything was approved.
+    pub fn approval(&self) -> Option<&ApprovedPluginArtifact> {
+        self.approval.as_ref()
     }
 }
 
@@ -690,15 +767,15 @@ fn load_one_native_plugin(
         ))
     })?;
     let manifest_sha256 = sha256_hex(&manifest_bytes);
-    if let Some(approved) = &spec.approved_identity
-        && approved.manifest_sha256 != manifest_sha256
+    if let Some(approved) = spec.approval()
+        && approved.identity().manifest_sha256 != manifest_sha256
     {
         return Err(PluginError::RegistrationFailed(format!(
             "dynamic plugin '{}' is not the approved artifact: '{}' hashes to \
              {manifest_sha256}, while {} was approved",
             spec.plugin_id,
             manifest_path.display(),
-            approved.manifest_sha256
+            approved.identity().manifest_sha256
         )));
     }
     let manifest_ref = manifest_path.to_string_lossy().into_owned();
@@ -770,17 +847,17 @@ fn load_one_native_plugin(
     // the copy is what the loader opens. A load with nothing approved keeps the
     // old in-place behaviour and its post-load re-check, because there is no
     // identity to bind it to.
-    let (library_path, staging) = match &spec.approved_identity {
+    let (library_path, staging) = match spec.approval() {
         Some(approved) => {
-            let (staged, guard) = stage_verified_library(&library_path, &approved.library_sha256)?;
+            let (staged, guard) =
+                stage_verified_library(&library_path, &approved.identity().library_sha256)?;
             (staged, Some(guard))
         }
         None => (library_path.clone(), None),
     };
     let verified_library_sha256 = spec
-        .approved_identity
-        .as_ref()
-        .map(|approved| approved.library_sha256.clone());
+        .approval()
+        .map(|approved| approved.identity().library_sha256.clone());
     let symbol = load
         .symbol
         .as_deref()

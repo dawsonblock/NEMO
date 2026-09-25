@@ -268,18 +268,19 @@ impl PluginExecutionBackend for InProcessPluginBackend {
             // handle immediately before it opens the library, so the digest and
             // the file it describes are the same instance.
             let approved = request.identity.clone();
-            let activation = match load_native_plugins([NativePluginLoadSpec {
-                plugin_id: request.plugin_id.clone(),
-                manifest_ref: request.artifact.clone(),
-                approved_identity: Some(approved.clone()),
-            }]) {
-                Ok(activation) => activation,
-                Err(error) => {
-                    // Release the reservation so a later attempt is possible.
-                    self.loaded().remove(&request.plugin_id);
-                    return Err(refused(error.to_string()));
-                }
-            };
+            let activation =
+                match load_native_plugins([NativePluginLoadSpec::with_approved_identity(
+                    request.plugin_id.clone(),
+                    request.artifact.clone(),
+                    approved.clone(),
+                )]) {
+                    Ok(activation) => activation,
+                    Err(error) => {
+                        // Release the reservation so a later attempt is possible.
+                        self.loaded().remove(&request.plugin_id);
+                        return Err(refused(error.to_string()));
+                    }
+                };
 
             // Checked rather than wrapping: a generation that silently reused a
             // number would let a stale handle address a newer instance, which

@@ -153,7 +153,13 @@ max_transitive_packages = 265
 #
 # Raised once more for the kernel's deadline test: the constant became a ceiling, and the
 # test that pins inheritance, shortening and capping is four lines of budget arithmetic.
-max_source_lines = 74657
+# Raised for the approved-artifact type: the loader now takes an `ApprovedPluginArtifact`
+# rather than an optional identity in a struct with public fields, so the three ways to ask
+# for a load name themselves and a load with nothing approved has to be written. It is a
+# type and its documentation rather than new reach — the digests were already checked, and
+# no dependency moved and no `unsafe` did — and it is here because the next milestone makes
+# the bindings use this API rather than remember the convention.
+max_source_lines = 74734
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -456,7 +462,11 @@ max_transitive_packages = 239
 # it. That removes a structural re-entrancy dependency — a single-lane caller can no longer make a
 # plugin's codec call fail — and the two LLM qualifications now run on a current-thread caller to
 # keep it that way. No dependency moved and no `unsafe` did.
-max_source_lines = 22211
+# Raised by one line for the same commit's other change: the load the host performs names its
+# approval with `NativePluginLoadSpec::with_approved_identity` rather than filling a field, and
+# the one-line break that costs is the whole of the growth. No dependency moved and no `unsafe`
+# did.
+max_source_lines = 22212
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
@@ -501,7 +511,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 74657
+raised_to = 74734
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"
