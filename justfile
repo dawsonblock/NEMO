@@ -2146,15 +2146,26 @@ package-python-plugin:
     python_executable="$(project_python_executable)"
     "$python_executable" scripts/validate_python_plugin_package.py
 
-# Package a prebuilt CLI binary for PyPI.
-package-cli-bin binary target version package_dir:
+# Package a prebuilt CLI binary and its plugin host for PyPI.
+package-cli-bin binary host_binary target version package_dir:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "$NEMO_RELAY_REPO_ROOT"
     args=(
         --binary "{{ binary }}"
+        --host-binary "{{ host_binary }}"
         --target "{{ target }}"
         --version "{{ version }}"
         --output-dir "{{ package_dir }}"
     )
     uv run --no-project python scripts/package-cli-bin.py "${args[@]}"
+
+# Verify that an installed CLI wheel carries a plugin host it can start.
+# --set binary=<path> host_binary=<path>
+verify-installed-host binary host_binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv run --no-project python scripts/verify-installed-plugin-host.py \
+        --binary "{{ binary }}" \
+        --host-binary "{{ host_binary }}"

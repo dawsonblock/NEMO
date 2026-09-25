@@ -38,6 +38,11 @@ Install the latest stable release:
 pip install nemo-relay-cli-bin
 ```
 
+This wheel installs `nemo-plugin-host` beside the `nemo-relay` executable. The
+CLI starts that host to run native plugins outside its own process, and it looks
+for it in the directory holding the executable that started it, so the two are
+installed together rather than separately.
+
 To install the Python API and matching CLI together:
 
 ```bash

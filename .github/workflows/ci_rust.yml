@@ -352,18 +352,43 @@ jobs:
           set -euo pipefail
           target="${{ matrix.target }}"
           binary="nemo-relay"
+          host_binary="nemo-plugin-host"
           if [ "${{ runner.os }}" = "Windows" ]; then
             binary="${binary}.exe"
+            host_binary="${host_binary}.exe"
           fi
           source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${binary}"
+          host_source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${host_binary}"
           version="$NEMO_RELAY_CLI_PACKAGE_VERSION"
           rm -rf "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli-packages"
           mkdir -p "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli-packages"
           python scripts/package-cli-bin.py \
             --binary "$source" \
+            --host-binary "$host_source" \
             --target "$target" \
             --version "$version" \
             --output-dir "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli-packages"
+
+      # The wheel is installed into a virtual environment that has nothing else
+      # in it and exercised from there, because a package that installs cleanly
+      # and then cannot start its own plugin host is the failure this packaging
+      # exists to prevent, and only an installation can show it.
+      - name: Verify the CLI wheel carries a usable plugin host
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="nemo-relay"
+          host_binary="nemo-plugin-host"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            binary="${binary}.exe"
+            host_binary="${host_binary}.exe"
+          fi
+          python scripts/verify-installed-plugin-host.py \
+            --binary "${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${binary}" \
+            --host-binary "${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${host_binary}" \
+            --target "$target" \
+            --version "$NEMO_RELAY_CLI_PACKAGE_VERSION"
 
       - name: Upload CLI binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -453,9 +478,11 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             venv_python="${RUNNER_TEMP}/nemo-relay-cli-venv/Scripts/python.exe"
             venv_cli="${RUNNER_TEMP}/nemo-relay-cli-venv/Scripts/nemo-relay.exe"
+            venv_host="${RUNNER_TEMP}/nemo-relay-cli-venv/Scripts/nemo-plugin-host.exe"
           else
             venv_python="${RUNNER_TEMP}/nemo-relay-cli-venv/bin/python"
             venv_cli="${RUNNER_TEMP}/nemo-relay-cli-venv/bin/nemo-relay"
+            venv_host="${RUNNER_TEMP}/nemo-relay-cli-venv/bin/nemo-plugin-host"
           fi
           # SONAR_IGNORE_START: local wheel with no dependencies or index access.
           uv pip install --python "$venv_python" --no-deps --no-index "$wheel"
@@ -463,6 +490,24 @@ jobs:
           wheel_version="$("$venv_cli" --version)"
           if [ "$binary_version" != "$wheel_version" ]; then
             echo "Error: CLI binary reports '$binary_version' but wheel reports '$wheel_version'" >&2
+            exit 1
+          fi
+          # The plugin host travels with the CLI, in the directory the
+          # supervisor looks in when a deployment names no host: the one
+          # holding the executable that started the process. A wheel that
+          # installed without it would pass everything above and fail the
+          # first time a deployment used a native plugin.
+          test -x "$venv_host"
+          host_status=0
+          "$venv_host" >/dev/null 2>host-stderr || host_status=$?
+          if [ "$host_status" -ne 2 ]; then
+            echo "Error: the installed plugin host exited ${host_status} with no socket" >&2
+            cat host-stderr >&2
+            exit 1
+          fi
+          if ! grep -q "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set" host-stderr; then
+            echo "Error: the installed nemo-plugin-host is not the plugin host" >&2
+            cat host-stderr >&2
             exit 1
           fi
 
@@ -488,6 +533,14 @@ jobs:
               wheel_version="$(/tmp/nemo-relay-cli-venv/bin/nemo-relay --version)"
               if [ "$binary_version" != "$wheel_version" ]; then
                 echo "Error: CLI binary and wheel versions differ" >&2
+                exit 1
+              fi
+              test -x /tmp/nemo-relay-cli-venv/bin/nemo-plugin-host
+              host_status=0
+              /tmp/nemo-relay-cli-venv/bin/nemo-plugin-host >/dev/null 2>host-stderr || host_status=$?
+              if [ "$host_status" -ne 2 ] || ! grep -q "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set" host-stderr; then
+                echo "Error: the installed plugin host is not a usable host" >&2
+                cat host-stderr >&2
                 exit 1
               fi
             '

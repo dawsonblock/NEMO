@@ -2252,6 +2252,54 @@ session's capability, and every operation after that presents the capability too
 Nothing in this matrix changes the ordering that moves the metric: coverage, then
 the cutover, then the loader leaving, which is what finally drops the 622.
 
+## The host has to reach a deployment before isolation can be mandatory
+
+Isolation is only as available as the executable that provides it. The supervisor
+starts `nemo-plugin-host` from the directory holding the executable that started
+*it* — for a binding loaded into Python, the interpreter's own directory — so a
+wheel that installs the runtime and not the host installs a runtime whose native
+plugins cannot be hosted. That failure is quiet at install time and loud at first
+use, which is the worst order, and it is why packaging is a prerequisite of the
+cutover rather than a release detail: making the process backend mandatory while
+the shipped artifact cannot start one would turn a working in-process path into a
+failing out-of-process path.
+
+**What the CLI platform wheel carries now.** `scripts/package-cli-bin.py` puts
+`nemo-relay` and `nemo-plugin-host` in the wheel's `.data/scripts`, which is the
+directory pip installs executables into — the same directory the supervisor
+probes first, so the lookup and the installation agree by construction rather
+than by coincidence of a development checkout. The platform records name the
+Windows spellings too, because a wheel that shipped `nemo-plugin-host` where the
+supervisor looks for `nemo-plugin-host.exe` would install a file nothing starts.
+
+**And the property is checked by installing, not by reading.** Two checks, at
+two levels:
+
+- `scripts/tests/test_package_cli_bin.py` asserts the wheel's layout: both
+  executables present, both marked executable, in the same directory.
+- `scripts/verify-installed-plugin-host.py` (and `just verify-installed-host`)
+  builds the wheel, creates a virtual environment, installs into it with no
+  index and no dependencies, and exercises the installation: the host is
+  beside the interpreter, it *runs* and identifies itself — started with no
+  socket it exits 2 saying the socket variable is unset — and the CLI reports
+  its version. The identity check is what makes the check about the right
+  binary rather than about a file of the right name: run against a wheel whose
+  "host" is a second copy of the CLI, it fails.
+- CI runs the same verification in `Package` and asserts the installed host in
+  `PackageSmoke`, where the wheel under test is the artifact that was uploaded
+  rather than one built in the same step.
+
+**What this does not yet cover, named so it is not mistaken for done.** The
+release *assets* — what `install.sh` and `install.ps1` fetch — still contain only
+`nemo-relay`, so a deployment installed from an asset rather than from a wheel
+has a CLI and no host beside it. Node and FFI have no distribution model for the
+host at all yet: npm's convention is a platform-specific optional dependency and
+the FFI surface has no packaging step of its own, and both need the same
+treatment the CLI wheel got. None of the three bindings starts the host today,
+because none of them has cut over, so what is missing right now is the two
+artifacts rather than a running failure — the failure arrives with the cutover,
+which is exactly when this has to be finished.
+
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process
 implementation the kernel used before. That is deliberate — the boundary and its
