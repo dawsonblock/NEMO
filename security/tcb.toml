@@ -510,7 +510,12 @@ max_transitive_packages = 240
 # for the transaction — because a caller that stops waiting midway through an activation must
 # not be able to leave the process-owned half-applied. No direct dependency moved and no `unsafe`
 # did.
-max_source_lines = 23180
+# Raised by thirty-four lines for the fidelity a refusal carries across the boundary: a refusal
+# from the host is mapped back to the plugin-error kind it corresponds to, so a caller can still
+# tell a rejected plugin from a crashed host, and the executor one worker rather than a
+# current-thread runtime so a lane that spawns onto the runtime driving it is not refused. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 23214
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"

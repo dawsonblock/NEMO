@@ -447,10 +447,10 @@ impl ActivatedPluginRuntime {
                 )
                 .await
                 .map_err(|error| {
-                    PluginActivationError::Plugin(PluginError::RegistrationFailed(format!(
-                        "native plugin load failed: {}",
-                        error.failure.message
-                    )))
+                    PluginActivationError::Plugin(context(
+                        "native plugin load failed",
+                        plugin_error_from_boundary(error),
+                    ))
                 })?,
             );
         }
@@ -698,7 +698,12 @@ fn activation_executor()
         std::thread::Builder::new()
             .name("nemo-relay-plugin-activation".to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
+                // One worker rather than a current-thread runtime: the lanes a
+                // transaction starts may spawn onto the runtime that is driving
+                // them, and a runtime that cannot accept a spawn from another
+                // thread turns that into a refusal the caller never asked for.
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
                     .enable_all()
                     .build()
                 {
@@ -775,6 +780,35 @@ fn validate_dynamic_plugin_specs(
         }
     }
     Ok(())
+}
+
+/// The plugin error a boundary refusal corresponds to.
+///
+/// A refusal that arrives from the host is as specific as the one the kernel
+/// would have produced in process, and the kind is the part a caller acts on: a
+/// binding that cannot tell "the plugin was rejected" from "the host crashed"
+/// reports both as the same failure, and a caller loses the half it could have
+/// fixed. Anything with no closer equivalent stays a registration failure, which
+/// is what "this activation did not happen" means.
+fn plugin_error_from_boundary(
+    error: nemo_relay_plugin_protocol::PluginProtocolError,
+) -> PluginError {
+    use nemo_relay_plugin_protocol::PluginFailureCode;
+
+    let message = error.failure.message;
+    match error.failure.code {
+        PluginFailureCode::Rejected | PluginFailureCode::MalformedResponse => {
+            PluginError::InvalidConfig(message)
+        }
+        PluginFailureCode::UnknownPlugin | PluginFailureCode::Unavailable => {
+            PluginError::NotFound(message)
+        }
+        PluginFailureCode::AlreadyLoading
+        | PluginFailureCode::AlreadyLoaded
+        | PluginFailureCode::StaleHandle
+        | PluginFailureCode::GenerationExhausted => PluginError::Conflict(message),
+        _ => PluginError::RegistrationFailed(message),
+    }
 }
 
 /// Add the context a failure is about, keeping the kind it carries.
