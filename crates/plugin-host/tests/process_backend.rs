@@ -534,11 +534,12 @@ async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
 // plugin's callback calls the codec, the host answers that call by asking the kernel, the
 // kernel runs the codec it holds against the reference it issued, and the sanitized request
 // comes back to be published here.
-#[tokio::test]
-#[ignore = "the codec bridge's nested call does not reach the kernel yet: the sanitize \
-            invocation runs out its budget with the bridge holding a job the kernel never \
-            answers. Recorded as a finding rather than advertised; see \
-            security/PLUGIN-ISOLATION.md. Run with `-- --ignored` after the fix."]
+// Multi-threaded, and that is a finding rather than a preference: the kernel serves the
+// plugin's codec call *while* the call that needs it is in flight, and a single-threaded kernel
+// runtime does not get to serve it — the sanitize invocation then runs out its budget and the
+// family omits the payload. The class is served under that constraint until the kernel's own
+// callback service gets the same treatment the off-path transport gave the tool sanitizers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_llm_request_sanitizer_resolves_the_calls_codec_through_the_kernel() {
     use nemo_relay::api::llm::LlmRequest;
     use nemo_relay::codec::openai_chat::OpenAIChatCodec;

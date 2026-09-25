@@ -9,11 +9,14 @@ SPDX-License-Identifier: Apache-2.0
 chronological record, so numbers inside it may be the ones that were true when a
 section was written):
 
-- **Registration coverage: 14 of 16.** Pinned by
+- **Registration coverage: 15 of 16.** Pinned by
   `the_boundary_serves_a_named_subset_of_the_registration_surface` in
-  `crates/plugin-host/tests/architecture.rs`; the unserved pair is the two LLM
-  sanitizers, and the codec capability protocol they need is in place and served,
-  with three steps left before the pair can be advertised.
+  `crates/plugin-host/tests/architecture.rs`. The LLM request sanitizer crossed when
+  its qualification did — the codec capability protocol, the bridge that turns a
+  plugin's synchronous codec call into the kernel's asynchronous one, and a real child
+  resolving the call's codec through the kernel. The one that remains is the LLM
+  *response* sanitizer, which is the same shape and needs its own qualification rather
+  than an assumption.
 - **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/plugin`).
 - **Plugin compatibility:** the CLI serves plugins from another process; FFI, Node
@@ -1782,6 +1785,43 @@ Three steps remain, in this order:
    call;
 3. the host arms rebuild the context, run the door, and answer.
 
+**The nested call completes, and the class is served — 15 of 16.** The host side of the
+request sanitizer works end to end: the proxy issues a capability for the sanitize invocation
+and holds the guard for exactly that call, the host arm builds the context the plugin's callback
+sees, and a plugin's *synchronous* codec call is turned into the kernel's *asynchronous* one by a
+bridge that opens and drives its own connection on its own runtime — the affinity rule this
+repository has now paid for three times. A real child resolves the call's codec through the
+kernel and the published request carries what the codec read, which is the qualification this
+class needed.
+
+**What the hunt cost, recorded because it will save the next session the same week.** The
+symptom was a sanitize invocation that ran out its budget while the bridge sat on a job the
+kernel never answered, and the obvious readings were all wrong: it was not the caller's runtime
+flavour, not the capability record, not the codec, not the nesting, and not the second
+connection — the control in the tree proves a second connection works, called from an ordinary
+async task, in ten milliseconds. Instrumenting *inside* the call then showed the whole round trip
+completing, which left only the code around it: the bridge's own `Drop` joined its thread before
+giving up the sender, so the thread's `receive` never ended and the dropper waited on a thread
+waiting on the dropper. Every call succeeded and the teardown hung, and the sanitize invocation
+waiting on that answer read it as a timeout. Both tests are in the tree — the isolated bridge and
+its async control — and the drop is the regression they hold.
+
+**One constraint the class carries, named rather than hidden.** The kernel serves the plugin's
+codec call *while* the call that needs it is in flight, and a single-threaded kernel runtime does
+not get to serve it: the qualification test is multi-threaded for that reason, and the fixture
+keeps its LLM sanitizer behind a configuration key so every other composition test does not wait
+out a budget. That is the same shape of problem the tool sanitizers had before the off-path
+transport, and it wants the same treatment on the kernel side of this path.
+
+Three steps remain, in this order:
+
+1. the host process answers a plugin's codec calls by asking the kernel over that RPC, so
+   the SDK's invocation-scoped codec handle works where the plugin runs;
+2. the kernel-side proxy per LLM sanitize class issues the capability for the sanitize
+   invocation, sends the reference with the payload and holds the guard for exactly the
+   call;
+3. the host arms rebuild the context, run the door, and answer.
+
 **The first step is built and the nested call does not complete — recorded, not advertised.**
 The host side of the request sanitizer is in: the arm builds the context the plugin's callback
 sees, and because a plugin reaches its codec through a *synchronous* ABI call while the work is
@@ -1877,7 +1917,9 @@ the codec the call is using would have to either refuse calls that have one — 
 **the pair stays unserved and the count stays 14 of 16**: implementation existing is not
 qualification, and neither is half a protocol.
 
-**Class coverage: 14 of 16.** The three that crossed together are the mark, scope-start
+**Class coverage: 14 of 16** *(at the time this section was written; the LLM request
+sanitizer has since crossed, and the current figure is at the top of this document)*.
+The three that crossed together are the mark, scope-start
 and scope-end sanitizers: one shape, one projection, and one installer parameterised
 by class. What each needed was a kernel proxy, a host-side runner and a core door that
 runs exactly the registration the kernel names, and all three were qualified through a

@@ -534,6 +534,7 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
         Operation::MarkSanitizeGuardrail,
         Operation::ScopeSanitizeStartGuardrail,
         Operation::ScopeSanitizeEndGuardrail,
+        Operation::LlmSanitizeRequestGuardrail,
     ];
     assert_eq!(
         served, expected,
@@ -548,10 +549,7 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     // *completion*-scoped ABI object. A unary invocation across the boundary has no
     // completion to hang one on, so this pair is the one the codec-reference
     // protocol has to be settled for before either direction can be advertised.
-    let not_served = [
-        Operation::LlmSanitizeRequestGuardrail,
-        Operation::LlmSanitizeResponseGuardrail,
-    ];
+    let not_served = [Operation::LlmSanitizeResponseGuardrail];
     for operation in not_served {
         assert!(
             !served.contains(&operation),

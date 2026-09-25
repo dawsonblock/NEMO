@@ -212,7 +212,11 @@ struct CodecBridge {
     /// inside the plugin's code, and the thread that answers must never block the runtime it
     /// drives. A blocking receive on a `current_thread` runtime would starve the very
     /// connection the answer arrives on.
-    jobs: tokio::sync::mpsc::UnboundedSender<CodecJob>,
+    ///
+    /// `Option` so the drop below can give the sender up *before* it waits: the thread's
+    /// `recv` returns nothing only once no sender is left, and joining first is a hang of the
+    /// dropper's own making — which is exactly what this cost once.
+    jobs: Option<tokio::sync::mpsc::UnboundedSender<CodecJob>>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -226,8 +230,10 @@ struct CodecJob {
 
 impl Drop for CodecBridge {
     fn drop(&mut self) {
-        // The sender drops with the struct, which ends the loop; joining here keeps a
-        // bridge from outliving its host by a thread.
+        // Give the sender up first: that is what ends the loop, and joining before it is a
+        // hang the dropper builds for itself. Then join, so a bridge cannot outlive its host
+        // by a thread.
+        drop(self.jobs.take());
         if let Ok(mut thread) = self.thread.lock()
             && let Some(thread) = thread.take()
         {
@@ -270,24 +276,33 @@ impl CodecBridge {
                         }
                     };
                     while let Some(job) = queue.recv().await {
-                        let answer = client
-                            .resolve_codec(
-                                &session_id,
-                                &job.operation_request_id,
-                                job.operation,
-                                &job.payload_json,
-                                &job.reference,
-                            )
-                            .await;
-                        // A caller that gave up is the plugin's business, not this task's: the
-                        // work was asked for and was done.
-                        let _ = job.answer.send(answer);
+                        // Each call is a *task* rather than the future this `block_on` is
+                        // driving. Two reasons, and the second is the one that was measured:
+                        // two plugin callbacks can want the codec at once, and a call driven as
+                        // the `block_on` future itself did not come back, while the same call
+                        // driven from a task does.
+                        let client = client.clone();
+                        let session_id = session_id.clone();
+                        tokio::spawn(async move {
+                            let answer = client
+                                .resolve_codec(
+                                    &session_id,
+                                    &job.operation_request_id,
+                                    job.operation,
+                                    &job.payload_json,
+                                    &job.reference,
+                                )
+                                .await;
+                            // A caller that gave up is the plugin's business, not this task's:
+                            // the work was asked for and was done.
+                            let _ = job.answer.send(answer);
+                        });
                     }
                 });
             })
             .expect("a codec bridge thread");
         Arc::new(Self {
-            jobs,
+            jobs: Some(jobs),
             thread: std::sync::Mutex::new(Some(thread)),
         })
     }
@@ -301,15 +316,17 @@ impl CodecBridge {
         reference: &str,
     ) -> Result<String, String> {
         let (answer, received) = std::sync::mpsc::channel();
-        self.jobs
-            .send(CodecJob {
-                operation,
-                operation_request_id: operation_request_id.to_string(),
-                payload_json,
-                reference: reference.to_string(),
-                answer,
-            })
-            .map_err(|_| "this host's codec bridge has stopped".to_string())?;
+        let Some(jobs) = self.jobs.as_ref() else {
+            return Err("this host's codec bridge has stopped".to_string());
+        };
+        jobs.send(CodecJob {
+            operation,
+            operation_request_id: operation_request_id.to_string(),
+            payload_json,
+            reference: reference.to_string(),
+            answer,
+        })
+        .map_err(|_| "this host's codec bridge has stopped".to_string())?;
         received
             .recv()
             .map_err(|_| "this host's codec bridge stopped before answering".to_string())?
@@ -494,17 +511,15 @@ mod tests {
     /// a capability issued for one operation, and a *blocking* caller on a thread of its own —
     /// which is what a plugin's synchronous codec call is.
     ///
-    /// It hangs, and that is the finding rather than a defect in the test. Its control — the
-    /// same socket, the same capability, the same call made from the async task instead of a
-    /// bridge thread — passes, which rules the connection and the service out: a *second
-    /// connection* works, and a client driven from an ordinary async context works. What does
-    /// not work is the same call driven from the bridge's own thread and runtime, and the shape
-    /// has been changed twice without helping (one `block_on` for the connection and the calls,
-    /// a multi-thread runtime instead of a current-thread one). The next thing to try is not
-    /// another shape: it is to find out what the bridge's thread does that a task does not, by
-    /// instrumenting the call itself rather than the code around it.
-    #[ignore = "hangs: a bridge thread's call over its own connection never returns; see \
-                security/PLUGIN-ISOLATION.md. Run with `-- --ignored` after the fix."]
+    /// It hung, and finding out why is what this pair of tests is for. Its control — the same
+    /// socket, the same capability, the same call made from the async task instead of a bridge
+    /// thread — passed, which ruled out the connection, the service and the codec. Instrumenting
+    /// the call itself then showed the whole round trip completing, which left only the code
+    /// *around* it: `CodecBridge::drop` joined the thread before giving up the sender, so the
+    /// thread's `recv` never ended and the dropper waited on a thread waiting on the dropper.
+    /// The bridge passed every call and hung on its own teardown, and the sanitize invocation
+    /// that was waiting for the answer read that as a timeout. The drop now gives the sender up
+    /// first, and this test is the regression for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_bridge_reaches_a_kernel_over_a_connection_it_opens_itself() {
         use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;

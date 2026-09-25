@@ -443,7 +443,10 @@ max_transitive_packages = 239
 # bug: the control that passes (a second connection called from an async task) and the case that
 # hangs (the same call driven from the bridge's own thread), both in the tree because a finding
 # without its control is an anecdote. No dependency moved and no `unsafe` did.
-max_source_lines = 21818
+# Raised for the regression that came out of the codec bridge's hunt: the bridge's own drop
+# order, which every call survived and which hung only on teardown. No dependency moved and no
+# `unsafe` did.
+max_source_lines = 21835
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "a269212d567fbbd7ae107dd5711c2bc7e3976069f5300a9ec4f9929a765e4c11"
