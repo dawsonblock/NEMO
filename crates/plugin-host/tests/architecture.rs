@@ -535,6 +535,7 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
         Operation::ScopeSanitizeStartGuardrail,
         Operation::ScopeSanitizeEndGuardrail,
         Operation::LlmSanitizeRequestGuardrail,
+        Operation::LlmSanitizeResponseGuardrail,
     ];
     assert_eq!(
         served, expected,
@@ -549,14 +550,9 @@ fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     // *completion*-scoped ABI object. A unary invocation across the boundary has no
     // completion to hang one on, so this pair is the one the codec-reference
     // protocol has to be settled for before either direction can be advertised.
-    let not_served = [Operation::LlmSanitizeResponseGuardrail];
-    for operation in not_served {
-        assert!(
-            !served.contains(&operation),
-            "{operation:?} is not served yet; if it has become servable, this list \
-             is what the bindings' cutover was waiting for"
-        );
-    }
+    // Nothing is left unserved. The half stays, empty, so the day a class is added to the ABI
+    // it has to be a decision rather than a silent addition to the served list.
+    let not_served: [Operation; 0] = [];
     assert_eq!(
         served.len() + not_served.len(),
         16,

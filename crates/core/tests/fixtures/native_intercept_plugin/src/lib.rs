@@ -59,6 +59,12 @@ pub const LLM_SANITIZE_REQUEST_MARKER: &str = "fixture_llm_sanitize_request";
 /// handed an identity it could not use records why.
 pub const LLM_SANITIZE_CODEC_MARKER: &str = "fixture_llm_sanitize_codec";
 
+/// The key an LLM response sanitizer adds to the copy an end event carries.
+pub const LLM_SANITIZE_RESPONSE_MARKER: &str = "fixture_llm_sanitize_response";
+
+/// The key that records which response codec the LLM response sanitizer resolved.
+pub const LLM_SANITIZE_RESPONSE_CODEC_MARKER: &str = "fixture_llm_sanitize_response_codec";
+
 /// The metadata key the first mark sanitizer adds.
 ///
 /// Three mark sanitizers rather than one because the property these fixtures exist
@@ -346,6 +352,24 @@ impl NativePlugin for InterceptPlugin {
                 }
                 Ok(Some(request))
             },
+            )?;
+            ctx.register_llm_sanitize_response_guardrail(
+                "fixture_llm_sanitize_response",
+                0,
+                |mut response, context| async move {
+                    let resolved = match context.resolve_codec() {
+                        Some(codec) => match codec.decode(&response) {
+                            Ok(annotated) => annotated.id.unwrap_or_else(|| "decoded".to_string()),
+                            Err(error) => format!("codec failed: {error}"),
+                        },
+                        None => "no codec".to_string(),
+                    };
+                    if let Json::Object(object) = &mut response {
+                        object.insert(LLM_SANITIZE_RESPONSE_MARKER.into(), json!(true));
+                        object.insert(LLM_SANITIZE_RESPONSE_CODEC_MARKER.into(), json!(resolved));
+                    }
+                    Ok(Some(response))
+                },
             )?;
         }
         // The failure shapes are behaviours rather than classes, so a test asks for

@@ -209,6 +209,7 @@ pub struct RegistrationProxies {
     scope_sanitize_start: Vec<String>,
     scope_sanitize_end: Vec<String>,
     llm_sanitize_request: Vec<String>,
+    llm_sanitize_response: Vec<String>,
     tool_sanitize_request: Vec<String>,
     tool_execution_intercepts: Vec<String>,
     llm_execution_intercepts: Vec<String>,
@@ -232,6 +233,7 @@ impl std::fmt::Debug for RegistrationProxies {
             .field("scope_sanitize_start", &self.scope_sanitize_start)
             .field("scope_sanitize_end", &self.scope_sanitize_end)
             .field("llm_sanitize_request", &self.llm_sanitize_request)
+            .field("llm_sanitize_response", &self.llm_sanitize_response)
             .field("tool_sanitize_request", &self.tool_sanitize_request)
             .field("tool_execution_intercepts", &self.tool_execution_intercepts)
             .field("llm_execution_intercepts", &self.llm_execution_intercepts)
@@ -258,6 +260,7 @@ impl RegistrationProxies {
             .chain(self.scope_sanitize_start.iter())
             .chain(self.scope_sanitize_end.iter())
             .chain(self.llm_sanitize_request.iter())
+            .chain(self.llm_sanitize_response.iter())
             .chain(self.tool_sanitize_request.iter())
             .chain(self.tool_execution_intercepts.iter())
             .chain(self.llm_execution_intercepts.iter())
@@ -305,6 +308,10 @@ impl Drop for RegistrationProxies {
                 registration,
             );
         }
+        for registration in &self.llm_sanitize_response {
+            let _ =
+                nemo_relay::api::registry::deregister_llm_sanitize_response_guardrail(registration);
+        }
         for registration in &self.llm_sanitize_request {
             let _ =
                 nemo_relay::api::registry::deregister_llm_sanitize_request_guardrail(registration);
@@ -346,6 +353,7 @@ pub fn install(
         scope_sanitize_start: Vec::new(),
         scope_sanitize_end: Vec::new(),
         llm_sanitize_request: Vec::new(),
+        llm_sanitize_response: Vec::new(),
         tool_sanitize_request: Vec::new(),
         tool_execution_intercepts: Vec::new(),
         llm_execution_intercepts: Vec::new(),
@@ -395,6 +403,14 @@ pub fn install(
                 install_llm_sanitize_request(&context, registration, &handle)?;
                 installed
                     .llm_sanitize_request
+                    .push(registration.registration_id.clone());
+            }
+            // The other direction of the same shape: the payload is a response and the codec
+            // beside it is the call's response codec.
+            PluginRegistrationOperation::LlmSanitizeResponseGuardrail => {
+                install_llm_sanitize_response(&context, registration, &handle)?;
+                installed
+                    .llm_sanitize_response
                     .push(registration.registration_id.clone());
             }
             // The three event sanitize families. One installer parameterised by
@@ -457,21 +473,13 @@ pub fn install(
                 installed
                     .llm_stream_execution_intercepts
                     .push(registration.registration_id.clone());
-            }
-            other => {
-                // Refused rather than skipped. A registration the kernel cannot
-                // proxy would be one the plugin believes it made and the
-                // runtime never calls, and silence is the worst of the three
-                // possible answers.
-                return Err(PluginProtocolError::new(
-                    PluginFailureCode::Rejected,
-                    format!(
-                        "plugin {} registered {} and this kernel cannot proxy it",
-                        descriptor.plugin_id,
-                        other.as_str()
-                    ),
-                ));
-            }
+            } // There is no arm for a class this kernel cannot proxy, because there is no such
+              // class: every attachment point the ABI exposes is installed above. That is a
+              // stronger statement than the refusal that used to live here — a class added to
+              // the ABI fails to compile in this match rather than being refused at runtime —
+              // and the runtime refusal it replaces still exists where it belongs: a plugin
+              // registering a class the *session* does not offer is refused whole at activation,
+              // so a future class is a decision rather than a silent half-served plugin.
         }
     }
     Ok(installed)
@@ -1437,6 +1445,167 @@ fn install_tool_sanitize(
         )
     };
     installed.map_err(|error| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "the proxy for '{}' could not be installed: {error}",
+                registration.registration_id
+            ),
+        )
+    })
+}
+
+/// Install the proxy for one LLM response sanitize registration.
+///
+/// The request direction's twin: the payload is the response the runtime is about to record,
+/// the codec beside it is the call's *response* codec, and the reference is issued for this
+/// invocation and dropped when it ends. A request capability is not a weaker capability here —
+/// the two are different traits on this side — so the kernel's check is what keeps a sanitizer
+/// from decoding a response with the codec that reads requests.
+fn install_llm_sanitize_response(
+    context: &ProxyContext,
+    registration: &PluginRegistrationDescriptor,
+    handle: &PluginHandle,
+) -> Result<(), PluginProtocolError> {
+    let registration_id = registration.registration_id.clone();
+    let handle = handle.clone();
+    let priority = registration.ordering.priority.unwrap_or_default();
+    let context = context.clone();
+    let off_path = context.off_path.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is an LLM response sanitizer and this runtime started no runtime for work \
+                 beside a call, so its answer could never arrive",
+                registration.registration_id
+            ),
+        )
+    })?;
+    let codecs = context.codec_capabilities.clone().ok_or_else(|| {
+        PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            format!(
+                "'{}' is an LLM response sanitizer and this runtime has no codec capability \
+                 record, so a sanitizer could not use the codec the call is running under",
+                registration.registration_id
+            ),
+        )
+    })?;
+
+    let callable: nemo_relay::api::runtime::LlmSanitizeResponseFn = Arc::new(
+        move |response: nemo_relay::json::Json,
+              sanitize: nemo_relay::api::runtime::LlmSanitizeResponseContext| {
+            let context = context.clone();
+            let handle = handle.clone();
+            let registration_id = registration_id.clone();
+            let off_path = Arc::clone(&off_path);
+            let codecs = Arc::clone(&codecs);
+            Box::pin(async move {
+                let recording = registration_id.clone();
+                let operation_request_id = nemo_relay_plugin_protocol::Uuid::now_v7().to_string();
+                let identity = sanitize.codec().clone();
+                let issued = sanitize
+                    .resolve_codec()
+                    .map(|codec| codecs.issue_response(&operation_request_id, codec));
+                let (reference, _capability) = match issued {
+                    Some((reference, guard)) => (Some(reference), Some(guard)),
+                    None => (None, None),
+                };
+                let (kind, id) = crate::codec_context::identity_to_wire(&identity);
+                let mut call_context = serde_json::json!({ "codec_kind": kind });
+                if let Some(id) = id {
+                    call_context["codec_id"] = serde_json::Value::String(id);
+                }
+                if let Some(reference) = reference.as_ref() {
+                    call_context["codec_reference"] =
+                        serde_json::Value::String(reference.as_str().to_string());
+                }
+                let payload = serde_json::json!({
+                    "response": response,
+                    "context": call_context,
+                })
+                .to_string();
+                let submitted = Arc::clone(&off_path).submit(async move {
+                    let execution = context.passive_execution_context(operation_request_id)?;
+                    let invoke = PluginInvokeRequest {
+                        handle,
+                        registration_id: registration_id.clone(),
+                        arguments: payload,
+                        budget_millis: execution.remaining_budget_millis,
+                    };
+                    let _in_flight = context.operation_scopes.as_ref().map(|scopes| {
+                        scopes.enter(
+                            &execution.operation_request_id,
+                            nemo_relay::api::runtime::current_scope_stack(),
+                        )
+                    });
+                    let outcome = off_path.invoke(invoke, execution).await.map_err(|error| {
+                        nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id.clone(),
+                            dispatch: error.dispatch(),
+                            certainty: error.certainty(),
+                            failure: error.failure,
+                        }
+                    })?;
+                    match outcome.result {
+                        Ok(PluginSuccess::Invoked(answer)) => {
+                            serde_json::from_str::<nemo_relay::json::Json>(&answer.output)
+                                .map(Some)
+                                .map_err(|error| {
+                                    nemo_relay::error::FlowError::Internal(format!(
+                                        "a proxied LLM response sanitizer answered with something \
+                                         that is not a response: {error}"
+                                    ))
+                                })
+                        }
+                        Ok(other) => Err(nemo_relay::error::FlowError::Internal(format!(
+                            "a proxied LLM response sanitizer answered with {}",
+                            other_name(&other)
+                        ))),
+                        Err(failure) => Err(nemo_relay::error::FlowError::PluginInvocation {
+                            registration: registration_id,
+                            dispatch: outcome.dispatch,
+                            certainty: outcome.certainty,
+                            failure,
+                        }),
+                    }
+                });
+                let Some(answer) = submitted else {
+                    let error = nemo_relay::error::FlowError::ResourceExhausted {
+                        resource: "plugin_observability_in_flight",
+                        limit: 0,
+                    };
+                    crate::off_path::record_failure(
+                        crate::off_path::SANITIZE_FAILURE_MARK,
+                        &recording,
+                        &error.to_string(),
+                    );
+                    return Err(error);
+                };
+                match crate::off_path::OffPathPluginExecutor::answer(answer)
+                    .await
+                    .and_then(|inner| inner)
+                {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        crate::off_path::record_failure(
+                            crate::off_path::SANITIZE_FAILURE_MARK,
+                            &recording,
+                            &error.to_string(),
+                        );
+                        Err(error)
+                    }
+                }
+            })
+        },
+    );
+
+    nemo_relay::api::registry::register_llm_sanitize_response_guardrail(
+        &registration.registration_id,
+        priority,
+        callable,
+    )
+    .map_err(|error| {
         PluginProtocolError::new(
             PluginFailureCode::Rejected,
             format!(
@@ -2665,40 +2834,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_registration_the_kernel_cannot_proxy_is_refused_rather_than_skipped() {
-        let backend = Arc::new(RecordingProxyBackend::default());
-        let context = ProxyContext::new(
-            Arc::new(PluginManager::new(
-                backend as Arc<dyn PluginExecutionBackend>,
-            )),
-            "test-binding",
-            5_000,
-        );
-        // A class with no proxy at all. Every class but this one has been given a proxy,
-        // including the LLM request sanitizer whose codec capability protocol landed last —
-        // so this names the last one whose shape the boundary does not carry yet, and it
-        // will need a new example when that lands too.
-        let error = install(
-            context,
-            &descriptor(PluginRegistrationOperation::LlmSanitizeResponseGuardrail),
-            PluginHandle {
-                plugin_id: "example".into(),
-                generation: 1,
-            },
-        )
-        .expect_err("a class this kernel cannot proxy");
-
-        // A registration the kernel cannot proxy is one the plugin believes it
-        // made and the runtime would never call, so activation refuses instead of
-        // installing what it can and forgetting the rest.
-        assert_eq!(error.failure.code, PluginFailureCode::Rejected);
-        assert!(
-            error
-                .failure
-                .message
-                .contains("llm_sanitize_response_guardrail"),
-            "{error:?}"
-        );
-    }
+    // The rule this module's match used to enforce at runtime is now a type, and the runtime half
+    // lives where a session's capability set is decided.
+    //
+    // There is no test here for "a class the kernel cannot proxy", because there is no such
+    // class: every attachment point the ABI exposes has an arm in `install`, so a class added
+    // to the ABI fails to compile there rather than being refused at run time. The refusal that
+    // matters — a plugin registering a class this *session* does not offer is refused whole
+    // rather than half-served — is `a_serving_session_refuses_what_it_cannot_serve` in
+    // `service.rs`, which drives it with a deliberately narrow session.
 }

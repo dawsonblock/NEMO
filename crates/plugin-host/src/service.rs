@@ -499,6 +499,17 @@ impl PluginHostService {
                     )
                     .await
                 }
+                // The response direction of the same shape: the payload is the response the
+                // runtime is about to record, and the codec beside it is the response codec.
+                nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeResponseGuardrail => {
+                    sanitized_llm_response(
+                        &request,
+                        self.kernel.clone(),
+                        &wire.session_id,
+                        &context.operation_request_id,
+                    )
+                    .await
+                }
                 // The first class that wraps a call rather than answering one.
                 // The plugin's callback decides *when* the rest of the chain
                 // runs, and the rest of the chain is the kernel's, so the
@@ -1979,6 +1990,101 @@ async fn sanitized_tool_payload(
     }
 }
 
+/// Run one LLM response sanitize registration over the payload a call would publish.
+///
+/// The request direction's twin, and the difference between them is the direction of the codec
+/// the sanitizer may resolve: a response codec is a different trait, so the capability the
+/// kernel checks is the one it issued for *this* direction, and a payload that was issued for
+/// the other is refused rather than adapted.
+async fn sanitized_llm_response(
+    request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
+    kernel: Option<crate::runtime_service::KernelCallbacks>,
+    session_id: &str,
+    operation_request_id: &str,
+) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
+    let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
+        refused(format!(
+            "an LLM response sanitize payload must be JSON: {error}"
+        ))
+    })?;
+    let sanitize_response: nemo_relay::json::Json = payload
+        .get("response")
+        .cloned()
+        .ok_or_else(|| refused("an LLM response sanitize payload carries no response"))?;
+    let call_context = payload
+        .get("context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let kind = call_context
+        .get("codec_kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    let id = call_context
+        .get("codec_id")
+        .and_then(serde_json::Value::as_str);
+    let identity = crate::codec_context::identity_from_wire(kind, id)
+        .map_err(|error| refused(error.to_string()))?;
+
+    let sanitize_context = match identity {
+        nemo_relay_plugin_protocol::LlmCodecIdentity::None => {
+            nemo_relay::api::runtime::LlmSanitizeResponseContext::with_identity(
+                nemo_relay_plugin_protocol::LlmCodecIdentity::None,
+            )
+        }
+        identity => {
+            let Some(kernel) = kernel else {
+                return Err(refused(
+                    "this host has no kernel to resolve the call's codec with, so an LLM \
+                     response sanitizer cannot be served the codec its call is running under",
+                ));
+            };
+            let Some(reference) = call_context
+                .get("codec_reference")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Err(refused(
+                    "an LLM response sanitize payload names a codec without the capability \
+                     reference that would let a sanitizer use it",
+                ));
+            };
+            nemo_relay::api::runtime::LlmSanitizeResponseContext::for_response_codec(Some(
+                std::sync::Arc::new(crate::codec_context::KernelResponseCodec::new(
+                    kernel,
+                    session_id,
+                    operation_request_id,
+                    identity,
+                    reference,
+                )),
+            ))
+        }
+    };
+
+    match nemo_relay::api::llm::invoke_llm_sanitize_response_registration(
+        &request.registration_id,
+        sanitize_response,
+        sanitize_context,
+    )
+    .await
+    {
+        Ok(outcome) => match (outcome.response, outcome.failure) {
+            (Some(response), _) => Ok(success(serde_json::to_string(&response).map_err(
+                |error| {
+                    refused(format!(
+                        "the sanitized response could not be serialized: {error}"
+                    ))
+                },
+            )?)),
+            // The family's rule is omission, in this direction as in the other: a response
+            // nobody could sanitize is not published, and a refusal is what says so.
+            (None, Some(reason)) => Ok(refusal(format!("the sanitizer did not answer: {reason}"))),
+            (None, None) => Ok(refusal(
+                "the sanitizer omitted the payload rather than publishing it unsanitized",
+            )),
+        },
+        Err(error) => Ok(refusal(error.to_string())),
+    }
+}
+
 /// Run one LLM request sanitize registration over the payload a call would publish.
 ///
 /// Three things cross: the request, the codec's *identity* — which is what a sanitizer
@@ -3451,10 +3557,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&manifest_dir);
     }
 
-    /// A session that can serve nothing, so activation of a real plugin must
-    /// fail closed on whatever it registers.
-    /// A discovery session reports what a serving one refuses — and the same
-    /// plugin, in the same host, tells both stories truthfully.
+    /// A session that offers one class, a fixture that registers sixteen, and the two stories the
+    /// same plugin tells: refused whole while serving, reported in full while inspecting.
+    ///
+    /// The narrow session is deliberate and is the point of the test rather than a limitation of
+    /// it: the boundary serves every class the ABI exposes now, so a session that does not is what
+    /// keeps the refusal and the blocker visible.
     #[tokio::test]
     async fn a_discovery_activation_reports_what_a_serving_one_refuses() {
         let _guard = PLUGIN_ACTIVATION_LOCK.lock().await;
@@ -3498,8 +3606,10 @@ mod tests {
             }))
         };
 
-        // Serving: this session cannot proxy everything the fixture registers, so
-        // activation is refused whole rather than half-served.
+        // Serving: this session offers one class and the fixture registers sixteen, so
+        // activation is refused whole rather than half-served. The *boundary* serves all
+        // sixteen now, which is why this test needs a session that deliberately does not: the
+        // refusal rule is about what a session offers, not about what the boundary can carry.
         let serving = activate(false)
             .await
             .expect("a served activation")
@@ -3526,7 +3636,10 @@ mod tests {
             .expect("a converted activation")
             .into_result()
             .expect("a discovery session reports rather than refuses");
-        let serveable = crate::ProcessPluginBackend::supported_registration_operations();
+        // What this *session* offers, which is what decides whether the report has a blocker in
+        // it: the boundary serves every class the ABI exposes, and a session need not.
+        let serveable =
+            [nemo_relay_plugin_protocol::PluginRegistrationOperation::ToolRequestIntercept];
         let reported: Vec<nemo_relay_plugin_protocol::PluginRegistrationOperation> = descriptors
             .iter()
             .flat_map(|descriptor| descriptor.registrations.iter())

@@ -9,14 +9,14 @@ SPDX-License-Identifier: Apache-2.0
 chronological record, so numbers inside it may be the ones that were true when a
 section was written):
 
-- **Registration coverage: 15 of 16.** Pinned by
+- **Registration coverage: 16 of 16.** Pinned by
   `the_boundary_serves_a_named_subset_of_the_registration_surface` in
-  `crates/plugin-host/tests/architecture.rs`. The LLM request sanitizer crossed when
-  its qualification did — the codec capability protocol, the bridge that turns a
-  plugin's synchronous codec call into the kernel's asynchronous one, and a real child
-  resolving the call's codec through the kernel. The one that remains is the LLM
-  *response* sanitizer, which is the same shape and needs its own qualification rather
-  than an assumption.
+  `crates/plugin-host/tests/architecture.rs`, whose unserved half is now empty. The last
+  two to cross were the LLM sanitizers — one codec capability protocol, one bridge that
+  turns a plugin's synchronous codec call into the kernel's asynchronous one, and a real
+  child in each direction resolving the call's codec through the kernel. Every attachment
+  point the ABI exposes is served, and the match that installs proxies is exhaustive: a
+  class added to the ABI fails to compile there rather than being refused at runtime.
 - **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/plugin`).
 - **Plugin compatibility:** the CLI serves plugins from another process; FFI, Node
@@ -1805,6 +1805,20 @@ giving up the sender, so the thread's `receive` never ended and the dropper wait
 waiting on the dropper. Every call succeeded and the teardown hung, and the sanitize invocation
 waiting on that answer read it as a timeout. Both tests are in the tree — the isolated bridge and
 its async control — and the drop is the regression they hold.
+
+**The response direction crossed on its own qualification, and the difference is the point.** It
+is the same shape — the response the runtime is about to record goes down with the call's codec
+identity and a reference, and what comes back is the sanitized copy — but a response *codec* is a
+different trait on this side, so the capability the kernel checks is the one it issued for that
+direction. A request capability used to decode a response is refused by the record rather than
+quietly adapted, and that is the test the direction needed rather than an assumption that the
+request's qualification covered it.
+
+**And the boundary has no unproxied class left.** The install match is exhaustive now: the
+refusal that used to sit in its `other` arm is gone because there is no other arm, which turns "a
+class the kernel cannot proxy" from a runtime refusal into a compile error the day the ABI grows.
+The runtime refusal it replaced still exists where it belongs — a plugin registering a class the
+*session* does not offer is refused whole at activation — so a future class stays a decision.
 
 **One constraint the class carries, named rather than hidden.** The kernel serves the plugin's
 codec call *while* the call that needs it is in flight, and a single-threaded kernel runtime does

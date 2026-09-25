@@ -78,6 +78,42 @@ impl CodecOperation {
     }
 }
 
+impl nemo_relay::codec::traits::LlmCodec for KernelRequestCodec {
+    fn codec_identity(&self) -> LlmCodecIdentity {
+        self.identity.clone()
+    }
+
+    fn decode(&self, request: &LlmRequest) -> Result<AnnotatedLlmRequest, FlowError> {
+        let output = self.call(
+            nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+            serde_json::json!({ "request": request }),
+        )?;
+        serde_json::from_str(&output).map_err(|error| {
+            FlowError::Internal(format!(
+                "the kernel answered a request decode with something that is not an \
+                 annotated request: {error}"
+            ))
+        })
+    }
+
+    fn encode(
+        &self,
+        annotated: &AnnotatedLlmRequest,
+        original: &LlmRequest,
+    ) -> Result<LlmRequest, FlowError> {
+        let output = self.call(
+            nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestEncode,
+            serde_json::json!({ "annotated": annotated, "original": original }),
+        )?;
+        serde_json::from_str(&output).map_err(|error| {
+            FlowError::Internal(format!(
+                "the kernel answered a request encode with something that is not a request: \
+                 {error}"
+            ))
+        })
+    }
+}
+
 /// The identity a plugin was told, as the wire spells it.
 ///
 /// # Errors
@@ -398,37 +434,68 @@ impl KernelRequestCodec {
     }
 }
 
-impl nemo_relay::codec::traits::LlmCodec for KernelRequestCodec {
+/// The response direction's twin: the codec a plugin resolves in a host that holds none.
+///
+/// The two directions are different traits on this side, and this is the other one: a response
+/// codec decodes and does not encode, so a capability issued for a request is not a weaker
+/// capability here — it is a different one, and the kernel checks that rather than assuming it.
+pub struct KernelResponseCodec {
+    bridge: Arc<CodecBridge>,
+    operation_request_id: String,
+    identity: LlmCodecIdentity,
+    reference: String,
+}
+
+impl KernelResponseCodec {
+    /// A response codec for one sanitize invocation.
+    pub fn new(
+        client: crate::runtime_service::KernelCallbacks,
+        session_id: &str,
+        operation_request_id: &str,
+        identity: LlmCodecIdentity,
+        reference: &str,
+    ) -> Self {
+        Self {
+            bridge: CodecBridge::start(client, session_id.to_string()),
+            operation_request_id: operation_request_id.to_string(),
+            identity,
+            reference: reference.to_string(),
+        }
+    }
+}
+
+impl nemo_relay::codec::traits::LlmResponseCodec for KernelResponseCodec {
     fn codec_identity(&self) -> LlmCodecIdentity {
         self.identity.clone()
     }
 
-    fn decode(&self, request: &LlmRequest) -> Result<AnnotatedLlmRequest, FlowError> {
-        let output = self.call(
-            nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
-            serde_json::json!({ "request": request }),
-        )?;
-        serde_json::from_str(&output).map_err(|error| {
-            FlowError::Internal(format!(
-                "the kernel answered a request decode with something that is not an \
-                 annotated request: {error}"
-            ))
-        })
-    }
-
-    fn encode(
+    fn decode_response(
         &self,
-        annotated: &AnnotatedLlmRequest,
-        original: &LlmRequest,
-    ) -> Result<LlmRequest, FlowError> {
-        let output = self.call(
-            nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestEncode,
-            serde_json::json!({ "annotated": annotated, "original": original }),
-        )?;
+        response: &nemo_relay::json::Json,
+    ) -> Result<nemo_relay::codec::response::AnnotatedLlmResponse, FlowError> {
+        let (kind, id) = identity_to_wire(&self.identity);
+        let mut payload = serde_json::json!({ "response": response, "codec_kind": kind });
+        if let Some(id) = id {
+            payload["codec_id"] = serde_json::Value::String(id);
+        }
+        let payload = serde_json::to_string(&payload).map_err(|error| {
+            FlowError::Internal(format!(
+                "a codec call payload could not be written: {error}"
+            ))
+        })?;
+        let output = self
+            .bridge
+            .resolve(
+                nemo_relay_plugin_proto::v1::CodecOperation::LlmResponseDecode,
+                &self.operation_request_id,
+                payload,
+                &self.reference,
+            )
+            .map_err(FlowError::Internal)?;
         serde_json::from_str(&output).map_err(|error| {
             FlowError::Internal(format!(
-                "the kernel answered a request encode with something that is not a request: \
-                 {error}"
+                "the kernel answered a response decode with something that is not an \
+                 annotated response: {error}"
             ))
         })
     }

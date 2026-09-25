@@ -559,6 +559,7 @@ impl ProcessPluginBackend {
             nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeStartGuardrail,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::ScopeSanitizeEndGuardrail,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeRequestGuardrail,
+            nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeResponseGuardrail,
         ]
     }
 

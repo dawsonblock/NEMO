@@ -529,6 +529,134 @@ async fn a_real_event_sanitizer_in_the_child_changes_only_what_is_published() {
     drop(loaded);
 }
 
+// The response direction of the same class, through a real child: the sanitizer is shown the
+// response the runtime is about to record, resolves the call's *response* codec through the
+// kernel, and the copy this runtime publishes carries what that codec read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_llm_response_sanitizer_resolves_the_calls_codec_through_the_kernel() {
+    use nemo_relay::codec::response::AnnotatedLlmResponse;
+    use nemo_relay::codec::traits::LlmResponseCodec;
+    use nemo_relay::json::Json;
+    use nemo_relay_plugin_host::ProcessLoadedPlugins;
+    use nemo_relay_plugin_protocol::{
+        BuiltinLlmCodec, LlmCodecIdentity, PluginComponentConfiguration,
+    };
+
+    /// A response codec that answers with a recognizable id, so the test can tell that the
+    /// codec the *kernel* holds is the one that ran.
+    struct TestResponseCodec;
+
+    impl LlmResponseCodec for TestResponseCodec {
+        fn codec_identity(&self) -> LlmCodecIdentity {
+            LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiResponses)
+        }
+
+        fn decode_response(
+            &self,
+            _response: &Json,
+        ) -> nemo_relay::error::Result<AnnotatedLlmResponse> {
+            Ok(AnnotatedLlmResponse {
+                id: Some("resp-kernel".to_string()),
+                ..Default::default()
+            })
+        }
+    }
+
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-llm-response-sanitize",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let loaded = ProcessLoadedPlugins::load(
+        host_config(),
+        5_000,
+        nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+            budget_millis: 5_000,
+            max_in_flight: 8,
+        },
+        [("fixture_intercept".to_string(), fixture.artifact())],
+        [PluginComponentConfiguration {
+            kind: "fixture_intercept".into(),
+            config_json: serde_json::json!({ "llm_sanitizer": true }).to_string(),
+        }],
+    )
+    .await
+    .expect("a plugin served from another process");
+
+    let published: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let published = std::sync::Arc::clone(&published);
+        nemo_relay::api::subscriber::register_subscriber(
+            "process-backend-llm-response-sanitize",
+            std::sync::Arc::new(move |event: &nemo_relay::api::event::Event| {
+                published.lock().unwrap().push(serde_json::json!({
+                    "name": event.name(),
+                    "kind": event.kind(),
+                    "data": event.data().cloned(),
+                }));
+            }),
+        )
+        .expect("a subscriber");
+    }
+
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + 30_000,
+            30_000,
+        ),
+        async {
+            nemo_relay::api::llm::llm_call_execute(
+                nemo_relay::api::llm::LlmCallExecuteParams::builder()
+                    .name("sanitize-response-codec")
+                    .request(nemo_relay::api::llm::LlmRequest {
+                        headers: serde_json::Map::new(),
+                        content: serde_json::json!({
+                            "model": "gpt-4o",
+                            "messages": [{ "role": "user", "content": "hello" }]
+                        }),
+                    })
+                    // The response codec the call runs under: the sanitizer in the child is
+                    // given its identity and reaches the object through the capability.
+                    .response_codec(std::sync::Arc::new(TestResponseCodec))
+                    .func(std::sync::Arc::new(|_request| {
+                        Box::pin(async move {
+                            Ok(Json::Object(serde_json::Map::from_iter([(
+                                "id".to_string(),
+                                Json::String("resp-kernel".to_string()),
+                            )])))
+                        })
+                    }))
+                    .build(),
+            )
+            .await
+        },
+    )
+    .await
+    .expect("a managed LLM call whose response the child sanitizes");
+    nemo_relay::api::subscriber::flush_subscribers().expect("a flush");
+
+    let published = published.lock().unwrap().clone();
+    let end = published
+        .iter()
+        .find(|event| {
+            event["name"] == serde_json::json!("sanitize-response-codec")
+                && event["data"]["fixture_llm_sanitize_response"] == serde_json::json!(true)
+        })
+        .unwrap_or_else(|| panic!("the sanitized LLM end event was published: {published:#?}"));
+    assert_eq!(
+        end["data"]["fixture_llm_sanitize_response_codec"],
+        serde_json::json!("resp-kernel"),
+        "the sanitizer read the response with the kernel's own response codec, through the \
+         capability it was given: {end:#?}"
+    );
+
+    nemo_relay::api::subscriber::deregister_subscriber("process-backend-llm-response-sanitize")
+        .expect("a deregistration");
+    drop(loaded);
+}
+
 // The class that is given the call's codec, through a real child. This is the nested path
 // the codec capability protocol exists for: the kernel sends a sanitize invocation, the
 // plugin's callback calls the codec, the host answers that call by asking the kernel, the
@@ -1959,7 +2087,7 @@ async fn an_answer_that_outgrows_its_operation_is_refused_by_the_kernel() {
 /// When the boundary serves all sixteen this test changes from a refusal to a
 /// load, which is the diff that says the bindings can follow the CLI.
 #[tokio::test]
-async fn a_plugin_the_boundary_cannot_serve_whole_is_refused() {
+async fn the_full_fixture_is_served_whole_by_the_boundary() {
     use nemo_relay_plugin_host::ProcessLoadedPlugins;
 
     let fixture = support::PreparedFixture::write(
@@ -1968,7 +2096,11 @@ async fn a_plugin_the_boundary_cannot_serve_whole_is_refused() {
         support::native_fixture(),
         "nemo_relay_fixture_native_plugin",
     );
-    let refusal = ProcessLoadedPlugins::load(
+    // Sixteen of sixteen: the fixture that registers on every surface the ABI exposes is
+    // served whole. This test used to be the refusal — the same plugin against the same
+    // boundary, told that classes did not cross — and what it now pins is that the *whole*
+    // registration surface crosses, which is what the bindings' cutover was waiting on.
+    let loaded = ProcessLoadedPlugins::load(
         host_config(),
         5_000,
         nemo_relay_plugin_host::off_path::ObservabilityPolicy {
@@ -1982,22 +2114,20 @@ async fn a_plugin_the_boundary_cannot_serve_whole_is_refused() {
         }],
     )
     .await
-    .err()
-    .expect("a plugin registering classes the boundary cannot serve is refused");
+    .expect("a plugin registering every class the ABI exposes is served whole");
 
-    let message = refusal.failure.message.clone();
-    assert!(
-        message.contains("registers") && message.contains("can serve"),
-        "the refusal says what the plugin registered and what this session can \
-         serve: {message}"
+    let mut registrations = loaded.registrations();
+    registrations.sort_unstable();
+    assert_eq!(
+        registrations.len(),
+        17,
+        "seventeen attachment points across the sixteen classes the ABI exposes, every one of \
+         them proxied: {registrations:?}"
     );
-    // The classes it names are the ones the boundary does not carry, which is the
-    // list this refusal exists to make visible — and the list the bindings'
-    // cutover waits on.
-    assert!(
-        message.contains("tool_execution_intercept") && message.contains("mark_sanitize_guardrail"),
-        "the refusal names the classes that do not cross: {message}"
-    );
+    // The refusal that used to live here still exists, and lives where it belongs: a session
+    // that does not offer a class a plugin registers refuses the plugin whole rather than
+    // half-serving it. `a_discovery_activation_reports_what_a_serving_one_refuses` in
+    // `service.rs` drives that with a deliberately narrow session.
 }
 
 /// A wrapped call runs the rest of the chain, in the kernel, from a callback in
@@ -2451,8 +2581,12 @@ async fn the_full_fixture_is_inspectable_over_the_boundary() {
         kind: "fixture_native".into(),
         config_json: "{}".into(),
     }];
-    // Serving first, and refused: the point of the inspection that follows.
-    let serving = backend
+    // Serving first, and accepted: every class this fixture registers is one the boundary
+    // carries, so the plugin is served whole. The inspection that follows is the same
+    // plugin, in the same host, telling the same story — the report is still the
+    // authoritative description of what a plugin registered, which is what the coverage
+    // calculation below rests on.
+    let served = backend
         .activate(
             nemo_relay_plugin_protocol::PluginActivateRequest {
                 discovery: false,
@@ -2460,10 +2594,15 @@ async fn the_full_fixture_is_inspectable_over_the_boundary() {
             },
             context(),
         )
-        .await;
-    assert!(
-        serving.is_err(),
-        "a serving activation of a plugin with unserved classes is refused whole"
+        .await
+        .expect("a serving activation of a plugin every class of which crosses");
+    assert_eq!(
+        served
+            .iter()
+            .flat_map(|descriptor| descriptor.registrations.iter())
+            .count(),
+        17,
+        "seventeen attachment points across sixteen classes, served"
     );
 
     let descriptors = backend
