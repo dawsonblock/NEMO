@@ -386,6 +386,88 @@ fn ffi_activation_rejects_overlapping_outputs_without_claiming_host() {
 }
 
 #[test]
+fn ffi_llm_execution_reaches_a_native_plugin_across_the_boundary() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = nemo_relay_clear_plugin_configuration();
+
+    let manifest_dir = TempDir::new().expect("native manifest tempdir");
+    let manifest = write_native_manifest(manifest_dir.path(), build_native_fixture());
+    let (mut activation, _) = initialize_with_dynamic_plugins(json!([{
+        "plugin_id": "fixture_native",
+        "kind": "rust_dynamic",
+        "manifest_ref": manifest,
+        "config": {}
+    }]));
+
+    // The LLM entry points are managed actions too, and a registration that runs
+    // in another process is refused when it is reached with no budget. Until they
+    // published one, this call failed with "reached outside a managed action" —
+    // which the tool path's qualification could not see, because it never ran a
+    // plugin through the LLM family.
+    let name = cstring("ffi-native-llm");
+    let request = cstring(
+        r#"{"headers":{},"content":{"model":"fixture","messages":[{"role":"user","content":"hi"}]}}"#,
+    );
+    let mut out = ptr::null_mut();
+    let status = unsafe {
+        api::nemo_relay_llm_call_execute(
+            name.as_ptr(),
+            request.as_ptr(),
+            llm_exec_cb,
+            ptr::null_mut(),
+            None,
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            None,
+            None,
+            ptr::null_mut(),
+            None,
+            ptr::null(),
+            &mut out,
+        )
+    };
+    assert_eq!(
+        status,
+        NemoRelayStatus::Ok,
+        "the LLM call failed: {:?}",
+        unsafe { read_last_error() }
+    );
+    let executed = unsafe { returned_json(out) };
+    assert_eq!(
+        executed["native_plugin_llm_execution"],
+        json!(true),
+        "the plugin's LLM execution intercept did not run: {executed}"
+    );
+
+    unsafe {
+        assert_eq!(
+            api::nemo_relay_plugin_activation_clear(activation),
+            NemoRelayStatus::Ok
+        );
+        nemo_relay_plugin_activation_free(&mut activation);
+    }
+}
+
+/// Answer an LLM call with the request it was given.
+unsafe extern "C" fn llm_exec_cb(
+    _user_data: *mut libc::c_void,
+    request_json: *const c_char,
+) -> *mut c_char {
+    let request: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(request_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap_or(Json::Null);
+    CString::new(request.to_string())
+        .expect("no interior null")
+        .into_raw()
+}
+
+#[test]
 fn ffi_activation_refuses_an_unusable_host_without_falling_back() {
     let _guard = TEST_MUTEX.lock().unwrap();
     let _ = nemo_relay_clear_plugin_configuration();

@@ -128,15 +128,30 @@ pub fn plugin_runtime_binding(implementation: &str) -> String {
 }
 
 /// Where the host executable is, given where this process is.
+///
+/// An environment variable that names a host is authoritative: a deployment that
+/// said which host to use gets that host or a failure, never a quiet fallback to
+/// whichever executable happens to sit beside the process. A typo in an override
+/// is a configuration mistake, and discovering it at startup as "the host is not
+/// there" is the only reading that keeps the operator's choice meaningful.
 fn resolve_executable() -> PathBuf {
-    if let Some(configured) = std::env::var_os(EXECUTABLE_ENV) {
-        let configured = PathBuf::from(configured);
-        if configured.exists() {
-            return configured;
-        }
+    resolve_from(
+        std::env::var_os(EXECUTABLE_ENV),
+        &directory_holding_this_process(),
+    )
+}
+
+/// The same decision, with the two things it reads passed in.
+///
+/// Split out so the rule can be tested as a rule: reading the environment and
+/// asking where this process lives are the parts a test cannot vary without
+/// touching process-wide state, and the part that matters — which input wins —
+/// is neither of them.
+fn resolve_from(configured: Option<std::ffi::OsString>, beside: &Path) -> PathBuf {
+    if let Some(configured) = configured {
+        return PathBuf::from(configured);
     }
-    let beside = directory_holding_this_process();
-    for candidate in beside_this_process(&beside) {
+    for candidate in beside_this_process(beside) {
         if candidate.exists() {
             return candidate;
         }
@@ -1319,5 +1334,31 @@ mod tests {
         );
         assert!(message.contains(EXECUTABLE_ENV), "{message}");
         assert!(message.contains(executable_name()), "{message}");
+    }
+
+    #[test]
+    fn an_override_that_names_a_host_is_the_host_that_is_used() {
+        // A deployment that said which host to use gets that host or a failure.
+        // Falling back to whichever executable happens to sit beside the process
+        // would make the operator's choice advisory, and a typo in it invisible
+        // until the mismatched host answered a handshake.
+        let directory = std::env::temp_dir();
+        let beside = directory.join(format!("nemo-ph-override-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&beside).expect("a directory for the beside case");
+        let neighbour = beside.join(executable_name());
+        std::fs::write(&neighbour, b"a host this deployment did not ask for").expect("a neighbour");
+
+        let configured = PathBuf::from("/nonexistent/by/override/nemo-plugin-host");
+        let resolved = resolve_from(Some(configured.clone().into_os_string()), &beside);
+
+        std::fs::remove_dir_all(&beside).ok();
+        assert_eq!(
+            resolved, configured,
+            "the override has to be authoritative even when it does not exist"
+        );
+        assert!(
+            !neighbour.exists(),
+            "the neighbour a fallback would have found was removed with its directory"
+        );
     }
 }
