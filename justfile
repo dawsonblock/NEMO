@@ -1707,6 +1707,13 @@ test-node:
     trap 'rm -rf "$test_config_home"' EXIT
     export XDG_CONFIG_HOME="$test_config_home"
     export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    # The binding starts native plugins in the host its package ships, and a
+    # checkout has no installed host: this names the one the checkout builds. It
+    # is the same escape hatch a source deployment uses, used here for the same
+    # reason — and a native plugin activation without it still fails closed with
+    # the message that says where the host was looked for.
+    cargo build --locked -p nemo-relay-plugin-host
+    export NEMO_RELAY_PLUGIN_HOST="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-plugin-host"
     if is_true "{{ ci }}"; then
         coverage_out="$(prepare_artifact node-coverage.xml)"
         junit_out="$(prepare_artifact node-junit.xml)"

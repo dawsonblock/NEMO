@@ -267,6 +267,11 @@ enabled = true
       assert.deepEqual(activation.report.diagnostics, []);
       assert.equal(activation.active, true);
       assert.throws(() => plugin.clear(), /active dynamic plugin host/i);
+      // The plugins loaded somewhere, and it was not here: the pid the activation
+      // reports is a process of its own, which is the isolation claim the managed
+      // callbacks below can only imply.
+      assert.equal(typeof activation.hostPid, 'number');
+      assert.notEqual(activation.hostPid, process.pid, 'the plugins must not run in this process');
 
       const toolResult = await executeTool('node_native_dynamic_tool');
       assert.equal(toolResult.result.downstream, true);
@@ -280,6 +285,7 @@ enabled = true
 
       await Promise.all([activation.close(), activation.close()]);
       assert.equal(activation.active, false);
+      assert.equal(activation.hostPid, null);
       await activation.close();
 
       const toolAfterClose = await executeTool('node_native_closed_tool');

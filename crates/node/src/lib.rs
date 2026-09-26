@@ -18,6 +18,7 @@ mod api;
 mod callable;
 mod callback_factory;
 mod convert;
+mod plugin_host_location;
 mod promise_call;
 mod stream;
 mod types;

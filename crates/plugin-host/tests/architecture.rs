@@ -52,10 +52,11 @@ const LOADER_TOKENS: &[&str] = &["libloading", "dlopen", "LoadLibraryW", "Librar
 ///
 /// Checking for direct calls to the loader alone missed the real path: Node,
 /// Python, and FFI do not call `load_native_plugins`, they call this, and core
-/// loads on their behalf. Naming the current callers makes the remaining
-/// migration visible instead of invisible, and stops a *new* consumer from
-/// adopting the same route while it is being replaced.
-const INDIRECT_LOAD_CALLERS: &[&str] = &["node"];
+/// loads on their behalf. The list is empty now that the last consumer — Node —
+/// composes the process backend, and it stays here rather than being deleted
+/// with the entry: an empty grandfather list stops the *next* consumer from
+/// adopting the in-process route, which a deleted check would not.
+const INDIRECT_LOAD_CALLERS: &[&str] = &[];
 
 /// The token that identifies a call through that API.
 const INDIRECT_LOAD_TOKEN: &str = "PluginHostActivation::";

@@ -19,12 +19,14 @@ section was written):
   class added to the ABI fails to compile there rather than being refused at runtime.
 - **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/plugin`).
-- **Plugin compatibility:** the CLI, FFI and Python serve plugins from another
-  process. Node is the one consumer still reaching the in-process activation path,
-  and that list is pinned by the architecture test
-  (`INDIRECT_LOAD_CALLERS` in `crates/plugin-host/tests/architecture.rs`) rather
-  than recorded only here — it is a list of one, and the entry is deleted with the
-  binding rather than shrunk to an empty list.
+- **Plugin compatibility:** the CLI, FFI, Python and Node serve plugins from
+  another process. No consumer reaches the in-process activation path any more,
+  and that is pinned by the architecture test (`INDIRECT_LOAD_CALLERS` in
+  `crates/plugin-host/tests/architecture.rs`) rather than recorded only here: the
+  list is empty, and it stays in the test so the next consumer to reach for that
+  route fails the check instead of being grandfathered by a missing one. The
+  loader is still linked into the kernel until it moves, which is why the unsafe
+  count above has not moved with it.
 
 Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
 in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
@@ -497,44 +499,58 @@ fails the mark rather than growing the host's heap.
 
 **What is not true yet.** The three blockers, stated plainly:
 
-1. **One consumer still selects the in-process loader.** The CLI, FFI and Python
-   have cut over: each composes the same shared activation, the native plugin's
-   register callbacks run in the host process, and each suite asserts both that a
-   managed call reaches the plugin and that the plugin's kind is absent from the
-   consumer's own registry — the fact the in-process path could not state. Node
-   still calls `PluginHostActivation::activate_with_discovered_config`, so the TCB
-   number has not moved yet: the loader is still in the kernel's dependency graph
-   until the last consumer stops reaching it.
+1. **The loader is still in the kernel's dependency graph.** Every consumer has
+   cut over: the CLI, FFI, Python and Node each compose the same shared
+   activation, the native plugin's register callbacks run in the host process, and
+   each suite asserts both that a managed call reaches the plugin and that the
+   plugin's kind is absent from the consumer's own registry — the fact the
+   in-process path could not state. Nothing calls
+   `PluginHostActivation::activate_with_discovered_config` outside the kernel's own
+   tests, and `INDIRECT_LOAD_CALLERS` is empty and stays in place so the next
+   consumer to reach for that route fails the check. What has not moved is the
+   loader itself: it is still compiled into the kernel, so the TCB number above is
+   unchanged until step two of the plan below extracts it.
 
-   **The Node cutover was attempted and stopped, with the fault narrowed to a
-   deterministic reproducer.** The binding composes the shared activation, resolves
-   the host the platform package ships, and publishes a budget for its five managed
-   entry points — and without that budget its tests fail with the same refusal the
-   FFI's LLM path had, which is the coverage-class failure the matrix exists to
-   catch, now demonstrated for Node rather than inferred.
+   **The Node cutover stopped once on two native faults, and both are fixed.** The
+   binding composes the shared activation, resolves the host its package ships, and
+   publishes a budget for its five managed entry points — and without that budget
+   its tests fail with the same refusal the FFI's LLM path had, which is the
+   coverage-class failure the matrix exists to catch, now demonstrated for Node
+   rather than inferred.
 
-   What stops the cutover is narrower and reproducible:
+   The fault that stopped the first attempt was reachable in one command:
 
    ```text
    node --test-name-pattern="owns native managed" tests/dynamic_plugin_tests.mjs
    ```
 
-   A tool call through the boundary completes. The *LLM* call then dies with
-   SIGSEGV (exit 139), on the main thread, inside V8's frame unwinder
-   (`Isolate::UnwindAndFindHandler` → `StackMemory::jslimit` faulting) while V8 is
-   reporting a message from a promise hook, reached from `napi_create_promise`
-   inside `execute_tokio_future`. It is not the codec path — the fixture test
-   passes no codecs — it is not one entry point (the sync and promise-aware LLM
-   variants both die), and raising V8's own stack (`--stack-size=8000`) changes the
-   signal rather than the outcome, which is what a *native* stack fault looks like
-   from inside V8. It is not a Rust panic: nothing prints, and the reverted tree
-   passes the whole file.
+   A tool call through the boundary completed; the *LLM* call then died with
+   SIGSEGV (exit 139) on the main thread, inside V8's frame unwinder
+   (`Isolate::UnwindAndFindHandler` → `StackMemory::jslimit` faulting) while V8
+   reported a message from a promise hook reached from `napi_create_promise`
+   inside `execute_tokio_future`. Reading the message instead of the signal —
+   `--print-all-exceptions` — is what named it: `Maximum call stack size
+   exceeded`, thrown by the promise hook V8 runs while creating the entry point's
+   promise. The entry points built their future in the frame V8 calls back into,
+   and in a build that does not collapse the layers that future is over a
+   megabyte deep against the one V8 allots the JavaScript on that thread, so the
+   hook — not the script — was the first thing to reach for the far side of the
+   limit. The managed future is boxed now (`with_managed_budget` in
+   `crates/node/src/api/mod.rs`), which is a statement about where the pipeline
+   lives rather than a size optimization: the JavaScript thread holds a pointer,
+   not the pipeline.
 
-   That is a Node-specific fault rather than an architectural one, and it needs
-   Node-specific instrumentation — the thread identity at each callback entry, and
-   the frame V8 could not parse — before it is a diagnosis. The attempt is
-   preserved in a stash named for the fault, and Node stays on the in-process path
-   until it has one.
+   Fixing that exposed the second: the poll of a call that reaches a plugin ran
+   off the end of the 2 MiB stack Tokio gives a worker by default, and a worker
+   that walks off the end takes Node with it — SIGSEGV, not a rejected call. The
+   Python extension had already met that fault and answered it with an 8 MiB
+   runtime stack, so the Node addon states the same size for its runtime
+   (`NODE_FUTURE_STACK_BYTES`), installed from the module initializer before
+   anything can enter it.
+
+   Neither fault was architectural. Both were about the stack a managed call
+   occupies, and both are recorded here because the shape of the mistake is the
+   one that recurs: a binding's entry point is not a place to be deep.
 
    That cutover was blocked on **registration coverage**, not on composition: a
    plugin that registers any class the boundary cannot serve is refused *whole*,
@@ -961,8 +977,10 @@ Still open, in the order they need closing:
    The `invoke` and `invoke_stream` RPCs already answer with structured refusals,
    so a host that cannot serve an invocation says so rather than looking like an
    empty success.
-3. **Migrate Node, Python and FFI** off `PluginHostActivation`, which the
-   architecture guard currently grandfathers by crate name.
+3. **Migrate Node, Python and FFI** off `PluginHostActivation` — done: all three
+   compose the process backend, and the architecture guard's grandfather list is
+   empty, so the route is closed rather than merely unused. What remains of this
+   step is the loader extraction itself, which is step two above.
 4. **Resource limits beyond process separation and the deadline.** The child
    gets a filtered environment, its own socket directory and a kill at expiry.
    Address-space and descriptor ceilings and `no_new_privs` are now applied
@@ -2358,13 +2376,16 @@ because none of them has cut over, so what is missing right now is the two
 artifacts rather than a running failure — the failure arrives with the cutover,
 which is exactly when this has to be finished.
 
-*(The two paragraphs above were true when they were written. Both artifacts now
-carry the host — the Node platform package at `bin/nemo-plugin-host`, the CLI
-wheel and its release assets beside the CLI — so what remains of this list is the
-binding cutover itself.)*
+*(The two paragraphs above were true when they were written. The CLI wheel and its
+release assets now carry the host, and so does the Python wheel. The bindings have
+cut over since, which turns the missing Node artifact from a future gap into a
+present one: nothing on npm carries `bin/nemo-plugin-host` yet, so a native-plugin
+activation from an installed npm package fails closed with the message naming
+where the host was looked for, rather than searching for one. The FFI surface still
+has no packaging step of its own.)*
 
 **And the Linux host is built and checked on Linux, not merely compiled for it.**
-The Python and Node packages carry a *static* host on Linux, so it runs on the
+The Python wheel carries a *static* host on Linux, so it runs on the
 oldest glibc their tags promise rather than on the builder's. That claim was
 checked in an `ubuntu:24.04` container on arm64 rather than inferred from a
 successful build:

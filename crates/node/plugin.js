@@ -10,6 +10,28 @@ const nativeRequire = createRequire(path.join(__dirname, 'index.js'));
 const lib = nativeRequire('./index.js');
 
 /**
+ * Where this installation's plugin host is.
+ *
+ * The package that carries the addon carries the host, in its own `bin/`, and a
+ * deployment that installed the host somewhere else says so through the
+ * environment. Nothing searches: a companion executable that runs native code
+ * beside the runtime is resolved from what shipped it, and an explicit path is
+ * used exactly as given — a deployment that names a host it did not install gets
+ * a failure from the runtime, not a different host discovered elsewhere.
+ *
+ * @returns {string|undefined} The host to run native plugins in.
+ * @remarks Undefined leaves the addon to look beside its own module, and to fail
+ * if it cannot.
+ */
+function resolvePluginHost() {
+  if (process.env.NEMO_RELAY_PLUGIN_HOST) {
+    return process.env.NEMO_RELAY_PLUGIN_HOST;
+  }
+  const candidate = path.join(__dirname, 'bin', process.platform === 'win32' ? 'nemo-plugin-host.exe' : 'nemo-plugin-host');
+  return require('node:fs').existsSync(candidate) ? candidate : undefined;
+}
+
+/**
  * Create an empty plugin configuration.
  *
  * Returns the canonical top-level config shape with `version = 1` and no
@@ -92,6 +114,10 @@ function initialize(config) {
  *
  * @param {object} config - Base configuration layered over discovered `plugins.toml` files.
  * @param {DynamicPluginActivationSpec[]} specs - Non-empty native-library or worker plugin specifications.
+ * @param {string} [pluginHost] - The `nemo-plugin-host` this package shipped. Defaults to the one
+ *   beside this package's `bin/`, which is where the platform package puts it. Native plugins run
+ *   in that process, so nothing is searched for it: a path that is not there is a failure rather
+ *   than a lookup somewhere else.
  * @returns {Promise<object>} An owned activation with `report`, `active`, `close()`, and async disposal.
  * @remarks File-configured static components initialize before dynamic
  * components. Keep the returned activation alive while its callbacks may run
@@ -99,7 +125,7 @@ function initialize(config) {
  * `initialize()` for a static-only configuration.
  */
 function initializeWithDynamicPlugins(config, specs) {
-  return lib.initializeWithDynamicPlugins(config, specs);
+  return lib.initializeWithDynamicPlugins(config, specs, resolvePluginHost());
 }
 
 /**
