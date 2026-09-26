@@ -19,9 +19,12 @@ section was written):
   class added to the ABI fails to compile there rather than being refused at runtime.
 - **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/plugin`).
-- **Plugin compatibility:** the CLI serves plugins from another process; FFI, Node
-  and Python still reach the in-process activation path, and that list is pinned by
-  the architecture test rather than recorded only here.
+- **Plugin compatibility:** the CLI, FFI and Python serve plugins from another
+  process. Node is the one consumer still reaching the in-process activation path,
+  and that list is pinned by the architecture test
+  (`INDIRECT_LOAD_CALLERS` in `crates/plugin-host/tests/architecture.rs`) rather
+  than recorded only here — it is a list of one, and the entry is deleted with the
+  binding rather than shrunk to an empty list.
 
 Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
 in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
@@ -494,20 +497,19 @@ fails the mark rather than growing the host's heap.
 
 **What is not true yet.** The three blockers, stated plainly:
 
-1. **Three consumers still select the in-process loader.** The CLI has cut over:
-   `crates/cli/src/server/mod.rs` composes `ProcessLoadedPlugins`, the native
-   plugin's register callbacks run in the host process, and
-   `cli_activation_serves_a_native_plugin_from_another_process` asserts both that
-   the registration answers through the CLI's chain and that the plugin's kind is
-   absent from the CLI's own registry — the fact the in-process path could not
-   state. FFI, Node and Python still call
-   `PluginHostActivation::activate_with_discovered_config`, so the TCB number has
-   not moved yet: the loader is still in the kernel's dependency graph until the
-   last of them stops reaching it.
-   Their cutover is blocked on **registration coverage**, not on their
-   composition: a plugin that registers any class the boundary cannot serve is
-   refused *whole*, and the fixture all three suites load — and the shape a real
-   plugin takes — registers all sixteen classes. *(The table below is the state this
+1. **One consumer still selects the in-process loader.** The CLI, FFI and Python
+   have cut over: each composes the same shared activation, the native plugin's
+   register callbacks run in the host process, and each suite asserts both that a
+   managed call reaches the plugin and that the plugin's kind is absent from the
+   consumer's own registry — the fact the in-process path could not state. Node
+   still calls `PluginHostActivation::activate_with_discovered_config`, so the TCB
+   number has not moved yet: the loader is still in the kernel's dependency graph
+   until the last consumer stops reaching it.
+   That cutover was blocked on **registration coverage**, not on composition: a
+   plugin that registers any class the boundary cannot serve is refused *whole*,
+   and the fixture those suites load — and the shape a real plugin takes —
+   registers all sixteen classes. Coverage is no longer the blocker for anyone
+   *(the table below is the state this
    section was written in; the current count is at the top of this document and the
    current list is in the architecture test. It read ten served then and reads
    fourteen now.)*
@@ -526,22 +528,15 @@ fails the mark rather than growing the host's heap.
    | LLM execution intercept | — |
 
    `the_boundary_serves_a_named_subset_of_the_registration_surface` in
-   `crates/plugin-host/tests/architecture.rs` pins both halves. The tool execution
-   intercept was the first to move: it needed the kernel to hold a suspended
-   chain position and resume it when the host asked, which is what
-   `crates/plugin-host/src/continuations.rs` and the `Continue` RPC now do, and the
-   provider intercept reuses that machinery rather than adding a second. The
-   streaming intercept needs the duplex session instead of a unary resume, and both
-   halves of it exist — the kernel's driver, the host's channel, and the upstream
-   direction where a callback's returned stream crosses back. What remains is
-   credit, the three budget limits, stream deadlines, and the qualification
-   matrix. Two things used to be on that list and are not any more: cancellation
-   that reaches the producer behind a dropped consumer (it holds for every state a
-   consumer can leave in, including the open that is still in flight) and
-   interruptible pulls (a pull is routed to an actor, so no producer can hold up
-   the session or its own cancellation). The other
-   five classes need shapes of their own plus a core entry point that runs exactly
-   one registration of that class.
+   `crates/plugin-host/tests/architecture.rs` asserts both halves, and the unserved
+   half is empty now. The classes arrived in the order their shapes demanded: the
+   tool execution intercept first, because it needed the kernel to hold a suspended
+   chain position and resume it when the host asked
+   (`crates/plugin-host/src/continuations.rs` and the `Continue` RPC), then the
+   provider intercept reusing that machinery, then the event sanitizers sharing one
+   projection, and last the LLM pair, whose codec is the object the capability
+   protocol exists for. So this blocker is closed: what kept the bindings on the
+   in-process path was coverage, and coverage is complete.
 
    **This is a consequence of the CLI cutover too, and it is deliberate rather
    than incidental.** A plugin that registers one of the eight unserved classes

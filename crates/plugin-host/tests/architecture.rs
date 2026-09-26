@@ -481,13 +481,12 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
 
 /// The registration classes the boundary serves today, and the ones it does not.
 ///
-/// This is the number that gates the rest of the migration. The CLI has cut
-/// over, and the three entries in [`INDIRECT_LOAD_CALLERS`] have not — not
-/// because their composition is different, but because of this list: a plugin
-/// that registers any class the boundary cannot serve is refused **whole**, and
-/// the bindings' plugin fixtures register all sixteen. Widening this set is what
-/// makes the last three consumers interchangeable with the CLI, and it is also
-/// what those grandfather entries wait on.
+/// This was the number that gated the migration, and the gate is open: every
+/// class the ABI exposes is served, so the single entry left in
+/// [`INDIRECT_LOAD_CALLERS`] waits on its own cutover rather than on coverage.
+/// The list is kept as an equality rather than a subset precisely because that
+/// is now a statement about completeness — a class added to the ABI has to be
+/// served or named here, and the test is what makes that a decision.
 ///
 /// The test is written as an equality rather than a subset so that growth is a
 /// decision with a diff, and as two lists so that the gap is visible rather than

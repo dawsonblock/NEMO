@@ -9,13 +9,19 @@
 //! budget, while whoever composes the runtime decides how the plugin is reached
 //! and injects that choice.
 //!
-//! Today there is one implementation, and it is a compatibility bridge rather
-//! than a destination. [`InProcessPluginBackend`] calls the existing in-process
-//! loader, which means the native plugin ABI still runs inside the kernel
-//! address space and the milestone's `kernel-process unsafe tokens` metric does
-//! not move. It exists so the seam can be built and conformance-tested before
-//! anything is moved across a process boundary, and it is the implementation
-//! that the process backend will replace.
+//! There are two implementations, and they are not equal.
+//!
+//! [`ProcessPluginBackend`] is the production one: it starts a host process, and
+//! every native plugin's code runs there. [`crate::activation`] is what every
+//! consumer composes — the CLI, FFI and Python today — so the boundary has one
+//! lifecycle rather than four.
+//!
+//! [`InProcessPluginBackend`] remains for two reasons and no others: it serves
+//! the child process's own end of the protocol (the host runs the same loader the
+//! kernel used to), and it is what the conformance suite compares the process
+//! backend against. It is not a production path, and the milestone's
+//! `kernel-process unsafe tokens` metric does not move until the loader it calls
+//! leaves the kernel's dependency graph.
 
 pub mod activation;
 
