@@ -462,6 +462,31 @@ async def test_native_activation_context_owns_callbacks_and_close_is_idempotent(
     assert result.result == {"args": {"input": True}}
 
 
+@pytest.mark.parametrize("cycle", range(40))
+async def test_worker_activation_survives_repeated_cycles(
+    worker_dynamic_plugin: _BuiltPlugin,
+    cycle: int,
+):
+    """Activate, use and clear a worker plugin again and again in one process.
+
+    A lifecycle defect can pass once and fail later: a thread-affinity mistake, a
+    leaked host process, or a stack that only overflows on the deepest chain. One
+    green run is not evidence for any of them, so this walks the same path forty
+    times with the interpreter held open across all of them.
+    """
+    activation = await plugin.initialize_with_dynamic_plugins({}, [worker_dynamic_plugin.spec()])
+    try:
+        result = await tools.execute(
+            f"python-worker-cycle-{cycle}",
+            {"input": True},
+            lambda args: ToolExecutionResult({"args": args}),
+        )
+        assert result.result["worker_plugin_tool_execution"] is True, result.result
+    finally:
+        await activation.close()
+    assert not activation.is_active
+
+
 async def test_dynamic_activation_layers_plugins_toml_static_components(
     native_dynamic_plugin: _BuiltPlugin,
     tmp_path: Path,
@@ -633,7 +658,16 @@ async def test_invalid_dynamic_inputs_raise_normal_python_exceptions(native_dyna
 
 async def test_native_activation_finalizer_releases_callbacks(native_dynamic_plugin: _BuiltPlugin):
     activation = await plugin.initialize_with_dynamic_plugins({}, [native_dynamic_plugin.spec()])
-    assert "fixture_native" in plugin.list_kinds()
+    # The plugin's kind is registered where its library is — the host process —
+    # so this process not having it is the isolation property, and the intercepted
+    # call below is what proves the plugin is reachable while it is active.
+    assert "fixture_native" not in plugin.list_kinds()
+    reached = await tools.execute(
+        "python-native-while-active",
+        {"input": True},
+        lambda args: ToolExecutionResult(args),
+    )
+    assert reached.result.get("native_plugin") is True
 
     del activation
     # The asyncio Future returned by the native binding retains its completed
@@ -641,11 +675,8 @@ async def test_native_activation_finalizer_releases_callbacks(native_dynamic_plu
     await asyncio.sleep(0)
     gc.collect()
 
-    for _ in range(100):
-        if "fixture_native" not in plugin.list_kinds():
-            break
-        await asyncio.sleep(0.01)
-    assert "fixture_native" not in plugin.list_kinds()
+    # The activation's drop tears the host down, so the intercept is gone with it:
+    # the call reaches the tool unchanged rather than the plugin.
     result = await tools.execute(
         "python-native-after-finalize",
         {"input": True},

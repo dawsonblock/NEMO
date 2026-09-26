@@ -1077,6 +1077,7 @@ dependencies = [
  "libloading",
  "log",
  "nemo-relay-plugin",
+ "nemo-relay-plugin-protocol",
  "nemo-relay-types",
  "object_store",
  "opentelemetry",
@@ -1126,6 +1127,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "nemo-relay-plugin-protocol"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay-types",
+ "serde",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

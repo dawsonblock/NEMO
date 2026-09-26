@@ -24,6 +24,30 @@ use nemo_relay::api::runtime::subscriber_dispatcher::{
 use nemo_relay::api::runtime::{
     LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionNextFn, ToolExecutionNextFn,
 };
+
+/// Milliseconds one managed Python call may take.
+///
+/// Stated here because these entry points carry no deadline of their own. What it
+/// is *for* is the budget the kernel hands a registration that runs in another
+/// process — the runtime decides how long a plugin's work may take, and a plugin
+/// reached with no budget at all is refused rather than trusted. It cannot
+/// lengthen anything: the kernel narrows an inherited budget to its own ceiling.
+pub(crate) const MANAGED_CALL_BUDGET_MILLIS: u64 = 30_000;
+
+/// Run one managed Python operation under the budget this binding states.
+pub(crate) async fn with_managed_budget<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    nemo_relay::api::runtime::with_execution_budget(
+        nemo_relay::api::runtime::ExecutionBudget::new(
+            nemo_relay::api::runtime::budget_now_unix_ms() + MANAGED_CALL_BUDGET_MILLIS,
+            MANAGED_CALL_BUDGET_MILLIS,
+        ),
+        future,
+    )
+    .await
+}
 use nemo_relay::api::runtime::{
     TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
     capture_propagation_context_with_root as capture_propagation_context_with_root_handle,
@@ -995,32 +1019,35 @@ fn tool_call_execute<'py>(
     let publication_context = py_callable::capture_python_publication_context();
     let publication_buffer = capture_nested_publication_buffer();
     safe_future_into_py(py, async move {
-        with_task_nested_publication_buffer(
-            publication_buffer,
-            with_task_publication_context(
-                publication_context,
-                TASK_SCOPE_STACK.scope(scope_stack, async move {
-                    let result = core_tool_api::tool_call_execute(
-                        core_tool_api::ToolCallExecuteParams::builder()
-                            .name(name)
-                            .args(args_json)
-                            .func(default_fn)
-                            .parent(parent_handle)
-                            .attributes(attrs)
-                            .data_opt(data_json)
-                            .metadata_opt(metadata_json)
-                            .tool_call_id_opt(tool_call_id)
-                            .build(),
-                    )
-                    .await
-                    .map_err(to_py_err)?;
-                    Python::attach(|py| {
-                        Py::new(py, PyToolExecutionResult::from_inner(py, result)?)
-                            .map(Py::into_any)
-                    })
-                }),
-            ),
-        )
+        with_managed_budget(async move {
+            with_task_nested_publication_buffer(
+                publication_buffer,
+                with_task_publication_context(
+                    publication_context,
+                    TASK_SCOPE_STACK.scope(scope_stack, async move {
+                        let result = core_tool_api::tool_call_execute(
+                            core_tool_api::ToolCallExecuteParams::builder()
+                                .name(name)
+                                .args(args_json)
+                                .func(default_fn)
+                                .parent(parent_handle)
+                                .attributes(attrs)
+                                .data_opt(data_json)
+                                .metadata_opt(metadata_json)
+                                .tool_call_id_opt(tool_call_id)
+                                .build(),
+                        )
+                        .await
+                        .map_err(to_py_err)?;
+                        Python::attach(|py| {
+                            Py::new(py, PyToolExecutionResult::from_inner(py, result)?)
+                                .map(Py::into_any)
+                        })
+                    }),
+                ),
+            )
+            .await
+        })
         .await
     })
 }
@@ -1235,30 +1262,33 @@ fn llm_call_execute<'py>(
     let publication_context = py_callable::capture_python_publication_context();
     let publication_buffer = capture_nested_publication_buffer();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        with_task_nested_publication_buffer(
-            publication_buffer,
-            with_task_publication_context(
-                publication_context,
-                TASK_SCOPE_STACK.scope(scope_stack, async move {
-                    let params = core_llm_api::LlmCallExecuteParams::builder()
-                        .name(name)
-                        .request(request.inner)
-                        .func(default_fn)
-                        .parent(parent_handle)
-                        .attributes(attrs)
-                        .data_opt(data_json)
-                        .metadata_opt(metadata_json)
-                        .model_name_opt(model_name)
-                        .codec_opt(codec_arc)
-                        .response_codec_opt(response_codec_arc)
-                        .build();
-                    let result = core_llm_api::llm_call_execute(params)
-                        .await
-                        .map_err(to_py_err)?;
-                    Python::attach(|py| json_to_py(py, &result))
-                }),
-            ),
-        )
+        with_managed_budget(async move {
+            with_task_nested_publication_buffer(
+                publication_buffer,
+                with_task_publication_context(
+                    publication_context,
+                    TASK_SCOPE_STACK.scope(scope_stack, async move {
+                        let params = core_llm_api::LlmCallExecuteParams::builder()
+                            .name(name)
+                            .request(request.inner)
+                            .func(default_fn)
+                            .parent(parent_handle)
+                            .attributes(attrs)
+                            .data_opt(data_json)
+                            .metadata_opt(metadata_json)
+                            .model_name_opt(model_name)
+                            .codec_opt(codec_arc)
+                            .response_codec_opt(response_codec_arc)
+                            .build();
+                        let result = core_llm_api::llm_call_execute(params)
+                            .await
+                            .map_err(to_py_err)?;
+                        Python::attach(|py| json_to_py(py, &result))
+                    }),
+                ),
+            )
+            .await
+        })
         .await
     })
 }
@@ -1345,53 +1375,57 @@ fn llm_stream_call_execute<'py>(
     let publication_buffer = capture_nested_publication_buffer();
     let stream_publication_buffer = publication_buffer.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        with_task_nested_publication_buffer(
-            publication_buffer,
-            with_task_publication_context(
-                publication_context,
-                TASK_SCOPE_STACK.scope(scope_stack, async move {
-                    let params = core_llm_api::LlmStreamCallExecuteParams::builder()
-                        .name(name)
-                        .request(request.inner)
-                        .func(default_fn)
-                        .collector(collector_fn)
-                        .finalizer(Box::new(|| serde_json::Value::Null))
-                        .parent(parent_handle)
-                        .attributes(attrs)
-                        .data_opt(data_json)
-                        .metadata_opt(metadata_json)
-                        .model_name_opt(model_name)
-                        .codec_opt(codec_arc)
-                        .response_codec_opt(response_codec_arc)
-                        .build();
-                    let rust_stream =
-                        core_llm_api::llm_stream_call_execute_with_fallible_finalizer(
-                            params,
-                            finalizer_fn,
-                        )
-                        .await
-                        .map_err(to_py_err)?;
+        with_managed_budget(async move {
+            with_task_nested_publication_buffer(
+                publication_buffer,
+                with_task_publication_context(
+                    publication_context,
+                    TASK_SCOPE_STACK.scope(scope_stack, async move {
+                        let params = core_llm_api::LlmStreamCallExecuteParams::builder()
+                            .name(name)
+                            .request(request.inner)
+                            .func(default_fn)
+                            .collector(collector_fn)
+                            .finalizer(Box::new(|| serde_json::Value::Null))
+                            .parent(parent_handle)
+                            .attributes(attrs)
+                            .data_opt(data_json)
+                            .metadata_opt(metadata_json)
+                            .model_name_opt(model_name)
+                            .codec_opt(codec_arc)
+                            .response_codec_opt(response_codec_arc)
+                            .build();
+                        let rust_stream =
+                            core_llm_api::llm_stream_call_execute_with_fallible_finalizer(
+                                params,
+                                finalizer_fn,
+                            )
+                            .await
+                            .map_err(to_py_err)?;
 
-                    // Spawn a tokio task that drains the Rust stream into an mpsc channel
-                    let (tx, rx) = tokio::sync::mpsc::channel::<FlowResult<serde_json::Value>>(32);
-                    let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
-                    let (closed, closed_rx) = tokio::sync::watch::channel(None);
-                    tokio::spawn(with_task_nested_publication_buffer(
-                        stream_publication_buffer,
-                        with_task_publication_context(
-                            stream_publication_context,
-                            forward_stream_to_channel(rust_stream, tx, cancel_rx, closed),
-                        ),
-                    ));
+                        // Spawn a tokio task that drains the Rust stream into an mpsc channel
+                        let (tx, rx) =
+                            tokio::sync::mpsc::channel::<FlowResult<serde_json::Value>>(32);
+                        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+                        let (closed, closed_rx) = tokio::sync::watch::channel(None);
+                        tokio::spawn(with_task_nested_publication_buffer(
+                            stream_publication_buffer,
+                            with_task_publication_context(
+                                stream_publication_context,
+                                forward_stream_to_channel(rust_stream, tx, cancel_rx, closed),
+                            ),
+                        ));
 
-                    Ok(PyLlmStream {
-                        receiver: Arc::new(tokio::sync::Mutex::new(rx)),
-                        cancel,
-                        closed: closed_rx,
-                    })
-                }),
-            ),
-        )
+                        Ok(PyLlmStream {
+                            receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                            cancel,
+                            closed: closed_rx,
+                        })
+                    }),
+                ),
+            )
+            .await
+        })
         .await
     })
 }

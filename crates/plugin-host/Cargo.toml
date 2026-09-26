@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Plugin execution backends, including the in-process compatibility backend."
+
+[lints]
+workspace = true
+
+[dependencies]
+nemo-relay.workspace = true
+nemo-relay-plugin.workspace = true
+nemo-relay-plugin-protocol.workspace = true
+nemo-relay-plugin-proto.workspace = true
+chrono = "0.4"
+futures-util = "0.3"
+getrandom = "0.3"
+serde_json = "1"
+subtle = "2"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.2", default-features = false, features = [
+    "codegen",
+    "router",
+    "transport",
+] }
+tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["process", "thread"] }
+
+[features]
+# The worker lane: a plugin whose code runs in a process the kernel starts and
+# whose adapter lives here. Off by default because most consumers do not run
+# worker plugins, and the error a consumer without it gets says so.
+worker-grpc = ["nemo-relay/worker-grpc"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dependency-layer rules for the NEMO workspace.
+#
+# Layers are ordered lowest first, and document order is significant. A crate
+# may depend on its own layer or a lower one; an edge pointing upward is an
+# architectural violation, because it means a lower layer reaches into an
+# implementation that is supposed to be replaceable beneath it.
+#
+# This is the target layering from the 0.10 program, applied to the crate names
+# the repository actually uses today.
+
+version = 1
+
+[layers]
+# Stable vocabulary: identity, fingerprints, execution classes, receipts, and
+# the message contract for plugin execution across a process boundary.
+contracts = ["nemo-relay-types", "nemo-relay-plugin-protocol"]
+
+# The trusted core. It should know contracts and interfaces, and nothing about
+# PostgreSQL, HTTP, providers, the CLI, or a language binding.
+kernel = ["nemo-relay"]
+
+# Contracts and implementations that sit beside the kernel behind its traits.
+adapters = [
+    "nemo-relay-authority",
+    "nemo-relay-executor",
+    "nemo-relay-ledger",
+    "nemo-relay-plugin",
+    "nemo-relay-plugin-host",
+    "nemo-relay-plugin-proto",
+    "nemo-relay-worker",
+    "nemo-relay-worker-proto",
+]
+
+# Composition and runtime concerns.
+runtime = [
+    "nemo-effect-runtime",
+    "nemo-relay-adaptive",
+    "nemo-relay-dlp",
+    "nemo-relay-isolation",
+    "nemo-relay-pii-redaction",
+]
+
+# Operator and embedding surfaces.
+surfaces = [
+    "nemo-relay-cli",
+    "nemo-relay-ffi",
+    "nemo-relay-node",
+    "nemo-relay-python",
+]
+
+# Verification tooling.
+qualification = ["nemo-effect-qualification"]
+
+# Edges that point upward today and must be deleted by a later milestone.
+#
+# Every one of them starts at the kernel, which is the finding that matters
+# most: it means K-008 through K-014 are enforced in code the kernel does not
+# own. The gate fails when a *new* upward edge appears, so this list can only
+# shrink. Delete an entry when the corresponding edge is removed.
+[grandfathered]
+"nemo-relay" = [
+    "nemo-relay-authority",
+    "nemo-relay-executor",
+    "nemo-relay-ledger",
+    "nemo-relay-plugin",
+    "nemo-relay-worker-proto",
+]

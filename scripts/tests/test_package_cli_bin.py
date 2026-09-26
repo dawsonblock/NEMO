@@ -26,14 +26,16 @@ class PackageCliBinTests(unittest.TestCase):
             output = Path(temporary)
             binary = output / "nemo-relay"
             binary.write_bytes(b"test-binary")
+            host_binary = output / "nemo-plugin-host"
+            host_binary.write_bytes(b"test-host-binary")
             gnu_platform = PACKAGE_CLI_BIN.PLATFORMS["x86_64-unknown-linux-gnu"]
             musl_platform = PACKAGE_CLI_BIN.PLATFORMS["x86_64-unknown-linux-musl"]
 
             previous_directory = Path.cwd()
             try:
                 os.chdir(output)
-                wheel = PACKAGE_CLI_BIN.build_wheel(binary, gnu_platform, "0.7.0-rc.1", output)
-                musl_wheel = PACKAGE_CLI_BIN.build_wheel(binary, musl_platform, "0.7.0-rc.1", output)
+                wheel = PACKAGE_CLI_BIN.build_wheel(binary, host_binary, gnu_platform, "0.7.0-rc.1", output)
+                musl_wheel = PACKAGE_CLI_BIN.build_wheel(binary, host_binary, musl_platform, "0.7.0-rc.1", output)
             finally:
                 os.chdir(previous_directory)
 
@@ -44,10 +46,54 @@ class PackageCliBinTests(unittest.TestCase):
                 script_mode = script.external_attr >> 16
                 self.assertTrue(stat.S_ISREG(script_mode))
                 self.assertEqual(stat.S_IMODE(script_mode), 0o755)
+                # The host travels with the CLI, in the same directory, because
+                # that directory is what "beside the executable that starts me"
+                # resolves to once the wheel is installed.
+                host = next(
+                    info for info in archive.infolist() if info.filename.endswith(".data/scripts/nemo-plugin-host")
+                )
+                host_mode = host.external_attr >> 16
+                self.assertTrue(stat.S_ISREG(host_mode))
+                self.assertEqual(stat.S_IMODE(host_mode), 0o755)
+                self.assertEqual(archive.read(host.filename), b"test-host-binary")
+                self.assertEqual(
+                    Path(host.filename).parent,
+                    Path(script.filename).parent,
+                    "the host and the CLI install side by side",
+                )
                 wheel_metadata = archive.read(next(name for name in names if name.endswith("/WHEEL")))
                 self.assertIn(b"Tag: py3-none-manylinux_2_17_x86_64", wheel_metadata)
 
             self.assertIn("0.7.0rc1-py3-none-musllinux_1_2_x86_64", musl_wheel.name)
+
+    def test_windows_platforms_name_the_executables_they_ship(self) -> None:
+        # A wheel that shipped `nemo-plugin-host` on Windows would install a
+        # file nothing starts: the supervisor looks for the `.exe` its own
+        # platform spells.
+        for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+            with self.subTest(target=target):
+                platform = PACKAGE_CLI_BIN.PLATFORMS[target]
+                self.assertEqual(platform.executable, "nemo-relay.exe")
+                self.assertEqual(platform.host_executable, "nemo-plugin-host.exe")
+
+    def test_a_wheel_without_a_host_says_so_instead_of_promising_one(self) -> None:
+        # The one platform with no host to ship — the isolated runtime is not
+        # implemented on Windows yet — gets a wheel that carries the CLI alone and
+        # metadata that says which of the two it is.
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            binary = output / "nemo-relay.exe"
+            binary.write_bytes(b"test-binary")
+            platform = PACKAGE_CLI_BIN.PLATFORMS["x86_64-pc-windows-msvc"]
+
+            wheel = PACKAGE_CLI_BIN.build_wheel(binary, None, platform, "0.9.1-rc.4", output)
+
+            with zipfile.ZipFile(wheel) as archive:
+                names = archive.namelist()
+                self.assertFalse(any(name.endswith("nemo-plugin-host.exe") for name in names), names)
+                metadata = archive.read(next(name for name in names if name.endswith("/METADATA")))
+                self.assertIn(b"carries no plugin host", metadata)
+                self.assertNotIn(b"the `nemo-plugin-host` process", metadata)
 
     def test_rejects_unsupported_version(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported package version"):

@@ -19,16 +19,15 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use nemo_relay::plugin::dynamic::{
-    DynamicPluginKind, NativePluginActivation, NativePluginLoadSpec, WorkerPluginActivation,
-    WorkerPluginLoadSpec, load_native_plugins, load_worker_plugins,
-};
+use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, DynamicPluginKind};
 use nemo_relay::plugin::{
-    PluginComponentSpec, PluginConfig, clear_plugin_configuration,
-    ensure_builtin_plugins_registered, initialize_plugins_exact,
+    PluginConfig, clear_plugin_configuration, ensure_builtin_plugins_registered,
+    initialize_plugins_exact,
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
+use nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig;
 use reqwest::Client;
 use serde_json::Value;
 use subtle::ConstantTimeEq;
@@ -909,9 +908,57 @@ where
     })
 }
 
+/// The activation a served gateway holds, in the shape it came from.
+///
+/// Boxed rather than inline: a gateway holds one of these for its whole life, so
+/// the size clippy measures is paid once per process, and boxing would be paid
+/// on every access to the activation it wraps.
+#[allow(clippy::large_enum_variant)]
 enum ServerPluginActivation {
     Static,
     Dynamic(PluginActivation),
+}
+
+/// Longest one registration may take when it crosses the boundary.
+///
+/// A registration that has not answered in this long is a registration this
+/// runtime cannot wait for: the proxy gives up and the host is told, rather than
+/// letting a plugin's slowness become the runtime's.
+const NATIVE_REGISTRATION_CAP_MILLIS: u64 = 5_000;
+
+/// How many off-path plugin operations may be in flight at once.
+///
+/// Stated rather than left to whatever the machine can hold, because the point
+/// of the bound is that a plugin cannot choose it.
+const NATIVE_OFF_PATH_IN_FLIGHT: usize = 64;
+
+/// The identity this process's plugin sessions are bound to.
+///
+/// The host checks every operation's context against the binding it was started
+/// under, so this has to be one value per runtime rather than one per call, and
+/// it has to distinguish this runtime from another. It is derived from what
+/// identifies the runtime to a plugin — the implementation, its version, and the
+/// process that owns the session — the same way the kernel derives its own.
+fn plugin_runtime_binding() -> String {
+    use std::sync::OnceLock;
+
+    static BINDING: OnceLock<String> = OnceLock::new();
+    BINDING
+        .get_or_init(|| {
+            let binding = serde_json::json!({
+                "implementation": "nemo-relay-cli",
+                "version": env!("CARGO_PKG_VERSION"),
+                "process": std::process::id(),
+            });
+            let bytes = serde_json::to_vec(&binding)
+                .expect("a runtime binding this process owns must serialize");
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+        .clone()
 }
 
 const REMOVED_SWITCHYARD_MESSAGE: &str = "the built-in Switchyard service integration was removed in NeMo Relay >=0.8.0; remove this `[[components]]` entry and refer to the NeMo Relay migration guides for current Switchyard migration information: https://docs.nvidia.com/nemo/relay/reference/migration-guides";
@@ -1023,9 +1070,13 @@ async fn initialize_plugin_host(
 }
 
 struct PluginActivation {
-    active: bool,
-    native: Option<NativePluginActivation>,
-    worker: Option<WorkerPluginActivation>,
+    /// The shared activation: the process-wide ownership, the configuration's
+    /// own components, the process-hosted native plugins, and the rollback that
+    /// undoes all three together.
+    ///
+    /// Dropping this removes the proxies and ends the host process, so a
+    /// plugin's callbacks cannot outlive the runtime that installed them.
+    runtime: Option<ActivatedPluginRuntime>,
     _snapshots: Vec<Arc<DynamicPluginActivationSnapshot>>,
 }
 
@@ -1035,15 +1086,17 @@ impl PluginActivation {
         dynamic_plugins: Vec<ActiveDynamicPluginComponent>,
     ) -> Result<Self, CliError> {
         if config.is_none() && dynamic_plugins.is_empty() {
+            // Nothing to compose. The caller reaches this only through the
+            // dynamic path, so this is the empty case rather than a mis-call —
+            // and "activate nothing" is a state with a meaning here, not a
+            // failure to invent.
             return Ok(Self {
-                active: false,
-                native: None,
-                worker: None,
+                runtime: None,
                 _snapshots: Vec::new(),
             });
-        };
+        }
         // Gateway already resolved its config; activate exactly (no re-discovery).
-        let mut plugin_config: PluginConfig = match config {
+        let plugin_config: PluginConfig = match config {
             Some(config) => serde_json::from_value(config)
                 .map_err(|error| CliError::Config(format!("invalid plugin config: {error}")))?,
             None => PluginConfig::default(),
@@ -1060,22 +1113,12 @@ impl PluginActivation {
         {
             return Err(CliError::Config(error.to_string()));
         }
-        let static_plugin_config = plugin_config.clone();
-        plugin_config
-            .components
-            .extend(dynamic_plugins.iter().map(|plugin| PluginComponentSpec {
-                kind: plugin.plugin_id.clone(),
-                enabled: true,
-                config: plugin.config.clone(),
-            }));
-        for plugin in &dynamic_plugins {
-            if let Some(snapshot) = plugin.activation_snapshot.as_ref() {
-                snapshot.verify_current()?;
-            }
-        }
-        let native_specs = dynamic_plugins
+        // What the shared activation runs, described in the vocabulary it takes.
+        // The manifest a dynamic plugin is loaded from lives in the lifecycle
+        // state this binary discovered, so it is resolved here: the composition
+        // has no discovery of its own.
+        let specs = dynamic_plugins
             .iter()
-            .filter(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
             .map(|plugin| {
                 let manifest_ref = plugin
                     .activation_snapshot
@@ -1084,34 +1127,25 @@ impl PluginActivation {
                     .or_else(|| plugin.manifest_ref.clone())
                     .ok_or_else(|| {
                         CliError::Config(format!(
-                            "native dynamic plugin '{}' has no manifest_ref in lifecycle state",
-                            plugin.plugin_id
+                            "{} dynamic plugin '{}' has no manifest_ref in lifecycle state",
+                            // Named by the lane it belongs to rather than by the
+                            // list it arrived in: a deployment reading this is
+                            // looking for the plugin it configured, and "which
+                            // lane" is the half it has to know to find it.
+                            match plugin.kind {
+                                DynamicPluginKind::RustDynamic => "native",
+                                DynamicPluginKind::Worker => "worker",
+                            },
+                            plugin.plugin_id,
                         ))
                     })?;
-                Ok(NativePluginLoadSpec {
+                Ok(DynamicPluginActivationSpec {
                     plugin_id: plugin.plugin_id.clone(),
+                    kind: plugin.kind,
                     manifest_ref,
-                })
-            })
-            .collect::<Result<Vec<_>, CliError>>()?;
-        let worker_specs = dynamic_plugins
-            .iter()
-            .filter(|plugin| plugin.kind == DynamicPluginKind::Worker)
-            .map(|plugin| {
-                let manifest_ref = plugin
-                    .activation_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.activation_manifest_ref())
-                    .or_else(|| plugin.manifest_ref.clone())
-                    .ok_or_else(|| {
-                        CliError::Config(format!(
-                            "worker dynamic plugin '{}' has no manifest_ref in lifecycle state",
-                            plugin.plugin_id
-                        ))
-                    })?;
-                Ok(WorkerPluginLoadSpec {
-                    plugin_id: plugin.plugin_id.clone(),
-                    manifest_ref,
+                    // The snapshot is what the deployment last approved, so its
+                    // environment reference is the one that approval named; the
+                    // discovered value is the fallback for a plugin without one.
                     environment_ref: plugin
                         .activation_snapshot
                         .as_ref()
@@ -1122,78 +1156,60 @@ impl PluginActivation {
                 })
             })
             .collect::<Result<Vec<_>, CliError>>()?;
-        let snapshots = dynamic_plugins
+        let snapshots: Vec<Arc<DynamicPluginActivationSnapshot>> = dynamic_plugins
             .iter()
             .filter_map(|plugin| plugin.activation_snapshot.clone())
             .collect();
-        initialize_plugins_exact(static_plugin_config)
-            .await
-            .map_err(|error| CliError::Config(format!("plugin activation failed: {error}")))?;
-        let activation: Result<Self, CliError> = async {
-            let native = if native_specs.is_empty() {
-                None
-            } else {
-                Some(load_native_plugins(native_specs).map_err(|error| {
-                    CliError::Config(format!("native plugin load failed: {error}"))
-                })?)
-            };
-            for plugin in &dynamic_plugins {
-                if let Some(snapshot) = plugin.activation_snapshot.as_ref() {
-                    snapshot.verify_current()?;
+        // Asked between "the artifact was started" and "the activation
+        // committed", which is the only place the question can be asked without
+        // either approving late or committing first: a snapshot says what the
+        // deployment last approved, and a snapshot that no longer describes what
+        // is running rolls the whole activation back.
+        let verify_snapshots = {
+            let snapshots = snapshots.clone();
+            move || -> Result<(), String> {
+                for snapshot in &snapshots {
+                    snapshot
+                        .verify_current()
+                        .map_err(|error| error.to_string())?;
                 }
+                Ok(())
             }
-            let worker = if worker_specs.is_empty() {
-                None
-            } else {
-                Some(load_worker_plugins(worker_specs).map_err(|error| {
-                    CliError::Config(format!("worker plugin load failed: {error}"))
-                })?)
-            };
-            clear_plugin_configuration().map_err(|error| {
-                CliError::Config(format!("static plugin teardown failed: {error}"))
-            })?;
-            initialize_plugins_exact(plugin_config)
-                .await
-                .map_err(|error| CliError::Config(format!("plugin activation failed: {error}")))?;
-            Ok(Self {
-                active: true,
-                native,
-                worker,
-                _snapshots: snapshots,
-            })
-        }
-        .await;
-        if let Err(error) = activation {
-            return match clear_plugin_configuration() {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(CliError::Config(format!(
-                    "{error}; plugin activation cleanup failed: {cleanup_error}"
-                ))),
-            };
-        }
-        activation
+        };
+        let runtime = ActivatedPluginRuntime::activate(
+            plugin_config,
+            specs,
+            IsolationPolicy {
+                // Everything the supervisor needs beyond the executable and the
+                // binding is a default this composition accepts: the frame limit
+                // the protocol's ceiling stands for, the resource ceilings the
+                // host crate ships, and its startup budget.
+                supervisor: PluginHostSupervisorConfig::beside_this_executable(
+                    plugin_runtime_binding(),
+                ),
+                registration_cap_millis: NATIVE_REGISTRATION_CAP_MILLIS,
+                observability: nemo_relay_plugin_host::off_path::ObservabilityPolicy {
+                    budget_millis: NATIVE_REGISTRATION_CAP_MILLIS,
+                    max_in_flight: NATIVE_OFF_PATH_IN_FLIGHT,
+                },
+                after_native_startup: Some(Box::new(verify_snapshots)),
+            },
+        )
+        .await
+        .map_err(|error| CliError::Config(error.to_string()))?;
+
+        Ok(Self {
+            runtime: Some(runtime),
+            _snapshots: snapshots,
+        })
     }
 
     fn clear(mut self) -> Result<(), CliError> {
-        let result = if self.active {
-            self.active = false;
-            clear_plugin_configuration()
-                .map_err(|error| CliError::Config(format!("plugin teardown failed: {error}")))?;
-            Ok(())
-        } else {
-            Ok(())
-        };
-        self.native.take();
-        self.worker.take();
-        result
-    }
-}
-
-impl Drop for PluginActivation {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = clear_plugin_configuration();
-            self.active = false;
+        match self.runtime.take() {
+            Some(runtime) => runtime
+                .clear()
+                .map_err(|error| CliError::Config(error.to_string())),
+            None => Ok(()),
         }
     }
 }

@@ -1,0 +1,599 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Trusted computing base policy for the NEMO kernel.
+#
+# Two tiers, because they answer different questions.
+#
+#   [trusted]     Code that *enforces* a kernel invariant: canonical identity,
+#                 capability and grant verification, execution routing,
+#                 idempotency, effect state transitions, receipts, and lease
+#                 fencing. A function earns a place here by enforcing one of
+#                 the properties in security/INVARIANTS.md.
+#
+#   [in_process]  Additional code linked into the same process as the kernel.
+#                 It enforces none of those invariants, but a memory-safety or
+#                 logic bug in it can subvert them anyway, so it belongs to the
+#                 effective attack surface and is measured on its own tier.
+#
+# Providers, transports, bindings, the CLI, DLP and isolation implementations,
+# qualification tooling, tests, and docs stay outside both tiers. The kernel
+# must not know what PostgreSQL, Gmail, GitHub, or a language binding is.
+
+version = 1
+
+[trusted]
+crates = [
+    "nemo-relay",
+    "nemo-relay-types",
+    "nemo-relay-authority",
+    "nemo-relay-executor",
+    "nemo-relay-ledger",
+]
+
+# Crates that share the kernel's process but do not enforce an invariant.
+# Worker binaries run in their own processes and are deliberately excluded.
+[in_process]
+crates = [
+    "nemo-effect-runtime",
+    "nemo-relay-adaptive",
+    "nemo-relay-dlp",
+    "nemo-relay-isolation",
+    "nemo-relay-pii-redaction",
+    "nemo-relay-plugin",
+    # Core depends on the plugin contract, so it is in the kernel's process.
+    # It stays out of the invariant-enforcing tier: it carries vocabulary, not
+    # enforcement.
+    "nemo-relay-plugin-protocol",
+    # The compatibility backend runs inside whichever process links it, which
+    # today is the kernel's. It is counted here because that is physically true
+    # now, and separately in [plugin_host] because that is where it belongs once
+    # the loader crosses a process boundary. Counting it only in the target tier
+    # would let an architecture diagram stand in for an accounting fact.
+    "nemo-relay-plugin-host",
+    # The wire crate is linked into the kernel's process too: the supervisor
+    # converts and sends on the kernel's side of the boundary. It is budgeted on
+    # its own line because its transitive set is dominated by the protobuf and
+    # gRPC toolchain, but the tier is what says where its code runs.
+    "nemo-relay-plugin-proto",
+    "nemo-relay-worker-proto",
+]
+
+# The process that will host native plugins once the boundary exists. This is a
+# target classification, not a current one: `nemo-relay-plugin-host` is also
+# listed in [in_process] because that is where its code actually runs today.
+[plugin_host]
+crates = ["nemo-relay-plugin-host"]
+
+# Packages that must never appear in a trusted crate's resolved tree.
+#
+# The kernel depends on interfaces, not implementations, so a database driver
+# or a foreign-function binding appearing here means an implementation leaked
+# across the boundary. Measured with `cargo tree --all-features`, these hold
+# today: core reaches `nemo-relay-ledger` for its effect-store contract, but the
+# ledger crate keeps the PostgreSQL driver behind a feature core never enables.
+#
+# Transport and HTTP packages (`reqwest`, `tonic`, `axum`, `hyper`,
+# `object_store`, `libloading`) are still reachable and are held flat by the
+# budgets below rather than listed here, because a gate that is red on arrival
+# enforces nothing.
+[forbidden]
+nemo-relay = [
+    "sqlx",
+    "tokio-postgres",
+    "postgres",
+    "deadpool-postgres",
+    "diesel",
+    "napi",
+    "pyo3",
+]
+nemo-relay-types = [
+    "sqlx",
+    "tokio-postgres",
+    "postgres",
+    "deadpool-postgres",
+    "diesel",
+    "napi",
+    "pyo3",
+]
+nemo-relay-authority = ["sqlx", "tokio-postgres", "postgres", "napi", "pyo3"]
+nemo-relay-executor = ["sqlx", "tokio-postgres", "postgres", "napi", "pyo3"]
+nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
+
+# Budgets.
+#
+# The `max_*` numbers are ceilings: exceeding one fails the gate, so growth has
+# to be an explicit, reviewable edit to this file. They are deliberately not
+# two-sided, because every code change in a trusted crate moves the line count
+# and a gate that demands a file edit for every commit gets switched off.
+#
+# The `*_dependency_digest` fields are the ratchet that does not depend on the
+# counts. They pin the resolved dependency sets *including versions*, so
+# removing a harmless package and adding a dangerous one cannot pass by keeping
+# the count equal, and a version change cannot pass at all.
+#
+# Source lines and `unsafe` tokens count every file under the crate's `src`,
+# including inline test modules, and count `unsafe` textually without trying to
+# strip comments. Both are upper bounds and never undercount.
+
+[limits.nemo-relay]
+max_direct_dependencies = 40
+max_transitive_packages = 265
+# Raised for the exact-registration entry points the process boundary calls —
+# `invoke_tool_execution_intercept_registration`,
+# `invoke_llm_execution_intercept_registration`, and the name-retaining registry
+# merge behind them, which are what let a hosted plugin's callback resume a chain
+# position that lives in this process. No `unsafe` moved with it, and no
+# dependency did either: the kernel gained API surface, not reach. The last of it
+# is the loader recording the registrations an instance *has* rather than a log of
+# every one it ever made: a second activation against one instance used to double
+# its own description, which the conversion then refused.
+#
+# Raised for what serving the three event sanitize classes needed on this side. The
+# doors report whether the registration answered (`EventSanitizeOutcome`), because a
+# host running a plugin's callback has to be able to tell the kernel it broke — a
+# sanitizer that cleared everything and one that never worked are otherwise the same
+# event. `runtime_mark` publishes the runtime's own failure records without offering
+# them to the event sanitizers, which is the rule that keeps a sanitizer that cannot
+# answer from looping on the record of its own failure. A single-entry runner sits
+# under both, so the chain's fail-closed clearing and the door's reporting are one
+# implementation. No dependency moved and no `unsafe` did.
+#
+# Raised once more for the Layer 1 repair: the exact-registration doors now make the
+# same process-ownership claim every other entry point makes, their selection of a name
+# held twice is a documented rule with a home rather than the order a merged vector
+# happened to be built in, and the environment names the owner check reads are visible
+# to the crate's tests so a suite cannot test a second spelling of them. No dependency
+# moved and no `unsafe` did.
+# Raised for the exact-registration doors of the LLM sanitize pair and the single-entry
+# runners under them: one entry per direction, sharing the name-selection rule with the
+# event doors rather than restating it, and reporting a sanitizer that did not answer so
+# a host running the registration for another process can account for the omission. No
+# dependency moved and no `unsafe` did.
+#
+# Raised once more for the kernel's deadline test: the constant became a ceiling, and the
+# test that pins inheritance, shortening and capping is four lines of budget arithmetic.
+# Raised for the approved-artifact type: the loader now takes an `ApprovedPluginArtifact`
+# rather than an optional identity in a struct with public fields, so the three ways to ask
+# for a load name themselves and a load with nothing approved has to be written. It is a
+# type and its documentation rather than new reach — the digests were already checked, and
+# no dependency moved and no `unsafe` did — and it is here because the next milestone makes
+# the bindings use this API rather than remember the convention.
+# Raised for the composition surface: the plugin ownership lease, the owner-scoped clear, and
+# the exact initializer are now public, with the documentation that says why a composition
+# outside the kernel needs each one. Nothing moved: the kernel still owns the registry, the
+# lease and the teardown, and this is the narrower of the two ways to let a composition drive
+# them — the alternative is the composition reaching the in-process activation API, which is
+# what the cutover removes. No dependency moved and no `unsafe` did.
+#
+# Raised by eight lines for the documentation on the composition surface: the kernel's lease,
+# its owner-scoped clear and its exact initializer are public, and each says why a composition
+# outside the kernel needs it rather than leaving the next reader to infer it. No dependency
+# moved and no `unsafe` did.
+#
+# This is the last upward movement before the loader leaves: the next change to this number
+# is the deletion of the loader and the ABI bridge, and it moves down.
+max_source_lines = 74779
+# Raised for the three exact-registration entry points the event sanitize classes
+# need: one public entry per class over a private shared helper, which is how a host
+# is asked to run exactly the registration a proxy names rather than the family.
+max_unsafe_occurrences = 307
+direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
+transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
+
+[limits.nemo-relay-types]
+max_direct_dependencies = 7
+max_transitive_packages = 25
+max_source_lines = 3760
+max_unsafe_occurrences = 0
+direct_dependency_digest = "11e4bcc51abb330176957e169b265053384410421ab598cf026210efe3e2cfb9"
+transitive_dependency_digest = "32f9b5b8b290605bb864bb6d492723e78bb81c2efab0bc9d92cc3dfc4d7fd800"
+
+# The plugin-execution contract. The kernel depends on it, so it is in the
+# in-process tier above: naming these types is enough to put the crate in the
+# kernel's address space. Measured on its own line so a change to the vocabulary
+# is visible as itself rather than inside the kernel's total.
+#
+# Its `unsafe` budget is 3 while the crate contains no `unsafe` at all. Counting
+# is textual, so the three occurrences are the word in this crate's own
+# documentation. That is the price of an upper bound that cannot hide a token,
+# and it means a prose change can move this number.
+[limits.nemo-relay-plugin-protocol]
+max_direct_dependencies = 4
+max_transitive_packages = 24
+# Raised for the projection's two conversions and the tests that pin them: the
+# projection is built from an event for one class (refusing an event of another), the
+# synthetic event is built back from it, and the tests require that no event identity —
+# uuid, parent, timestamp — crosses in either direction. No dependency moved and no
+# `unsafe` did.
+#
+# Raised again for the disclosure list the ratchet compares against: the fields the
+# kernel keeps are written down as data, so a projection that grows a key fails a test
+# instead of passing silently, and the same list is asserted over every class. No
+# dependency moved and no `unsafe` did.
+#
+# Raised for the two read-only discriminators and the tests that keep them honest: the
+# fields themselves, the round trip that carries them through a synthetic event for all
+# three classes, the refusal of a scope projection that states no category, and the
+# proof that an answer has nowhere to put either one. No dependency moved and no
+# `unsafe` did.
+# Raised for the codec reference: an opaque, bounded, shape-validated name for a
+# capability the runtime issued, with the direction it authorizes and the tests that pin
+# what is refused. No dependency moved and no `unsafe` did.
+# Raised for the host's build identity: the release a host was built from and the native
+# ABI revision its loader carries, as one value the handshake compares rather than as two
+# fields a caller compares by remembering to, plus the named disagreement that turns a
+# mismatch into a failure code and a message. The boundary's ABI ceiling is declared here
+# rather than imported from the ABI crate, because a shared constant is not a check. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 2476
+max_unsafe_occurrences = 3
+direct_dependency_digest = "8762420a6f3fee260f247e75fd3829558a2527a0011096e4fe9bccc3c113f7cc"
+transitive_dependency_digest = "710995e81b0ff738ab197a0ef575fbbee3ef4641918affedd2811cfc336d0abd"
+
+[limits.nemo-relay-authority]
+max_direct_dependencies = 3
+max_transitive_packages = 34
+max_source_lines = 432
+max_unsafe_occurrences = 0
+direct_dependency_digest = "9fae7fb7e93e5b7c52cec0724706e33f05c6661099a052e9a6396bb488c5e868"
+transitive_dependency_digest = "323f7d63c70c92c75627b285090fe8e2610565df92bff434c7bafd40e3901b0a"
+
+[limits.nemo-relay-executor]
+max_direct_dependencies = 4
+max_transitive_packages = 33
+max_source_lines = 555
+max_unsafe_occurrences = 0
+direct_dependency_digest = "72f88f4f4d1c72fdb4c1a4f56afa48e9bbd07049aa83fc7131636693cf3b1bf5"
+transitive_dependency_digest = "1eef55b4e8ac605c5ce170bd8eb8604d56c35d9aa2f819f9c73723cc021c2df1"
+
+[limits.nemo-relay-ledger]
+max_direct_dependencies = 9
+max_transitive_packages = 106
+max_source_lines = 9455
+max_unsafe_occurrences = 0
+direct_dependency_digest = "02e902c5c51bdce194bcd36fc2a50e4af2468a338a405f1db48b6bc6dcbddcf2"
+transitive_dependency_digest = "1e5116e90ef0d74d6165fdbe239ac51fa536f8375be84749b3ba86fa0784d0ac"
+
+# Raised for the mark window, which is the SDK's side of ABI v5: an ambient
+# execution context that has to be captured where the host opens it and restored
+# across every task boundary the plugin owns — the callback's future and the
+# stream it returns alike. That is raw-pointer work by construction (the window is
+# an opaque host handle), which is where the `unsafe` growth is, and it is the
+# same shape as the scope binding the SDK already carried rather than a second
+# context system beside it.
+[limits.nemo-relay-plugin]
+max_direct_dependencies = 6
+max_transitive_packages = 39
+max_source_lines = 5463
+max_unsafe_occurrences = 333
+direct_dependency_digest = "c86fd580622db0b895e08d9ac8092f41be20e3e1eb4767b7f1d6c22a989ab1ec"
+transitive_dependency_digest = "9bc8864a9ca6215adb9194008a652fee077ae25f65f56cd6a10e07b44c0ced92"
+
+[limits.nemo-relay-worker-proto]
+max_direct_dependencies = 5
+max_transitive_packages = 97
+max_source_lines = 63
+max_unsafe_occurrences = 0
+direct_dependency_digest = "312841b91a4e54c298b1c092e9747e6d2d89d09089899df908bc4703dc8e4bb7"
+transitive_dependency_digest = "f182378dd10c8c07d8544097889fd5fe3b308e626c30bf1970f7a9b2bd92a817"
+
+[limits.nemo-relay-adaptive]
+max_direct_dependencies = 16
+max_transitive_packages = 224
+max_source_lines = 18355
+max_unsafe_occurrences = 3
+direct_dependency_digest = "331568db3de0a45bb18a65209ac977b74010caa4f161552c292e5f42b79e2663"
+transitive_dependency_digest = "85c902c98093122874f49ac21da4643225f11a1e8ef257143bb55c34a7b2e78d"
+
+[limits.nemo-relay-pii-redaction]
+max_direct_dependencies = 7
+max_transitive_packages = 215
+max_source_lines = 4869
+max_unsafe_occurrences = 0
+direct_dependency_digest = "53d627f83c8ce0f7e8da4fa458a586b8353029500ba62c880d6bf34638c1811d"
+transitive_dependency_digest = "025a0d74e4635ff33c29f9c97ce40364833fd8ba61262605b9d50b02efa40dbb"
+
+[limits.nemo-relay-dlp]
+max_direct_dependencies = 2
+max_transitive_packages = 11
+max_source_lines = 65
+max_unsafe_occurrences = 0
+direct_dependency_digest = "61f0d467ff7dcef34a5ee880322c96547f4afd65c3d7072d27aa790f26e4fd7e"
+transitive_dependency_digest = "daa262b6020edd226f6c6a617afacffcd16f230368b3bb4d02ce09204ebdc74d"
+
+[limits.nemo-relay-isolation]
+max_direct_dependencies = 1
+max_transitive_packages = 7
+max_source_lines = 68
+max_unsafe_occurrences = 0
+direct_dependency_digest = "819e4805cffa04c184b80f3cdacbbcd43983a38650a417842ee7be4dadc1ea74"
+transitive_dependency_digest = "e0bbdf96638cc171acc2b9f7b95b4a34fb959a94d70849104e345c69c9471f7f"
+
+[limits.nemo-effect-runtime]
+max_direct_dependencies = 3
+max_transitive_packages = 244
+max_source_lines = 589
+max_unsafe_occurrences = 0
+direct_dependency_digest = "59b383378c3be1f4d7e84e04ad1fc400c2233b2df975f3816d2d5948f5f73f98"
+transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c737afe4f65fafb6004"
+
+# The in-process plugin backend. Measured from the start so its growth is
+# visible, but it sits in neither tier: it is the compatibility bridge that the
+# process backend replaces, and its own `unsafe` count is 1 only because
+# counting is textual and this crate's documentation says the word once.
+#
+# It also builds the host process and the supervisor that starts it, which is
+# why it now carries a gRPC stack: the transport client is on the kernel's side
+# of the boundary and the transport server on the host's, and both live here
+# until the host becomes its own package.
+#
+# Budget raise (native-plugin process boundary, hardening): the code that
+# implements the boundary grew, which is the direction the milestone expects —
+# this crate is the destination the loader moves to, not the kernel. The
+# continuation machinery is now shared by the tool and provider families, so the
+# second family cost a tagged position and an arm rather than a second mechanism.
+# The duplex session's driver is the streaming family's first piece: the kernel's
+# side of the channel a plugin pulls a wrapped stream over, and — its other half —
+# the host's end of the same channel, where a callback's pull becomes a message and
+# a dropped stream becomes a cancellation. The upstream half is here too: the host
+# runs a streaming registration and answers with the frames its returned stream
+# produces, and the kernel reads them one at a time through the proxy for that
+# class. The streaming class is still not in the served set, so none of it runs in
+# production yet. Four direct
+# dependencies arrived with it: `getrandom` for the 256-bit session capability,
+# `subtle` for the comparison that must not leak it, `rustix` for the resource
+# ceilings applied between `fork` and `exec`, and `futures-util` for catching a
+# panic in a resumed chain rather than letting the request disappear. The second
+# `unsafe` token is that `pre_exec`, which is unsafe by construction: it runs in
+# the forked child, allocates nothing, and takes no locks. The transitive set is
+# unchanged, so nothing new was pulled in behind them. Both counts leave the
+# kernel-process figure when the loader does.
+#
+# Budget raise (cancellation cascade): the cascade is one property with three
+# ownership states, and the tests that pin it cost more than the fix. The host's
+# session-channel reader now cancels a stream the kernel opened for a call that
+# is no longer waiting — the one window where the identity of what to cancel
+# exists nowhere else — which is thirty lines and one awaited send. The rest is
+# the evidence: the streaming-cascade test drives a real plugin over a real
+# socket in each of those states (a producer that reports its own creation and
+# drop, and a gate that holds the kernel inside an open so the consumer can leave
+# while it is in flight) and the session channel names the same window directly.
+# No dependency moved and no `unsafe` did.
+#
+# Budget raise (per-stream actors): the kernel's session stopped answering pulls
+# itself and started routing them to an actor per stream, so that no producer can
+# decide whether the session serves anything else. It is a rewrite of the file
+# this budget already paid for plus the actors that replace its loop, and the
+# evidence is the larger half: the interruptibility tests (a producer parked in
+# `poll_next` while another stream is served and the parked one is cancelled, at
+# the dispatcher and again over a real socket), the one-outstanding-pull refusal,
+# cross-stream isolation, a panicking producer that fails only its own stream,
+# the two ceilings, and the shutdown drain that ends the answer stream only once
+# every producer is gone. Both the dispatcher and the actors also carry the
+# written form of the invariants they rest on, which is where most of the growth
+# is. No dependency moved, no `unsafe` did, and the streaming class is still not
+# served. The last of it is the cancellation this work made reachable: a consumer
+# that read a stream to its end and let it go sends the same message as one that
+# cancelled a live stream, and a kernel that refused the first would end the
+# session over a race the boundary creates. Cancellation is idempotent where the
+# stream is already settled, and the host releases a stream it is done with so the
+# kernel can forget it — three tests, and the prose that says which cancellation
+# is still refused.
+#
+# Budget raise (credit and the three ceilings): a stream's demand and its cost are
+# now counted rather than implied. Credit is granted by a pull and spent by a data
+# frame, so a stream nobody has asked about is not polled at all; the frame, byte
+# and frame-count ceilings are checked before every frame crosses, the frame that
+# opens a stream and the one that ends it included. The tests are more than half of
+# the growth — each ceiling runs limit−1, the limit and limit+1, and the laziness
+# test counts the polls a producer is asked for — and the rest is the measurement
+# and the prose that says which reading of "initial credit" this is. No dependency
+# moved and no `unsafe` did.
+#
+# Budget raise (deadlines and transport disappearance): the deadline is three more
+# waits in the actor — the open, the demand, and a pull whose producer is still
+# working — plus the state that holds a stream's ending for the pull that has not
+# been made yet, and half the growth is the four states' tests. The other half is
+# the host's end of the session learning what it had been assuming: a session that
+# ends fails the streams it was serving rather than closing them, with the calls
+# still waiting woken and the calls that follow refused, and two tests that require
+# the producer of a producing stream and of a stream nobody asked about to be gone
+# when their session is. The last of it is the mirror of that rule on the kernel's
+# side of the frames: a host that answered and stopped used to be read as a host
+# that finished, which is what the terminal frame exists to distinguish, and the
+# three shapes of a frames stream are now one test.
+#
+# Budget raise (mark matrix): the attribution matrix is a harness and three forced
+# schedules — a kernel serving two operations from one session, a harness that gives
+# both invocations the same schedule, and the schedules themselves — plus the
+# fixture's four marking positions and the gate that makes their order the test's
+# rather than the scheduler's. The last of it is the mark-context gates: the
+# lifecycle tests (a callback that panics, a stream that panics while being polled,
+# two continuations of one callback), the closed-window refusal that proves
+# capability non-reuse, the guard that puts a window back when a poll unwinds, and
+# the entry negotiation — extracted from the loader so the order every
+# already-built plugin depends on has a test of its own rather than a comment. No
+# dependency moved and no `unsafe` did. The coverage commit's growth is the served
+# set's one entry and the two lines of comment that say what crossed and what did
+# not.
+#
+# Budget raise (qualification): the streaming qualification work is mostly tests.
+# The raise is the fixture's mark, the test that records what was missing before it
+# was fixed, the four shapes of a frames stream (each also requiring the held chain
+# position to be given back), and the repeated mixture of three streams ending three
+# ways. No dependency moved and no `unsafe` did.
+#
+# Budget raise (qualification): the Layer 2 gate for the three event sanitize
+# classes is tests and one test-facing helper as well. The raise is the sentinel
+# helper (a value planted in every observable field, and the assertion that none of
+# it reaches an answer) plus the host's half of the nine properties: exactly one
+# registration runs, the class is the registration's own, and refusal, a throwing
+# callback, a malformed projection, an answer above the operation's budget and a
+# call naming another registration, session or runtime each fail closed. The
+# negative cases carry a control that the class is served at all, so none of them
+# can pass while the class is unserved. No dependency moved and no `unsafe` did:
+# this is what the boundary refuses, not what it reaches.
+#
+# Budget raise (serving the class): the kernel-side proxy for the three event sanitize
+# families, its three typed wrappers, the host's runner for the projection, and the
+# process-boundary qualification — a real child's sanitizers changing only the copy
+# this runtime publishes, and a failing one unable to publish what it was shown. The
+# recursion the qualification found is fixed on the core side, not here. No dependency
+# moved and no `unsafe` did.
+#
+# Raised again for the semantic qualification: a fixture registration that decides the
+# way the PII redaction component does — metric mark by data schema, otherwise by
+# category — a host test that drives every branch, and a real-child test that requires
+# the decision to be made on the child's side of the boundary. No dependency moved and
+# no `unsafe` did.
+[limits.nemo-relay-plugin-host]
+max_direct_dependencies = 15
+max_transitive_packages = 240
+# Raised for the codec capability record: references bound to an invocation, a
+# direction and a codec, with a guard whose drop is the revocation, and the refusal
+# matrix that keeps one call's capability from being another's. No dependency moved and
+# no `unsafe` did.
+# Raised for serving codec resolution: the kernel's own side resolves a capability against
+# the record it issued, checks the invocation, the direction and the codec the caller says
+# it is using, and executes the work with the codec object it holds. The store's entries
+# carry that object, because a capability the validator cannot use is a name rather than a
+# capability. No dependency moved and no `unsafe` did.
+# Raised for the LLM request sanitizer's kernel-side half and the host's: the proxy that
+# issues a capability per sanitize invocation and drops it when the call ends, the arm that
+# builds the context a plugin's callback sees, the bridge that turns a plugin's synchronous
+# codec call into the kernel's asynchronous one, and the client method it calls. The class is
+# not served yet — see security/PLUGIN-ISOLATION.md — so this is implementation, not
+# qualification. No dependency moved and no `unsafe` did.
+# Raised again for the two experiments that found the bridge's limit rather than the bridge's
+# bug: the control that passes (a second connection called from an async task) and the case that
+# hangs (the same call driven from the bridge's own thread), both in the tree because a finding
+# without its control is an anecdote. No dependency moved and no `unsafe` did.
+# Raised for the regression that came out of the codec bridge's hunt: the bridge's own drop
+# order, which every call survived and which hung only on teardown.
+#
+# Raised again for the response direction of the same class: its proxy, its host arm, the
+# response half of the bridge, and the real-child qualification that resolves the call's response
+# codec through the kernel. With that the boundary serves sixteen of sixteen, which is why the
+# install match has no refusal arm left. No dependency moved and no `unsafe` did.
+# Raised for the kernel's callback executor: the supervisor starts a runtime of its own for the
+# service that answers a plugin's callbacks, and the session's socket is bound as an ordinary one
+# and adopted from inside that executor, because a tokio listener belongs to the reactor that made
+# it. That removes a structural re-entrancy dependency — a single-lane caller can no longer make a
+# plugin's codec call fail — and the two LLM qualifications now run on a current-thread caller to
+# keep it that way. No dependency moved and no `unsafe` did.
+# Raised by one line for the same commit's other change: the load the host performs names its
+# approval with `NativePluginLoadSpec::with_approved_identity` rather than filling a field, and
+# the one-line break that costs is the whole of the growth. No dependency moved and no `unsafe`
+# did.
+# Raised for resolving the host, and for saying where it looked when it is not there: the paths
+# beside the starting executable are built once and read twice — by the lookup that picks one and
+# by the failure that reports all of them — so a deployment that received a runtime without the
+# host is told which locations were expected rather than only that a spawn failed. The test that
+# pins the message is in this crate. No dependency moved and no `unsafe` did.
+# Raised for expecting a host build rather than accepting whichever one answers: the config
+# carries what this runtime expects, the handshake refuses a disagreement before the frame limit
+# and before any capability, and the values a kernel offers are gathered into one struct so a
+# parameter list of seven strings cannot have two of them passed in the wrong order. No dependency
+# moved and no `unsafe` did.
+# Raised for the shared activation path: one module that claims the kernel's ownership, activates
+# the configuration's own components, starts the process-hosted plugins, rolls the whole thing
+# back if any stage fails, and refuses a worker plugin it cannot run rather than half-serving it.
+# It exists so the CLI and the bindings stop being four compositions with four lifecycles — the
+# security property this replaces is the drift between them. No dependency moved and no `unsafe`
+# did. Like the kernel's number above, this one moves down from here: the next change is the
+# loader leaving the kernel, not another stage arriving.
+# Raised again for the three things the shared path had to gain before a binding could adopt it,
+# all of them parity with what the old activation did rather than new capability: the worker lane
+# (whose feature brings one more transitive package, and whose kinds have to exist before the
+# component that names them is activated), configuration discovery, and an executor of its own
+# for the transaction — because a caller that stops waiting midway through an activation must
+# not be able to leave the process-owned half-applied. No direct dependency moved and no `unsafe`
+# did.
+# Raised by thirty-four lines for the fidelity a refusal carries across the boundary: a refusal
+# from the host is mapped back to the plugin-error kind it corresponds to, so a caller can still
+# tell a rejected plugin from a crashed host, and the executor one worker rather than a
+# current-thread runtime so a lane that spawns onto the runtime driving it is not refused. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 23215
+max_unsafe_occurrences = 2
+direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
+transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"
+
+# The wire schema. Measured because it is shipped and because its transitive set
+# is dominated by the protobuf and gRPC toolchain, which is exactly the kind of
+# weight the contract crate should not have inherited.
+[limits.nemo-relay-plugin-proto]
+max_direct_dependencies = 4
+max_transitive_packages = 108
+# ABI v5 adds the mark window: the kernel captures the window it opened, a plugin
+# carries the handle across its own tasks, and a mark is emitted through it. The
+# three functions are the extension, and the `unsafe` growth is theirs — an opaque
+# handle is a raw pointer by definition. The rest of the raise is the negotiation
+# that keeps older plugins working now that the current table is a version they do
+# not know: a frozen v4 table is offered before the v3 and v2 ones.
+#
+# Raised for the two helpers that measure an answer against its operation's
+# budget — `invoke_outcome_encoded_len` and `check_invoke_outcome_budget` — which
+# both sides of the boundary call so a response budget is one measurement rather
+# than two that can disagree. `session_message_encoded_len` is the same measurement
+# for a stream's frames: a stream's ceilings are ceilings on what it sends, so both
+# sides of the session measure a frame the one way.
+# Raised for the reference a codec call presents, and the golden vector that records the
+# bytes: the field is additive, and the vector moved by the seven bytes of the reference
+# it now carries. No dependency moved and no `unsafe` did.
+# Raised for the host's build identity on the wire: two additive fields on the handshake
+# response, the conversion that requires them (a session whose host does not say what it
+# was built from cannot be compared against anything), and the recorded vector, which moved
+# by the fifteen bytes the two fields encode to. No dependency moved and no `unsafe` did.
+max_source_lines = 4438
+max_unsafe_occurrences = 0
+direct_dependency_digest = "c4361b0a002a63822c2cf1119fbd0b7986e39da195d3006dd6d0382cde01750f"
+transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0fe6f6b704faf6add5"
+
+# Temporary ceilings: the raises a migration needed, and what gives them back.
+#
+# A budget that only moves upward is a counter. Each entry below is a raise that exists
+# because the tree is between two states, names the milestone that removes it, and states
+# the value the budget has to fall to. `scripts/tcb/report.py` refuses an entry that does
+# not promise a decrease, refuses one that describes a ceiling the policy does not have,
+# and refuses one whose target has already been reached but whose entry — and whose raised
+# budget — are still in place. The loader-removal milestone cannot pass this gate without
+# taking all three of these down with it.
+
+[[temporary]]
+crate = "nemo-relay"
+field = "max_source_lines"
+raised_to = 74779
+target = 67832
+reason = "the native loader and the ABI bridge are still compiled into the kernel"
+introduced = "2514f27..eb975ae"
+must_fall_by = "loader-removal"
+# The target is the current ceiling minus the 6825 lines of
+# crates/core/src/plugin/dynamic/native.rs, which is the file the milestone moves out of
+# the kernel's dependency closure. Measured at the time this entry was written; the
+# milestone should be measured again rather than trusted to this number.
+
+[[temporary]]
+crate = "nemo-relay"
+field = "max_unsafe_occurrences"
+raised_to = 307
+target = 19
+reason = "288 of the kernel's 307 textual unsafe tokens are the native loader's"
+introduced = "2514f27..eb975ae"
+must_fall_by = "loader-removal"
+# A memory-corruption bug in the loader corrupts the kernel today because the loader is
+# in the kernel's address space. This is the number the isolation milestone is judged on,
+# and it is the one that has to move.
+
+[[temporary]]
+crate = "nemo-relay-plugin"
+field = "max_source_lines"
+raised_to = 5463
+target = 0
+reason = "the ABI crate is in the kernel's process only while the loader is"
+introduced = "2514f27..eb975ae"
+must_fall_by = "loader-removal"
+# Zero rather than a smaller number: when the loader moves, this crate belongs to the
+# host's side of the boundary, and the kernel's policy should stop listing it at all
+# rather than listing a smaller amount of code that should not be there.

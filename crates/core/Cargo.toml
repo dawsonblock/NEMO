@@ -57,11 +57,12 @@ unstable-hardening = [
 [dependencies]
 nemo-relay-types.workspace = true
 nemo-relay-plugin.workspace = true
+nemo-relay-plugin-protocol.workspace = true
 nemo-relay-worker-proto = { workspace = true, optional = true }
 nemo-relay-authority = { workspace = true, optional = true, features = ["unstable-hardening"] }
 nemo-relay-ledger = { workspace = true, optional = true, features = ["unstable-hardening"] }
 nemo-relay-executor = { workspace = true, optional = true, features = ["unstable-hardening"] }
-uuid = { workspace = true, features = ["v7", "serde"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = { version = "0.9" }
@@ -136,6 +137,10 @@ required-features = ["worker-grpc"]
 [[test]]
 name = "middleware_integration"
 path = "tests/integration/middleware_tests.rs"
+
+[[test]]
+name = "managed_budget_integration"
+path = "tests/integration/managed_budget_tests.rs"
 
 [[test]]
 name = "pipeline_integration"

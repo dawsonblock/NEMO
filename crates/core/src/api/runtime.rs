@@ -5,6 +5,7 @@
 
 pub mod callbacks;
 mod continuation_context;
+pub mod execution_budget;
 pub mod global;
 pub mod scope_stack;
 pub mod state;
@@ -23,6 +24,12 @@ pub use callbacks::{
 pub use continuation_context::MiddlewareContinuationContext;
 #[cfg(test)]
 pub(crate) use continuation_context::MiddlewareContinuationLease;
+pub use execution_budget::{
+    ExecutionBudget, ManagedBudget, ManagedCall, ManagedExecutionConfiguration,
+    configure_managed_execution, current_effect_lease_expiry_unix_ms, current_execution_budget,
+    managed_execution_configuration, now_unix_ms as budget_now_unix_ms, resolve_managed_budget,
+    resolve_managed_call_budget, with_effect_lease_expiry, with_execution_budget,
+};
 pub use global::global_context;
 pub use scope_stack::{
     IdentitySource, PropagationContext, RuntimeIdentity, ScopeStack, ScopeStackHandle,

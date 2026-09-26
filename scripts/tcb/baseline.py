@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Capture the minimal-trusted-kernel baseline for the current tree.
+
+Stage 1 of the NEMO 0.10 program is a freeze: record objective measurements
+before any code moves, so later milestones compare against something real
+instead of a memory of the previous layout. No behavioral change belongs in
+that stage, and this script makes none.
+
+It composes existing tooling rather than re-implementing it. The canonical
+source-tree digest comes from ``scripts/qualification/source_tree.py``, and the
+trusted-surface measurements come from ``scripts/tcb/report.py``. What is added
+here is the recording: digests, toolchain versions, and the workspace crate
+graph, written under ``reports/``.
+
+Public API enumeration is deliberately not attempted. It needs a rustdoc-JSON
+or ``cargo-public-api`` pass, and a hand-rolled approximation would be a number
+that looks authoritative without being one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+QUALIFICATION_DIR = SCRIPT_DIR.parent / "qualification"
+for directory in (SCRIPT_DIR, QUALIFICATION_DIR):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+import report  # noqa: E402  (local module)
+import source_tree  # noqa: E402  (qualification module)
+
+REPO_ROOT = SCRIPT_DIR.parents[1]
+
+# Lockfiles whose digest pins the dependency surface for each ecosystem.
+LOCKFILES = ("Cargo.lock", "uv.lock", "package-lock.json")
+
+# Toolchains that can change what the recorded measurements mean.
+TOOLS = (
+    ("rustc", ["rustc", "--version"]),
+    ("cargo", ["cargo", "--version"]),
+    ("node", ["node", "--version"]),
+)
+
+# Contract revisions that identify what this baseline speaks.
+#
+# Read from the declaration rather than by building the crate to ask it: these
+# numbers identify the baseline, and a build-time query would make recording
+# them depend on compiling the thing being recorded. A test pins the
+# extraction, so a change of declaration style fails loudly instead of
+# silently recording nothing.
+REVISION_DECLARATIONS = {
+    "plugin_protocol": (
+        "crates/plugin-protocol/src/lib.rs",
+        r"pub const PROTOCOL_VERSION: u16 = (\d+);",
+    ),
+    "native_plugin_abi": (
+        "crates/plugin/src/lib.rs",
+        r"pub const NEMO_RELAY_NATIVE_ABI_VERSION: u32 = (\d+);",
+    ),
+}
+
+
+def declared_revisions(root: pathlib.Path) -> dict[str, int | None]:
+    """Return the contract revisions declared in the tree at ``root``."""
+    revisions: dict[str, int | None] = {}
+    for name, (relative, pattern) in REVISION_DECLARATIONS.items():
+        path = pathlib.Path(root) / relative
+        match = re.search(pattern, path.read_text(encoding="utf-8")) if path.is_file() else None
+        revisions[name] = int(match.group(1)) if match else None
+    return revisions
+
+
+def lockfile_digests(root: pathlib.Path) -> dict[str, str | None]:
+    """Return a SHA-256 per lockfile, or ``None`` when it is absent."""
+    digests: dict[str, str | None] = {}
+    for name in LOCKFILES:
+        path = pathlib.Path(root) / name
+        if path.is_file():
+            digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            digests[name] = None
+    return digests
+
+
+def tool_versions() -> dict[str, str | None]:
+    """Return the first line of each tool's version output."""
+    versions: dict[str, str | None] = {}
+    for name, command in TOOLS:
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        except OSError:
+            versions[name] = None
+            continue
+        lines = (completed.stdout or completed.stderr or "").strip().splitlines()
+        versions[name] = lines[0] if lines else None
+    return versions
+
+
+def crate_graph(metadata: dict) -> dict[str, list[str]]:
+    """Return workspace-member edges, ignoring external dependencies."""
+    by_id, _ = report.package_index(metadata)
+    members = {by_id[identifier]["name"] for identifier in metadata["workspace_members"]}
+    graph: dict[str, list[str]] = {}
+    for identifier in metadata["workspace_members"]:
+        package = by_id[identifier]
+        graph[package["name"]] = sorted(
+            {
+                dependency["name"]
+                for dependency in package.get("dependencies", [])
+                if dependency.get("kind") is None and dependency["name"] in members
+            }
+        )
+    return dict(sorted(graph.items()))
+
+
+def capture(root: pathlib.Path) -> dict[str, dict]:
+    """Capture every baseline report for the tree at ``root``."""
+    metadata = report.cargo_metadata(root)
+    policy = report.load_policy(report.DEFAULT_POLICY)
+    by_id, _ = report.package_index(metadata)
+
+    entries = source_tree.enumerate_entries(root)
+    repository = {
+        "source_tree_digest": source_tree.entries_digest(entries),
+        "enumeration_policy_version": source_tree.ENUMERATION_POLICY_VERSION,
+        "entry_count": len(entries),
+        "lockfiles": lockfile_digests(root),
+        "toolchain": tool_versions(),
+        "contract_revisions": declared_revisions(root),
+        "workspace_members": sorted(by_id[identifier]["name"] for identifier in metadata["workspace_members"]),
+    }
+
+    # Freeze all three surfaces. The policy distinguishes code that enforces an
+    # invariant, code that can subvert one in the same process, and the process
+    # that will host native plugins, so a baseline recording fewer is not
+    # freezing the attack surface the policy says matters.
+    logical = report.enforcement_crates(policy)
+    in_process = report.in_process_crates(policy)
+    plugin_host = report.plugin_host_crates(policy)
+    crates = sorted(set(logical) | set(in_process) | set(plugin_host))
+    identities = {crate: report.dependency_identities(root, crate) for crate in crates}
+    measured = {crate: vars(report.measure(metadata, identities[crate], crate)) for crate in crates}
+
+    dependency = {
+        "crate_graph": crate_graph(metadata),
+        "direct_dependencies": {
+            crate: report.direct_dependency_names(metadata, identities[crate], crate) for crate in crates
+        },
+    }
+
+    trusted = {
+        "policy_version": policy["version"],
+        "logical_tcb": {crate: measured[crate] for crate in logical},
+        # Disjoint from `logical_tcb` on purpose. The effective in-process tier
+        # is the union of the two, so recording the union under a second name
+        # would double count for anyone who added the sections together.
+        "additional_in_process": {crate: measured[crate] for crate in in_process if crate not in set(logical)},
+        "plugin_host": {crate: measured[crate] for crate in plugin_host},
+    }
+
+    return {
+        "repository-baseline.json": repository,
+        "dependency-baseline.json": dependency,
+        "tcb-baseline.json": trusted,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Write the baseline reports."""
+    parser = argparse.ArgumentParser(description="Capture the minimal-trusted-kernel baseline for the current tree.")
+    parser.add_argument("--root", type=pathlib.Path, default=REPO_ROOT)
+    parser.add_argument("--out", type=pathlib.Path, default=REPO_ROOT / "reports")
+    arguments = parser.parse_args(argv)
+
+    reports = capture(arguments.root)
+    arguments.out.mkdir(parents=True, exist_ok=True)
+    for name, payload in reports.items():
+        path = arguments.out / name
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"wrote {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

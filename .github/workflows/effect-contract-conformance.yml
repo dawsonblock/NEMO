@@ -159,9 +159,62 @@ jobs:
           NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: just test-postgres-db-failure-boundaries
 
+      # The positive production-composition case needs a transport that can
+      # attest readiness, which the shared plaintext service cannot. PostgreSQL
+      # refuses a key file with weaker permissions than the database user, and a
+      # bind mount does not carry ownership into the container, so the trust
+      # material is baked into a small image instead of mounted.
+      - name: Start a TLS-enabled PostgreSQL for the production composition case
+        run: |
+          set -euo pipefail
+          workdir="${RUNNER_TEMP}/nemo-tls"
+          mkdir -p "$workdir"
+          # A CA-signed leaf rather than a self-signed certificate. The test
+          # client verifies the chain, and a certificate that is both leaf and
+          # trust anchor is accepted by openssl but not by every verifier.
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$workdir/ca.key" -out "$workdir/ca.crt" \
+            -days 2 -subj "/CN=NEMO test CA"
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$workdir/server.key" -out "$workdir/server.csr" \
+            -subj "/CN=localhost"
+          # `serverAuth` is not optional here: a verifier that enforces purpose
+          # rejects a server certificate that does not claim it.
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n' \
+            > "$workdir/san.ext"
+          openssl x509 -req -in "$workdir/server.csr" \
+            -CA "$workdir/ca.crt" -CAkey "$workdir/ca.key" -CAcreateserial \
+            -out "$workdir/server.crt" -days 2 -extfile "$workdir/san.ext"
+          printf '%s\n' \
+            'FROM postgres:17.6-alpine@sha256:747d5ed1fdeeb124b880fbe3d7c6557d2c4064ae41d6b6297d417882effce4be' \
+            'USER root' \
+            'COPY server.crt /etc/ssl/server.crt' \
+            'COPY server.key /etc/ssl/server.key' \
+            'RUN chown postgres:postgres /etc/ssl/server.crt /etc/ssl/server.key \' \
+            '    && chmod 600 /etc/ssl/server.key' \
+            > "$workdir/Dockerfile"
+          docker build -t nemo-pg-tls "$workdir"
+          docker run -d --name nemo-tls-pg \
+            -e POSTGRES_PASSWORD=postgres -p 5433:5432 nemo-pg-tls \
+            -c ssl=on \
+            -c ssl_cert_file=/etc/ssl/server.crt \
+            -c ssl_key_file=/etc/ssl/server.key
+          for _ in $(seq 1 40); do
+            if docker exec nemo-tls-pg pg_isready -U postgres >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the TLS-enabled PostgreSQL server did not become ready" >&2
+          docker logs nemo-tls-pg >&2
+          exit 1
+
       - name: Run runtime composition tests
         env:
-          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          # Points at the TLS-enabled server so the fixture's schema and role
+          # setup and the verified-transport store share one database.
+          NEMO_RELAY_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5433/postgres
+          NEMO_RELAY_TEST_POSTGRES_TLS_CA: ${{ runner.temp }}/nemo-tls/ca.crt
         run: just test-runtime-composition
 
       - name: Run physical schema verification

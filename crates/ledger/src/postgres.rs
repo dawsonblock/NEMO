@@ -555,6 +555,52 @@ pub struct PostgresDatabaseSettings {
     pub timezone: String,
 }
 
+/// Lowest PostgreSQL release this adapter is qualified against.
+///
+/// The repository pins PostgreSQL 17 for qualification. Refusing an older
+/// server is the honest reading of "production ready": a release that was never
+/// qualified has not been shown to hold the same guarantees.
+pub const MINIMUM_QUALIFIED_SERVER_MAJOR: i32 = 17;
+
+/// Durability and isolation requirements a production database must meet.
+///
+/// [`PostgresEffectStore::database_settings`] reports what the server is
+/// configured to do; this type is what the runtime requires it to do. Without
+/// the two being compared, an observation was being reported as readiness, and
+/// a database running `synchronous_commit = off` passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseReadinessPolicy {
+    /// Lowest acceptable `server_version_num / 10000`.
+    pub minimum_server_major: i32,
+    /// `synchronous_commit` settings that keep a committed effect durable.
+    ///
+    /// PostgreSQL accepts a comma-separated list for this setting, so each
+    /// element is checked rather than the string as a whole.
+    pub acceptable_synchronous_commit: Vec<String>,
+    /// Transaction isolation levels the runtime accepts.
+    pub acceptable_transaction_isolation: Vec<String>,
+}
+
+impl Default for DatabaseReadinessPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_server_major: MINIMUM_QUALIFIED_SERVER_MAJOR,
+            // `off` and `local` both let a committed write be lost in a crash,
+            // which is the one outcome a durable effect cannot tolerate.
+            acceptable_synchronous_commit: vec![
+                "on".to_owned(),
+                "remote_write".to_owned(),
+                "remote_apply".to_owned(),
+            ],
+            acceptable_transaction_isolation: vec![
+                "read committed".to_owned(),
+                "repeatable read".to_owned(),
+                "serializable".to_owned(),
+            ],
+        }
+    }
+}
+
 /// Failures the PostgreSQL durable-effect adapter can report.
 #[derive(Debug)]
 pub enum PostgresEffectStoreError {
@@ -591,6 +637,17 @@ pub enum PostgresEffectStoreError {
         role: String,
         /// Privileges that must not be granted to a runtime role.
         privileges: String,
+    },
+    /// A production kernel was offered a store opened over the test-only transport.
+    ProductionTestTransport,
+    /// The server is configured in a way that cannot hold durable effects.
+    DatabasePolicyViolation {
+        /// Which setting failed.
+        setting: &'static str,
+        /// What the server reported.
+        observed: String,
+        /// What the runtime requires.
+        requirement: String,
     },
     /// A qualification test injected a durable-operation failure at a boundary.
     ///
@@ -646,6 +703,19 @@ impl std::fmt::Display for PostgresEffectStoreError {
                 "runtime role {role} can modify the effect-store schema and must be \
                  restricted to data privileges: {privileges}"
             ),
+            Self::ProductionTestTransport => write!(
+                formatter,
+                "the test-only plaintext transport cannot attest production readiness"
+            ),
+            Self::DatabasePolicyViolation {
+                setting,
+                observed,
+                requirement,
+            } => write!(
+                formatter,
+                "PostgreSQL {setting} is {observed}, which does not meet the production \
+                 durability requirement: {requirement}"
+            ),
             Self::InjectedFailure(point) => {
                 write!(formatter, "injected durable-operation failure at {point}")
             }
@@ -679,6 +749,8 @@ impl std::error::Error for PostgresEffectStoreError {
             | Self::SchemaFingerprintMismatch(_)
             | Self::SchemaObjectMismatch { .. }
             | Self::DatabasePrivilegeViolation { .. }
+            | Self::ProductionTestTransport
+            | Self::DatabasePolicyViolation { .. }
             | Self::InjectedFailure(_)
             | Self::CorruptData(_)
             | Self::IntegerOutOfRange(_) => None,
@@ -729,6 +801,15 @@ pub struct PostgresEffectStore {
     /// every checked-out session is instead bounded by what is left of it, so no
     /// database wait can outlive the action it serves.
     deadline: Option<Instant>,
+    /// Whether this handle was opened over the explicitly test-only transport.
+    ///
+    /// Plaintext loopback is correct for a qualification run and permanently
+    /// wrong for a production kernel, so the handle remembers how it was built
+    /// and refuses to attest production readiness afterwards. Without this,
+    /// every store carried the `ProductionEffectStore` bound no matter which
+    /// transport it was opened with, and a production kernel could be composed
+    /// around a connection that was never verified.
+    plaintext_test_transport: bool,
 }
 
 impl PostgresEffectStore {
@@ -738,6 +819,9 @@ impl PostgresEffectStore {
     /// history, physical schema, credential privileges, and recorded database
     /// settings must all hold before a kernel can be composed around it.
     pub fn verify_production_readiness(&self) -> Result<(), PostgresEffectStoreError> {
+        if self.plaintext_test_transport {
+            return Err(PostgresEffectStoreError::ProductionTestTransport);
+        }
         self.verify_database_readiness().map(|_| ())
     }
 
@@ -778,6 +862,7 @@ impl PostgresEffectStore {
             lease_configuration,
             maximum_pool_size,
             budgets,
+            true,
         )
     }
 
@@ -816,6 +901,7 @@ impl PostgresEffectStore {
             lease_configuration,
             maximum_pool_size,
             budgets,
+            false,
         )
     }
 
@@ -914,6 +1000,7 @@ impl PostgresEffectStore {
         lease_configuration: LeaseConfiguration,
         maximum_pool_size: u32,
         budgets: PostgresOperationBudgets,
+        plaintext_test_transport: bool,
     ) -> Result<Self, PostgresEffectStoreError> {
         validate_store_configuration(schema, maximum_pool_size, &budgets)?;
         let manager = PostgresConnectionManager::new(configuration, NoTls);
@@ -924,6 +1011,7 @@ impl PostgresEffectStore {
             lease_configuration,
             budgets,
             deadline: None,
+            plaintext_test_transport,
         })
     }
 
@@ -946,6 +1034,7 @@ impl PostgresEffectStore {
             lease_configuration,
             budgets,
             deadline: None,
+            plaintext_test_transport: false,
         })
     }
 
@@ -1223,7 +1312,59 @@ impl PostgresEffectStore {
         self.verify_migration_history()?;
         self.verify_physical_schema()?;
         self.verify_runtime_privileges()?;
+        self.verify_database_policy(&DatabaseReadinessPolicy::default())?;
         self.database_settings()
+    }
+
+    /// Verify the server settings that durable operation depends on.
+    ///
+    /// `statement_timeout`, `idle_in_transaction_session_timeout`, and the
+    /// session time zone are deliberately not enforced. The adapter sets
+    /// statement and lock timeouts on every checked-out session from the action
+    /// budget, so the server defaults are not the binding constraint; enforcing
+    /// them here would reject a deployment for a setting that never applies.
+    pub fn verify_database_policy(
+        &self,
+        policy: &DatabaseReadinessPolicy,
+    ) -> Result<(), PostgresEffectStoreError> {
+        let settings = self.database_settings()?;
+        if settings.server_major < policy.minimum_server_major {
+            return Err(PostgresEffectStoreError::DatabasePolicyViolation {
+                setting: "server_version",
+                observed: settings.server_version.clone(),
+                requirement: format!("major version >= {}", policy.minimum_server_major),
+            });
+        }
+
+        for element in settings.synchronous_commit.split(',') {
+            let element = element.trim().to_ascii_lowercase();
+            if !policy
+                .acceptable_synchronous_commit
+                .iter()
+                .any(|accepted| accepted == &element)
+            {
+                return Err(PostgresEffectStoreError::DatabasePolicyViolation {
+                    setting: "synchronous_commit",
+                    observed: settings.synchronous_commit.clone(),
+                    requirement: policy.acceptable_synchronous_commit.join(", "),
+                });
+            }
+        }
+
+        let isolation = settings.transaction_isolation.trim().to_ascii_lowercase();
+        if !policy
+            .acceptable_transaction_isolation
+            .iter()
+            .any(|accepted| accepted == &isolation)
+        {
+            return Err(PostgresEffectStoreError::DatabasePolicyViolation {
+                setting: "default_transaction_isolation",
+                observed: settings.transaction_isolation.clone(),
+                requirement: policy.acceptable_transaction_isolation.join(", "),
+            });
+        }
+
+        Ok(())
     }
 
     /// Verify that the connected role cannot modify the schema or its ledger.
@@ -1244,7 +1385,43 @@ impl PostgresEffectStore {
              has_table_privilege(current_user, $2, 'TRUNCATE'), \
              has_table_privilege(current_user, $3, 'INSERT'), \
              has_table_privilege(current_user, $3, 'UPDATE'), \
-             has_table_privilege(current_user, $3, 'TRUNCATE')",
+             has_table_privilege(current_user, $3, 'DELETE'), \
+             has_table_privilege(current_user, $3, 'TRUNCATE'), \
+             coalesce((select rolsuper from pg_roles where rolname = current_user), false), \
+             coalesce((select rolbypassrls from pg_roles where rolname = current_user), false), \
+             coalesce((select rolcreaterole from pg_roles where rolname = current_user), false), \
+             coalesce((select rolcreatedb from pg_roles where rolname = current_user), false), \
+             coalesce((select rolreplication from pg_roles where rolname = current_user), false), \
+             coalesce((select pg_get_userbyid(nspowner) = current_user from pg_namespace \
+                       where nspname = $1), false), \
+             exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+                     where n.nspname = $1 and pg_get_userbyid(c.relowner) = current_user), \
+             coalesce((with recursive reachable(roleid) as ( \
+                         select oid from pg_roles where rolname = current_user \
+                         union \
+                         select m.roleid from pg_auth_members m \
+                         join reachable r on m.member = r.roleid \
+                       ) \
+                       select string_agg(rolname, ', ') from pg_roles \
+                       where oid in (select roleid from reachable) \
+                         and rolname <> current_user \
+                         and (rolsuper or rolcreaterole or rolcreatedb or rolbypassrls)), ''), \
+             coalesce((with recursive reachable(roleid) as ( \
+                         select oid from pg_roles where rolname = current_user \
+                         union \
+                         select m.roleid from pg_auth_members m \
+                         join reachable r on m.member = r.roleid \
+                       ) \
+                       select string_agg(rolname, ', ') from pg_roles \
+                       where oid in (select roleid from reachable) \
+                         and rolname <> current_user \
+                         and (exists (select 1 from pg_namespace n \
+                                      where n.nspname = $1 \
+                                        and pg_get_userbyid(n.nspowner) = rolname) \
+                              or exists (select 1 from pg_class c \
+                                         join pg_namespace n2 on n2.oid = c.relnamespace \
+                                         where n2.nspname = $1 \
+                                           and pg_get_userbyid(c.relowner) = rolname))), '')",
             &[
                 &self.schema,
                 &self.table("effect_schema_migrations"),
@@ -1252,7 +1429,12 @@ impl PostgresEffectStore {
             ],
         )?;
         let role: String = row.get(0);
-        let violations = [
+        // Every attribute a data-only principal must not carry, including the
+        // two the inherited walk already considered. A role that can create
+        // databases or open replication connections is not data-only either,
+        // and checking the connected role for fewer attributes than its
+        // inherited roles was a gap rather than a policy.
+        let violations: [(&str, bool); 16] = [
             ("CREATE on schema", row.get::<_, bool>(1)),
             ("INSERT into effect_schema_migrations", row.get(3)),
             ("UPDATE of effect_schema_migrations", row.get(4)),
@@ -1260,13 +1442,38 @@ impl PostgresEffectStore {
             ("TRUNCATE of effect_schema_migrations", row.get(6)),
             ("INSERT into effect_schema_state", row.get(7)),
             ("UPDATE of effect_schema_state", row.get(8)),
-            ("TRUNCATE of effect_schema_state", row.get(9)),
+            ("DELETE from effect_schema_state", row.get(9)),
+            ("TRUNCATE of effect_schema_state", row.get(10)),
+            ("SUPERUSER role attribute", row.get(11)),
+            ("BYPASSRLS role attribute", row.get(12)),
+            ("CREATEROLE role attribute", row.get(13)),
+            ("CREATEDB role attribute", row.get(14)),
+            ("REPLICATION role attribute", row.get(15)),
+            ("ownership of the effect-store schema", row.get(16)),
+            ("ownership of an effect-store relation", row.get(17)),
         ];
-        let granted: Vec<&str> = violations
+        let mut granted: Vec<String> = violations
             .iter()
             .filter(|(_, present)| *present)
-            .map(|(name, _)| *name)
+            .map(|(name, _)| (*name).to_owned())
             .collect();
+
+        // A role that inherits a dangerous role has that role's powers without
+        // carrying any of its attributes, so checking only the connected role
+        // proves much less than it appears to. Both walks are transitive for the
+        // same reason a chain of two memberships is no safer than one.
+        let inherited_dangerous: String = row.get(18);
+        if !inherited_dangerous.trim().is_empty() {
+            granted.push(format!(
+                "inherited role(s) with dangerous attributes: {inherited_dangerous}"
+            ));
+        }
+        let inherited_owners: String = row.get(19);
+        if !inherited_owners.trim().is_empty() {
+            granted.push(format!(
+                "inherited role(s) owning effect-store objects: {inherited_owners}"
+            ));
+        }
         if !granted.is_empty() {
             return Err(PostgresEffectStoreError::DatabasePrivilegeViolation {
                 role,
@@ -2286,6 +2493,25 @@ impl EffectStore for PostgresEffectStore {
             failure_point: "terminal_finalization",
         })
     }
+
+    /// Route the shared trait's budget-aware form to the adapter's own one.
+    ///
+    /// This is the load-bearing half of the trusted deadline: the kernel holds a
+    /// deadline, the trait is what it can call, and only here does that deadline
+    /// become the PostgreSQL lock and statement timeouts derived by
+    /// [`PostgresEffectStore::for_remaining`].
+    fn finalize_terminal_receipt_within_budget(
+        &self,
+        action_id: &str,
+        expected: ExecutionState,
+        lease: &ActionLease,
+        receipt: &ReceiptRecord,
+        remaining: Duration,
+    ) -> Result<EffectFinalizeResult, Self::Error> {
+        PostgresEffectStore::finalize_terminal_receipt_within_budget(
+            self, action_id, expected, lease, receipt, remaining,
+        )
+    }
 }
 
 fn validate_schema_name(schema: &str) -> Result<(), PostgresEffectStoreError> {
@@ -2764,6 +2990,58 @@ mod tests {
             .verify_schema()
             .expect("fresh migrations must satisfy this runtime");
         effects
+    }
+
+    #[test]
+    #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+    fn the_shared_trait_routes_finalization_through_the_trusted_budget() {
+        let schema = unique_schema();
+        let effects = create_store(&test_connection_string(), &schema);
+
+        // The kernel holds only the shared trait, so this is the path a trusted
+        // deadline actually takes. Exercising the inherent method would prove
+        // nothing about what the kernel can reach.
+        fn finalize_through_trait<E: EffectStore>(
+            store: &E,
+            action_id: &str,
+            lease: &ActionLease,
+            receipt: &ReceiptRecord,
+            remaining: Duration,
+        ) -> Result<EffectFinalizeResult, E::Error> {
+            store.finalize_terminal_receipt_within_budget(
+                action_id,
+                ExecutionState::Dispatching,
+                lease,
+                receipt,
+                remaining,
+            )
+        }
+
+        let mut action = fixture_action();
+        action.grant_digest = Some("grant".into());
+        let action_id = action.action_id.clone();
+        let receipt = fixture_receipt(&action, ExecutionState::Committed, "budget-routing");
+        let lease = ActionLease {
+            owner_id: "budget-routing".into(),
+            generation: 1,
+            expires_at_unix_ms: u64::MAX,
+        };
+
+        // The budget is validated before the action is loaded, so with the
+        // receipt correctly bound this is a statement about the budget rather
+        // than about a missing action. The default trait implementation ignores
+        // its budget and would instead report the action as missing, which is
+        // what makes the error variant the thing that distinguishes a wired
+        // budget from an ignored one.
+        let outcome =
+            finalize_through_trait(&effects, &action_id, &lease, &receipt, Duration::ZERO);
+        assert!(
+            matches!(
+                outcome,
+                Err(PostgresEffectStoreError::InvalidOperationBudget(_))
+            ),
+            "a zero trusted budget must be refused by the adapter: {outcome:?}"
+        );
     }
 
     #[test]

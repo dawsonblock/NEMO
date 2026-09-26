@@ -1,0 +1,926 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package nemo.relay.plugin.v1;
+
+// The wire protocol between the kernel and the process that hosts native
+// plugins. This file is the single authority for what crosses that boundary:
+// no other crate declares plugin wire messages, and the semantic Rust types in
+// `nemo-relay-plugin-protocol` are the in-domain vocabulary that maps onto it.
+//
+// Every operation carries the session it belongs to and its execution context.
+// The context is on the wire rather than being an out-of-band Rust argument
+// because the host has to enforce the budget, and a value the host cannot see
+// is a value it cannot enforce.
+//
+// There is no request envelope with a `oneof request`: the RPC method already
+// says which operation is being performed, and a second discriminator inside
+// the message could disagree with it.
+
+// Why an operation failed. The variants are the cases the kernel reasons about;
+// a plugin that hangs, crashes or answers unreadably is not the same as one that
+// refused, and the caller may not treat them alike.
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0;
+  VERSION_MISMATCH = 1;
+  ABI_MISMATCH = 2;
+  UNKNOWN_PLUGIN = 3;
+  STALE_HANDLE = 4;
+  ALREADY_LOADING = 5;
+  ALREADY_LOADED = 6;
+  REJECTED = 7;
+  OVERSIZED_FRAME = 8;
+  DEADLINE_EXCEEDED = 9;
+  HOST_CRASHED = 10;
+  MALFORMED_RESPONSE = 11;
+  UNAVAILABLE = 12;
+  CANCELLED = 13;
+  GENERATION_EXHAUSTED = 14;
+}
+
+// Whether the plugin may have reached an external system. Kept separate from
+// the outcome: an effect that was dispatched and definitely failed is a
+// different case from one never dispatched, and both differ from one nobody can
+// account for.
+enum DispatchState {
+  DISPATCH_STATE_UNSPECIFIED = 0;
+  NOT_DISPATCHED = 1;
+  DISPATCH_ATTEMPTED = 2;
+  DISPATCH_CONFIRMED = 3;
+}
+
+// Whether the runtime can prove what happened.
+enum OutcomeCertainty {
+  OUTCOME_CERTAINTY_UNSPECIFIED = 0;
+  CONFIRMED_FAILURE = 1;
+  CONFIRMED_SUCCESS = 2;
+  UNKNOWN = 3;
+}
+
+enum PluginCapabilityKind {
+  PLUGIN_CAPABILITY_KIND_UNSPECIFIED = 0;
+  TOOL = 1;
+  LLM = 2;
+  SUBSCRIBER = 3;
+}
+
+// The exact attachment point a registration installs itself at.
+//
+// The values mirror the runtime's own registration vocabulary, one per surface
+// the runtime calls into. A coarse class such as "middleware" or "guardrail" is
+// not enough to install a proxy: a tool request sanitizer, a tool execution
+// intercept and an LLM stream intercept all answer to those names and attach in
+// different places. Protobuf enum values are siblings of their type rather than
+// children of it, so these are prefixed to stay unique within the package.
+enum PluginRegistrationOperation {
+  PLUGIN_REGISTRATION_OPERATION_UNSPECIFIED = 0;
+  REGISTRATION_OPERATION_SUBSCRIBER = 1;
+  REGISTRATION_OPERATION_EVENT_METADATA_INJECTOR = 2;
+  REGISTRATION_OPERATION_MARK_SANITIZE_GUARDRAIL = 3;
+  REGISTRATION_OPERATION_SCOPE_SANITIZE_START_GUARDRAIL = 4;
+  REGISTRATION_OPERATION_SCOPE_SANITIZE_END_GUARDRAIL = 5;
+  REGISTRATION_OPERATION_TOOL_SANITIZE_REQUEST_GUARDRAIL = 6;
+  REGISTRATION_OPERATION_TOOL_SANITIZE_RESPONSE_GUARDRAIL = 7;
+  REGISTRATION_OPERATION_TOOL_CONDITIONAL_EXECUTION_GUARDRAIL = 8;
+  REGISTRATION_OPERATION_TOOL_REQUEST_INTERCEPT = 9;
+  REGISTRATION_OPERATION_TOOL_EXECUTION_INTERCEPT = 10;
+  REGISTRATION_OPERATION_LLM_SANITIZE_REQUEST_GUARDRAIL = 11;
+  REGISTRATION_OPERATION_LLM_SANITIZE_RESPONSE_GUARDRAIL = 12;
+  REGISTRATION_OPERATION_LLM_CONDITIONAL_EXECUTION_GUARDRAIL = 13;
+  REGISTRATION_OPERATION_LLM_REQUEST_INTERCEPT = 14;
+  REGISTRATION_OPERATION_LLM_EXECUTION_INTERCEPT = 15;
+  REGISTRATION_OPERATION_LLM_STREAM_EXECUTION_INTERCEPT = 16;
+}
+
+// Whether a registration answers once or streams.
+enum PluginExecutionShape {
+  PLUGIN_EXECUTION_SHAPE_UNSPECIFIED = 0;
+  SHAPE_UNARY = 1;
+  SHAPE_STREAMING = 2;
+}
+
+// Identity, binding and budget for one operation.
+message PluginExecutionContext {
+  // Correlation identity for the operation. Callbacks carry it too, so a call
+  // belongs to exactly one operation even when several are in flight.
+  string operation_request_id = 1;
+  uint32 protocol_version = 2;
+  string runtime_binding_digest = 3;
+  // Absolute deadline, for audit and logging.
+  uint64 deadline_unix_ms = 4;
+  // What is actually left, for enforcement.
+  uint64 remaining_budget_millis = 5;
+  uint32 max_response_bytes = 6;
+}
+
+// Stable identity of one loaded plugin instance.
+message PluginHandle {
+  string plugin_id = 1;
+  uint64 generation = 2;
+}
+
+message PluginCapability {
+  string id = 1;
+  PluginCapabilityKind kind = 2;
+  // Present only when the plugin supplies one. An empty string would be a
+  // claim; absence is the truth.
+  optional string declared_digest = 3;
+}
+
+// What a plugin declares about itself once loaded. Optional fields are the ones
+// the host may genuinely not know; reporting the host's maximum ABI as the
+// plugin's negotiated one would invent a guarantee the plugin never made.
+message PluginDescriptor {
+  string plugin_id = 1;
+  optional string plugin_version = 2;
+  optional uint32 negotiated_abi_version = 3;
+  optional string manifest_digest = 4;
+  repeated string registration_kinds = 5;
+  repeated PluginCapability capabilities = 6;
+  repeated PluginRegistrationDescriptor registrations = 7;
+}
+
+// How one registration sits relative to others in its class.
+//
+// Both fields are optional because the native ABI declares them for some
+// registrations and not others; a default would be a claim nobody made.
+message PluginRegistrationOrdering {
+  // Lower runs first, as the runtime orders its own registrations.
+  optional int32 priority = 1;
+  // Whether this registration can stop the chain it is part of.
+  optional bool may_break_chain = 2;
+}
+
+// Everything the kernel needs to re-create one registration as a proxy.
+//
+// A loaded plugin is not a single thing the kernel invokes: it registers
+// components that the runtime then calls, and each installs itself at an exact
+// attachment point with an order, a shape and configuration of its own. A
+// process host cannot hand back local objects, so it hands back this
+// description instead. A list of kind names cannot carry it — the runtime would
+// not know where to install the proxy, how to order two registrations, whether
+// one breaks a chain, whether its callback streams, or which configuration it
+// reads.
+message PluginRegistrationDescriptor {
+  reserved 3;
+  reserved "class";
+  string registration_id = 1;
+  string component_kind = 2;
+  PluginRegistrationOrdering ordering = 4;
+  PluginExecutionShape shape = 5;
+  // Configuration keys the component reads, so a validator can require them.
+  repeated string config_keys = 6;
+  // Present only when the plugin supplies one; absence is the truth.
+  optional string declared_digest = 7;
+  // The exact attachment point this registration installs itself at.
+  PluginRegistrationOperation operation = 8;
+  // Present only when this registration is a gate: the name of the registration
+  // whose execution it decides, as the plugin declared it. The runtime matches
+  // it against the qualified registration name, so a gate whose target does not
+  // exist matches nothing rather than installing nothing.
+  optional string gated_registration = 9;
+}
+
+message PluginFailure {
+  FailureCode code = 1;
+  // Human-readable detail. Never parsed.
+  string message = 2;
+  optional uint64 observed = 3;
+  optional uint32 limit = 4;
+  optional uint32 expected_version = 5;
+  optional uint32 received_version = 6;
+}
+
+// First message the kernel sends.
+//
+// It binds the session to a runtime identity, so a host started under one NEMO
+// runtime cannot be retained by another, and it authenticates the peer: the
+// supervisor generates a session credential and passes it to the host out of
+// band, so another local process cannot present itself as the kernel merely by
+// knowing the socket path.
+//
+// `client_nonce` is the kernel's; `host_instance_id` is the host's and is
+// returned rather than asserted here, because the host is the only party that
+// knows which process it is.
+message HandshakeRequest {
+  uint32 protocol_version = 1;
+  string runtime_binding_digest = 2;
+  string client_nonce = 3;
+  string session_credential = 4;
+  uint32 maximum_frame_bytes = 5;
+  repeated string supported_features = 6;
+  // Kernel-held state the host is offered.
+  //
+  // Reading the old ABI's diagnostics or registration inventory in process is
+  // not a reason for another process to read them, and the host is the side a
+  // boundary exists to distrust: it is offered what it may read and can only
+  // accept or decline, never ask for more. A call it cannot serve under what it
+  // accepted fails, which is the fail-closed direction.
+  repeated HostReadCapability offered_read_capabilities = 7;
+  // Registration classes the kernel can install a proxy for.
+  //
+  // A plugin whose registrations are not all in this set must not be loaded:
+  // the alternative is a load that reports success while a callback the plugin
+  // registered simply disappears, which is the failure this field exists to make
+  // impossible. Declared by the kernel because the kernel is the side that has
+  // to install the proxy.
+  repeated PluginRegistrationOperation supported_registration_operations = 8;
+}
+
+// The session the host establishes.
+//
+// `session_id` is the single authority for everything that follows: every later
+// request names it, and the host checks it against the session it holds. Before
+// this the schema carried a `session_id` on each request that nothing ever
+// issued, so "which session?" had no answer.
+message HandshakeResponse {
+  uint32 protocol_version = 1;
+  string session_id = 2;
+  string host_instance_id = 3;
+  string host_nonce = 4;
+  uint32 maximum_frame_bytes = 5;
+  repeated string supported_features = 6;
+  // What the host accepted. It must be a subset of what was offered, and the
+  // kernel checks that rather than trusting the answer.
+  repeated HostReadCapability accepted_read_capabilities = 7;
+  // What the host says it was built from: the release, and the newest native ABI
+  // revision its loader can load. The host is a separate executable and nothing
+  // in the process model makes a deployment replace it together with the runtime
+  // that starts it, so the pair is compared before any operation rather than
+  // assumed — a mismatch found when a plugin loads is a mismatch found after the
+  // decision to give that host work.
+  string host_release_version = 8;
+  uint32 host_native_abi_version = 9;
+}
+
+// Attach a second transport to a session this host has already established.
+//
+// A handshake creates a session; an attach joins one. The distinction exists
+// because the kernel's off-path work — the callbacks it runs beside a call rather
+// than on the call's own path — needs a transport whose tasks live on the runtime
+// that drives it, and a second transport must not be a second session: a plugin
+// already loaded, activated and proxied belongs to the session that did that, and
+// an attach that created another session, reloaded plugins or renegotiated
+// capabilities would solve a runtime-affinity problem by weakening the session
+// model.
+//
+// So an attach proves the same three facts a handshake does, plus the session it
+// is joining, and it returns the parameters that session already fixed rather
+// than any the caller offers. This message carries no frame limit, no feature
+// list and no read capabilities: a caller that could state those could state
+// weaker ones.
+message AttachRequest {
+  // The session being joined. A session this host did not establish is refused
+  // rather than created.
+  string session_id = 1;
+  // The credential this host was started with, checked here as it is at
+  // handshake: knowing where the socket is must not be enough to be a transport.
+  string session_credential = 2;
+  // Digest of the runtime identity the session is bound to.
+  string runtime_binding_digest = 3;
+  // Protocol version of the attaching client.
+  uint32 protocol_version = 4;
+}
+
+// The session parameters an attach joins.
+//
+// Every field is what the session already established. The attaching client
+// checks them against what it was told rather than using them to negotiate
+// anything: its only decision is whether this is the session it meant.
+message AttachedSession {
+  string session_id = 1;
+  uint32 negotiated_frame_limit = 2;
+  repeated PluginRegistrationOperation supported_registration_operations = 3;
+  repeated HostReadCapability accepted_read_capabilities = 4;
+  string runtime_binding_digest = 5;
+}
+
+message AttachOutcome {
+  oneof result {
+    AttachedSession attached = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// Kernel-held state a plugin host may be allowed to read.
+//
+// These exist because a less-trusted process asking for them is a decision
+// about what it may learn, not a translation of what the in-process ABI could
+// reach. Enum values are siblings of their type rather than children of it, so
+// these are prefixed to stay unique within the package.
+enum HostReadCapability {
+  HOST_READ_CAPABILITY_UNSPECIFIED = 0;
+  HOST_READ_CAPABILITY_RUNTIME_DIAGNOSTICS = 1;
+  HOST_READ_CAPABILITY_REGISTRATION_INVENTORY = 2;
+}
+
+// Load a plugin.
+//
+// `artifact` is a reference, so on its own it would let the host load a file
+// the kernel did not approve: something could be verified, the path left in
+// place, and the file replaced before the host opens it. The digests are the
+// kernel's statement of what it approved, and the host verifies both
+// immediately before loading — a manifest whose contents decide what is loaded,
+// and the library itself.
+message LoadRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  string plugin_id = 3;
+  string artifact = 4;
+  string manifest_digest = 5;
+  string library_digest = 6;
+}
+
+message LoadResponse {
+  PluginHandle handle = 1;
+  PluginDescriptor descriptor = 2;
+}
+
+message UnloadRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  PluginHandle handle = 3;
+}
+
+message UnloadResponse {}
+
+message InspectRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  optional PluginHandle handle = 3;
+}
+
+message InspectResponse {
+  repeated PluginDescriptor descriptors = 1;
+}
+
+// One component the kernel wants activated.
+//
+// Registration is config-driven: the kernel decides which components exist and
+// what configuration each reads, the plugin's register callback runs in
+// response, and only then does the host know what the plugin registered. So
+// activation cannot be folded into load — at load time there is no
+// configuration to run and nothing to report.
+message ComponentConfiguration {
+  string kind = 1;
+  string config_json = 2;
+}
+
+// Ask a session to run a plugin's register callbacks.
+//
+// `discovery` says this session is inspecting rather than serving: a serving
+// session refuses a plugin that registered a class it cannot serve, because a load
+// reporting success while a callback disappears is worse than a refused load, and
+// an inspecting one reports every registration so the classes this kernel cannot
+// serve are visible as what they are — the blockers.
+message ActivateRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  repeated ComponentConfiguration components = 3;
+  // Whether this session is inspecting rather than serving. See the comment
+  // above this message: it changes what is reported, not what may be installed.
+  bool discovery = 4;
+}
+
+// What the host holds once the components are activated.
+//
+// The descriptors are the point: they carry the registrations the plugin made,
+// which is what the kernel needs to install a proxy per registration. A serving
+// session refuses a plugin that registered something it cannot serve, rather than
+// reporting it as activated; an inspecting session reports them all, because the
+// unsupported ones are what it is looking for.
+message ActivateResponse {
+  repeated PluginDescriptor descriptors = 1;
+}
+
+message ActivateOutcome {
+  oneof result {
+    ActivateResponse activated = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// Invoke one registration a loaded plugin made.
+//
+// The registration is named by the identity the host reported when the
+// components were activated, because that identity is what the kernel installs
+// its proxy under: an invocation that named a capability or a component would
+// have to be resolved back to a registration, and the resolution could pick a
+// different one than the proxy stood for.
+//
+// `arguments` carries the payload the registration's class defines, as a JSON
+// object whose shape the class documents — a tool request intercept, for
+// instance, is given a tool name and the arguments to rewrite. The host refuses
+// a payload that does not fit the class rather than guessing.
+message InvokeRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  PluginHandle handle = 3;
+  string registration_id = 4;
+  string arguments = 5;
+}
+
+// The result of an invocation, with what is known about dispatch.
+//
+// Dispatch certainty is present for failures as well as successes, because that
+// is the case that matters: a plugin that dies after possibly reaching an
+// external system produced no definite outcome, and the kernel has to record
+// `UNKNOWN` rather than `FAILED`. Carrying certainty only on the success path
+// would lose exactly that distinction.
+//
+// The failure travels in this message rather than as a gRPC status. A gRPC
+// error means the channel or the process failed; a plugin that answered with a
+// refusal is a different event, and the transport's error vocabulary cannot
+// express the difference.
+message InvokeOutcome {
+  DispatchState dispatch_state = 1;
+  OutcomeCertainty outcome_certainty = 2;
+  oneof result {
+    string output = 3;
+    PluginFailure failure = 4;
+  }
+  // The invocation this answer belongs to, named by the side that accepted it.
+  //
+  // The call carries the operation in its context; the answer names it back, so
+  // the kernel can check that the outcome it received is the outcome it asked
+  // for. Correlation that exists only inside the transport is a property of the
+  // channel rather than of the protocol, and a peer that answered a different
+  // operation — by confusion or by design — would otherwise have its answer
+  // attributed to this one.
+  string operation_request_id = 5;
+}
+
+// One frame of a streaming invocation. The stream ends with `end`, or with a
+// failure that terminates it; a stream that simply stops is a truncation and
+// must be treated as one.
+message StreamChunk {
+  string operation_request_id = 1;
+  oneof chunk {
+    string data = 2;
+    PluginFailure failure = 3;
+    bool end = 4;
+  }
+  // Certainty of a terminal chunk. A stream that ends in a failure after the
+  // plugin may have dispatched is the same ambiguity as a unary failure, so the
+  // terminal outcome carries the same vocabulary.
+  DispatchState dispatch_state = 5;
+  OutcomeCertainty outcome_certainty = 6;
+}
+
+message CancelOperationRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+  string operation_request_id = 3;
+}
+
+message CancelOperationResponse {}
+
+message HealthRequest {
+  string session_id = 1;
+  PluginExecutionContext context = 2;
+}
+
+message HealthResponse {
+  uint32 protocol_version = 1;
+  bool accepting_work = 2;
+  repeated PluginHandle loaded = 3;
+}
+
+message SessionCloseRequest {
+  string session_id = 1;
+}
+
+message SessionCloseResponse {}
+
+// The outcome of closing a session.
+//
+// Every other lifecycle operation answers with its failure arm, and this one did
+// not: a refusal here travelled as a transport status, which is the conflation
+// the rest of this schema exists to prevent. A session that is already gone is a
+// result, not a channel failure.
+message SessionCloseOutcome {
+  oneof result {
+    SessionCloseResponse closed = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// Every call a plugin makes into the runtime carries the operation it belongs
+// to and its own identity, so several calls in one operation stay
+// distinguishable.
+//
+// These are typed RPCs rather than one generic `HostCall` with a capability
+// enum. Having both gave two ways to perform the same category of action, and a
+// security boundary is better served by one canonical representation for each
+// operation. A typed RPC is also the only shape that can express streaming
+// semantics: a unary call cannot carry open, pull, cancel and release.
+// A scope a mark belongs to.
+//
+// The identity is the scope's canonical UUID text, not a name and not an
+// opaque token: a name is not unique and a token would have to be resolved
+// before it meant anything. Conversion rejects anything that is not a UUID.
+message ScopeReference {
+  string scope_id = 1;
+}
+
+// The schema a mark's payload is written against.
+message MarkDataSchema {
+  string name = 1;
+  string version = 2;
+}
+
+// How severe a mark is. Protobuf enum values are siblings of their type rather
+// than children of it, so these are prefixed to stay unique within the package.
+enum MarkSeverity {
+  MARK_SEVERITY_UNSPECIFIED = 0;
+  MARK_SEVERITY_TRACE = 1;
+  MARK_SEVERITY_DEBUG = 2;
+  MARK_SEVERITY_INFO = 3;
+  MARK_SEVERITY_WARN = 4;
+  MARK_SEVERITY_ERROR = 5;
+}
+
+// Emit a mark.
+//
+// This is the complete payload the ABI passes, not the subset an earlier shape
+// carried: the parent scope, metadata, data schema, severity and timestamp all
+// affect the event a subscriber sees, and dropping any of them would make the
+// remote mark a different event than the in-process one. Each field that the
+// ABI may omit is optional here, so absence stays absence rather than becoming
+// a default nobody chose.
+message EmitMarkRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  string name = 4;
+  optional string data_json = 5;
+  optional ScopeReference parent = 6;
+  optional string metadata_json = 7;
+  optional MarkDataSchema data_schema = 8;
+  optional MarkSeverity severity = 9;
+  // Microseconds since the Unix epoch. Negative values are refused: a mark
+  // cannot have happened before the epoch, and accepting one would let a peer
+  // write an event the runtime cannot order.
+  optional int64 timestamp_unix_micros = 10;
+}
+
+message EmitMarkResponse {}
+
+// What the caller wants done with the scope stack.
+//
+// The set is what the ABI exposes rather than a guess at what it might: a
+// free-form string let a less-trusted peer manufacture an operation name, and
+// nothing could refuse one it did not recognize.
+enum ScopeOperation {
+  SCOPE_OPERATION_UNSPECIFIED = 0;
+  SCOPE_OPERATION_CURRENT = 1;
+  SCOPE_OPERATION_PUSH = 2;
+  SCOPE_OPERATION_POP = 3;
+  SCOPE_OPERATION_CREATE_ISOLATED = 4;
+  SCOPE_OPERATION_RELEASE_ISOLATED = 5;
+}
+
+message ScopeStackRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  ScopeOperation operation = 4;
+  // Present exactly when the operation carries one: a push describes the scope
+  // it pushes, and reading the current scope describes nothing.
+  optional string payload_json = 5;
+}
+
+message ScopeStackResponse {
+  oneof result {
+    string output = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// Which codec operation is being asked for. Closed for the same reason as
+// `ScopeOperation`: the three operations are what the ABI exposes, and a peer
+// cannot invent a fourth by writing a new string.
+enum CodecOperation {
+  CODEC_OPERATION_UNSPECIFIED = 0;
+  CODEC_OPERATION_LLM_REQUEST_DECODE = 1;
+  CODEC_OPERATION_LLM_REQUEST_ENCODE = 2;
+  CODEC_OPERATION_LLM_RESPONSE_DECODE = 3;
+}
+
+message ResolveCodecRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  CodecOperation operation = 4;
+  // The capability reference the kernel issued for this invocation, or empty when
+  // the caller has none. It is what makes the request a *use* of a capability
+  // rather than a request to name a codec: the kernel resolves the reference
+  // against the record it issued, and an empty or unknown reference is refused.
+  //
+  // `payload_json` carries the operation's own shape, and each shape states the
+  // codec the caller believes it is using, so the kernel can refuse a reference
+  // issued for one codec being used as another:
+  //   LLM_REQUEST_DECODE   {"codec_kind": .., "codec_id": .., "request": {..}}
+  //   LLM_REQUEST_ENCODE   {"codec_kind": .., "codec_id": .., "annotated": {..},
+  //                         "original": {..}}
+  //   LLM_RESPONSE_DECODE  {"codec_kind": .., "codec_id": .., "response": {..}}
+  string payload_json = 5;
+  string codec_reference = 6;
+}
+
+message ResolveCodecResponse {
+  oneof result {
+    string output = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// Continues the interceptor chain for one operation.
+//
+// A plugin's interceptor calls "next" to mean "run the rest of the chain",
+// which includes other plugins' interceptors and the base call. In process it is
+// the runtime that runs the rest, so the call has to cross. It is a typed
+// request rather than a session message because it is exactly one request and
+// one answer, and the kernel answers it on the same call — the plugin's
+// callback or completion is what the host settles from that answer.
+message ContinuationRequest {
+  string session_id = 1;
+  string operation_request_id = 2;
+  string host_call_id = 3;
+  // The invocation to continue with, after any rewriting the plugin did.
+  string invocation_json = 4;
+}
+
+// The rest of the chain's answer, or the failure that replaced it.
+message ContinuationOutcome {
+  oneof result {
+    string value_json = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+// A duplex control channel for the calls that one request and one answer cannot
+// express.
+//
+// Most calls between the two sides are one request and one answer, and those
+// stay typed unary RPCs. Two families are not. A completion is settled *after*
+// the callback that produced it has already returned, so its answer is not the
+// answer to any call in flight. A downstream stream is opened, pulled one item
+// at a time by the plugin, and possibly cancelled or released while a pull is
+// outstanding — its pace is the plugin's, and cancellation travels the other
+// way while a pull is pending. Splitting those into independent unary calls
+// would put the correlation between them in the transport, where neither side
+// could check it.
+//
+// Every message carries the session it belongs to and its own identity, so
+// several calls and several streams stay distinguishable on one channel. A
+// changed runtime binding requires a new session, as it does everywhere else.
+//
+// What deliberately does not travel here: operation requests and outcomes, and
+// the one-shot host calls (marks, scope stack, codec resolution). Each of those
+// already has exactly one typed representation, and a second way to perform the
+// same operation is a second thing that can disagree with the first.
+message PluginSessionMessage {
+  string session_id = 1;
+  oneof message {
+    DownstreamStreamOpenRequest stream_open = 2;
+    DownstreamStreamOpened stream_opened = 3;
+    DownstreamStreamOpenFailed stream_open_failed = 4;
+    DownstreamStreamPullRequest stream_pull = 5;
+    DownstreamStreamItem stream_item = 6;
+    DownstreamStreamEnd stream_end = 7;
+    DownstreamStreamFailed stream_failed = 8;
+    DownstreamStreamCancel stream_cancel = 9;
+    DownstreamStreamRelease stream_release = 10;
+    CompletionSettle completion_settle = 11;
+    CompletionOutcome completion_outcome = 12;
+    CompletionCancelled completion_cancelled = 13;
+    ContinuationChunk continuation_chunk = 14;
+    ContinuationChunkDisposition continuation_disposition = 15;
+    OutputCredit output_credit = 16;
+  }
+}
+
+// Capacity for the plugin's output stream, granted by the kernel.
+//
+// In process, a full bounded queue makes the push return `Backpressured` and
+// the plugin retries. Transport flow control says only that bytes are not being
+// consumed quickly, which is not the same statement, so the grant is explicit:
+// the host reports "the producer may continue" exactly while it holds credit,
+// and the kernel grants more as it consumes. Credits are additional items, so
+// granting two twice allows four.
+message OutputCredit {
+  string operation_request_id = 1;
+  uint64 items = 2;
+}
+
+// Opens an independent downstream LLM stream for one operation.
+//
+// The kernel answers with a stream the plugin addresses by identity, or with a
+// structured failure. The answer is a message rather than a return value
+// because opening is asynchronous on the plugin's side: its callback receives
+// the result.
+message DownstreamStreamOpenRequest {
+  string host_call_id = 1;
+  string operation_request_id = 2;
+  string request_json = 3;
+}
+
+message DownstreamStreamOpened {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+message DownstreamStreamOpenFailed {
+  string host_call_id = 1;
+  PluginFailure failure = 2;
+}
+
+// One item at a time. The plugin paces the stream: production advances when a
+// pull arrives, so a plugin that stops pulling stops the work behind it rather
+// than buffering it.
+message DownstreamStreamPullRequest {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+message DownstreamStreamItem {
+  string host_call_id = 1;
+  string stream_id = 2;
+  string chunk_json = 3;
+}
+
+// Clean completion: the stream produced everything it had.
+message DownstreamStreamEnd {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+message DownstreamStreamFailed {
+  string host_call_id = 1;
+  string stream_id = 2;
+  PluginFailure failure = 3;
+}
+
+message DownstreamStreamCancel {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+// Releases the plugin's reference. A released stream is not pulled again.
+message DownstreamStreamRelease {
+  string host_call_id = 1;
+  string stream_id = 2;
+}
+
+// One chunk of a stream the runtime produces and the plugin consumes through a
+// callback.
+//
+// This is the other half of the pull stream's pacing: there the plugin pulls
+// and the runtime answers, here the runtime produces and the plugin answers
+// whether to continue. The sequence is per continuation call and one-based, so
+// an answer names the chunk it decides rather than whichever chunk was
+// outstanding.
+message ContinuationChunk {
+  string host_call_id = 1;
+  uint64 sequence = 2;
+  string chunk_json = 3;
+}
+
+// What the plugin decided about the chunk it just received.
+//
+// The runtime does not produce chunk N+1 until this message permits it, which
+// is what makes the in-process callback's return value mean the same thing
+// here: a plugin that stops consuming stops production rather than merely
+// ignoring what arrives.
+enum ChunkDisposition {
+  CHUNK_DISPOSITION_UNSPECIFIED = 0;
+  CHUNK_DISPOSITION_CONTINUE = 1;
+  CHUNK_DISPOSITION_STOP = 2;
+}
+
+message ContinuationChunkDisposition {
+  string host_call_id = 1;
+  uint64 sequence = 2;
+  oneof disposition {
+    ChunkDisposition decision = 3;
+    PluginFailure failure = 4;
+  }
+}
+
+// Settles a callback that returned before its result existed.
+//
+// Exactly one arm is present: a value, or the failure that replaced it. The
+// kernel answers with the outcome, because a completion that has already been
+// cancelled or settled has an answer, and a settlement that silently did
+// nothing would leave the callback's owner waiting forever.
+message CompletionSettle {
+  string completion_id = 1;
+  string operation_request_id = 2;
+  oneof result {
+    string value_json = 3;
+    PluginFailure failure = 4;
+  }
+}
+
+message CompletionOutcome {
+  string completion_id = 1;
+  oneof result {
+    CompletionAccepted accepted = 2;
+    PluginFailure failure = 3;
+  }
+}
+
+message CompletionAccepted {}
+
+// The runtime that was awaiting the callback has cancelled it. The plugin is
+// not obliged to stop — the kernel does not trust a plugin to honour
+// cancellation — but it is told, so it can release what it holds.
+message CompletionCancelled {
+  string completion_id = 1;
+}
+
+// Served by the plugin host process.
+// Semantic outcomes for the lifecycle operations.
+//
+// Each pairs the success payload with a structured failure, because these
+// operations have meaningful failures of their own — a plugin that is already
+// loaded, a handle from a previous generation, a version the host does not
+// speak. Reporting them as a gRPC status would conflate a peer that answered
+// coherently with a channel that failed, and the two call for different
+// responses: one is a result, the other is a transport problem.
+//
+// The hierarchy this preserves:
+//
+//   transport failure  !=  host failure  !=  semantic plugin failure
+//                      !=  uncertain external effect
+message HandshakeOutcome {
+  oneof result {
+    HandshakeResponse established = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message LoadOutcome {
+  oneof result {
+    LoadResponse loaded = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message UnloadOutcome {
+  oneof result {
+    UnloadResponse unloaded = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message InspectOutcome {
+  oneof result {
+    InspectResponse inspected = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message CancelOperationOutcome {
+  oneof result {
+    CancelOperationResponse cancelled = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+message HealthOutcome {
+  oneof result {
+    HealthResponse health = 1;
+    PluginFailure failure = 2;
+  }
+}
+
+service PluginHost {
+  rpc Handshake(HandshakeRequest) returns (HandshakeOutcome);
+  // Join an established session with another transport. It creates no session.
+  rpc Attach(AttachRequest) returns (AttachOutcome);
+  rpc Load(LoadRequest) returns (LoadOutcome);
+  rpc Unload(UnloadRequest) returns (UnloadOutcome);
+  rpc Inspect(InspectRequest) returns (InspectOutcome);
+  rpc Activate(ActivateRequest) returns (ActivateOutcome);
+  rpc Invoke(InvokeRequest) returns (InvokeOutcome);
+  rpc InvokeStream(InvokeRequest) returns (stream StreamChunk);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationOutcome);
+  rpc Health(HealthRequest) returns (HealthOutcome);
+  rpc SessionClose(SessionCloseRequest) returns (SessionCloseOutcome);
+}
+
+// Served by the kernel for plugins that call back into the runtime while they
+// run. This is the direction the earlier request-only model could not express.
+service RelayRuntime {
+  rpc EmitMark(EmitMarkRequest) returns (EmitMarkResponse);
+  rpc ScopeStack(ScopeStackRequest) returns (ScopeStackResponse);
+  rpc ResolveCodec(ResolveCodecRequest) returns (ResolveCodecResponse);
+  rpc Continue(ContinuationRequest) returns (ContinuationOutcome);
+  // The duplex channel for completions and downstream stream control. One
+  // session carries both directions; the messages name what they belong to.
+  rpc Session(stream PluginSessionMessage) returns (stream PluginSessionMessage);
+}

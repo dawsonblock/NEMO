@@ -13,7 +13,8 @@ use crate::api::runtime::subscriber_dispatcher::{
     register_pending_publication,
 };
 use crate::api::runtime::{
-    EventSubscriberFn, ScopeStackHandle, ToolExecutionNextFn, with_active_event_uuid,
+    EventSubscriberFn, ManagedBudget, ManagedCall, ScopeStackHandle, ToolExecutionNextFn,
+    resolve_managed_call_budget, with_active_event_uuid, with_execution_budget,
 };
 use crate::api::scope::event;
 use crate::api::scope::{EmitMarkEventParams, ScopeHandle, metadata_with_log_severity};
@@ -766,6 +767,22 @@ impl Drop for ManagedToolCompletion {
 /// When execution fails after the start event has been emitted, the runtime
 /// still emits a tool-end event without an output payload.
 pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<ToolExecutionResult> {
+    ensure_runtime_owner()?;
+    // The budget is resolved before anything runs, so a call that inherited an
+    // expired deadline — or that is running under a lease which has already
+    // lapsed — is refused rather than started on time the runtime has spent.
+    // What it resolves to covers the whole managed call, including the intercept
+    // chains, because that is where a remote registration is reached.
+    match resolve_managed_call_budget(ManagedCall::Tool)? {
+        ManagedBudget::Bounded(budget) => {
+            with_execution_budget(budget, tool_call_execute_managed(params)).await
+        }
+        ManagedBudget::Unbounded => tool_call_execute_managed(params).await,
+    }
+}
+
+/// The body of a managed tool call, under whatever budget the boundary resolved.
+async fn tool_call_execute_managed(params: ToolCallExecuteParams) -> Result<ToolExecutionResult> {
     let ToolCallExecuteParams {
         name,
         args,
@@ -776,7 +793,6 @@ pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<ToolExec
         metadata,
         tool_call_id,
     } = params;
-    ensure_runtime_owner()?;
     {
         let (entries, subscribers, parent_uuid, guardrail_metadata) = {
             let scope_stack = current_scope_stack();
@@ -929,6 +945,133 @@ pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<ToolExec
     }
 }
 
+/// Run exactly one tool request sanitize guardrail, named by its registration.
+///
+/// A sanitize guardrail changes what observers see and never what the runtime
+/// does: the chain it belongs to rewrites the copy of the payload that goes into
+/// events, and the callback's arguments and result are untouched. That is why a
+/// host can run one of these without being trusted with the call — and why the
+/// answer here is the sanitized *copy* rather than a call to make.
+///
+/// `None` means the chain omitted the observability payload, which is what a
+/// failing sanitizer produces: a payload that could not be sanitized is not
+/// published unsanitized. A caller reports that as a refusal so the runtime
+/// omits the payload the same way it would in process.
+pub async fn invoke_tool_sanitize_request_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+) -> Result<Option<Json>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.tool_sanitize_request_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_sanitize_request_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool request sanitize guardrail is registered as '{registration}'"
+        )));
+    };
+    Ok(NemoRelayContextState::tool_sanitize_request_snapshot_chain(name, args, &[entry]).await)
+}
+
+/// Run exactly one tool response sanitize guardrail, named by its registration.
+///
+/// The response direction of [`invoke_tool_sanitize_request_registration`], with
+/// the same rule: what comes back is the sanitized copy for the event, and `None`
+/// is a payload that could not be sanitized and is therefore omitted.
+pub async fn invoke_tool_sanitize_response_registration(
+    registration: &str,
+    name: &str,
+    result: Json,
+) -> Result<Option<Json>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.tool_sanitize_response_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_sanitize_response_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool response sanitize guardrail is registered as '{registration}'"
+        )));
+    };
+    Ok(NemoRelayContextState::tool_sanitize_response_snapshot_chain(name, result, &[entry]).await)
+}
+
+/// Run exactly one tool conditional-execution guardrail, named by its registration.
+///
+/// The chain entry point runs every guardrail for a name, which is what a tool
+/// call needs and what a host cannot use: a host holding one plugin's
+/// registrations has to run *that* guardrail when the kernel asks, or the kernel's
+/// chain — which holds one proxy per registration — would run the plugin's whole
+/// set once per proxy.
+///
+/// The answer is the decision and nothing else: `Some(reason)` refuses the call,
+/// `None` allows it. The guardrail's own scope events are emitted by the chain
+/// that holds the proxy, in the process that owns the subscribers, so a remote
+/// guardrail is observable exactly as an in-process one is.
+pub async fn invoke_tool_conditional_execution_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+) -> Result<Option<String>> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.tool_conditional_execution_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_conditional_execution_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool conditional-execution guardrail is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::tool_conditional_execution_snapshot_chain(
+        name,
+        &args,
+        &[entry],
+        &[],
+        None,
+        None,
+    )
+    .await
+}
+
 /// Run only the tool request-intercept chain.
 ///
 /// This applies the currently active global and scope-local request intercepts
@@ -963,6 +1106,106 @@ pub async fn tool_request_intercepts(name: &str, args: Json) -> Result<Json> {
         state.tool_request_intercept_entries(&scope_local_refs)
     };
     NemoRelayContextState::tool_request_intercepts_snapshot_chain(name, args, &entries).await
+}
+
+/// Run exactly one tool request intercept, named by its registration.
+///
+/// The chain entry points run every intercept for a tool name, which is what a
+/// tool call needs and what a host cannot use: a host holding one plugin's
+/// registrations has to run *that* registration when the kernel asks, or the
+/// kernel's chain — which holds one proxy per registration — would run the
+/// plugin's whole set on every call, once per proxy.
+///
+/// The callback is invoked with the same arguments, in the same arena, and with
+/// the same error handling as it would have had from the chain, because it *is*
+/// the chain runner with one entry: identity is the only thing this changes.
+///
+/// # Errors
+/// NotFound when nothing is registered under that name, which is the answer a
+/// caller needs to refuse the invocation rather than silently do nothing.
+pub async fn invoke_tool_request_intercept_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+) -> Result<Json> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.tool_request_intercepts);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_request_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool request intercept is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::tool_request_intercepts_snapshot_chain(name, args, &[entry]).await
+}
+
+/// Run exactly one tool execution intercept, by registration name.
+///
+/// The class that wraps the call rather than rewriting its arguments: the caller
+/// supplies the continuation, because the rest of the chain is not always in
+/// this process. A native plugin hosted in another process registers its
+/// intercept here and runs the callback there, so the continuation it calls is
+/// the kernel's own remainder of the chain, reached over the boundary — and the
+/// answer it receives is the downstream tool's result.
+///
+/// The continuation is the engine's, not this function's: the lease rules that
+/// apply to any intercept's `next` (a call that begins after the intercept
+/// settles is refused, one still in flight when it settles is cancelled) are
+/// enforced by the continuation the caller passes, so a caller that supplies a
+/// bare callback gets those rules from the chain it took it from.
+///
+/// # Parameters
+/// - `registration`: Registration name to run, as registered.
+/// - `name`: Tool name associated with the execution.
+/// - `args`: Current JSON argument payload.
+/// - `next`: Continuation for the remaining execution chain.
+///
+/// # Returns
+/// The intercept's outcome: the result it decided on, and any lifecycle marks it
+/// asked the owner of the tool call to emit.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when nothing is registered under
+/// `registration`, and the intercept's own error when it fails.
+pub async fn invoke_tool_execution_intercept_registration(
+    registration: &str,
+    name: &str,
+    args: Json,
+    next: crate::api::runtime::ToolExecutionNextFn,
+) -> Result<ToolExecutionInterceptOutcome> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.tool_execution_intercepts);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .tool_execution_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no tool execution intercept is registered as '{registration}'"
+        )));
+    };
+    (entry.payload)(name, args, next).await
 }
 
 /// Run only the tool conditional-execution guardrail chain.

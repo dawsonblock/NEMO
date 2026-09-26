@@ -303,6 +303,12 @@ jobs:
           set -e
           # SONAR_IGNORE_START: dependencies were fetched from Cargo.lock before dynamic package metadata is applied.
           cargo build --locked --offline --release --target "${{ matrix.target }}" -p nemo-relay-cli
+          # The isolated plugin runtime is not implemented on Windows yet, so
+          # there is no host to build there and the wheel says so instead of
+          # promising one.
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            cargo build --locked --offline --release --target "${{ matrix.target }}" -p nemo-relay-plugin-host
+          fi
           # SONAR_IGNORE_END
 
       - name: Build CLI release binary in manylinux
@@ -320,6 +326,7 @@ jobs:
                 sh -s -- -y --profile minimal --default-toolchain "$NEMO_RELAY_RUST_VERSION"
               export PATH="$HOME/.cargo/bin:$PATH"
               cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-cli
+              cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-plugin-host
             '
 
       - name: Stage CLI binary artifact
@@ -332,12 +339,17 @@ jobs:
             version="dev-${GIT_COMMIT::8}"
           fi
           binary="nemo-relay"
+          host_binary="nemo-plugin-host"
           asset="nemo-relay-cli-${target}-${version}"
+          host_asset="nemo-plugin-host-${target}-${version}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             binary="${binary}.exe"
+            host_binary="${host_binary}.exe"
             asset="${asset}.exe"
+            host_asset="${host_asset}.exe"
           fi
           source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${binary}"
+          host_source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${host_binary}"
           if [ ! -f "$source" ]; then
             echo "Error: expected CLI binary at ${source}" >&2
             exit 1
@@ -345,6 +357,19 @@ jobs:
           rm -rf "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli"
           mkdir -p "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli"
           cp "$source" "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli/${asset}"
+          # The host is a release asset of its own as well as a file inside the
+          # CLI wheel: install.sh and install.ps1 install both executables beside
+          # each other, and the CLI looks for the host beside itself. There is no
+          # host to publish on Windows, where the isolated runtime is not
+          # implemented yet, and the installer reports that rather than looking
+          # complete.
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            if [ ! -f "$host_source" ]; then
+              echo "Error: expected plugin host binary at ${host_source}" >&2
+              exit 1
+            fi
+            cp "$host_source" "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli/${host_asset}"
+          fi
 
       - name: Package CLI binary for PyPI
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
@@ -352,18 +377,50 @@ jobs:
           set -euo pipefail
           target="${{ matrix.target }}"
           binary="nemo-relay"
+          host_binary="nemo-plugin-host"
           if [ "${{ runner.os }}" = "Windows" ]; then
             binary="${binary}.exe"
+            host_binary="${host_binary}.exe"
           fi
           source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${binary}"
+          host_source="${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${host_binary}"
           version="$NEMO_RELAY_CLI_PACKAGE_VERSION"
           rm -rf "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli-packages"
           mkdir -p "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli-packages"
-          python scripts/package-cli-bin.py \
-            --binary "$source" \
-            --target "$target" \
-            --version "$version" \
+          package_args=(
+            --binary "$source"
+            --target "$target"
+            --version "$version"
             --output-dir "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli-packages"
+          )
+          # No host to bundle on Windows, where the isolated runtime is not
+          # implemented: the wheel carries the CLI and says so.
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            package_args+=(--host-binary "$host_source")
+          fi
+          python scripts/package-cli-bin.py "${package_args[@]}"
+
+      # The wheel is installed into a virtual environment that has nothing else
+      # in it and exercised from there, because a package that installs cleanly
+      # and then cannot start its own plugin host is the failure this packaging
+      # exists to prevent, and only an installation can show it.
+      - name: Verify the CLI wheel carries a usable plugin host
+        if: ${{ runner.os != 'Windows' }}
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="nemo-relay"
+          host_binary="nemo-plugin-host"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            binary="${binary}.exe"
+            host_binary="${host_binary}.exe"
+          fi
+          python scripts/verify-installed-plugin-host.py \
+            --binary "${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${binary}" \
+            --host-binary "${NEMO_RELAY_CI_WORKSPACE}/target/${target}/release/${host_binary}" \
+            --target "$target" \
+            --version "$NEMO_RELAY_CLI_PACKAGE_VERSION"
 
       - name: Upload CLI binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -453,9 +510,11 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             venv_python="${RUNNER_TEMP}/nemo-relay-cli-venv/Scripts/python.exe"
             venv_cli="${RUNNER_TEMP}/nemo-relay-cli-venv/Scripts/nemo-relay.exe"
+            venv_host="${RUNNER_TEMP}/nemo-relay-cli-venv/Scripts/nemo-plugin-host.exe"
           else
             venv_python="${RUNNER_TEMP}/nemo-relay-cli-venv/bin/python"
             venv_cli="${RUNNER_TEMP}/nemo-relay-cli-venv/bin/nemo-relay"
+            venv_host="${RUNNER_TEMP}/nemo-relay-cli-venv/bin/nemo-plugin-host"
           fi
           # SONAR_IGNORE_START: local wheel with no dependencies or index access.
           uv pip install --python "$venv_python" --no-deps --no-index "$wheel"
@@ -463,6 +522,29 @@ jobs:
           wheel_version="$("$venv_cli" --version)"
           if [ "$binary_version" != "$wheel_version" ]; then
             echo "Error: CLI binary reports '$binary_version' but wheel reports '$wheel_version'" >&2
+            exit 1
+          fi
+          # Windows wheels carry the CLI alone: the isolated runtime is not
+          # implemented there, so there is no host to check for.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            exit 0
+          fi
+          # The plugin host travels with the CLI, in the directory the
+          # supervisor looks in when a deployment names no host: the one
+          # holding the executable that started the process. A wheel that
+          # installed without it would pass everything above and fail the
+          # first time a deployment used a native plugin.
+          test -x "$venv_host"
+          host_status=0
+          "$venv_host" >/dev/null 2>host-stderr || host_status=$?
+          if [ "$host_status" -ne 2 ]; then
+            echo "Error: the installed plugin host exited ${host_status} with no socket" >&2
+            cat host-stderr >&2
+            exit 1
+          fi
+          if ! grep -q "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set" host-stderr; then
+            echo "Error: the installed nemo-plugin-host is not the plugin host" >&2
+            cat host-stderr >&2
             exit 1
           fi
 
@@ -488,6 +570,14 @@ jobs:
               wheel_version="$(/tmp/nemo-relay-cli-venv/bin/nemo-relay --version)"
               if [ "$binary_version" != "$wheel_version" ]; then
                 echo "Error: CLI binary and wheel versions differ" >&2
+                exit 1
+              fi
+              test -x /tmp/nemo-relay-cli-venv/bin/nemo-plugin-host
+              host_status=0
+              /tmp/nemo-relay-cli-venv/bin/nemo-plugin-host >/dev/null 2>host-stderr || host_status=$?
+              if [ "$host_status" -ne 2 ] || ! grep -q "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set" host-stderr; then
+                echo "Error: the installed plugin host is not a usable host" >&2
+                cat host-stderr >&2
                 exit 1
               fi
             '

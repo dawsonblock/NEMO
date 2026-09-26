@@ -28,8 +28,9 @@ use crate::api::runtime::subscriber_dispatcher::{
 };
 use crate::api::runtime::{
     EventSubscriberFn, LlmCollectorFn, LlmExecutionNextFn, LlmFinalizerFn, LlmJsonStream,
-    LlmSanitizeRequestContext, LlmSanitizeResponseContext, LlmStreamExecutionNextFn,
-    MiddlewareContinuationContext, with_active_event_uuid,
+    LlmSanitizeRequestContext, LlmSanitizeResponseContext, LlmStreamExecutionNextFn, ManagedBudget,
+    ManagedCall, MiddlewareContinuationContext, resolve_managed_call_budget,
+    with_active_event_uuid, with_execution_budget,
 };
 use crate::api::runtime::{ScopeStackHandle, capture_traceparent, current_scope_stack};
 use crate::api::scope::event;
@@ -1601,6 +1602,20 @@ impl Drop for ManagedLlmCompletion {
 /// Response codecs enrich observability output only and do not change the
 /// value returned to the caller.
 pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
+    ensure_runtime_owner()?;
+    // Resolved before anything runs and published for the whole call: a managed
+    // LLM call reaches remote registrations through the same intercept chains a
+    // tool call does, and both need the same trusted deadline underneath them.
+    match resolve_managed_call_budget(ManagedCall::Llm)? {
+        ManagedBudget::Bounded(budget) => {
+            with_execution_budget(budget, llm_call_execute_managed(params)).await
+        }
+        ManagedBudget::Unbounded => llm_call_execute_managed(params).await,
+    }
+}
+
+/// The body of a managed LLM call, under whatever budget the boundary resolved.
+async fn llm_call_execute_managed(params: LlmCallExecuteParams) -> Result<Json> {
     let LlmCallExecuteParams {
         name,
         request,
@@ -1613,7 +1628,6 @@ pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
         codec,
         response_codec,
     } = params;
-    ensure_runtime_owner()?;
     {
         let (entries, subscribers, parent_uuid, guardrail_metadata) = {
             let scope_stack = current_scope_stack();
@@ -2080,6 +2094,238 @@ pub async fn llm_request_intercepts(
     Ok(outcome)
 }
 
+/// What one LLM request intercept is invoked with.
+///
+/// The chain holds both the request and whatever annotation a codec produced for
+/// it, and the callback may rewrite either, so both cross. A second shape that
+/// carried only the request would be a different invocation than the one the
+/// in-process chain makes, and a callback that rewrites `content` through the
+/// annotation would silently do nothing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LlmRequestInterceptInvocation {
+    /// The LLM call's logical name, as the chain passes it to callbacks.
+    pub name: String,
+    /// The provider request as the chain holds it.
+    pub request: LlmRequest,
+    /// The normalized annotation, when a request codec produced one.
+    #[serde(default)]
+    pub annotated_request: Option<AnnotatedLlmRequest>,
+}
+
+/// Run exactly one LLM request intercept, named by its registration.
+///
+/// The chain entry point runs every intercept for a name, which is what an LLM
+/// call needs and what a host cannot use: a host holding one plugin's
+/// registrations has to run *that* registration when the kernel asks, or the
+/// kernel's chain — which holds one proxy per registration — would run the
+/// plugin's whole set once per proxy. The callback is invoked with the same
+/// request, the same annotation and the same error handling it would have had
+/// from the chain, because it *is* the chain runner with one entry: identity is
+/// the only thing this changes.
+///
+/// The outcome crosses whole rather than as a rewritten request, because the
+/// callback may also schedule marks and record optimization evidence, and an
+/// invocation that dropped those would be a different invocation than the
+/// in-process one.
+///
+/// # Errors
+/// `NotFound` when nothing is registered under that name, which is the answer a
+/// caller needs to refuse the invocation rather than silently do nothing.
+pub async fn invoke_llm_request_intercept_registration(
+    registration: &str,
+    invocation: LlmRequestInterceptInvocation,
+) -> Result<LlmRequestInterceptOutcome> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.llm_request_intercepts);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_request_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no LLM request intercept is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::llm_request_intercepts_snapshot_chain(
+        &invocation.name,
+        invocation.request,
+        invocation.annotated_request,
+        &[entry],
+        false,
+    )
+    .await
+}
+
+/// Run exactly one LLM execution intercept, by registration name.
+///
+/// The tool execution intercept's twin: the class that wraps a provider call
+/// rather than rewriting its request, so the caller supplies the continuation,
+/// because the rest of the chain is not always in this process. A native plugin
+/// hosted elsewhere runs the callback there, and the continuation it calls is the
+/// kernel's own remainder of the chain — reached over the boundary, answered with
+/// the provider response the downstream call produced.
+///
+/// The continuation carries the engine's own lease, so a call that begins after
+/// this intercept settles is refused and one still in flight when it settles is
+/// cancelled: the rules are the ones any intercept's `next` gets, not ones this
+/// function adds.
+///
+/// # Parameters
+/// - `registration`: Registration name to run, as registered.
+/// - `name`: Logical provider or model family name.
+/// - `request`: Current LLM request.
+/// - `next`: Continuation for the remaining execution chain.
+///
+/// # Returns
+/// The provider response the intercept decided on.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when nothing is registered under
+/// `registration`, and the intercept's own error when it fails.
+pub async fn invoke_llm_execution_intercept_registration(
+    registration: &str,
+    name: &str,
+    request: LlmRequest,
+    next: crate::api::runtime::LlmExecutionNextFn,
+) -> Result<Json> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| &registries.llm_execution_intercepts);
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_execution_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no LLM execution intercept is registered as '{registration}'"
+        )));
+    };
+    (entry.payload)(name, request, next).await
+}
+
+/// Run exactly one streaming LLM execution intercept, by registration name.
+///
+/// The third of the execution families, and the one whose answer is not a value
+/// but a stream: the caller supplies the continuation because the rest of the
+/// chain is not always in this process, and what comes back is the stream the
+/// registration produced. A plugin hosted elsewhere runs its callback there, pulls
+/// the downstream stream it was given a continuation for, and returns its own.
+///
+/// The continuation carries the engine's own lease, so calling it after this
+/// registration settles is refused and a call still in flight when it settles is
+/// cancelled, exactly as for the unary families.
+///
+/// # Parameters
+/// - `registration`: Registration name to run, as registered.
+/// - `name`: Logical provider or model family name.
+/// - `request`: Current LLM request.
+/// - `next`: Continuation for the remaining streaming execution chain.
+///
+/// # Returns
+/// The stream the registration produced.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when nothing is registered under
+/// `registration`, and the registration's own error when it fails.
+pub async fn invoke_llm_stream_execution_intercept_registration(
+    registration: &str,
+    name: &str,
+    request: LlmRequest,
+    next: crate::api::runtime::LlmStreamExecutionNextFn,
+) -> Result<LlmJsonStream> {
+    ensure_runtime_owner()?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_stream_execution_intercepts
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_stream_execution_intercept_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no streaming LLM execution intercept is registered as '{registration}'"
+        )));
+    };
+    (entry.payload)(name, request, next).await
+}
+
+/// Run exactly one LLM conditional-execution guardrail, named by its registration.
+///
+/// The decision direction of the LLM chain, and the same rule as the tool one:
+/// the host runs *that* registration, because the kernel's chain already holds one
+/// proxy per registration and running the plugin's whole set once per proxy would
+/// ask the same question several times and take the strictest answer.
+///
+/// `Some(reason)` refuses the call, `None` allows it. The guardrail's scope events
+/// belong to the chain that holds the proxy, in the process that owns the
+/// subscribers, so nothing about them has to cross.
+pub async fn invoke_llm_conditional_execution_registration(
+    registration: &str,
+    request: Json,
+) -> Result<Option<String>> {
+    ensure_runtime_owner()?;
+    let request: LlmRequest = serde_json::from_value(request).map_err(|error| {
+        FlowError::InvalidArgument(format!(
+            "an LLM conditional payload must be a request: {error}"
+        ))
+    })?;
+    let entry = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_conditional_execution_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .llm_conditional_execution_entries(&scope_local_refs);
+        state.into_iter().find(|entry| entry.name == registration)
+    };
+    let Some(entry) = entry else {
+        return Err(FlowError::NotFound(format!(
+            "no LLM conditional-execution guardrail is registered as '{registration}'"
+        )));
+    };
+    NemoRelayContextState::llm_conditional_execution_snapshot_chain(
+        &request,
+        &[entry],
+        &[],
+        None,
+        None,
+    )
+    .await
+}
+
 /// Run only the LLM conditional-execution guardrail chain.
 ///
 /// This evaluates whether an LLM call should be allowed to proceed without
@@ -2140,6 +2386,144 @@ pub async fn llm_conditional_execution(request: &LlmRequest) -> Result<()> {
     Ok(())
 }
 
+/// What one exact LLM request sanitize registration did.
+///
+/// The request is the one to publish — the sanitizer's answer, or nothing when it did
+/// not answer — and `failure` is the sanitizer's own words in that second case. The
+/// family's rule is omission, so "no request" is an answer rather than a lost one; what
+/// the failure adds is the ability to say why, which the caller needs when it is running
+/// the registration on another process's behalf.
+#[derive(Debug, Clone)]
+pub struct LlmRequestSanitizeOutcome {
+    /// The request as it should be published, or nothing when it was omitted.
+    pub request: Option<LlmRequest>,
+    /// Why the sanitizer did not answer, when it did not.
+    pub failure: Option<String>,
+}
+
+impl From<(Option<LlmRequest>, Option<String>)> for LlmRequestSanitizeOutcome {
+    fn from((request, failure): (Option<LlmRequest>, Option<String>)) -> Self {
+        Self { request, failure }
+    }
+}
+
+/// What one exact LLM response sanitize registration did.
+///
+/// The response direction of [`LlmRequestSanitizeOutcome`], with the same rule.
+#[derive(Debug, Clone)]
+pub struct LlmResponseSanitizeOutcome {
+    /// The response as it should be published, or nothing when it was omitted.
+    pub response: Option<Json>,
+    /// Why the sanitizer did not answer, when it did not.
+    pub failure: Option<String>,
+}
+
+impl From<(Option<Json>, Option<String>)> for LlmResponseSanitizeOutcome {
+    fn from((response, failure): (Option<Json>, Option<String>)) -> Self {
+        Self { response, failure }
+    }
+}
+
+/// Run exactly one LLM request sanitize guardrail, named by its registration.
+///
+/// The same door the event sanitizers have, for the same reason: a host running a
+/// plugin's registration has to run *that* registration when the kernel asks, not the
+/// family. The registration is chosen here, by an identity the kernel owns — a plugin
+/// registers under names, the chain holds one proxy per registration, and this runs
+/// exactly the one the proxy names.
+///
+/// The context is the caller's because the codec it may carry belongs to the call:
+/// a host cannot construct one for itself, which is what the codec capability protocol
+/// is for.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when this process holds no registration of this class
+/// under that name.
+pub async fn invoke_llm_sanitize_request_registration(
+    registration: &str,
+    request: LlmRequest,
+    context: LlmSanitizeRequestContext,
+) -> crate::error::Result<LlmRequestSanitizeOutcome> {
+    ensure_runtime_owner()?;
+    let (entries, _full_payloads) = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_sanitize_request_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .registry_snapshot(&[RuntimeRegistrationKind::LlmSanitizeRequestGuardrail]);
+        (
+            state.llm_sanitize_request_entries(&scope_local_refs),
+            state.observability_full_payloads_enabled,
+        )
+    };
+    let entry = crate::context::registries::exact_guardrail_entry(&entries, registration)
+        .ok_or_else(|| {
+            FlowError::NotFound(format!(
+                "no LLM request sanitize guardrail is registered as '{registration}'"
+            ))
+        })?;
+    Ok(
+        NemoRelayContextState::llm_sanitize_request_one(request, context, &entry)
+            .await
+            .into(),
+    )
+}
+
+/// Run exactly one LLM response sanitize guardrail, named by its registration.
+///
+/// The response direction of [`invoke_llm_sanitize_request_registration`], with the same
+/// rule and the same reason.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when this process holds no registration of this class
+/// under that name.
+pub async fn invoke_llm_sanitize_response_registration(
+    registration: &str,
+    response: Json,
+    context: LlmSanitizeResponseContext,
+) -> crate::error::Result<LlmResponseSanitizeOutcome> {
+    ensure_runtime_owner()?;
+    let entries = {
+        let scope_stack = current_scope_stack();
+        let scope_locals = scope_stack
+            .read()
+            .expect("scope stack lock poisoned")
+            .snapshot_scope_local_registries(|registries| {
+                &registries.llm_sanitize_response_guardrails
+            });
+        let scope_local_refs = scope_locals.iter().collect::<Vec<_>>();
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?
+            .registry_snapshot(&[RuntimeRegistrationKind::LlmSanitizeResponseGuardrail]);
+        state.llm_sanitize_response_entries(&scope_local_refs)
+    };
+    let entry = crate::context::registries::exact_guardrail_entry(&entries, registration)
+        .ok_or_else(|| {
+            FlowError::NotFound(format!(
+                "no LLM response sanitize guardrail is registered as '{registration}'"
+            ))
+        })?;
+    Ok(
+        NemoRelayContextState::llm_sanitize_response_one(response, context, &entry)
+            .await
+            .into(),
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/llm_api_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/llm_sanitize_api_tests.rs"]
+mod llm_sanitize_api_tests;

@@ -32,6 +32,151 @@ pub extern "C" fn nemo_relay_fixture_async_pending_entered() -> bool {
     ASYNC_PENDING_ENTERED.swap(false, Ordering::AcqRel)
 }
 
+/// The schedule a matrix run walks its two streams in.
+///
+/// A test that wants a *specific* interleaving cannot hope for one: the plugin's
+/// work runs on its own executor, so which stream reaches its next mark first is
+/// whatever the scheduler decides. The run therefore carries its schedule with it —
+/// both invocations are given the same list of stream names — and each stream waits
+/// until the schedule's current step names it before raising its next mark. The
+/// order the marks are raised in is then the order the test asked for.
+static MATRIX_GENERATION: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static MATRIX_SCHEDULE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static MATRIX_STEP: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static MATRIX_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Starts (or restarts) a matrix run under a new generation.
+fn matrix_start(generation: u64, schedule: &[String]) {
+    let mut current = MATRIX_GENERATION.lock().unwrap_or_else(|error| error.into_inner());
+    if *current == generation {
+        // The other stream of this run has already started it: the schedule is the
+        // same one, and restarting it would lose the steps already taken.
+        return;
+    }
+    *current = generation;
+    *MATRIX_SCHEDULE.lock().unwrap_or_else(|error| error.into_inner()) = schedule.to_vec();
+    *MATRIX_STEP.lock().unwrap_or_else(|error| error.into_inner()) = 0;
+    MATRIX_READY.notify_all();
+}
+
+/// Waits until the schedule's current step names `stream`, and takes it.
+///
+/// Answers whether the step was taken before the wait expired, so a schedule the
+/// run cannot satisfy fails where it was walked rather than hanging.
+fn matrix_step(stream: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut step = MATRIX_STEP.lock().unwrap_or_else(|error| error.into_inner());
+    loop {
+        // Only the step the schedule names may be taken: a stream whose turn has
+        // not come waits rather than racing ahead of it.
+        let scheduled = MATRIX_SCHEDULE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(*step)
+            .cloned();
+        if scheduled.as_deref() == Some(stream) {
+            *step += 1;
+            MATRIX_READY.notify_all();
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let (guard, _) = MATRIX_READY
+            .wait_timeout(step, remaining)
+            .unwrap_or_else(|error| error.into_inner());
+        step = guard;
+    }
+}
+
+/// The marks one matrix stream raises, in the order it raises them.
+const MATRIX_POSITIONS: [&str; 4] = [
+    "before-downstream",
+    "downstream-active",
+    "between-frames",
+    "before-terminal",
+];
+
+/// A stream that raises a mark at each of the four positions, one schedule step
+/// at a time.
+struct MatrixStream {
+    inner: LlmJsonAsyncStream,
+    runtime: PluginRuntime,
+    stream: &'static str,
+    /// The position this stream raises next.
+    step: usize,
+    /// Whether the downstream stream has been polled, so the second position is
+    /// raised once rather than once per pull.
+    opened: bool,
+}
+
+impl MatrixStream {
+    /// Raises the next position's mark, once the schedule permits it.
+    fn raise(&mut self, position: &'static str) {
+        matrix_step(self.stream);
+        let _ = self.runtime.emit_mark(
+            "fixture.native.llm_stream.mark",
+            Some(&json!({"stream": self.stream, "position": position})),
+            None,
+        );
+        self.step += 1;
+    }
+}
+
+impl futures::Stream for MatrixStream {
+    type Item = std::result::Result<Json, String>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if !self.opened {
+            self.opened = true;
+            self.raise(MATRIX_POSITIONS[1]);
+        }
+        let this = self.as_mut().get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                // Between the frames the downstream returned: the third position,
+                // raised for every frame the downstream produces.
+                this.raise(MATRIX_POSITIONS[2]);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => std::task::Poll::Ready(Some(Err(error))),
+            std::task::Poll::Ready(None) => {
+                // After the last frame and before the terminal one.
+                this.raise(MATRIX_POSITIONS[3]);
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// A stream whose first poll panics, so the panic a returned stream can raise is
+/// the panic the cleanup has to survive.
+struct PanickingStream {
+    inner: LlmJsonAsyncStream,
+    polled: bool,
+}
+
+impl futures::Stream for PanickingStream {
+    type Item = std::result::Result<Json, String>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if !self.polled {
+            self.polled = true;
+            panic!("the stream a callback returned panicked while being polled");
+        }
+        let this = self.as_mut().get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
 impl NativePlugin for FixtureNativePlugin {
     fn plugin_kind(&self) -> &str {
         "fixture_native"
@@ -320,17 +465,121 @@ impl NativePlugin for FixtureNativePlugin {
         ctx.register_llm_stream_execution_intercept(
             "fixture_llm_stream_execution",
             0,
-            |_name, request, next| async move {
-                let stream = next
-                    .call(mark_llm_request(
-                        request,
-                        "native_plugin_llm_stream_execution_request",
-                    ))
-                    .await?;
-                let stream: LlmJsonAsyncStream = Box::pin(stream.map(|chunk| {
-                    chunk.map(|chunk| mark_json(chunk, "native_plugin_llm_stream_execution"))
-                }));
-                Ok(stream)
+            {
+                let runtime = runtime.clone();
+                move |_name, request, next| {
+                    let runtime = runtime.clone();
+                    async move {
+                        let shape = request
+                            .content
+                            .get("fixture_stream_shape")
+                            .and_then(Json::as_str)
+                            .unwrap_or("plain")
+                            .to_owned();
+                        // The first of the four positions a streaming mark can be
+                        // raised in: before the downstream stream is opened.
+                        let stream_name = request
+                            .content
+                            .get("fixture_stream")
+                            .and_then(Json::as_str)
+                            .map(str::to_owned);
+                        if let Some(stream_name) = stream_name.as_deref() {
+                            if let Some(schedule) = request
+                                .content
+                                .get("fixture_schedule")
+                                .and_then(|schedule| serde_json::from_value::<Vec<String>>(schedule.clone()).ok())
+                            {
+                                let generation = request
+                                    .content
+                                    .get("fixture_generation")
+                                    .and_then(Json::as_u64)
+                                    .unwrap_or(0);
+                                matrix_start(generation, &schedule);
+                            }
+                            matrix_step(stream_name);
+                            runtime.emit_mark(
+                                "fixture.native.llm_stream.mark",
+                                Some(&json!({
+                                    "stream": stream_name,
+                                    "position": MATRIX_POSITIONS[0],
+                                })),
+                                None,
+                            )?;
+                        } else {
+                            runtime.emit_mark(
+                                "fixture.native.llm_stream.mark",
+                                Some(&json!({"position": MATRIX_POSITIONS[0]})),
+                                None,
+                            )?;
+                        }
+                        // Two independent downstream continuations of one call,
+                        // each raising its own mark: what the continuation test
+                        // proves is that both marks stay attributed to the call
+                        // while the two continuations keep distinct identities.
+                        if shape == "two-continuations" {
+                            let first = next.call(request.clone()).await?;
+                            let second = next.call(request).await?;
+                            runtime.emit_mark(
+                                "fixture.native.llm_stream.mark",
+                                Some(&json!({"position": "first-continuation"})),
+                                None,
+                            )?;
+                            runtime.emit_mark(
+                                "fixture.native.llm_stream.mark",
+                                Some(&json!({"position": "second-continuation"})),
+                                None,
+                            )?;
+                            let stream: LlmJsonAsyncStream = Box::pin(
+                                first.chain(second).map(|chunk| {
+                                    chunk.map(|chunk| {
+                                        mark_json(chunk, "native_plugin_llm_stream_execution")
+                                    })
+                                }),
+                            );
+                            return Ok(stream);
+                        }
+                        if shape == "panic-in-callback" {
+                            // A panic in the callback's own future, after the mark
+                            // it raised: the mark belongs to the call, and the call
+                            // fails rather than answering.
+                            panic!("the streaming callback panicked before it answered");
+                        }
+                        let stream = next
+                            .call(mark_llm_request(
+                                request,
+                                "native_plugin_llm_stream_execution_request",
+                            ))
+                            .await?;
+                        if shape == "panic-in-stream" {
+                            let stream: LlmJsonAsyncStream = Box::pin(
+                                stream.map(|chunk| {
+                                    chunk.map(|chunk| {
+                                        mark_json(chunk, "native_plugin_llm_stream_execution")
+                                    })
+                                }),
+                            );
+                            return Ok(Box::pin(PanickingStream { inner: stream, polled: false }));
+                        }
+                        if let Some(stream_name) = stream_name {
+                            let stream: LlmJsonAsyncStream = Box::pin(MatrixStream {
+                                inner: Box::pin(stream.map(move |chunk| {
+                                    chunk.map(move |chunk| {
+                                        mark_json(chunk, "native_plugin_llm_stream_execution")
+                                    })
+                                })),
+                                runtime,
+                                stream: Box::leak(stream_name.into_boxed_str()),
+                                step: 1,
+                                opened: false,
+                            });
+                            return Ok(stream);
+                        }
+                        let stream: LlmJsonAsyncStream = Box::pin(stream.map(|chunk| {
+                            chunk.map(|chunk| mark_json(chunk, "native_plugin_llm_stream_execution"))
+                        }));
+                        Ok(stream)
+                    }
+                }
             },
         )?;
 

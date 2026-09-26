@@ -8,11 +8,11 @@ use super::{
     NemoRelayLlmExecInterceptCb, NemoRelayLlmRequestInterceptCb, NemoRelayLlmSanitizeRequestCb,
     NemoRelayLlmSanitizeResponseCb, NemoRelayPluginRegisterCb, NemoRelayPluginValidateCb,
     NemoRelayStatus, NemoRelayToolConditionalCb, NemoRelayToolExecInterceptCb,
-    NemoRelayToolSanitizeCb, Pin, Plugin, PluginConfig, PluginError, PluginHostActivation,
-    PluginRegistrationContext, active_plugin_report, c_char, c_str_to_json, c_str_to_string,
-    clear_last_error, clear_plugin_configuration, deregister_plugin, initialize_plugins,
-    json_to_c_string, last_error_message, list_plugin_kinds, nemo_relay_string_free,
-    register_adaptive_component, register_plugin, set_last_error, status_from_plugin_error,
+    NemoRelayToolSanitizeCb, Pin, Plugin, PluginConfig, PluginError, PluginRegistrationContext,
+    active_plugin_report, c_char, c_str_to_json, c_str_to_string, clear_last_error,
+    clear_plugin_configuration, deregister_plugin, initialize_plugins, json_to_c_string,
+    last_error_message, list_plugin_kinds, nemo_relay_string_free, register_adaptive_component,
+    register_plugin, set_last_error, status_from_activation_error, status_from_plugin_error,
     tokio_runtime, validate_plugin_config, wrap_event_metadata_injector_fn, wrap_event_sanitize_fn,
     wrap_event_subscriber, wrap_llm_conditional_fn, wrap_llm_exec_intercept_fn,
     wrap_llm_request_intercept_fn, wrap_llm_sanitize_request_fn, wrap_llm_sanitize_response_fn,
@@ -21,6 +21,7 @@ use super::{
 };
 use crate::api::event_registry::Surface;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
 struct FfiHostedPluginUserData {
     ptr: *mut libc::c_void,
@@ -156,7 +157,8 @@ fn parse_dynamic_plugin_specs(
 
 fn lock_plugin_activation(
     activation: &FfiPluginActivation,
-) -> std::result::Result<std::sync::MutexGuard<'_, Option<PluginHostActivation>>, NemoRelayStatus> {
+) -> std::result::Result<std::sync::MutexGuard<'_, Option<ActivatedPluginRuntime>>, NemoRelayStatus>
+{
     activation.0.lock().map_err(|error| {
         set_last_error(&format!("plugin activation lock poisoned: {error}"));
         NemoRelayStatus::Internal
@@ -246,13 +248,20 @@ pub unsafe extern "C" fn nemo_relay_initialize_with_dynamic_plugins(
         Ok(dynamic_plugins) => dynamic_plugins,
         Err(status) => return status,
     };
-    let (activation, report) = match tokio_runtime().block_on(
-        PluginHostActivation::activate_with_discovered_config(config, dynamic_plugins),
-    ) {
-        Ok(result) => result,
-        Err(error) => return status_from_plugin_error(&error),
-    };
-    let report_json = match serde_json::to_value(report) {
+    // The one activation path, shared with the CLI and the other bindings: it
+    // resolves the discovered configuration, activates what this process runs,
+    // starts the native plugins in a host process, and rolls the whole thing back
+    // if any stage fails. What this function adds is the C-shaped error mapping.
+    let activation =
+        match tokio_runtime().block_on(ActivatedPluginRuntime::activate_with_discovered_config(
+            config,
+            dynamic_plugins,
+            IsolationPolicy::for_runtime("nemo-relay-ffi"),
+        )) {
+            Ok(activation) => activation,
+            Err(error) => return status_from_activation_error(&error),
+        };
+    let report_json = match serde_json::to_value(activation.report()) {
         Ok(value) => value,
         Err(error) => {
             let _ = activation.clear();
@@ -267,6 +276,48 @@ pub unsafe extern "C" fn nemo_relay_initialize_with_dynamic_plugins(
         ))));
         *out_report_json = json_to_c_string(&report_json);
     }
+    NemoRelayStatus::Ok
+}
+
+/// Clear one owned dynamic plugin activation.
+///
+/// Before that, ask which process the native plugins are in. **Experimental:**
+/// this accessor exists so an embedder can check the isolation claim rather than
+/// take it on faith; it reports `0` when the activation has no process-hosted
+/// plugin, which is the case for a configuration of worker plugins alone.
+///
+/// # Safety
+/// `activation` must be a valid activation handle returned by
+/// `nemo_relay_initialize_with_dynamic_plugins`, or null. `out_pid` must be a
+/// valid pointer. A null `activation` reports `0` rather than failing: "this
+/// handle has nothing" and "this handle was cleared" are the same answer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nemo_relay_plugin_activation_host_pid(
+    activation: *const FfiPluginActivation,
+    out_pid: *mut u32,
+) -> NemoRelayStatus {
+    clear_last_error();
+    if out_pid.is_null() {
+        set_last_error("out_pid pointer is null");
+        return NemoRelayStatus::NullPointer;
+    }
+    if activation.is_null() {
+        unsafe { *out_pid = 0 };
+        return NemoRelayStatus::Ok;
+    }
+    let activation = unsafe { &*activation };
+    let guard = match activation.0.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            set_last_error(&format!("plugin activation lock poisoned: {error}"));
+            return NemoRelayStatus::Internal;
+        }
+    };
+    let pid = guard
+        .as_ref()
+        .and_then(ActivatedPluginRuntime::native_process_id)
+        .unwrap_or(0);
+    unsafe { *out_pid = pid };
     NemoRelayStatus::Ok
 }
 
@@ -304,7 +355,7 @@ pub unsafe extern "C" fn nemo_relay_plugin_activation_clear(
     };
     match activation.clear() {
         Ok(()) => NemoRelayStatus::Ok,
-        Err(error) => status_from_plugin_error(&error),
+        Err(error) => status_from_activation_error(&error),
     }
 }
 

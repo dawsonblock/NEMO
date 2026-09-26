@@ -8,6 +8,7 @@
 //! external providers of the contracts defined by the hardening crates.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use nemo_relay_authority::unstable::{
     AuthorityDecision, AuthorityProvider, GrantVerifier, VerifiedGrant, request_from_identity,
@@ -43,6 +44,13 @@ pub enum KernelError {
     /// A production kernel was requested outside the production environment.
     #[error("production composition requires a production runtime environment")]
     ProductionEnvironmentMismatch,
+    /// A development kernel was requested with a production runtime identity.
+    ///
+    /// The profile decides which admission checks apply, so a caller must not
+    /// be able to hold a production identity while composing through the
+    /// development constructor and skipping them.
+    #[error("development composition cannot use a production runtime identity")]
+    DevelopmentEnvironmentMismatch,
     /// A production kernel was requested without any consequential capability.
     #[error(
         "production composition requires at least one admitted MUTATION or CRITICAL capability"
@@ -791,14 +799,14 @@ pub struct Kernel<A, F, E, ES> {
 }
 
 impl<A, F, E, ES> Kernel<A, F, E, ES> {
-    /// Construct a kernel from an already-sealed registry without readiness.
+    /// Assemble a kernel from an already-sealed registry.
     ///
-    /// This is the development and test construction path. It performs no
-    /// production readiness checks, so it is deliberately named to make its
-    /// trust level obvious at every call site, and production code is checked
-    /// for it by an architectural test.
-    #[doc(hidden)]
-    pub fn new_unchecked_for_tests(
+    /// This is the single assembly step behind every constructor, and it
+    /// performs no admission checks of its own. It stays private so the only
+    /// reachable entry points are [`Self::new_development`] and
+    /// [`Self::new_production`], each of which applies the rules for its
+    /// profile before assembling.
+    fn assemble(
         runtime: RuntimeIdentity,
         registry: SealedCapabilityRegistry,
         router: BackendRouter<A, F, E>,
@@ -810,6 +818,22 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
             router,
             effect_store,
         }
+    }
+
+    /// Assemble a kernel without any admission check.
+    ///
+    /// Unit tests use this to prove that later stages still reject what
+    /// composition would have rejected. It is compiled only for this crate's
+    /// own test builds, so no downstream crate can reach an unchecked
+    /// constructor.
+    #[cfg(test)]
+    fn new_unchecked_for_tests(
+        runtime: RuntimeIdentity,
+        registry: SealedCapabilityRegistry,
+        router: BackendRouter<A, F, E>,
+        effect_store: ES,
+    ) -> Self {
+        Self::assemble(runtime, registry, router, effect_store)
     }
 
     /// Construct a development kernel after validating the runtime identity.
@@ -826,12 +850,10 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
     ) -> Result<Self, KernelError> {
         let sealed = registry.seal()?;
         Self::new_production_identity_check(&runtime)?;
-        Ok(Self::new_unchecked_for_tests(
-            runtime,
-            sealed,
-            router,
-            effect_store,
-        ))
+        if runtime.environment == "production" {
+            return Err(KernelError::DevelopmentEnvironmentMismatch);
+        }
+        Ok(Self::assemble(runtime, sealed, router, effect_store))
     }
 
     fn new_production_identity_check(runtime: &RuntimeIdentity) -> Result<(), KernelError> {
@@ -883,12 +905,7 @@ impl<A, F, E, ES> Kernel<A, F, E, ES> {
         effect_store
             .verify_production_readiness()
             .map_err(|error| KernelError::EffectStoreNotProductionReady(error.to_string()))?;
-        Ok(Self::new_unchecked_for_tests(
-            runtime,
-            registry,
-            router,
-            effect_store,
-        ))
+        Ok(Self::assemble(runtime, registry, router, effect_store))
     }
 
     fn bind(&self, invocation: &InvocationRequest) -> Result<BoundExecutionRequest, KernelError> {
@@ -1760,11 +1777,28 @@ where
                 "effect receipt does not bind to the execution identity".into(),
             ));
         }
-        let finalization = self.effect_store.finalize_terminal_receipt(
+        // Finalization is the last place a database wait can outlive the action
+        // it serves, so it is bounded by what is left of the trusted deadline
+        // rather than by the store's static maximum. An exhausted budget means
+        // the outcome cannot be persisted inside the action, which is exactly
+        // the case `UNKNOWN` plus reconciliation exists to cover.
+        let Some(remaining) =
+            remaining_action_budget(request.backend_request().identity.deadline_unix_ms)
+        else {
+            return Err(self.unknown_after_dispatching(
+                request,
+                lease,
+                "trusted action budget was exhausted before the terminal receipt could \
+                 be persisted"
+                    .into(),
+            ));
+        };
+        let finalization = self.effect_store.finalize_terminal_receipt_within_budget(
             &request.backend_request().identity.action_id,
             ExecutionState::Dispatching,
             lease,
             receipt,
+            remaining,
         );
         match finalization {
             Err(error) => {
@@ -2405,12 +2439,48 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The kernel's own ceiling for one operation.
+///
+/// A ceiling rather than the policy. An operation's deadline is the smallest of what the
+/// caller published and what this kernel is willing to take, so a caller can shorten an
+/// operation and nothing can lengthen it. The ceiling exists because a store call needs
+/// *some* bound even when nobody above this layer stated one: an unbounded kernel
+/// operation is a transaction that can outlive the request that asked for it, and the
+/// store waits derived from this number are what the kernel's own `UNKNOWN` handling
+/// exists to cover.
+const KERNEL_OPERATION_CEILING_MILLIS: u64 = 29_000;
+
+/// The deadline one kernel operation runs under, as an absolute instant.
+///
+/// Inherited from the trusted budget the caller published, narrowed by the kernel's own
+/// ceiling. This used to be a local constant, which made every kernel operation run under
+/// a deadline the runtime had never agreed to: a caller that published two seconds got
+/// twenty-nine, and a caller that published a minute got twenty-nine as well. The
+/// arithmetic is [`ExecutionBudget::narrowed_to`]'s, because that is the only arithmetic
+/// a layer is allowed to do with a budget — a cap can shorten and cannot lengthen.
 fn kernel_deadline_unix_ms() -> u64 {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .saturating_add(29_000)
-        .try_into()
-        .unwrap_or(u64::MAX)
+    let now = crate::api::runtime::budget_now_unix_ms();
+    let budget = crate::api::runtime::current_execution_budget().map_or_else(
+        || {
+            crate::api::runtime::ExecutionBudget::new(
+                now.saturating_add(KERNEL_OPERATION_CEILING_MILLIS),
+                KERNEL_OPERATION_CEILING_MILLIS,
+            )
+        },
+        |inherited| inherited.narrowed_to(KERNEL_OPERATION_CEILING_MILLIS, now),
+    );
+    budget.deadline_unix_ms.unwrap_or(u64::MAX)
+}
+
+/// Remaining trusted action budget, or `None` once the deadline has passed.
+///
+/// The store derives its PostgreSQL waits from this, so an exhausted budget has
+/// to be refused here rather than handed over as zero: a zero-budget store call
+/// would fail inside the transaction it was supposed to bound.
+fn remaining_action_budget(deadline_unix_ms: u64) -> Option<Duration> {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let remaining_ms = deadline_unix_ms.saturating_sub(now);
+    (remaining_ms > 0).then(|| Duration::from_millis(remaining_ms))
 }
 
 fn runtime_binding_digest(runtime: &RuntimeIdentity) -> String {
@@ -2490,6 +2560,48 @@ mod tests {
         Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    /// A kernel operation runs under the budget its caller published, capped by the
+    /// kernel's own ceiling.
+    ///
+    /// This is the difference between a policy constant and a policy: a caller that has
+    /// two seconds left cannot be given twenty-nine, and a caller that has a minute cannot
+    /// extend the kernel's own bound either. The budget is a task-local, so the three
+    /// cases are three calls under three budgets.
+    #[tokio::test]
+    async fn a_kernel_operation_runs_under_the_budget_it_inherited() {
+        use crate::api::runtime::{ExecutionBudget, budget_now_unix_ms, with_execution_budget};
+
+        let now = budget_now_unix_ms();
+
+        // Nothing published: the kernel's ceiling is the whole policy.
+        let bare = kernel_deadline_unix_ms();
+        assert!(
+            bare >= now + KERNEL_OPERATION_CEILING_MILLIS - 100
+                && bare <= now + KERNEL_OPERATION_CEILING_MILLIS + 100,
+            "with nothing published the ceiling applies: {bare}"
+        );
+
+        // A shorter budget shortens it.
+        let inherited = with_execution_budget(ExecutionBudget::new(now + 2_000, 2_000), async {
+            kernel_deadline_unix_ms()
+        })
+        .await;
+        assert!(
+            inherited >= now + 1_900 && inherited <= now + 2_100,
+            "a shorter published deadline wins: {inherited}"
+        );
+
+        // A longer one cannot lengthen it.
+        let capped = with_execution_budget(ExecutionBudget::new(now + 120_000, 120_000), async {
+            kernel_deadline_unix_ms()
+        })
+        .await;
+        assert!(
+            capped <= now + KERNEL_OPERATION_CEILING_MILLIS + 100,
+            "a published budget cannot extend the kernel's own ceiling: {capped}"
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum Decision {
@@ -3737,6 +3849,55 @@ mod tests {
     }
 
     #[test]
+    fn remaining_action_budget_is_none_once_the_deadline_has_passed() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+        assert!(remaining_action_budget(0).is_none());
+        assert!(remaining_action_budget(now.saturating_sub(1)).is_none());
+        assert!(remaining_action_budget(now).is_none());
+    }
+
+    #[test]
+    fn remaining_action_budget_reports_what_is_left() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+        let remaining = remaining_action_budget(now.saturating_add(5_000))
+            .expect("a future deadline has budget left");
+
+        // The clock moves between the two calls, so assert a window rather than
+        // an exact value.
+        assert!(remaining <= Duration::from_millis(5_000), "{remaining:?}");
+        assert!(remaining > Duration::from_millis(4_000), "{remaining:?}");
+    }
+
+    #[test]
+    fn development_composition_rejects_a_production_identity() {
+        // Without this, a caller could hold a production identity and still
+        // compose through the development constructor, which skips production
+        // admission. The profile has to be enforced where the kernel is built,
+        // not only where the runtime configuration is built.
+        let mut production = runtime();
+        production.environment = "production".into();
+        let result = Kernel::new_development(
+            production,
+            registry(ExecutionClass::Mutation),
+            BackendRouter::new(
+                TestAuthority {
+                    decision: Decision::Allow,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                TestBackend::default(),
+                TestBackend::default(),
+            ),
+            TestEffectStore::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(KernelError::DevelopmentEnvironmentMismatch)
+        ));
+    }
+
+    #[test]
     fn kernel_runs_against_the_reference_effect_store_as_one_contract() {
         let authority = TestAuthority {
             decision: Decision::Allow,
@@ -3897,6 +4058,91 @@ mod tests {
         assert_eq!(existing.action_id, action_id);
         assert_eq!(existing.state, ExecutionState::Unknown);
         assert!(existing.reconciliation_required);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_plugin_failure_that_may_have_dispatched_is_unknown_and_is_never_redispatched() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        // The shape a managed call returns when a remote registration entered
+        // the backend and the answer was lost: nobody can say the plugin did not
+        // reach the external system.
+        let plugin_failure = crate::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::HostCrashed,
+                message: "the host exited while the call was in flight".into(),
+            },
+            dispatch: nemo_relay_executor::unstable::DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+        };
+        *effect.effect_error.lock().unwrap() = Some(
+            crate::plugin::execution::plugin_failure_as_effect_error(&plugin_failure)
+                .expect("a plugin invocation failure describes an effect"),
+        );
+
+        let request = invocation_with_request_id("plugin-post-dispatch");
+        let action_id = match kernel.begin(&request) {
+            Err(KernelError::EffectUnknown { action, .. }) => action.action_id,
+            _ => panic!("a plugin that may have dispatched cannot be a definite failure"),
+        };
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Unknown)
+        );
+        assert_eq!(
+            effect.calls.load(Ordering::SeqCst),
+            1,
+            "the plugin ran exactly once"
+        );
+
+        let existing = match kernel.begin(&request) {
+            Ok(InvocationOutcome::ExistingAction(status)) => status,
+            _ => panic!("a retry of an unknown action must not reach the plugin"),
+        };
+        assert_eq!(existing.action_id, action_id);
+        assert_eq!(existing.state, ExecutionState::Unknown);
+        assert!(existing.reconciliation_required);
+        assert_eq!(
+            effect.calls.load(Ordering::SeqCst),
+            1,
+            "an action whose plugin may have dispatched is never dispatched again"
+        );
+    }
+
+    #[test]
+    fn a_plugin_refusal_before_the_backend_is_a_definite_failure_rather_than_an_unknown() {
+        let (kernel, _authority, _function, effect, actions, _receipts) =
+            kernel(ExecutionClass::Mutation, Decision::Allow);
+        // The other half of the same boundary: the runtime refused the call
+        // before the plugin ran, which is the one plugin failure that *is* a
+        // definite outcome.
+        let plugin_refusal = crate::error::FlowError::PluginInvocation {
+            registration: "resize-image".into(),
+            failure: nemo_relay_plugin_protocol::PluginFailure {
+                code: nemo_relay_plugin_protocol::PluginFailureCode::Unavailable,
+                message: "no host is serving this registration".into(),
+            },
+            dispatch: nemo_relay_executor::unstable::DispatchState::NotDispatched,
+            certainty: OutcomeCertainty::ConfirmedFailure,
+        };
+        *effect.effect_error.lock().unwrap() = Some(
+            crate::plugin::execution::plugin_failure_as_effect_error(&plugin_refusal)
+                .expect("a plugin invocation failure describes an effect"),
+        );
+
+        let action_id = match kernel.begin(&invocation_with_request_id("plugin-refused")) {
+            Err(KernelError::EffectFailed { action, .. }) => {
+                assert_eq!(action.state, ExecutionState::Failed);
+                action.action_id
+            }
+            _ => panic!("a refusal before the backend is a definite failure"),
+        };
+        assert_eq!(
+            actions.load_state(&action_id).unwrap(),
+            Some(ExecutionState::Failed)
+        );
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
     }
 

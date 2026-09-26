@@ -62,6 +62,8 @@ rust_package:
   - 'python/cli-bin/**'
   - 'rust-toolchain.toml'
   - 'scripts/package-cli-bin.py'
+  - 'scripts/verify-installed-plugin-host.py'
+  - 'scripts/bundle-plugin-host.py'
 
 node_package:
   - 'Cargo.lock'
@@ -103,6 +105,8 @@ python_package:
   - 'python/nemo_relay/**'
   - 'rust-toolchain.toml'
   - 'scripts/package-cli-bin.py'
+  - 'scripts/verify-installed-plugin-host.py'
+  - 'scripts/bundle-plugin-host.py'
   - 'uv.lock'
 
 python_integration_langchain:

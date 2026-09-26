@@ -13,6 +13,9 @@ use nemo_relay::api::llm::{
     LlmCallEndParams, LlmCallExecuteParams, LlmCallParams, LlmRequest, LlmStreamCallExecuteParams,
     llm_call, llm_call_end, llm_call_execute, llm_stream_call_execute,
 };
+use nemo_relay::api::registry::{
+    RuntimeRegistrationKind, deregister_tool_request_intercept, register_tool_request_intercept,
+};
 use nemo_relay::api::runtime::{
     LlmJsonStream, TASK_SCOPE_STACK, ThreadScopeStackBinding, capture_thread_scope_stack,
     create_scope_stack, restore_thread_scope_stack, set_thread_scope_stack,
@@ -23,12 +26,13 @@ use nemo_relay::api::scope::{
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use nemo_relay::api::tool::{
-    ToolCallExecuteParams, ToolExecutionResult, tool_call_execute, tool_request_intercepts,
+    ToolCallExecuteParams, ToolExecutionResult, invoke_tool_request_intercept_registration,
+    tool_call_execute, tool_request_intercepts,
 };
 use nemo_relay::codec::response::AnnotatedLlmResponse;
 use nemo_relay::plugin::dynamic::{
     DynamicPluginActivationSpec, DynamicPluginKind, NativePluginLoadSpec, PluginHostActivation,
-    load_native_plugins,
+    load_native_plugins, plugin_artifact_identity,
 };
 use nemo_relay::plugin::{
     ConfigDiagnostic, Plugin, PluginComponentSpec, PluginConfig, PluginRegistrationContext,
@@ -204,17 +208,69 @@ impl Drop for NativePluginTestCleanup {
     }
 }
 
+/// The tool sanitize runner terminates and returns the sanitized copy, with no
+/// process boundary anywhere: the fixture is loaded into this process and the
+/// exact registration is invoked through the same entry point the host calls.
+///
+/// This is the causal experiment. The same fixture's sanitizers already run
+/// through the runtime's own chain — the events below assert their markers today
+/// — so a hang here would be the runner or the callback plumbing, while a hang
+/// only over the boundary is the boundary. The answer decides which layer to fix
+/// rather than which layer to guess at.
+#[tokio::test]
+async fn the_tool_sanitize_runner_returns_the_sanitized_copy_in_process() {
+    use nemo_relay::api::registry::list_runtime_registrations;
+
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture);
+
+    // Held for the test's duration: dropping it unloads the library, and the
+    // runner below needs the guardrail it registered.
+    let _activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native plugin should load");
+    let mut cleanup = NativePluginTestCleanup::new();
+
+    let mut plugin_config = PluginConfig::default();
+    plugin_config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(plugin_config)
+        .await
+        .expect("native plugin should initialize");
+    cleanup.mark_plugin_configuration_active();
+
+    let registration = list_runtime_registrations(None)
+        .expect("the registrations this process holds")
+        .into_iter()
+        .map(|identity| identity.effective_name)
+        .find(|name| name.ends_with("fixture_tool_sanitize_request"))
+        .expect("the fixture's tool request sanitize guardrail");
+
+    let sanitized = nemo_relay::api::tool::invoke_tool_sanitize_request_registration(
+        &registration,
+        "native-fixture-tool",
+        serde_json::json!({"input": true}),
+    )
+    .await
+    .expect("the runner must return rather than wait")
+    .expect("the guardrail produced a payload");
+    assert_eq!(
+        sanitized["native_plugin_tool_sanitize_request"], true,
+        "the runner returned the guardrail's copy: {sanitized}"
+    );
+}
+
 #[tokio::test]
 async fn sdk_cdylib_registers_tool_request_intercept() {
     let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
     let fixture = build_fixture_plugin();
     let manifest_ref = write_manifest(&fixture);
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-    }])
-    .expect("native plugin should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native plugin should load");
     let mut cleanup = NativePluginTestCleanup::new();
 
     let mut plugin_config = PluginConfig::default();
@@ -708,11 +764,8 @@ async fn native_v3_async_registration_supports_all_middleware_kinds() {
         "nemo_relay_fixture_async_entry",
     );
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_async".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-    }])
-    .expect("v3 async native fixture should load");
+    let activation = load_native_plugins([load_spec("fixture_async", &manifest_ref)])
+        .expect("v3 async native fixture should load");
     let fixture_library = unsafe { libloading::Library::new(&fixture.library_path) }
         .expect("loaded v3 async native fixture should open for synchronization");
     let pending_entered = unsafe {
@@ -884,11 +937,8 @@ async fn native_validation_diagnostics_prevent_initialization() {
     let fixture = build_fixture_plugin();
     let manifest_ref = write_manifest(&fixture);
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-    }])
-    .expect("native plugin should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native plugin should load");
 
     let mut plugin_config = PluginConfig::default();
     plugin_config.components.push(PluginComponentSpec {
@@ -1072,10 +1122,7 @@ fn native_loader_rejects_missing_library() {
     });
 
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native", &manifest_ref),
         "missing library should fail",
     );
     assert!(error.contains("does not exist"), "{error}");
@@ -1147,11 +1194,9 @@ fn native_loader_resolves_manifest_directory_and_relative_library_paths() {
         integrity: None,
     });
 
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: fixture.manifest_dir.path().to_string_lossy().into_owned(),
-    }])
-    .expect("native plugin should load from manifest directory");
+    let activation =
+        load_native_plugins([load_spec("fixture_native", fixture.manifest_dir.path())])
+            .expect("native plugin should load from manifest directory");
     activation.clear();
 }
 
@@ -1243,10 +1288,7 @@ fn native_loader_rejects_unsupported_relay_requirement_before_loading() {
     });
 
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native", &manifest_ref),
         "unsupported relay requirement should fail",
     );
     assert!(error.contains("requires relay"), "{error}");
@@ -1268,10 +1310,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         ),
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_expected_id".into(),
-            manifest_ref: mismatched_id.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_expected_id", &mismatched_id),
         "manifest id mismatch should fail",
     );
     assert!(error.contains("does not match expected id"), "{error}");
@@ -1287,10 +1326,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         ),
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: invalid_relay.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native", &invalid_relay),
         "invalid relay requirement should fail",
     );
     assert!(
@@ -1309,10 +1345,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         ),
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: unsupported_native_api.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native", &unsupported_native_api),
         "unsupported native API should fail",
     );
     assert!(error.contains("compat.native_api = \"1\""), "{error}");
@@ -1342,13 +1375,220 @@ entrypoint = "fixture.worker:create_plugin"
 "#,
     );
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_worker".into(),
-            manifest_ref: worker_manifest.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_worker", &worker_manifest),
         "worker manifest should fail native loading",
     );
     assert!(error.contains("only supports rust_dynamic"), "{error}");
+}
+
+#[tokio::test]
+async fn native_loader_records_where_every_registration_attaches() {
+    // The ABI v4 callback inventory, as a test. Each native registration hook
+    // runs a different piece of the runtime, so "the plugin registered a
+    // guardrail" is not enough to install a proxy: the attachment point decides
+    // which chain the callback belongs to. The fixture registers on every
+    // surface the host exposes, which is what makes this the complete list
+    // rather than a sample of it.
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture);
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("fixture should load");
+    let mut cleanup = NativePluginTestCleanup::new();
+
+    // Native registration is config-driven, so a freshly loaded plugin has
+    // registered nothing yet. Reporting an empty list here is the truth, and it
+    // is also why a descriptor frozen at load time cannot be used.
+    let loaded = activation.loaded_plugins();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].plugin_kind, "fixture_native");
+    assert!(loaded[0].declared_compat.is_some());
+    assert!(
+        loaded[0].registrations.is_empty(),
+        "the register callback has not run yet, so nothing has been recorded: {:?}",
+        loaded[0].registrations
+    );
+
+    let mut config = PluginConfig::default();
+    config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(config)
+        .await
+        .expect("fixture should register its components");
+    cleanup.mark_plugin_configuration_active();
+
+    let loaded = activation.loaded_plugins();
+    let registrations = &loaded[0].registrations;
+    let operations: std::collections::BTreeSet<_> = registrations
+        .iter()
+        .map(|registration| registration.operation)
+        .collect();
+    let expected = std::collections::BTreeSet::from([
+        RuntimeRegistrationKind::Subscriber,
+        RuntimeRegistrationKind::EventMetadataInjector,
+        RuntimeRegistrationKind::MarkSanitizeGuardrail,
+        RuntimeRegistrationKind::ScopeSanitizeStartGuardrail,
+        RuntimeRegistrationKind::ScopeSanitizeEndGuardrail,
+        RuntimeRegistrationKind::ToolSanitizeRequestGuardrail,
+        RuntimeRegistrationKind::ToolSanitizeResponseGuardrail,
+        RuntimeRegistrationKind::ToolConditionalExecutionGuardrail,
+        RuntimeRegistrationKind::ToolRequestIntercept,
+        RuntimeRegistrationKind::ToolExecutionIntercept,
+        RuntimeRegistrationKind::LlmSanitizeRequestGuardrail,
+        RuntimeRegistrationKind::LlmSanitizeResponseGuardrail,
+        RuntimeRegistrationKind::LlmConditionalExecutionGuardrail,
+        RuntimeRegistrationKind::LlmRequestIntercept,
+        RuntimeRegistrationKind::LlmExecutionIntercept,
+        RuntimeRegistrationKind::LlmStreamExecutionIntercept,
+    ]);
+    assert_eq!(
+        operations, expected,
+        "every attachment point the fixture registers at has to be recorded, and nothing else"
+    );
+
+    let find = |operation: RuntimeRegistrationKind| {
+        registrations
+            .iter()
+            .find(|registration| registration.operation == operation)
+            .unwrap_or_else(|| panic!("no registration recorded for {}", operation.as_str()))
+    };
+
+    // A priority-bearing hook records the priority and the chain answer the
+    // plugin declared.
+    let intercept = find(RuntimeRegistrationKind::ToolRequestIntercept);
+    assert_eq!(intercept.local_name, "fixture_rewrite_args");
+    assert_eq!(intercept.priority, Some(0));
+    assert_eq!(intercept.may_break_chain, Some(false));
+    assert!(
+        intercept.qualified_name.contains("fixture_rewrite_args"),
+        "the record names the registration the runtime gates by: {}",
+        intercept.qualified_name
+    );
+
+    // A subscriber hook carries neither, and the record says so rather than
+    // claiming zero.
+    let subscriber = find(RuntimeRegistrationKind::Subscriber);
+    assert_eq!(subscriber.priority, None);
+    assert_eq!(subscriber.may_break_chain, None);
+
+    // The streaming attachment point is recorded as itself, not as its
+    // non-streaming neighbour.
+    let stream = find(RuntimeRegistrationKind::LlmStreamExecutionIntercept);
+    assert_eq!(stream.local_name, "fixture_llm_stream_execution");
+    assert_eq!(stream.priority, Some(0));
+
+    // A gate names the registration it decides, once per kind it gates.
+    let gate = registrations
+        .iter()
+        .find(|registration| registration.gated_registration.is_some())
+        .expect("the fixture registers a gate");
+    assert_eq!(
+        gate.gated_registration.as_deref(),
+        Some("missing-initial-target")
+    );
+    assert_eq!(gate.operation, RuntimeRegistrationKind::Subscriber);
+
+    // A gate the plugin registered through its runtime handle and then removed
+    // is not still reported: the fixture does exactly that, and a description
+    // claiming it would name a registration that no longer runs.
+    assert!(
+        !registrations
+            .iter()
+            .any(|registration| registration.local_name == "fixture_dynamic_gate"),
+        "a gate the plugin removed is not part of what it registered"
+    );
+}
+
+/// A host holds one plugin's registrations and must be able to run exactly the
+/// one the kernel asks for: its chain entry points run every intercept for a
+/// tool name, so using them would run the plugin's whole set once per proxy.
+#[tokio::test]
+async fn a_named_registration_can_be_invoked_on_its_own() {
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture);
+    let activation = load_native_plugins([NativePluginLoadSpec::approved(
+        "fixture_native",
+        manifest_ref.to_string_lossy().into_owned(),
+    )
+    .expect("the fixture is approved")])
+    .expect("fixture should load");
+    let mut cleanup = NativePluginTestCleanup::new();
+    let mut config = PluginConfig::default();
+    config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(config)
+        .await
+        .expect("fixture should register");
+    cleanup.mark_plugin_configuration_active();
+
+    // The name the runtime qualified the plugin's intercept under, which is the
+    // identity a kernel would ask a host to run.
+    let qualified = activation.loaded_plugins()[0]
+        .registrations
+        .iter()
+        .find(|registration| {
+            registration.operation == RuntimeRegistrationKind::ToolRequestIntercept
+        })
+        .expect("the fixture registers a tool request intercept")
+        .qualified_name
+        .clone();
+
+    // A second intercept on the same tool name, so a chain run would prove
+    // nothing about running one registration.
+    let second = "nemo-relay-test.second_tool_request_intercept";
+    register_tool_request_intercept(
+        second,
+        100,
+        false,
+        Arc::new(|_name, mut args| {
+            Box::pin(async move {
+                args["second_intercept"] = json!(true);
+                Ok(args)
+            })
+        }),
+    )
+    .expect("the second intercept should register");
+
+    let args = json!({"input": true});
+    let alone =
+        invoke_tool_request_intercept_registration(&qualified, "fixture_tool", args.clone())
+            .await
+            .expect("the named registration");
+    assert_eq!(alone["native_plugin"], true, "{alone}");
+    assert_eq!(
+        alone.get("second_intercept"),
+        None,
+        "invoking one registration runs one registration: {alone}"
+    );
+
+    // The chain still runs both, which is what makes the difference meaningful.
+    let chain = tool_request_intercepts("fixture_tool", args)
+        .await
+        .expect("the chain");
+    assert_eq!(chain["native_plugin"], true, "{chain}");
+    assert_eq!(chain["second_intercept"], true, "{chain}");
+
+    // And a name nothing is registered under is refused rather than silently
+    // doing nothing: an invocation that cannot be attributed must not look like
+    // one that succeeded.
+    let missing = invoke_tool_request_intercept_registration(
+        "nemo-relay-test.no_such_registration",
+        "fixture_tool",
+        json!({"input": true}),
+    )
+    .await;
+    assert!(missing.is_err(), "{missing:?}");
+
+    assert!(
+        deregister_tool_request_intercept(second).expect("the second intercept should deregister")
+    );
 }
 
 #[test]
@@ -1385,41 +1625,93 @@ fn native_loader_rejects_missing_symbol_digest_mismatch_and_kind_mismatch() {
 
     let missing_symbol = write_manifest_with_symbol(&fixture, "missing_native_symbol");
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: missing_symbol.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native", &missing_symbol),
         "missing symbol should fail",
     );
     assert!(error.contains("symbol"), "{error}");
 
     let digest_match = write_manifest_with_integrity(&fixture, &sha256(&fixture.library_path));
-    let activation = load_native_plugins([NativePluginLoadSpec {
-        plugin_id: "fixture_native".into(),
-        manifest_ref: digest_match.to_string_lossy().into_owned(),
-    }])
-    .expect("matching digest should load");
+    let activation = load_native_plugins([load_spec("fixture_native", &digest_match)])
+        .expect("matching digest should load");
     activation.clear();
 
     let digest_mismatch = write_manifest_with_integrity(&fixture, "sha256:deadbeef");
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native".into(),
-            manifest_ref: digest_mismatch.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native", &digest_mismatch),
         "digest mismatch should fail",
     );
     assert!(error.contains("sha256 mismatch"), "{error}");
 
     let wrong_kind = write_manifest_with_plugin_id(&fixture, "fixture_native_mismatch");
     let error = expect_native_load_error(
-        NativePluginLoadSpec {
-            plugin_id: "fixture_native_mismatch".into(),
-            manifest_ref: wrong_kind.to_string_lossy().into_owned(),
-        },
+        load_spec("fixture_native_mismatch", &wrong_kind),
         "plugin kind mismatch should fail",
     );
     assert!(error.contains("returned kind"), "{error}");
+}
+
+/// The approval that arrives from another side is confirmed, not believed.
+///
+/// The side that performs a load is not always the side that approved it: over
+/// the process boundary the digests travel with the request, and the loader here
+/// is the one that has to hold them against the artifact it is about to open.
+/// Every refusal names which half disagreed, so "the digests were checked" is
+/// something the message says rather than something the reader assumes.
+#[test]
+fn a_load_confirms_an_approval_that_arrived_from_elsewhere() {
+    use nemo_relay_plugin_protocol::PluginArtifactIdentity;
+
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.blocking_lock();
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest(&fixture).to_string_lossy().into_owned();
+    let (manifest_sha256, library_sha256) =
+        plugin_artifact_identity(&manifest_ref).expect("the fixture's identity");
+
+    // Another manifest's digest: the approval does not describe what is here.
+    let wrong_manifest = expect_native_load_error(
+        NativePluginLoadSpec::with_approved_identity(
+            "fixture_native",
+            manifest_ref.clone(),
+            PluginArtifactIdentity {
+                manifest_sha256: "0".repeat(64),
+                library_sha256: library_sha256.clone(),
+            },
+        ),
+        "an approval naming another manifest should fail",
+    );
+    assert!(
+        wrong_manifest.contains("not the approved artifact"),
+        "{wrong_manifest}"
+    );
+
+    // Another library's digest: the manifest is the approved one and the bytes
+    // it names are not, which is the half a manifest check on its own misses.
+    let wrong_library = expect_native_load_error(
+        NativePluginLoadSpec::with_approved_identity(
+            "fixture_native",
+            manifest_ref.clone(),
+            PluginArtifactIdentity {
+                manifest_sha256: manifest_sha256.clone(),
+                library_sha256: "0".repeat(64),
+            },
+        ),
+        "an approval naming another library should fail",
+    );
+    assert!(wrong_library.contains("was approved"), "{wrong_library}");
+
+    // And the identity that describes this artifact loads, which is what makes
+    // the two refusals above about the disagreement rather than about the
+    // constructor being unusable.
+    let activation = load_native_plugins([NativePluginLoadSpec::with_approved_identity(
+        "fixture_native",
+        manifest_ref,
+        PluginArtifactIdentity {
+            manifest_sha256,
+            library_sha256,
+        },
+    )])
+    .expect("the artifact the approval names should load");
+    activation.clear();
 }
 
 #[test]
@@ -2259,10 +2551,11 @@ where
 }
 
 fn load_spec(plugin_id: &str, manifest_ref: &Path) -> NativePluginLoadSpec {
-    NativePluginLoadSpec {
-        plugin_id: plugin_id.into(),
-        manifest_ref: manifest_ref.to_string_lossy().into_owned(),
-    }
+    // The loader's own tests load without an approval: they exercise what the
+    // loader does with an artifact, not what a runtime approved. The spec's
+    // approval field is private so that this is a thing a caller has to write,
+    // and the constructor that says it is the one used here.
+    NativePluginLoadSpec::development(plugin_id, manifest_ref.to_string_lossy().into_owned())
 }
 
 fn host_spec(plugin_id: &str, manifest_ref: &Path) -> DynamicPluginActivationSpec {

@@ -227,6 +227,21 @@ jobs:
           set -e
           mkdir -p "${{ env.NEMO_RELAY_CI_WORKSPACE_TMP }}/wheels"
 
+      # The host bundled into the wheel is built static on Linux, so it runs on
+      # the oldest glibc the wheel's tag promises rather than on the one this
+      # runner happens to have.
+      - name: Add the static plugin host target
+        if: ${{ !contains(matrix.platform, 'musl') && runner.os == 'Linux' }}
+        run: |
+          set -e
+          host_target="$(rustc -vV | sed -n 's/^host: //p' | sed 's/-gnu$/-musl/')"
+          rustup target add "$host_target"
+          # The Rust target brings the standard library; the C dependencies are
+          # linked by a musl C compiler, which is what makes the bundled host
+          # statically linked rather than linked against this runner's glibc.
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y musl-tools
+
       - name: Derive Python package version
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
         run: |
@@ -460,6 +475,28 @@ jobs:
           uv pip install --python "$venv_python" --no-deps --no-index "$wheel"
           # SONAR_IGNORE_END
           "$venv_python" -c "import nemo_relay"
+          # Windows wheels carry the runtime alone: the isolated runtime is not
+          # implemented there, so there is no host to check for.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            exit 0
+          fi
+          # The plugin host travels inside the wheel: it is the executable that
+          # runs native plugins out of process, and a runtime installed without
+          # it cannot isolate anything. It is checked where a binding looks for
+          # it — beside the interpreter it was installed for.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            venv_host="${RUNNER_TEMP}/nemo-relay-wheel-venv/Scripts/nemo-plugin-host.exe"
+          else
+            venv_host="${RUNNER_TEMP}/nemo-relay-wheel-venv/bin/nemo-plugin-host"
+          fi
+          test -x "$venv_host"
+          host_status=0
+          "$venv_host" >/dev/null 2>host-stderr || host_status=$?
+          if [ "$host_status" -ne 2 ] || ! grep -q "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set" host-stderr; then
+            echo "Error: the installed nemo-plugin-host is not a usable host" >&2
+            cat host-stderr >&2
+            exit 1
+          fi
 
       - name: Download matching musllinux Python wheel artifact
         if: ${{ contains(matrix.platform, 'musl') }}
@@ -484,6 +521,14 @@ jobs:
               /opt/python/cp311-cp311/bin/python -m venv /tmp/nemo-relay-wheel-venv
               /tmp/nemo-relay-wheel-venv/bin/python -m pip install --no-deps "$wheel"
               /tmp/nemo-relay-wheel-venv/bin/python -c "import nemo_relay"
+              test -x /tmp/nemo-relay-wheel-venv/bin/nemo-plugin-host
+              host_status=0
+              /tmp/nemo-relay-wheel-venv/bin/nemo-plugin-host >/dev/null 2>host-stderr || host_status=$?
+              if [ "$host_status" -ne 2 ] || ! grep -q "NEMO_RELAY_PLUGIN_HOST_SOCKET is not set" host-stderr; then
+                echo "Error: the installed nemo-plugin-host is not a usable host" >&2
+                cat host-stderr >&2
+                exit 1
+              fi
             '
 
       - name: Download Python source distribution artifact
