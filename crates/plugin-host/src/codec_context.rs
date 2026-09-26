@@ -243,16 +243,20 @@ fn write_failed(error: serde_json::Error) -> FlowError {
 /// client. The caller blocks on the answer and holds nothing while it waits; nothing the
 /// kernel does to answer it needs the blocked thread. One bridge per host, because one
 /// client is enough and one thread is the bound.
-struct CodecBridge {
-    /// Unbounded and asynchronous on the receiving side: the caller is a synchronous thread
+pub(crate) struct CodecBridge {
+    /// Bounded, and asynchronous on the receiving side: the caller is a synchronous thread
     /// inside the plugin's code, and the thread that answers must never block the runtime it
     /// drives. A blocking receive on a `current_thread` runtime would starve the very
     /// connection the answer arrives on.
     ///
+    /// Bounded because the work is a plugin's: a sanitizer that asks for codecs faster than
+    /// the kernel answers would otherwise grow this queue without limit, and the bound is
+    /// what makes that a refusal the plugin's callback sees rather than memory nobody chose.
+    ///
     /// `Option` so the drop below can give the sender up *before* it waits: the thread's
     /// `recv` returns nothing only once no sender is left, and joining first is a hang of the
     /// dropper's own making — which is exactly what this cost once.
-    jobs: Option<tokio::sync::mpsc::UnboundedSender<CodecJob>>,
+    jobs: Option<tokio::sync::mpsc::Sender<CodecJob>>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -280,8 +284,16 @@ impl Drop for CodecBridge {
 
 impl CodecBridge {
     /// Start a bridge for one session's kernel client.
-    fn start(client: crate::runtime_service::KernelCallbacks, session_id: String) -> Arc<Self> {
-        let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<CodecJob>();
+    ///
+    /// Fallible rather than infallible, because the thread and the runtime it
+    /// owns can be refused by the operating system, and a host that cannot create
+    /// them has to say so: the caller is a plugin's callback, and a panic here
+    /// would take the host down with a plugin's codec call.
+    pub(crate) fn start(
+        client: crate::runtime_service::KernelCallbacks,
+        session_id: String,
+    ) -> Result<Arc<Self>, String> {
+        let (jobs, mut queue) = tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
         let thread = std::thread::Builder::new()
             .name("nemo-plugin-codec-bridge".to_string())
             .spawn(move || {
@@ -336,11 +348,11 @@ impl CodecBridge {
                     }
                 });
             })
-            .expect("a codec bridge thread");
-        Arc::new(Self {
+            .map_err(|error| format!("the codec bridge thread could not start: {error}"))?;
+        Ok(Arc::new(Self {
             jobs: Some(jobs),
             thread: std::sync::Mutex::new(Some(thread)),
-        })
+        }))
     }
 
     /// Run one codec operation on the bridge, blocking the calling thread for the answer.
@@ -355,19 +367,36 @@ impl CodecBridge {
         let Some(jobs) = self.jobs.as_ref() else {
             return Err("this host's codec bridge has stopped".to_string());
         };
-        jobs.send(CodecJob {
+        jobs.try_send(CodecJob {
             operation,
             operation_request_id: operation_request_id.to_string(),
             payload_json,
             reference: reference.to_string(),
             answer,
         })
-        .map_err(|_| "this host's codec bridge has stopped".to_string())?;
+        .map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => format!(
+                "this host's codec bridge is at its limit of {} calls in flight, so this \
+                 plugin's codec call was refused rather than queued",
+                CODEC_BRIDGE_QUEUE_CAPACITY
+            ),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "this host's codec bridge has stopped".to_string()
+            }
+        })?;
         received
             .recv()
             .map_err(|_| "this host's codec bridge stopped before answering".to_string())?
     }
 }
+
+/// How many codec calls one host may have in flight at once.
+///
+/// The number a plugin's own callback concurrency is bounded by, chosen the way
+/// the activation queue was: large enough for a busy host's ordinary overlap, and
+/// small enough that "a plugin asked for more" is a refusal rather than a queue
+/// this process grows for it.
+pub(crate) const CODEC_BRIDGE_QUEUE_CAPACITY: usize = 16;
 
 /// The codec a plugin's callback resolves in a host that does not hold one.
 ///
@@ -383,16 +412,20 @@ pub struct KernelRequestCodec {
 }
 
 impl KernelRequestCodec {
-    /// A request codec for one sanitize invocation.
-    pub fn new(
-        client: crate::runtime_service::KernelCallbacks,
-        session_id: &str,
+    /// A request codec for one sanitize invocation, on the host's own bridge.
+    ///
+    /// The bridge is passed in rather than started here: it owns a thread, a
+    /// runtime and a kernel connection, and a host that started one per sanitize
+    /// invocation would hold as many of those as it has concurrent sanitizers —
+    /// under load, hundreds of threads for work that one bridge answers.
+    pub(crate) fn new(
+        bridge: Arc<CodecBridge>,
         operation_request_id: &str,
         identity: LlmCodecIdentity,
         reference: &str,
     ) -> Self {
         Self {
-            bridge: CodecBridge::start(client, session_id.to_string()),
+            bridge,
             operation_request_id: operation_request_id.to_string(),
             identity,
             reference: reference.to_string(),
@@ -448,15 +481,14 @@ pub struct KernelResponseCodec {
 
 impl KernelResponseCodec {
     /// A response codec for one sanitize invocation.
-    pub fn new(
-        client: crate::runtime_service::KernelCallbacks,
-        session_id: &str,
+    pub(crate) fn new(
+        bridge: Arc<CodecBridge>,
         operation_request_id: &str,
         identity: LlmCodecIdentity,
         reference: &str,
     ) -> Self {
         Self {
-            bridge: CodecBridge::start(client, session_id.to_string()),
+            bridge,
             operation_request_id: operation_request_id.to_string(),
             identity,
             reference: reference.to_string(),
@@ -637,8 +669,7 @@ mod tests {
                 nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
             );
         let codec = KernelRequestCodec::new(
-            callbacks,
-            "bridge-session",
+            CodecBridge::start(callbacks, "bridge-session".to_string()).expect("a bridge"),
             "operation-bridge",
             LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
             reference.as_str(),
@@ -826,5 +857,55 @@ mod tests {
             identity_from_payload(&serde_json::json!({ "request": {} })).is_err(),
             "a payload that states no codec is refused rather than assumed"
         );
+    }
+
+    /// The bridge admits a bounded number of calls and refuses the rest.
+    ///
+    /// The work behind a codec call is a plugin's, so a sanitizer that asks faster
+    /// than the kernel answers must meet a refusal it can see rather than a queue
+    /// this host grows for it. The bridge is built here with a consumer that never
+    /// drains, which is the state the bound exists for.
+    #[test]
+    fn the_codec_bridge_refuses_work_beyond_its_bound() {
+        let (jobs, _never_drained) =
+            tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
+        let bridge = CodecBridge {
+            jobs: Some(jobs),
+            thread: std::sync::Mutex::new(None),
+        };
+        let job = |operation_request_id: &str| {
+            let (answer, _received) = std::sync::mpsc::channel();
+            CodecJob {
+                operation: nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+                operation_request_id: operation_request_id.to_string(),
+                payload_json: "{}".to_string(),
+                reference: "reference".to_string(),
+                answer,
+            }
+        };
+
+        for index in 0..CODEC_BRIDGE_QUEUE_CAPACITY {
+            bridge
+                .jobs
+                .as_ref()
+                .expect("a bridge")
+                .try_send(job(&format!("call-{index}")))
+                .expect("the queue has room up to its capacity");
+        }
+        let refused = bridge
+            .jobs
+            .as_ref()
+            .expect("a bridge")
+            .try_send(job("one-too-many"))
+            .expect_err("the queue is full");
+        let reason = match refused {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => format!(
+                "this host's codec bridge is at its limit of {} calls in flight, so this \
+                 plugin's codec call was refused rather than queued",
+                CODEC_BRIDGE_QUEUE_CAPACITY
+            ),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => unreachable!("the queue is open"),
+        };
+        assert!(reason.contains("refused rather than queued"), "{reason}");
     }
 }

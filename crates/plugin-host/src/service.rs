@@ -112,6 +112,16 @@ pub struct PluginHostService {
     /// that never serves one has no reason to hold a channel open.
     session_channel:
         tokio::sync::Mutex<Option<std::sync::Arc<crate::session_channel::SessionChannel>>>,
+    /// The one bridge this host's synchronous codec calls are answered on.
+    ///
+    /// Created when the first sanitizer resolves a codec, for the same reason the
+    /// session channel is: a host that serves no LLM sanitizer has no reason to
+    /// hold a thread, a runtime and a kernel connection. Exactly one, because
+    /// those are the resources it owns — a bridge per invocation would give a busy
+    /// host as many of each as it has sanitizers in flight.
+    codec_bridge: tokio::sync::Mutex<
+        Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
+    >,
 }
 
 /// This host's end of the channel its forwarded marks travel on.
@@ -245,7 +255,34 @@ impl PluginHostService {
             mark_forwarding: None,
             kernel: None,
             session_channel: tokio::sync::Mutex::new(None),
+            codec_bridge: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// The bridge this host answers synchronous codec calls on, started once.
+    ///
+    /// `None` when this host has no kernel to call back into, which is a host
+    /// outside a kernel. A host that has one starts its bridge the first time a
+    /// sanitizer needs a codec and keeps it: the refusal a failed start produces is
+    /// kept too, because retrying it per sanitize call would spawn a thread per
+    /// call on the failure path.
+    async fn codec_bridge(
+        &self,
+    ) -> Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>> {
+        let kernel = self.kernel.clone()?;
+        let mut bridge = self.codec_bridge.lock().await;
+        let started = bridge.get_or_insert_with(|| {
+            let session_id = match &*self
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                HostSession::Active { identity, .. } => identity.session_id.clone(),
+                HostSession::New | HostSession::Closed => String::new(),
+            };
+            crate::codec_context::CodecBridge::start(kernel, session_id)
+        });
+        Some(started.clone())
     }
 
     /// Forward the marks this host's plugins raise to the kernel.
@@ -496,8 +533,7 @@ impl PluginHostService {
                 nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeRequestGuardrail => {
                     sanitized_llm_request(
                         &request,
-                        self.kernel.clone(),
-                        &wire.session_id,
+                        self.codec_bridge().await,
                         &context.operation_request_id,
                     )
                     .await
@@ -507,8 +543,7 @@ impl PluginHostService {
                 nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeResponseGuardrail => {
                     sanitized_llm_response(
                         &request,
-                        self.kernel.clone(),
-                        &wire.session_id,
+                        self.codec_bridge().await,
                         &context.operation_request_id,
                     )
                     .await
@@ -2006,8 +2041,7 @@ async fn sanitized_tool_payload(
 /// the other is refused rather than adapted.
 async fn sanitized_llm_response(
     request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
-    kernel: Option<crate::runtime_service::KernelCallbacks>,
-    session_id: &str,
+    bridge: Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
     operation_request_id: &str,
 ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
     let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
@@ -2040,11 +2074,18 @@ async fn sanitized_llm_response(
             )
         }
         identity => {
-            let Some(kernel) = kernel else {
-                return Err(refused(
-                    "this host has no kernel to resolve the call's codec with, so an LLM \
-                     response sanitizer cannot be served the codec its call is running under",
-                ));
+            let bridge = match bridge {
+                None => {
+                    return Err(refused(
+                        "this host has no kernel to resolve the call's codec with, so an LLM \
+                         response sanitizer cannot be served the codec its call is running under",
+                    ));
+                }
+                // A bridge that could not start is refused with the reason, rather
+                // than looking like a host without a kernel: the two need different
+                // answers from whoever reads the log.
+                Some(Err(reason)) => return Err(refused(reason)),
+                Some(Ok(bridge)) => bridge,
             };
             let Some(reference) = call_context
                 .get("codec_reference")
@@ -2057,8 +2098,7 @@ async fn sanitized_llm_response(
             };
             nemo_relay::api::runtime::LlmSanitizeResponseContext::for_response_codec(Some(
                 std::sync::Arc::new(crate::codec_context::KernelResponseCodec::new(
-                    kernel,
-                    session_id,
+                    bridge,
                     operation_request_id,
                     identity,
                     reference,
@@ -2108,8 +2148,7 @@ async fn sanitized_llm_response(
 /// is a sanitizer that has been misled about what it is sanitizing.
 async fn sanitized_llm_request(
     request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
-    kernel: Option<crate::runtime_service::KernelCallbacks>,
-    session_id: &str,
+    bridge: Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
     operation_request_id: &str,
 ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
     let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
@@ -2147,11 +2186,18 @@ async fn sanitized_llm_request(
             )
         }
         identity => {
-            let Some(kernel) = kernel else {
-                return Err(refused(
-                    "this host has no kernel to resolve the call's codec with, so an LLM \
-                     request sanitizer cannot be served the codec its call is running under",
-                ));
+            let bridge = match bridge {
+                None => {
+                    return Err(refused(
+                        "this host has no kernel to resolve the call's codec with, so an LLM \
+                         request sanitizer cannot be served the codec its call is running under",
+                    ));
+                }
+                // A bridge that could not start is refused with the reason: a host
+                // that failed to create one and a host that has no kernel need
+                // different answers from whoever reads the log.
+                Some(Err(reason)) => return Err(refused(reason)),
+                Some(Ok(bridge)) => bridge,
             };
             let Some(reference) = call_context
                 .get("codec_reference")
@@ -2164,8 +2210,7 @@ async fn sanitized_llm_request(
             };
             nemo_relay::api::runtime::LlmSanitizeRequestContext::for_request_codec(Some(
                 std::sync::Arc::new(crate::codec_context::KernelRequestCodec::new(
-                    kernel,
-                    session_id,
+                    bridge,
                     operation_request_id,
                     identity,
                     reference,
