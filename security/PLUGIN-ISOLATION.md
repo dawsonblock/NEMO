@@ -506,18 +506,35 @@ fails the mark rather than growing the host's heap.
    number has not moved yet: the loader is still in the kernel's dependency graph
    until the last consumer stops reaching it.
 
-   **The Node cutover was attempted and stopped, with the fault recorded.** The
-   binding composes the shared activation, resolves the host the platform package
-   ships, and publishes a budget — and without that budget its tests fail with the
-   same refusal the FFI's LLM path had, which is what a cutover is for. What stops
-   it is a fault in the *JavaScript* process that a tool call through the boundary
-   leaves behind: the next LLM call faults inside V8's frame unwinder
-   (`Isolate::UnwindAndFindHandler` → `StackMemory::jslimit`), as SIGSEGV or SIGILL
-   depending on the run, and a larger V8 stack size (`--stack-size=8000`) does not
-   change it. That is not a diagnosis yet, and the attempt is preserved rather than
-   shipped: Node stays on the in-process path until the fault has a native
-   backtrace that names the frame, the way the CPython stack overflow did. The
-   attempt is in a stash named for this fault.
+   **The Node cutover was attempted and stopped, with the fault narrowed to a
+   deterministic reproducer.** The binding composes the shared activation, resolves
+   the host the platform package ships, and publishes a budget for its five managed
+   entry points — and without that budget its tests fail with the same refusal the
+   FFI's LLM path had, which is the coverage-class failure the matrix exists to
+   catch, now demonstrated for Node rather than inferred.
+
+   What stops the cutover is narrower and reproducible:
+
+   ```text
+   node --test-name-pattern="owns native managed" tests/dynamic_plugin_tests.mjs
+   ```
+
+   A tool call through the boundary completes. The *LLM* call then dies with
+   SIGSEGV (exit 139), on the main thread, inside V8's frame unwinder
+   (`Isolate::UnwindAndFindHandler` → `StackMemory::jslimit` faulting) while V8 is
+   reporting a message from a promise hook, reached from `napi_create_promise`
+   inside `execute_tokio_future`. It is not the codec path — the fixture test
+   passes no codecs — it is not one entry point (the sync and promise-aware LLM
+   variants both die), and raising V8's own stack (`--stack-size=8000`) changes the
+   signal rather than the outcome, which is what a *native* stack fault looks like
+   from inside V8. It is not a Rust panic: nothing prints, and the reverted tree
+   passes the whole file.
+
+   That is a Node-specific fault rather than an architectural one, and it needs
+   Node-specific instrumentation — the thread identity at each callback entry, and
+   the frame V8 could not parse — before it is a diagnosis. The attempt is
+   preserved in a stash named for the fault, and Node stays on the in-process path
+   until it has one.
 
    That cutover was blocked on **registration coverage**, not on composition: a
    plugin that registers any class the boundary cannot serve is refused *whole*,
