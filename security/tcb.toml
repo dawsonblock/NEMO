@@ -527,7 +527,11 @@ max_transitive_packages = 240
 # sanitizers in flight. Its admission is bounded now (a plugin asking faster than the kernel
 # answers meets a refusal it can see), and its start is fallible rather than a panic in a
 # plugin's own callback. No dependency moved and no `unsafe` did.
-max_source_lines = 23382
+#
+# Raised by six for the crate documentation that says which of its two backends is production:
+# the process backend is what every consumer composes, and the in-process one is the child's own
+# end of the protocol and the conformance baseline rather than a path anything ships on.
+max_source_lines = 23388
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"
