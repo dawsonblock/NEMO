@@ -2376,16 +2376,46 @@ because none of them has cut over, so what is missing right now is the two
 artifacts rather than a running failure — the failure arrives with the cutover,
 which is exactly when this has to be finished.
 
-*(The two paragraphs above were true when they were written. The CLI wheel and its
-release assets now carry the host, and so does the Python wheel. The bindings have
-cut over since, which turns the missing Node artifact from a future gap into a
-present one: nothing on npm carries `bin/nemo-plugin-host` yet, so a native-plugin
-activation from an installed npm package fails closed with the message naming
-where the host was looked for, rather than searching for one. The FFI surface still
+*(The two paragraphs above were true when they were written. Both artifacts now
+carry the host — the Node platform package at `bin/nemo-plugin-host`, the CLI
+wheel and its release assets beside the CLI — and the Python wheel carries one
+too, so what remained of this list was the binding cutover itself, which has since
+happened: all four consumers compose the process backend. The FFI surface still
 has no packaging step of its own.)*
 
+**And the npm packages are checked the way the wheel is: by installing them.**
+`scripts/verify-installed-node-plugin.py` installs a built metapackage and
+platform package into an empty project, with nothing in the environment naming a
+host, and asks the installed runtime to run a native plugin. What it requires is
+the whole claim rather than a proxy for it: the addon resolves the host the
+platform package shipped, the host runs in a process of its own — compared
+against the runtime's own pid, not merely reported — the plugin answers a managed
+call, and the plugin's kind is absent from the runtime's registry. Run against a
+macOS arm64 build of the two tarballs this checkout produced:
+
+```text
+the installed runtime ran the plugin out of process (host 14575, runtime 14574)
+and did not load it here
+```
+
+The refusal half asks the other question by removing the host an install carried,
+which is the packager mistake it exists for: the activation must fail with the
+message that says where the host was looked for, and the check reads that message
+rather than only the exit status.
+
+```text
+an installation without a host refused the plugin and said where it looked
+```
+
+A revision of this document said, in the paragraph above it, that nothing on npm
+carries the host. That was wrong when it was written and wrong in the commit that
+wrote it: `package-node` builds the host for the platform, static on Linux, and
+`scripts/package-node-bin.py` has carried it since it was written. The mistake was
+reading the packaging script for its arguments and not for what it puts in the
+tarball; the verifier above is what makes that reading unnecessary.
+
 **And the Linux host is built and checked on Linux, not merely compiled for it.**
-The Python wheel carries a *static* host on Linux, so it runs on the
+The Python and Node packages carry a *static* host on Linux, so it runs on the
 oldest glibc their tags promise rather than on the builder's. That claim was
 checked in an `ubuntu:24.04` container on arm64 rather than inferred from a
 successful build:

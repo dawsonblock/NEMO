@@ -2338,3 +2338,29 @@ verify-installed-python-plugin python expect host="":
         args+=(--host "{{ host }}")
     fi
     uv run --no-project python scripts/verify-installed-python-plugin.py "${args[@]}"
+
+# Run a native plugin against an installed Node.js package, or require its refusal.
+# --set metapackage=<path> native=<path> expect=runs|refused [node=<path>] [host=<path>]
+verify-installed-node-plugin metapackage native expect="runs" node="" host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    fixture_name="libnemo_relay_plugin_fixture.so"
+    case "$(uname -s)" in
+        Darwin) fixture_name="libnemo_relay_plugin_fixture.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) fixture_name="nemo_relay_plugin_fixture.dll" ;;
+    esac
+    fixture="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures/debug/$fixture_name"
+    args=(
+        --metapackage "{{ metapackage }}"
+        --native "{{ native }}"
+        --fixture "$fixture"
+        --expect "{{ expect }}"
+    )
+    if [[ -n "{{ node }}" ]]; then
+        args+=(--node "{{ node }}")
+    fi
+    if [[ -n "{{ host }}" ]]; then
+        args+=(--host "{{ host }}")
+    fi
+    uv run --no-project python scripts/verify-installed-node-plugin.py "${args[@]}"

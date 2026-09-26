@@ -667,7 +667,9 @@ async def test_native_activation_finalizer_releases_callbacks(native_dynamic_plu
         {"input": True},
         lambda args: ToolExecutionResult(args),
     )
-    assert reached.result.get("native_plugin") is True
+    answered = reached.result
+    assert isinstance(answered, dict)
+    assert answered.get("native_plugin") is True
 
     del activation
     # The asyncio Future returned by the native binding retains its completed

@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_CRATES = {
     "nemo-relay-types",
@@ -58,7 +57,7 @@ def pep440_version(version: str) -> str:
     return release if label is None else f"{release}{labels[label]}{number}"
 
 
-def equal(actual: Any, expected: str, description: str) -> list[str]:
+def equal(actual: Any, expected: Any, description: str) -> list[str]:
     return [] if actual == expected else [f"{description}: expected {expected!r}, found {actual!r}"]
 
 
@@ -157,7 +156,11 @@ def integration_check(expected: str) -> Check:
 
 def ffi_check() -> Check:
     package = toml(ROOT / "crates/ffi/Cargo.toml")["package"]
-    errors = [] if package.get("version") == {"workspace": True} else ["crates/ffi/Cargo.toml must use version.workspace = true"]
+    errors = (
+        []
+        if package.get("version") == {"workspace": True}
+        else ["crates/ffi/Cargo.toml must use version.workspace = true"]
+    )
     return Check("FFI metadata", tuple(errors))
 
 
@@ -185,7 +188,8 @@ def documentation_check(expected: str) -> Check:
             or path in allowed
             or path.suffix in {".lock", ".zip", ".jsonl"}
             or any(
-                part in {
+                part
+                in {
                     ".git",
                     ".venv",
                     ".uv-cache",
@@ -207,8 +211,7 @@ def documentation_check(expected: str) -> Check:
         versions.discard(expected_badge)
         if versions:
             errors.append(
-                f"stale current release reference(s) in {path.relative_to(ROOT)}: "
-                + ", ".join(sorted(versions))
+                f"stale current release reference(s) in {path.relative_to(ROOT)}: " + ", ".join(sorted(versions))
             )
     return Check("Current-version references", tuple(errors))
 
