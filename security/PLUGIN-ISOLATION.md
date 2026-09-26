@@ -505,6 +505,20 @@ fails the mark rather than growing the host's heap.
    still calls `PluginHostActivation::activate_with_discovered_config`, so the TCB
    number has not moved yet: the loader is still in the kernel's dependency graph
    until the last consumer stops reaching it.
+
+   **The Node cutover was attempted and stopped, with the fault recorded.** The
+   binding composes the shared activation, resolves the host the platform package
+   ships, and publishes a budget — and without that budget its tests fail with the
+   same refusal the FFI's LLM path had, which is what a cutover is for. What stops
+   it is a fault in the *JavaScript* process that a tool call through the boundary
+   leaves behind: the next LLM call faults inside V8's frame unwinder
+   (`Isolate::UnwindAndFindHandler` → `StackMemory::jslimit`), as SIGSEGV or SIGILL
+   depending on the run, and a larger V8 stack size (`--stack-size=8000`) does not
+   change it. That is not a diagnosis yet, and the attempt is preserved rather than
+   shipped: Node stays on the in-process path until the fault has a native
+   backtrace that names the frame, the way the CPython stack overflow did. The
+   attempt is in a stash named for this fault.
+
    That cutover was blocked on **registration coverage**, not on composition: a
    plugin that registers any class the boundary cannot serve is refused *whole*,
    and the fixture those suites load — and the shape a real plugin takes —
