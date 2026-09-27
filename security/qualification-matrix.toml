@@ -237,6 +237,6 @@ note = "The CLI composes the shared activation in `crates/cli/src/server/mod.rs`
 
 [[claim]]
 id = "every-consumer-declares-where-its-host-is"
-statement = "Every consumer that hosts plugins resolves the host from the package that shipped it rather than from a search."
+statement = "Every consumer that hosts plugins finds the host its installation shipped, rather than searching for one."
 status = "unverified"
-note = "Python resolves the host its wheel carries from the installed package, and Node resolves the platform package's `bin/`; both are checked by their verifiers. The FFI and the CLI have no packaging step of their own yet, so there is nothing to resolve and nothing to check."
+note = "Node resolves the host from the package that carries the addon, and its verifier installs an npm metapackage with nothing in the environment naming one. Python finds it beside the interpreter, which is where a wheel's script lands in a virtual environment, and its verifier runs an installed wheel the same way. The FFI and the CLI have no packaging step of their own, so for those there is nothing to find yet — and Python's rule is the interpreter's directory rather than the package's, which is the same place for a virtual environment and not for every installation. That difference is what the deterministic-discovery work is for."
