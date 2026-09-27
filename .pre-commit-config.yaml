@@ -79,6 +79,29 @@ repos:
         pass_filenames: false
         files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/qualification/.*\.py|justfile|security/qualification-matrix\.toml|security/QUALIFICATION-MATRIX\.md)$'
 
+  # Trusted surface — the budgets and the dependency layers
+  #
+  # These two gates were run by hand, and the hole that leaves is exactly the one they
+  # exist to close: a budget measured before the last edit landed is a budget the tree
+  # does not have, and nothing noticed until somebody ran the report by hand. The same
+  # class of mistake was committed twice — a raise that did not match the tree — so the
+  # gates run where the edits do now.
+  - repo: local
+    hooks:
+      - id: tcb-report
+        name: TCB budgets
+        entry: python3 scripts/tcb/report.py
+        language: system
+        pass_filenames: false
+        files: '^(Cargo\.lock|Cargo\.toml|crates/.*/Cargo\.toml|crates/.*\.rs|security/tcb\.toml)$'
+
+      - id: layer-report
+        name: dependency layers
+        entry: python3 scripts/tcb/layers.py
+        language: system
+        pass_filenames: false
+        files: '^(Cargo\.lock|Cargo\.toml|crates/.*/Cargo\.toml|security/layers\.toml)$'
+
   # Documentation — external link validation
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.23.0

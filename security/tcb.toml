@@ -223,16 +223,18 @@ max_transitive_packages = 266
 # names spread across five modules; rewriting it against `NativeHostRuntime` replaced those
 # with one handle whose operations are the vocabulary, and the kernel is where that
 # vocabulary belongs — it stays when the loader leaves, because the operations are the
-# kernel's decisions about its own registry, invocations and artifacts. The 309 lines are
-# the handle, its documentation and the module doc that says what the four responsibilities
-# are. No dependency moved and no `unsafe` did: the three extra `unsafe` tokens an earlier
-# draft of the seam's own test added were moved out of `src/` rather than budgeted, because
-# a keyword list is not kernel code.
+# kernel's decisions about its own registry, invocations and artifacts. The raise is the
+# handle, its documentation and the module doc that says what the four responsibilities
+# are, and the number is written down once rather than estimated in prose here: it moved
+# by one line between the measurement and the commit, which is what a paragraph quoting a
+# figure cannot be trusted to stay ahead of. No dependency moved and no `unsafe` did: the
+# three extra `unsafe` tokens an earlier draft of the seam's own test added were moved out
+# of `src/` rather than budgeted, because a keyword list is not kernel code.
 #
 # The two postponed files are still owed: the loader (6760) and the artifact vocabulary
 # (171, now 186 with its own test). The milestone takes those, so this stays temporary and
 # its entry below moves with it.
-max_source_lines = 75122
+max_source_lines = 75123
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -702,7 +704,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 75122
+raised_to = 75123
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"
