@@ -66,6 +66,19 @@ repos:
         files: '^(examples/python-grpc-worker-plugin/nemo_relay_python_grpc_worker_example/.*\.py|python/plugin/src/nemo_relay_plugin/.*\.py)$'
         pass_filenames: false
 
+  # Qualification — the claims a milestone makes and what enforces them
+  - repo: local
+    hooks:
+      # Runs on anything that could be evidence, because the failure this catches is a
+      # test that was renamed or deleted: the matrix names it, and the gate says so
+      # rather than leaving the document asserting something nothing checks.
+      - id: qualification-matrix
+        name: qualification matrix
+        entry: python3 scripts/qualification/matrix.py
+        language: system
+        pass_filenames: false
+        files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/qualification/.*\.py|justfile|security/qualification-matrix\.toml|security/QUALIFICATION-MATRIX\.md)$'
+
   # Documentation — external link validation
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.23.0

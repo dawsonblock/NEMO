@@ -1812,6 +1812,14 @@ tcb-baseline:
 test-tcb-scripts:
     uv run --locked python -m pytest scripts/tcb -q
 
+# Check that every claim the qualification matrix makes names what enforces it.
+qualification-matrix:
+    python3 scripts/qualification/matrix.py
+
+# Regenerate security/QUALIFICATION-MATRIX.md from its policy file.
+qualification-matrix-write:
+    python3 scripts/qualification/matrix.py --write
+
 # Verify source, lockfile, Git, and archive digests against qualification evidence.
 provenance-check:
     python3 scripts/qualification/provenance_check.py

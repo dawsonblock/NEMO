@@ -27,6 +27,12 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The
   loader is still linked into the kernel until it moves, which is why the unsafe
   count above has not moved with it.
+- **Claims: 24 enforced, 2 asserted and not yet.** Every claim this document makes
+  is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
+  from `security/qualification-matrix.toml`, and `just qualification-matrix`
+  resolves each name against the tree. A test that is renamed or deleted turns that
+  gate red, so a sentence here cannot go on describing something nothing checks.
+  The two that are asserted rather than enforced are named there, with why.
 
 Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
 in `crates/core/src/plugin/dynamic/native.rs` and another 315 in

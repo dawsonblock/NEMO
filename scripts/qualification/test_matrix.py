@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the qualification matrix gate."""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import matrix  # noqa: E402
+
+
+def tree(tmp_path: pathlib.Path, files: dict[str, str], policy: str) -> pathlib.Path:
+    """Build a repository-shaped directory holding one policy file and its evidence."""
+    for name, content in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    (tmp_path / "security").mkdir(exist_ok=True)
+    (tmp_path / "security" / "qualification-matrix.toml").write_text("version = 1\n\n" + policy)
+    return tmp_path
+
+
+def claim(claim_id: str, status: str, evidence: str = "", note: str = "") -> str:
+    """Return one claim table, with the evidence and note written as they are given."""
+    return (
+        f'[[claim]]\nid = "{claim_id}"\nstatement = "the claim {claim_id} makes"\nstatus = "{status}"\n{evidence}{note}'
+    )
+
+
+def check(root: pathlib.Path) -> list[str]:
+    """Read and check one tree, the way the gate does."""
+    return matrix.problems(matrix.read_claims(root / "security" / "qualification-matrix.toml"), root)
+
+
+def test_the_repository_policy_is_green() -> None:
+    """The matrix this repository checks in resolves, name by name."""
+    assert matrix.problems(matrix.read_claims(matrix.POLICY), matrix.ROOT) == []
+
+
+def test_the_generated_document_is_current() -> None:
+    """The checked-in document is what the policy file renders to."""
+    claims = matrix.read_claims(matrix.POLICY)
+    assert matrix.GENERATED.read_text() == matrix.render(claims, matrix.ROOT)
+
+
+def test_the_milestone_quotes_the_counts_the_matrix_has() -> None:
+    """The figure the milestone states is the figure the policy file holds.
+
+    A number maintained by hand drifts, and this repository has already shipped a
+    revision where one figure appeared twice with two values.
+    """
+    claims = matrix.read_claims(matrix.POLICY)
+    enforced = sum(1 for claim in claims if claim.status == "enforced")
+    unverified = len(claims) - enforced
+    assert matrix.documented_counts(matrix.MILESTONE) == (enforced, unverified)
+
+
+def test_a_document_that_states_no_counts_is_not_an_error(tmp_path: pathlib.Path) -> None:
+    """A document that quotes no figure is not silently read as zero."""
+    milestone = tmp_path / "PLUGIN-ISOLATION.md"
+    milestone.write_text("# Milestone\n\nNo counts here.\n")
+    assert matrix.documented_counts(milestone) is None
+    assert matrix.documented_counts(tmp_path / "absent.md") is None
+
+
+def test_a_test_that_no_longer_exists_is_reported(tmp_path: pathlib.Path) -> None:
+    """A test that disappeared turns the gate red rather than the table stale."""
+    root = tree(
+        tmp_path,
+        {"crates/plugin-host/tests/architecture.rs": "fn something_else() {}\n"},
+        claim(
+            "an-absent-test",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_test_that_was_renamed" },\n]\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "nothing in the tree defines it" in problems[0]
+
+
+def test_a_name_two_places_define_is_reported(tmp_path: pathlib.Path) -> None:
+    """Two tests sharing a name are two facts wearing one label."""
+    root = tree(
+        tmp_path,
+        {
+            "crates/plugin-host/tests/one.rs": "fn a_shared_name() {}\n",
+            "crates/plugin-host/tests/two.rs": "fn a_shared_name() {}\n",
+        },
+        claim(
+            "an-ambiguous-test",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_shared_name" },\n]\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "2 places define it" in problems[0]
+
+
+def test_an_enforced_claim_with_no_evidence_is_reported(tmp_path: pathlib.Path) -> None:
+    """An enforced claim with nothing behind it is an assertion."""
+    root = tree(tmp_path, {}, claim("an-assertion", "enforced"))
+    problems = check(root)
+    assert len(problems) == 1
+    assert "names nothing" in problems[0]
+
+
+def test_an_unverified_claim_needs_a_note(tmp_path: pathlib.Path) -> None:
+    """A gap that is recorded is fixable, and a gap that is not is invisible."""
+    root = tree(tmp_path, {}, claim("an-unrecorded-gap", "unverified"))
+    problems = check(root)
+    assert len(problems) == 1
+    assert "says nothing about why" in problems[0]
+
+
+def test_an_unverified_claim_with_evidence_is_reported(tmp_path: pathlib.Path) -> None:
+    """A claim cannot be both recorded as a gap and enforced."""
+    root = tree(
+        tmp_path,
+        {"crates/plugin-host/tests/one.rs": "fn a_test() {}\n"},
+        claim(
+            "both-at-once",
+            "unverified",
+            'enforced_by = [\n  { rust_test = "a_test" },\n]\n',
+            'note = "why"\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "one of the two is wrong" in problems[0]
+
+
+def test_a_recipe_is_found_with_and_without_parameters(tmp_path: pathlib.Path) -> None:
+    """A recipe's line is its name, then its parameters or the colon."""
+    root = tree(
+        tmp_path,
+        {
+            "justfile": (
+                "# a comment naming a-recipe-with-parameters\n"
+                'a-recipe-with-parameters one two="":\n    true\n'
+                "a-recipe-without-parameters:\n    true\n"
+            )
+        },
+        claim(
+            "recipes",
+            "enforced",
+            "enforced_by = [\n"
+            '  { recipe = "a-recipe-with-parameters" },\n'
+            '  { recipe = "a-recipe-without-parameters" },\n'
+            "]\n",
+        ),
+    )
+    assert check(root) == []
+
+
+def test_a_comment_that_names_a_test_is_not_evidence(tmp_path: pathlib.Path) -> None:
+    """Evidence is a definition, not a mention: a comment must not satisfy a name."""
+    root = tree(
+        tmp_path,
+        {"crates/plugin-host/src/lib.rs": "// fn a_mentioned_test() {}\n"},
+        claim(
+            "only-mentioned",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_mentioned_test" },\n]\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "nothing in the tree defines it" in problems[0]
+
+
+def test_the_document_records_what_the_policy_says(tmp_path: pathlib.Path) -> None:
+    """The render carries each claim, its evidence and the place it was found."""
+    root = tree(
+        tmp_path,
+        {"crates/plugin-host/tests/one.rs": "fn a_test() {}\n"},
+        claim(
+            "rendered",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_test" },\n]\n',
+        )
+        + claim("a-gap", "unverified", note='note = "no test covers this yet"\n'),
+    )
+    document = matrix.render(matrix.read_claims(root / "security" / "qualification-matrix.toml"), root)
+    assert "| the claim rendered makes |" in document
+    assert "Rust test `a_test` — `crates/plugin-host/tests/one.rs`" in document
+    assert "| the claim a-gap makes | no test covers this yet |" in document
+
+
+def test_an_unknown_evidence_kind_is_reported(tmp_path: pathlib.Path) -> None:
+    """A kind this gate cannot read is refused rather than skipped."""
+    root = tree(
+        tmp_path,
+        {},
+        claim(
+            "an-unknown-kind",
+            "enforced",
+            'enforced_by = [\n  { instinct = "a_test" },\n]\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "not an evidence kind this gate reads" in problems[0]

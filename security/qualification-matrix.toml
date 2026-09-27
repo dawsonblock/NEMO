@@ -1,0 +1,242 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# What this milestone claims, and what enforces each claim.
+#
+# The problem this file answers is the one every milestone document has: prose that
+# says "the boundary serves every class" and a test that was renamed or deleted three
+# commits ago read the same to a reviewer. Here each claim names what enforces it, and
+# `just qualification-matrix` resolves every name against the tree. A test that
+# disappears turns that gate red rather than leaving a table quietly asserting it.
+#
+# Three rules the checker enforces, and why each one:
+#
+#   - An `enforced` claim needs evidence. A claim with no evidence is an assertion,
+#     and it belongs in the other section.
+#   - A name must resolve exactly once. Two tests with one name are two facts wearing
+#     one label, and evidence that cannot be pointed at is not evidence.
+#   - An `unverified` claim needs a note saying why. The gap is then recorded rather
+#     than hidden, which is the only thing that makes it fixable.
+#
+# Evidence kinds: `rust_test` (`fn name(`), `python_test` (`def name(`), `node_test`
+# (`it('name'`), and `recipe` (a `just` recipe). `security/QUALIFICATION-MATRIX.md` is
+# generated from this file; edit this one.
+
+version = 1
+
+[[claim]]
+id = "boundary-serves-every-class"
+statement = "Every registration class the ABI exposes is served by the process boundary, and the set is pinned rather than counted."
+status = "enforced"
+enforced_by = [
+  { rust_test = "the_boundary_serves_a_named_subset_of_the_registration_surface" },
+]
+
+[[claim]]
+id = "one-composition-owns-the-boundary"
+statement = "Only the shared composition starts a host, installs a proxy or loads a native plugin: a consumer cannot grow its own lifecycle semantics."
+status = "enforced"
+enforced_by = [
+  { rust_test = "only_the_composition_owner_assembles_the_process_boundary" },
+  { rust_test = "no_new_native_loading_appears_outside_the_grandfathered_paths" },
+]
+
+[[claim]]
+id = "kernel-does-not-depend-on-the-loader"
+statement = "The kernel does not depend on the loader's implementation, and the dynamic loader is a dependency of one crate."
+status = "enforced"
+enforced_by = [
+  { rust_test = "the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the_implementation" },
+]
+
+[[claim]]
+id = "no-execution-path-chooses-its-own-budget"
+statement = "A registration reached across the boundary inherits the managed action's budget; no plugin-execution path invents one."
+status = "enforced"
+enforced_by = [
+  { rust_test = "no_plugin_execution_path_chooses_its_own_budget" },
+]
+
+[[claim]]
+id = "native-plugin-loads-only-in-the-child"
+statement = "A native plugin's library is loaded in the host process and nowhere else."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_real_native_plugin_loads_in_the_child_and_only_there" },
+]
+
+[[claim]]
+id = "managed-tool-call-reaches-the-child"
+statement = "A tool call reaches the registration the plugin installed in the host process."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_real_tool_call_reaches_a_registration_inside_the_child" },
+]
+
+[[claim]]
+id = "managed-llm-call-reaches-the-child"
+statement = "An LLM call reaches the registration the plugin installed in the host process."
+status = "enforced"
+enforced_by = [
+  { rust_test = "an_llm_execution_intercept_wraps_a_call_across_the_boundary" },
+]
+
+[[claim]]
+id = "llm-sanitizer-resolves-the-calls-codec"
+statement = "An LLM sanitizer in the child resolves the call's codec through the kernel, in both directions."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_real_llm_request_sanitizer_resolves_the_calls_codec_through_the_kernel" },
+  { rust_test = "a_real_llm_response_sanitizer_resolves_the_calls_codec_through_the_kernel" },
+]
+
+[[claim]]
+id = "one-plugin-is-served-whole"
+statement = "A plugin that registers every class is served whole, and its registration set is inspected over the boundary rather than loaded here."
+status = "enforced"
+enforced_by = [
+  { rust_test = "the_full_fixture_is_served_whole_by_the_boundary" },
+  { rust_test = "the_full_fixture_is_inspectable_over_the_boundary" },
+]
+
+[[claim]]
+id = "a-hung-host-is-killed-at-the-deadline"
+statement = "A host that stops answering is killed at the configured deadline instead of holding the call open."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_host_that_stops_answering_is_killed_at_the_deadline" },
+]
+
+[[claim]]
+id = "killing-the-host-does-not-kill-the-kernel"
+statement = "A plugin that dies takes the host process with it and leaves the kernel running."
+status = "enforced"
+enforced_by = [
+  { rust_test = "killing_the_host_does_not_kill_the_kernel" },
+]
+
+[[claim]]
+id = "a-crashed-host-is-replaced-empty"
+statement = "A crashed host is replaced by one that holds nothing, rather than by one that holds the previous session's registrations."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_crashed_host_is_replaced_by_one_that_holds_nothing" },
+]
+
+[[claim]]
+id = "a-host-from-another-release-is-refused"
+statement = "A host built from another release is refused before any operation is sent to it."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_host_from_another_release_is_refused_before_any_operation" },
+]
+
+[[claim]]
+id = "an-oversized-answer-is-refused"
+statement = "An answer that outgrows its operation is refused by the kernel rather than accepted as the operation's result."
+status = "enforced"
+enforced_by = [
+  { rust_test = "an_answer_that_outgrows_its_operation_is_refused_by_the_kernel" },
+]
+
+[[claim]]
+id = "the-host-runs-under-its-limits"
+statement = "The host process runs under the limits it was started with, and the default profile bounds what one plugin can take."
+status = "enforced"
+enforced_by = [
+  { rust_test = "the_host_runs_under_the_limits_it_was_started_with" },
+  { rust_test = "the_default_profile_bounds_what_one_plugin_can_take" },
+]
+
+[[claim]]
+id = "a-capability-is-bound-to-its-invocation"
+statement = "A codec reference is bound to one invocation, direction and codec, and is revoked when that invocation ends."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_capability_resolves_for_the_invocation_it_was_issued_to" },
+  { rust_test = "one_calls_capability_is_refused_by_another_call" },
+  { rust_test = "an_unknown_or_finished_capability_is_refused" },
+  { rust_test = "a_capability_is_bound_to_its_direction" },
+  { rust_test = "concurrent_invocations_cannot_use_each_others_capabilities" },
+]
+
+[[claim]]
+id = "a-nested-codec-call-inherits-the-invocations-deadline"
+statement = "A codec call spends the invocation's remaining budget and no more: the kernel refuses a late one without doing the work, and the host refuses one with nothing left before it reaches the queue."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_capability_for_an_invocation_that_ran_out_of_time_is_refused" },
+  { rust_test = "a_codec_call_after_its_invocations_deadline_is_refused_without_the_work" },
+  { rust_test = "a_codec_call_with_no_budget_left_is_refused_before_it_is_sent" },
+  { rust_test = "a_codec_call_that_outlives_its_invocations_budget_is_refused" },
+]
+
+[[claim]]
+id = "a-missing-host-is-a-refusal"
+statement = "A composition with no host binary fails closed and owns nothing afterwards, rather than falling back to loading plugin code here."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwards" },
+]
+
+[[claim]]
+id = "a-cap-that-would-refuse-everything-is-refused"
+statement = "A composition whose cap would refuse every invocation is refused at composition time rather than at the first call."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_composition_refuses_a_cap_that_would_refuse_every_invocation" },
+]
+
+[[claim]]
+id = "the-bindings-reach-a-plugin-in-another-process"
+statement = "FFI, Python and Node each reach a plugin's registration from a process of their own."
+status = "enforced"
+enforced_by = [
+  { rust_test = "ffi_llm_execution_reaches_a_native_plugin_across_the_boundary" },
+  { python_test = "test_native_activation_context_owns_callbacks_and_close_is_idempotent" },
+  { node_test = "owns native managed callbacks until idempotent close" },
+]
+
+[[claim]]
+id = "the-installed-python-artifact-hosts-a-plugin"
+statement = "An installed Python wheel runs a native plugin out of process, and a source install that carries no host says where it looked."
+status = "enforced"
+enforced_by = [
+  { recipe = "verify-installed-python-plugin" },
+]
+
+[[claim]]
+id = "the-installed-node-artifact-hosts-a-plugin"
+statement = "An installed Node metapackage resolves the host its platform package ships, runs the plugin there, and refuses rather than searching when the package carries none."
+status = "enforced"
+enforced_by = [
+  { recipe = "verify-installed-node-plugin" },
+]
+
+[[claim]]
+id = "the-kernel-unsafe-surface-is-measured"
+statement = "The kernel-process `unsafe` surface is measured against a ceiling that only an explicit edit can raise."
+status = "enforced"
+enforced_by = [
+  { recipe = "tcb-report" },
+]
+
+[[claim]]
+id = "the-layer-rules-hold"
+statement = "The dependency layers hold, and a new upward edge fails the gate."
+status = "enforced"
+enforced_by = [
+  { recipe = "layer-report" },
+]
+
+[[claim]]
+id = "the-cli-serves-plugins-from-another-process"
+statement = "The CLI's server starts plugins in the host process."
+status = "unverified"
+note = "The CLI composes the shared activation in `crates/cli/src/server/mod.rs`, so it is the same path the shared tests drive and the same composition the architecture check keeps singular. What is missing is a CLI test that asserts the boundary from the CLI: its own suite covers plugin lifecycle, snapshots and trust, and none of those would notice if the server went back to loading in process."
+
+[[claim]]
+id = "every-consumer-declares-where-its-host-is"
+statement = "Every consumer that hosts plugins resolves the host from the package that shipped it rather than from a search."
+status = "unverified"
+note = "Python resolves the host its wheel carries from the installed package, and Node resolves the platform package's `bin/`; both are checked by their verifiers. The FFI and the CLI have no packaging step of their own yet, so there is nothing to resolve and nothing to check."
