@@ -332,6 +332,40 @@ def test_the_surface_renders_what_the_closure_reaches() -> None:
     assert "kernel closure reaches (target: nothing): libloading" in rendered
 
 
+def test_the_surface_keeps_the_test_tree_fact_visible() -> None:
+    # The artifact is what the reachability target is about, so the metric counts
+    # normal and build edges. What only a dev-dependency reaches is reported beside
+    # it: folding it in would make the target unreachable for a reason the symbol
+    # proof covers, and dropping it would hide a real dependency edge.
+    policy = {
+        "trusted": {"crates": []},
+        "in_process": {"crates": []},
+        "plugin_host": {"crates": []},
+        **CLOSURE_POLICY,
+    }
+
+    rendered = report.render_surface({"packages": []}, {}, policy, {"libloading"}, {"nemo-relay-plugin"})
+
+    assert "kernel closure reaches (target: nothing): libloading" in rendered
+    assert "and the test tree alone reaches: nemo-relay-plugin" in rendered
+
+
+def test_the_closure_counts_a_dev_only_package_as_part_of_the_test_tree() -> None:
+    # The check itself is about the build graph, so a package that only a
+    # dev-dependency reaches is not a failure — which is what makes the target
+    # attainable without deleting the tests that exercise the loader.
+    reachable = {"nemo-relay", "libloading"}
+    everything = reachable | {"nemo-relay-plugin"}
+
+    assert report.find_closure_problems(CLOSURE_POLICY, reachable) == []
+    # The test-tree half is computed the same way from the wider set, so a
+    # *new* package there is still visible rather than silently accepted.
+    assert report.kernel_closure_reachability(CLOSURE_POLICY, everything) == {
+        "libloading",
+        "nemo-relay-plugin",
+    }
+
+
 def test_the_repository_policy_records_what_the_kernel_still_reaches() -> None:
     # The policy's own record has to be the measurement: a recorded list that no
     # longer matches would make the ratchet pass by describing a graph that is not

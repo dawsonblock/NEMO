@@ -149,13 +149,24 @@ def identity_names(identities: list[str]) -> set[str]:
     return {identity.split("@", 1)[0] for identity in identities}
 
 
-def kernel_closure_names(repo_root: pathlib.Path, roots: list[str]) -> set[str]:
+def kernel_closure_names(
+    repo_root: pathlib.Path,
+    roots: list[str],
+    edges: str = "normal,build",
+) -> set[str]:
     """Return every package name the kernel's own process can reach.
 
     The kernel's roots are asked together, so the answer is the union of what any
     of them links: a crate that only the CLI pulls in is still in the kernel's
     process when the CLI runs, and the question this answers is what that process
     can reach rather than what one library of it can.
+
+    `edges` selects which dependency kinds count. The default is what a build
+    links — normal and build dependencies — because the property being measured is
+    about the *artifact*: a dev-dependency is not in the binary, and counting it
+    would make the target unreachable for a reason the symbol proof already covers.
+    Callers that want to know about the test tree as well pass `edges="all"` and
+    report the difference rather than hiding it.
     """
     completed = subprocess.run(
         [
@@ -164,6 +175,8 @@ def kernel_closure_names(repo_root: pathlib.Path, roots: list[str]) -> set[str]:
             *[f"-p{root}" for root in roots],
             "--all-features",
             "--locked",
+            "--edges",
+            edges,
             "--prefix",
             "none",
         ],
@@ -427,6 +440,7 @@ def render_surface(
     identities: dict[str, list[str]],
     policy: dict,
     reachable: set[str] | None = None,
+    test_only: set[str] | None = None,
 ) -> str:
     """Render the two-tier surface: invariant enforcers, then everything in-process."""
     rows = [
@@ -462,6 +476,12 @@ def render_surface(
         reached = sorted(kernel_closure_reachability(policy, reachable))
         rendered = ", ".join(reached) if reached else "nothing"
         rows.append(f"  kernel closure reaches (target: nothing): {rendered}")
+        # What only the test tree reaches is a different fact, and it is reported
+        # rather than folded in or left out: the artifact does not link it, and a
+        # reader deciding whether the target is reachable should see both numbers.
+        if test_only:
+            extra = ", ".join(sorted(test_only))
+            rows.append(f"  and the test tree alone reaches: {extra}")
     return "\n".join(rows)
 
 
@@ -530,13 +550,19 @@ def main(argv: list[str] | None = None) -> int:
     problems.extend(find_temporary_problems(policy, reports))
     kernel_closure = policy.get("kernel_closure")
     reachable: set[str] | None = None
+    test_only: set[str] = set()
     if kernel_closure:
         reachable = kernel_closure_names(arguments.repo_root, kernel_closure["roots"])
         problems.extend(find_closure_problems(policy, reachable))
+        # Dev-dependencies reach the same packages the artifact does today, but they
+        # are a separate fact: the loader can leave the kernel's build graph while a
+        # test still names it, and that is worth being able to see.
+        everything = kernel_closure_names(arguments.repo_root, kernel_closure["roots"], edges="all")
+        test_only = kernel_closure_reachability(policy, everything) - kernel_closure_reachability(policy, reachable)
 
     print(render(reports))
     print()
-    surface = render_surface(metadata, identities, policy, reachable)
+    surface = render_surface(metadata, identities, policy, reachable, test_only)
     print(surface)
     print()
     print(render_temporary(policy))

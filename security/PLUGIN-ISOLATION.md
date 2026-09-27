@@ -2712,6 +2712,37 @@ ABI-incompatible plugin without implying that the kernel/host protocol is itself
 incompatible. Conflating the two numbers would make that distinction unavailable
 exactly when it is needed.
 
+### What the reconnaissance settled
+
+Three facts change the mechanics of the steps above, and all three were measured
+rather than assumed.
+
+**Core is the only holder of both edges.** Within the kernel's roots, `libloading`
+and the ABI crate are reachable through `nemo-relay` alone: the ABI crate appears
+once in the whole of `core` (a single line in `native.rs`), and `native.rs` reaches
+core's own API through 31 public paths and exactly one `pub(crate)` helper. So the
+number moves when the loader leaves `core`, and nothing else has to move first.
+
+**The loader's move cannot be transitional.** The ABI crate can be extracted with a
+re-export while callers catch up, but the loader cannot: `core` re-exporting
+`native-loader` while `native-loader` depends on `core` is a cycle, and Cargo refuses
+it. The commit that moves `native.rs` and `host.rs` has to repoint every caller at
+once. That list is short and now known: `plugin-host`'s in-process host (the child's
+end), four test files under `crates/core/tests`, and two examples.
+
+**The reachability metric counts what the artifact links.** `cargo tree` includes
+dev-dependencies by default, and a dev-dependency is not in the binary — counting it
+would make the target unreachable for a reason the symbol proof already covers. The
+figure is therefore taken over normal and build edges, and what only the test tree
+reaches is printed beside it rather than folded in or left out:
+
+```text
+kernel closure reaches (target: nothing): libloading, nemo-relay-plugin
+```
+
+Both still appear in the build graph today, so the number is unchanged — what
+changed is that it is now measured against the right graph.
+
 ### The definition of done
 
 The dependency graph proves the kernel cannot reach the native loader; the release
