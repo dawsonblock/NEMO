@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 nemo-relay.workspace = true
-nemo-relay-plugin.workspace = true
+nemo-relay-native-abi.workspace = true
 nemo-relay-plugin-protocol.workspace = true
 chrono = "0.4"
 futures-util = "0.3"

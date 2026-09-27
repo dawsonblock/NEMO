@@ -177,7 +177,7 @@ max_direct_dependencies = 38
 # two direct dependencies (`libloading` and the plugin SDK) and the loader's whole
 # transitive set left with the loader, and the closure no longer reaches the ABI.
 # The digest moved with them, which is the same fact written as an identity.
-max_transitive_packages = 267
+max_transitive_packages = 266
 # Raised for the exact-registration entry points the process boundary calls —
 # `invoke_tool_execution_intercept_registration`,
 # `invoke_llm_execution_intercept_registration`, and the name-retaining registry
@@ -258,7 +258,7 @@ max_transitive_packages = 267
 # artifact vocabulary, which are the kernel's half of the boundary. The target below is
 # still above this number by less than a hundred lines, which is the honest state: the
 # composition surface grew slightly while the loader was leaving.
-max_source_lines = 67926
+max_source_lines = 67916
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -267,7 +267,7 @@ max_source_lines = 67926
 # 288 tokens left with the loader.
 max_unsafe_occurrences = 19
 direct_dependency_digest = "dd962de4535f5b463a4a20e68897424b53654a497eed52627da8706402a0754f"
-transitive_dependency_digest = "64e650e5adaeb51ed9eca4d81055c0ce8d7c71e0aaa30c9f5439772e1d5f1ed8"
+transitive_dependency_digest = "4de950fd4d82fca020798436d14e5bab2b31a1f925b93763284972d14d2aa3ce"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
@@ -385,13 +385,19 @@ transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a28259
 #
 # `libloading` is its own direct dependency here, which is the whole point: the
 # crate that opens a library is the only one that names the crate that can.
+#
+# The loader names the *ABI* rather than the authoring SDK, which is the dependency
+# the symbol proof caught: the SDK is what a plugin is built against, and a binary
+# that only loads plugins has no business carrying 829 of its symbols. The swap
+# moved one direct dependency and shrank the transitive set by one; what it really
+# removed is what the release binary linked.
 [limits.nemo-relay-native-loader]
 max_direct_dependencies = 14
-max_transitive_packages = 243
+max_transitive_packages = 242
 max_source_lines = 7227
 max_unsafe_occurrences = 288
-direct_dependency_digest = "5f9571b5361a6e20d9fb0d1f383ff9035cc0d61dabe3ff19b4392f3add9b5fb1"
-transitive_dependency_digest = "fa94d7b698f131052403bf65c768cd21e27d991926edaf258ba540be8a6502aa"
+direct_dependency_digest = "7ed8e5b484401a9709daa6b48c45e78fe5e71c5a078a9e5a0f8ff72872e71657"
+transitive_dependency_digest = "c3e3a59fadde88d4ed3070dde4e8f9cea4cb99f96c75a7e44a9791000bdc9085"
 
 # The native plugin ABI's own crate — the first staged step of the split, and the
 # reason the SDK's line above could lose its vocabulary without any caller noticing.
@@ -765,7 +771,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 67926
+raised_to = 67916
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"

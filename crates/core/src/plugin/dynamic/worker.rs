@@ -100,10 +100,9 @@ use crate::plugin::{
 };
 
 use super::{
-    DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad,
-    DynamicPluginTeardownOutcome, RegistrationTeardown, WorkerRuntime,
-    deregister_tracked_registrations_checked, validate_annotated_request_consumer_compatibility,
-    validate_dynamic_plugin_relay_compatibility,
+    DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad, RegistrationTeardown,
+    WorkerRuntime, deregister_tracked_registrations_checked,
+    validate_annotated_request_consumer_compatibility, validate_dynamic_plugin_relay_compatibility,
 };
 
 const JSON_SCHEMA: &str = "nemo.relay.Json@1";
@@ -301,8 +300,8 @@ impl Drop for WorkerPluginInstance {
 }
 
 impl WorkerPluginInstance {
-    fn shutdown_checked(&self) -> DynamicPluginTeardownOutcome {
-        let mut outcome = DynamicPluginTeardownOutcome::success();
+    fn shutdown_checked(&self) -> RegistrationTeardown {
+        let mut outcome = RegistrationTeardown::success();
         if self.teardown_started.swap(true, Ordering::AcqRel) {
             return outcome;
         }
@@ -393,7 +392,7 @@ impl WorkerPluginInstance {
         outcome
     }
 
-    fn stop_process_checked(&self, outcome: &mut DynamicPluginTeardownOutcome) {
+    fn stop_process_checked(&self, outcome: &mut RegistrationTeardown) {
         let mut process = match self.process.lock() {
             Ok(process) => process,
             Err(error) => {

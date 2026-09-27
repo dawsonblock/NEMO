@@ -2826,6 +2826,36 @@ invocations and remote endpoints; the ABI is a child-side vocabulary.
 
 ### The two proofs
 
+**The dependency proof now holds for the kernel library, and the symbol proof has a
+measured baseline.** A release build of the CLI — the process that runs the kernel —
+was inspected with `nm`, and it contains what the dependency graph says it should:
+
+```text
+nemo_relay_native_loader   0 undefined, 10 defined
+nemo_relay_native_abi      0 undefined,  0 defined
+libloading                 0 undefined,  0 defined
+dlsym                      1 undefined
+nemo_relay_plugin        829 defined          (before the loader dropped the SDK)
+```
+
+The 10 loader symbols are drop-glue and two constructors reachable through the
+composition — `DynamicPluginActivationSpec`'s destructor and
+`ApprovedPluginArtifact::approve` — and they are there because `plugin-host` still
+carries the child's own end inside the library the CLI links. The one undefined
+`dlsym` is the same fact: a process that links the loader can resolve a symbol at
+runtime. The 829 SDK symbols were the finding worth acting on immediately: the
+loader was built against the authoring SDK when it only needs the ABI, so a binary
+that loads plugins was carrying the crate plugins are written with. It depends on
+`nemo-relay-native-abi` now, and that is a change the dependency graph can check even
+though a symbol gate cannot yet be recorded honestly here.
+
+That is why the symbol check is a *measurement* rather than a gate in this revision,
+and the distinction is deliberate: the artifact is not clean yet, and a gate whose
+recorded baseline was taken before the last dependency change would be a number
+nobody re-measured — the failure mode this repository has already caught twice in
+its budget files. The gate lands with the child endpoint crate, when the expected
+sets are empty and the check is the property rather than a ratchet.
+
 They answer different questions, and neither substitutes for the other.
 
 - **Dependency proof.** Walk the resolved graph from the kernel's roots and fail if

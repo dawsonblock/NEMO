@@ -10,13 +10,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use nemo_relay_plugin::{
+use nemo_relay_native_abi::{
     NemoRelayNativeLlmNextFn, NemoRelayNativeLlmSanitizeRequestContext,
     NemoRelayNativeLlmSanitizeResponseContext, NemoRelayNativeLlmStreamNextFn,
     NemoRelayNativeToolNextFn,
 };
 #[cfg(unix)]
-use nemo_relay_plugin::{NemoRelayNativePluginRegisterFn, NemoRelayNativePluginValidateFn};
+use nemo_relay_native_abi::{NemoRelayNativePluginRegisterFn, NemoRelayNativePluginValidateFn};
 use serde_json::json;
 
 use nemo_relay::api::runtime::{
@@ -1919,8 +1919,8 @@ fn the_entry_negotiation_offers_the_newest_version_a_plugin_accepts() {
             NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
         ),
         (
-            nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
-            nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
+            nemo_relay_native_abi::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
+            nemo_relay_native_abi::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
         ),
         (
             NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,

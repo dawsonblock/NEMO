@@ -2005,7 +2005,7 @@ dependencies = [
  "libloading",
  "log",
  "nemo-relay",
- "nemo-relay-plugin",
+ "nemo-relay-native-abi",
  "nemo-relay-plugin-protocol",
  "schemars",
  "serde",

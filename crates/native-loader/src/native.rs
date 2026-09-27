@@ -55,7 +55,7 @@ use nemo_relay::plugin::{
     PluginRegistrationContext,
 };
 
-use nemo_relay_plugin::{
+use nemo_relay_native_abi::{
     NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
     NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY, NemoRelayNativeAsyncCallbackState,
     NemoRelayNativeAsyncCompletion, NemoRelayNativeAsyncLlmStreamOpenCb,

@@ -40,20 +40,11 @@ pub use registry::*;
 #[cfg(feature = "worker-grpc")]
 pub use worker::*;
 
-/// The teardown vocabulary, under the name the dynamic-plugin control plane uses
-/// for it.
-///
-/// It lives on the hosted-runtime seam now, because a teardown is something a
-/// hosted plugin's runtime reports rather than something private to this module.
-/// The alias keeps the control plane reading as it did; the type it names is
-/// [`RegistrationTeardown`].
-pub(crate) type DynamicPluginTeardownOutcome = RegistrationTeardown;
-
 pub(super) fn deregister_tracked_registrations_checked(
     registrations: &mut Vec<(String, u64)>,
     plugin_type: &str,
-) -> DynamicPluginTeardownOutcome {
-    let mut outcome = DynamicPluginTeardownOutcome::success();
+) -> RegistrationTeardown {
+    let mut outcome = RegistrationTeardown::success();
     for (plugin_kind, registration_id) in std::mem::take(registrations).into_iter().rev() {
         match deregister_plugin_registration_checked(&plugin_kind, registration_id) {
             Ok(PluginDeregistrationOutcome::Removed) => {}
