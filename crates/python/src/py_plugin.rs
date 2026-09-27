@@ -1187,7 +1187,23 @@ fn initialize_with_dynamic_plugins_py<'py>(
         let policy = IsolationPolicy::for_runtime("nemo-relay-python");
         let policy = match crate::plugin_host_location::resolved_host() {
             Some(host) => policy.with_host(host),
-            None => policy,
+            None => {
+                // Nothing named a host and this extension never learned where it
+                // lives, so there is no installation whose companion it could
+                // name. The runtime would search beside the process, which is
+                // exactly the behaviour the derivation above exists to remove: an
+                // executable that runs plugin code should come from the package
+                // that shipped it or from a deployment that named it. Failing
+                // closed costs a deployment nothing it can reproduce — the
+                // documented answer is `NEMO_RELAY_PLUGIN_HOST`, or an
+                // installation the extension can see — and it removes the case
+                // where this binding runs a host nobody chose.
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "this nemo_relay extension cannot tell which installation it came from, so \
+                     it will not search for a plugin host beside the process. Install the \
+                     package, or name the host explicitly in NEMO_RELAY_PLUGIN_HOST.",
+                ));
+            }
         };
         let activation = ActivatedPluginRuntime::activate_with_discovered_config(
             config,

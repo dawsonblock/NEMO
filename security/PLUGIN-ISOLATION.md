@@ -2625,6 +2625,24 @@ looked in the shim's directory and found nothing. The Python activation reports
 only that it ran, which is the difference between a test that proves the boundary
 and one that proves the call succeeded.
 
+## The Python binding fails closed when it cannot say where it came from
+
+The binding derives the host from the extension's own installation rather than from
+`sys.executable`, and an audit found the one case where that derivation could still
+degrade into the search it replaces: an extension that never learns where it lives
+(a frozen interpreter, an embedded one, a statically linked module) left the
+isolation policy unset, and the runtime then looked for a host beside the process.
+
+That case is a refusal now. If nothing named a host in the environment and this
+extension cannot tell which installation it came from, it has no companion it can
+name and no installation whose layout it could report, so it says so instead of
+running whichever executable happens to sit near the process: the message names
+`NEMO_RELAY_PLUGIN_HOST`, which is the documented way to tell it. A deployment with
+an ordinary installation is unaffected — a wheel, a virtual environment, a user
+install and a `PYTHONPATH` package all have a `__file__` — and the refusal is the
+same shape as the one a missing host already produced, just earlier and with a
+better reason.
+
 ## The launch decision has a module of its own now
 
 The loader extraction has two halves, and this is the first. The *decision* about
@@ -2650,6 +2668,38 @@ that: of the three entries in `LOAD_CALL_PATHS`, two are the loader inside `core
 and the third is that child's end, and the entry that has to move for the metric to
 move is the third. Until it does, `kernel-process unsafe tokens` stays where it is,
 and it is not made to move by reclassifying anything.
+
+## Assurance gaps this document is still carrying
+
+The qualification matrix resolves every claim against evidence in the tree, and an audit
+of that machinery found three places where the evidence was weaker than the claim's
+reach. Two are closed in this revision and one is recorded rather than guessed at.
+
+**A `rust_test` was resolved by name alone.** Deleting `#[test]` from a referenced test
+left the matrix green, because the gate matched `fn name(` and a function is not a test.
+The matcher requires a test attribute above the function now — including the
+parameterized forms this repository uses — and the gate's own tests cover both the
+requirement and the forms.
+
+**Three claim statements said more than their tests prove.** The seam claim now says the
+hosted side's reach into *kernel-private* implementation is mediated rather than claiming
+all of its reach is; the dependency claim says the loader is a dependency of exactly one
+crate and no kernel root reaches it; and the host-process claim is scoped to the
+compositions that ship. A claim that overstates its evidence is the thing this matrix
+exists to prevent, and the fix is the statement rather than a test widened to match it.
+
+**The installed-artifact recipes exist but no lane runs them.** `just
+verify-installed-python-plugin` and `just verify-installed-node-plugin` drive a real
+fixture through an *installed* wheel or npm package and check the child ran the plugin;
+both are named as evidence by matrix claims. No workflow invokes either, so what the
+matrix proves today is that the recipe exists rather than that an accepted build ran it.
+Closing it is a packaging-lane change rather than a code change, and it is written down
+here rather than half-wired: the Python lane needs a job that has a Rust toolchain, the
+built fixture (`just build-test-plugin-fixtures`), `just` itself installed beside it, and
+the installed wheel — the `source-and-plugin` package-smoke job has the first and the
+fourth, so it is one tool-install step and one recipe invocation away. The Node lane
+needs the same, and its package-smoke job has no Rust toolchain at all today, so it is
+the larger of the two.
 
 ## The codec bridge's bound is a bound now
 
