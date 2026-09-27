@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use nemo_relay::plugin::dynamic::DynamicPluginKind;
+use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, DynamicPluginKind};
 #[cfg(feature = "worker-grpc")]
 use nemo_relay::plugin::dynamic::{
     WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins,
@@ -38,7 +38,6 @@ use nemo_relay::plugin::{
     PluginHostLease, acquire_plugin_host_lease, clear_plugin_configuration_for_host,
     ensure_builtin_plugins_registered, initialize_plugins_exact_for_host,
 };
-use nemo_relay_native_loader::{DynamicPluginActivationSpec, NativePluginLoadSpec};
 use nemo_relay_plugin_protocol::PluginProtocolError;
 
 use crate::ProcessLoadedPlugins;
@@ -442,12 +441,16 @@ impl ActivatedPluginRuntime {
         .map_err(PluginActivationError::Plugin)?;
 
         if !native_specs.is_empty() {
-            for (plugin_id, artifact) in &native_specs {
+            for (_, artifact) in &native_specs {
                 // Approval happens before a process starts, so an artifact that
                 // cannot be approved is a refusal rather than a host to clean up.
-                NativePluginLoadSpec::approved(plugin_id, artifact).map_err(|error| {
-                    PluginActivationError::Plugin(context("native plugin load failed", error))
-                })?;
+                // It is the kernel's verifier that answers, not the loader's: what a
+                // load is allowed to open is a decision about the artifact.
+                nemo_relay::plugin::dynamic::ApprovedPluginArtifact::approve(artifact).map_err(
+                    |error| {
+                        PluginActivationError::Plugin(context("native plugin load failed", error))
+                    },
+                )?;
             }
             stage.native = Some(
                 ProcessLoadedPlugins::load(

@@ -520,20 +520,41 @@ def measured_kernel_unsafe(surface: str) -> int | None:
     return None
 
 
-def documented_kernel_unsafe(repo_root: pathlib.Path) -> int | None:
-    """Return the figure quoted by the milestone document, if it quotes one."""
+def documented_kernel_unsafe(repo_root: pathlib.Path) -> tuple[int | None, list[str]]:
+    """Return the figure the milestone document quotes, and every disagreement with it.
+
+    The document is a chronological record, so prose inside it may describe numbers
+    that were true when a section was written — that is history, not drift. What may
+    not happen is the document carrying two *canonical* figures, because the earlier
+    revision this check exists for did exactly that: one paragraph said 617 and
+    another said 621, and a lookup that returns the first number it understands
+    cannot see the second. So the canonical form is counted rather than sampled: the
+    figure has to appear exactly once, and it has to be the measurement.
+    """
     document = pathlib.Path(repo_root) / "security" / "PLUGIN-ISOLATION.md"
     if not document.exists():
-        return None
+        return None, []
+    prefix = "kernel-process unsafe tokens:"
+    quilted: list[int] = []
     for line in document.read_text(encoding="utf-8").splitlines():
-        prefix = "kernel-process unsafe tokens:"
-        if prefix in line:
-            figure = line.split(prefix, 1)[1].strip().strip("`").strip()
-            try:
-                return int(figure)
-            except ValueError:
-                return None
-    return None
+        if prefix not in line:
+            continue
+        figure = line.split(prefix, 1)[1].strip().strip("`").strip()
+        try:
+            quilted.append(int(figure))
+        except ValueError:
+            continue
+    if not quilted:
+        return None, []
+    problems = []
+    if len(quilted) > 1:
+        problems.append(
+            "security/PLUGIN-ISOLATION.md states the kernel-process unsafe figure "
+            f"{len(quilted)} times ({', '.join(str(value) for value in quilted)}); "
+            "exactly one canonical figure may exist, because a second one is how "
+            "this document drifted before"
+        )
+    return quilted[0], problems
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -606,8 +627,12 @@ def main(argv: list[str] | None = None) -> int:
     # number that is maintained by hand drifts: a revision said 617 in one
     # paragraph and 621 in another. The figure is checked here instead, so the
     # prose cannot disagree with the measurement.
-    documented = documented_kernel_unsafe(arguments.repo_root)
+    documented, documented_problems = documented_kernel_unsafe(arguments.repo_root)
     measured = measured_kernel_unsafe(surface)
+    if documented_problems:
+        for problem in documented_problems:
+            print(f"error: {problem}", file=sys.stderr)
+        return 1
     if documented is not None and measured is not None and documented != measured:
         print(
             f"error: security/PLUGIN-ISOLATION.md says kernel-process unsafe tokens: "

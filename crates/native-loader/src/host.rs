@@ -12,9 +12,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value as Json};
-
 use nemo_relay::plugin::{
     ConfigReport, PluginComponentSpec, PluginConfig, PluginHostLease, Result,
     acquire_plugin_host_lease, clear_plugin_configuration_for_host,
@@ -22,30 +19,15 @@ use nemo_relay::plugin::{
 };
 
 use crate::{NativePluginActivation, NativePluginLoadSpec, load_native_plugins};
-use nemo_relay::plugin::dynamic::{DynamicPluginKind, NativeHostRuntime, RegistrationTeardown};
+
+use nemo_relay::plugin::dynamic::{
+    DynamicPluginActivationSpec, DynamicPluginKind, NativeHostRuntime, RegistrationTeardown,
+};
 
 #[cfg(feature = "worker-grpc")]
 use nemo_relay::plugin::dynamic::{
     WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins,
 };
-
-/// One dynamic plugin component to load and activate in an embedding host.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct DynamicPluginActivationSpec {
-    /// Expected plugin identifier from the authored manifest.
-    pub plugin_id: String,
-    /// Plugin execution lane.
-    pub kind: DynamicPluginKind,
-    /// Path or reference to the authored `relay-plugin.toml`.
-    pub manifest_ref: String,
-    /// Relay-managed runtime environment used by Python workers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment_ref: Option<String>,
-    /// Component-local configuration passed to the dynamically loaded plugin.
-    #[serde(default)]
-    pub config: Map<String, Json>,
-}
 
 /// Owns one process-wide dynamic plugin configuration and its loaded runtimes.
 ///

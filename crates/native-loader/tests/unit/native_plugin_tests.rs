@@ -7148,9 +7148,10 @@ fn an_artifact_identity_describes_the_manifest_and_library_it_named() {
     );
     std::fs::write(&manifest, &manifest_source).expect("write the manifest");
 
-    let (manifest_sha256, library_sha256) = host_runtime()
-        .artifact_identity(&manifest.to_string_lossy())
-        .expect("an identity");
+    let (manifest_sha256, library_sha256) =
+        nemo_relay::plugin::dynamic::ApprovedPluginArtifact::approve(&manifest.to_string_lossy())
+            .expect("an approval")
+            .digests();
     assert_eq!(
         manifest_sha256,
         host_runtime().hash_bytes(manifest_source.as_bytes()),
@@ -7164,9 +7165,10 @@ fn an_artifact_identity_describes_the_manifest_and_library_it_named() {
 
     // A directory reference names the manifest inside it, as the loader does, so
     // the same artifact has one identity however it is named.
-    let (from_directory, _) = host_runtime()
-        .artifact_identity(&directory.to_string_lossy())
-        .expect("an identity");
+    let (from_directory, _) =
+        nemo_relay::plugin::dynamic::ApprovedPluginArtifact::approve(&directory.to_string_lossy())
+            .expect("an approval")
+            .digests();
     assert_eq!(
         from_directory, manifest_sha256,
         "naming the directory and naming the manifest are the same artifact"

@@ -344,6 +344,36 @@ def test_a_policy_without_a_library_closure_section_checks_nothing() -> None:
     assert report.find_library_closure_problems({}, {"libloading"}) == []
 
 
+def test_a_second_canonical_figure_in_the_document_fails(tmp_path: pathlib.Path) -> None:
+    # The drift this gate exists for was one document stating two different figures,
+    # so a lookup that returns the first number it understands is not enough: a
+    # second canonical line has to fail.
+    document = tmp_path / "security"
+    document.mkdir()
+    (document / "PLUGIN-ISOLATION.md").write_text(
+        "kernel-process unsafe tokens: 648\n"
+        "... prose that says nothing canonical ...\n"
+        "kernel-process unsafe tokens: 622\n"
+    )
+
+    value, problems = report.documented_kernel_unsafe(tmp_path)
+
+    assert value == 648
+    assert len(problems) == 1
+    assert "622" in problems[0] and "648" in problems[0]
+
+
+def test_one_canonical_figure_is_not_a_problem(tmp_path: pathlib.Path) -> None:
+    document = tmp_path / "security"
+    document.mkdir()
+    (document / "PLUGIN-ISOLATION.md").write_text("kernel-process unsafe tokens: 26\n")
+
+    value, problems = report.documented_kernel_unsafe(tmp_path)
+
+    assert value == 26
+    assert problems == []
+
+
 def test_the_surface_renders_what_the_closure_reaches() -> None:
     policy = {
         "trusted": {"crates": []},
@@ -391,16 +421,20 @@ def test_the_closure_counts_a_dev_only_package_as_part_of_the_test_tree() -> Non
     }
 
 
-def test_the_repository_policy_records_what_the_kernel_still_reaches() -> None:
+def test_the_repository_policy_records_a_closure_that_reaches_nothing() -> None:
     # The policy's own record has to be the measurement: a recorded list that no
     # longer matches would make the ratchet pass by describing a graph that is not
-    # there.
+    # there. The record is empty now, and this test is what would notice it becoming
+    # non-empty again — which is the milestone's structural property rather than its
+    # progress, so it is asserted here as well as in the report.
     policy = report.load_policy(report.DEFAULT_POLICY)
     closure = policy["kernel_closure"]
     reachable = report.kernel_closure_names(report.REPO_ROOT, closure["roots"])
 
     assert report.find_closure_problems(policy, reachable) == []
-    assert set(closure["reachable_now"]) <= set(closure["forbidden"]), (
-        "the recorded work is a subset of what the closing target forbids"
+    assert closure["reachable_now"] == [], (
+        "the kernel and the composition surfaces reach nothing that loads native "
+        "code; a non-empty record here is the split going backwards"
     )
-    assert "libloading" in reachable, "the loader is still in the kernel's graph, which is what the split moves"
+    assert set(closure["forbidden"]), "a closure with no forbidden set checks nothing"
+    assert report.kernel_closure_reachability(policy, reachable) == set()

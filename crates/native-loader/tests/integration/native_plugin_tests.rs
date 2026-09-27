@@ -30,15 +30,14 @@ use nemo_relay::api::tool::{
     tool_call_execute, tool_request_intercepts,
 };
 use nemo_relay::codec::response::AnnotatedLlmResponse;
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use nemo_relay::plugin::dynamic::{DynamicPluginKind, plugin_artifact_identity};
 use nemo_relay::plugin::{
     ConfigDiagnostic, Plugin, PluginComponentSpec, PluginConfig, PluginRegistrationContext,
     Result as PluginResult, clear_plugin_configuration, deregister_plugin,
     initialize_plugins_exact, list_plugin_kinds, lookup_plugin, register_plugin,
 };
-use nemo_relay_native_loader::{
-    DynamicPluginActivationSpec, NativePluginLoadSpec, PluginHostActivation, load_native_plugins,
-};
+use nemo_relay_native_loader::{NativePluginLoadSpec, PluginHostActivation, load_native_plugins};
 use serde_json::{Map, Value as Json, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;

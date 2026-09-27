@@ -66,20 +66,20 @@
 //!    appetite, not its producer's willingness to run ahead. One pull at a time is
 //!    the strongest demand the protocol can express, which is why the grant is one.
 //! 10. **Every frame is measured, and the ceilings are the session's.** What a
-//!    stream sends is what it costs: the frame that opens it, its data, the failure
-//!    that ends it and the terminal frame are each measured against the session's
-//!    frame, byte and frame-count ceilings before they cross, and a frame that
-//!    would cross one is not sent — the stream is over instead, and so is the work
-//!    behind it.
+//!     stream sends is what it costs: the frame that opens it, its data, the failure
+//!     that ends it and the terminal frame are each measured against the session's
+//!     frame, byte and frame-count ceilings before they cross, and a frame that
+//!     would cross one is not sent — the stream is over instead, and so is the work
+//!     behind it.
 //! 11. **A stream may not outlive the call it belongs to.** The deadline is the
-//!    operation's, taken from the budget the chain position was parked under, and
-//!    it is enforced whether or not anyone is asking: an idle stream is over when
-//!    its call's time is up and its producer goes with it, an open still blocked at
-//!    the deadline never becomes a stream, and a pull whose producer is still
-//!    working at the deadline is answered with the deadline rather than with a
-//!    frame. What ended the stream is held for the next pull when nothing was
-//!    outstanding — a stream's frames are answers to demand, and the ending is one
-//!    of them.
+//!     operation's, taken from the budget the chain position was parked under, and
+//!     it is enforced whether or not anyone is asking: an idle stream is over when
+//!     its call's time is up and its producer goes with it, an open still blocked at
+//!     the deadline never becomes a stream, and a pull whose producer is still
+//!     working at the deadline is answered with the deadline rather than with a
+//!     frame. What ended the stream is held for the next pull when nothing was
+//!     outstanding — a stream's frames are answers to demand, and the ending is one
+//!     of them.
 //!
 //! What the streaming increment still owes is the mark-attribution matrix and the
 //! last of the death phases, not more of this session: the mark window now follows

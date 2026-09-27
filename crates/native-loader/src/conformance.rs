@@ -92,8 +92,7 @@ pub async fn check_lifecycle<B: PluginExecutionBackend + ?Sized>(
     fixture: &LifecycleFixture,
 ) -> Vec<String> {
     let mut findings = Vec::new();
-    let Ok((manifest_sha256, library_sha256)) =
-        nemo_relay::plugin::dynamic::plugin_artifact_identity(&fixture.artifact)
+    let Ok((manifest_sha256, library_sha256)) = crate::backend::artifact_digests(&fixture.artifact)
     else {
         findings.push(format!(
             "the lifecycle fixture is not a loadable artifact: {}",

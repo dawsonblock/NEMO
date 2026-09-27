@@ -244,7 +244,7 @@ fn write_failed(error: serde_json::Error) -> FlowError {
 /// client. The caller blocks on the answer and holds nothing while it waits; nothing the
 /// kernel does to answer it needs the blocked thread. One bridge per host, because one
 /// client is enough and one thread is the bound.
-pub(crate) struct CodecBridge {
+pub struct CodecBridge {
     /// Bounded, and asynchronous on the receiving side: the caller is a synchronous thread
     /// inside the plugin's code, and the thread that answers must never block the runtime it
     /// drives. A blocking receive on a `current_thread` runtime would starve the very
@@ -296,7 +296,7 @@ impl CodecBridge {
     /// owns can be refused by the operating system, and a host that cannot create
     /// them has to say so: the caller is a plugin's callback, and a panic here
     /// would take the host down with a plugin's codec call.
-    pub(crate) fn start(
+    pub fn start(
         client: crate::runtime_service::KernelCallbacks,
         session_id: String,
     ) -> Result<Arc<Self>, String> {
@@ -464,7 +464,7 @@ impl KernelRequestCodec {
     /// runtime and a kernel connection, and a host that started one per sanitize
     /// invocation would hold as many of those as it has concurrent sanitizers —
     /// under load, hundreds of threads for work that one bridge answers.
-    pub(crate) fn new(
+    pub fn new(
         bridge: Arc<CodecBridge>,
         operation_request_id: &str,
         identity: LlmCodecIdentity,
@@ -532,7 +532,7 @@ pub struct KernelResponseCodec {
 
 impl KernelResponseCodec {
     /// A response codec for one sanitize invocation.
-    pub(crate) fn new(
+    pub fn new(
         bridge: Arc<CodecBridge>,
         operation_request_id: &str,
         identity: LlmCodecIdentity,

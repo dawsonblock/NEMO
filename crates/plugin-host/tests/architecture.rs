@@ -41,9 +41,9 @@ const LOADER_PATHS: &[&str] = &["native-loader:native.rs"];
 /// because that is what the child does, and the kernel does not, which is the
 /// property this list exists to keep true: no entry in it is a `core` path.
 const LOAD_CALL_PATHS: &[&str] = &[
+    "native-loader:backend.rs",
     "native-loader:host.rs",
     "native-loader:native.rs",
-    "plugin-host:lib.rs",
 ];
 
 /// Tokens that only a native loader has any business containing.

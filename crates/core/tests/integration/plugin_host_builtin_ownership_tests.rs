@@ -7,13 +7,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use nemo_relay::plugin::dynamic::DynamicPluginKind;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginComponentSpec, PluginConfig,
     PluginRegistrationContext, Result, deregister_plugin, list_plugin_kinds, lookup_plugin,
     register_plugin, validate_plugin_config,
 };
-use nemo_relay_native_loader::{DynamicPluginActivationSpec, PluginHostActivation};
+use nemo_relay_native_loader::PluginHostActivation;
 use serde_json::{Map, Value as Json};
 
 struct PreclaimedObservabilityPlugin;

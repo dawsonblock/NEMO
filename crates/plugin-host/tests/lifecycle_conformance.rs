@@ -15,8 +15,8 @@
 
 mod support;
 
-use nemo_relay_plugin_host::InProcessPluginBackend;
-use nemo_relay_plugin_host::conformance;
+use nemo_relay_native_loader::InProcessPluginBackend;
+use nemo_relay_native_loader::conformance;
 
 #[tokio::test]
 async fn the_in_process_backend_satisfies_the_shared_lifecycle_suite() {

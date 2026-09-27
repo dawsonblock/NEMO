@@ -83,8 +83,8 @@ use tokio_stream::{Stream, StreamExt};
 use uuid::Uuid;
 
 use nemo_relay::plugin::dynamic::{
-    DYNAMIC_PLUGIN_MANIFEST_FILENAME, DynamicPluginKind, DynamicPluginManifest,
-    DynamicPluginManifestLoad, NativeHostRuntime, RegistrationTeardown,
+    ApprovedPluginArtifact, DYNAMIC_PLUGIN_MANIFEST_FILENAME, DynamicPluginKind,
+    DynamicPluginManifest, DynamicPluginManifestLoad, NativeHostRuntime, RegistrationTeardown,
 };
 use nemo_relay_plugin_protocol::PluginArtifactIdentity;
 
@@ -100,43 +100,6 @@ fn host_runtime() -> NativeHostRuntime {
 
 /// An artifact whose bytes this side has approved.
 ///
-/// The loader takes one of these rather than a reference plus a pair of digests
-/// it may or may not have: what a load is allowed to open is decided by hashing
-/// the artifact, and this value is where that decision lives. Approving is the
-/// only way to make one, and the production load accepts nothing weaker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovedPluginArtifact {
-    identity: PluginArtifactIdentity,
-}
-
-impl ApprovedPluginArtifact {
-    /// Approve the artifact at `manifest_ref` by hashing it now.
-    pub fn approve(manifest_ref: &str) -> nemo_relay::plugin::Result<Self> {
-        let (manifest_sha256, library_sha256) = host_runtime().artifact_identity(manifest_ref)?;
-        Ok(Self {
-            identity: PluginArtifactIdentity {
-                manifest_sha256,
-                library_sha256,
-            },
-        })
-    }
-
-    /// Record an approval that was made elsewhere and travelled here.
-    ///
-    /// Recording is not trusting: the loader still confirms these digests
-    /// against the bytes of the manifest and of an open handle to the library
-    /// immediately before either is used, so an approval that does not describe
-    /// this artifact is a refused load rather than a load without a guarantee.
-    pub fn from_identity(identity: PluginArtifactIdentity) -> Self {
-        Self { identity }
-    }
-
-    /// What was approved.
-    pub fn identity(&self) -> &PluginArtifactIdentity {
-        &self.identity
-    }
-}
-
 /// Native plugin load request derived from host dynamic-plugin state.
 ///
 /// Built through one of the constructors below and nowhere else, so that a load

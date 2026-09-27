@@ -79,141 +79,6 @@ impl std::fmt::Debug for SessionChannel {
     }
 }
 
-impl KernelCallbacks {
-    /// Open the channel a host pulls its plugins' downstream streams over.
-    ///
-    /// # Errors
-    /// Returns the transport's words when the kernel cannot be reached, and the
-    /// kernel's when it refuses the channel — a credential that is not this
-    /// session's, a session this kernel does not serve.
-    pub async fn open_session(&self, session_id: &str) -> Result<SessionChannel, String> {
-        let (outbound, messages) = tokio::sync::mpsc::channel(SESSION_OUTBOUND_CAPACITY);
-        let answers: std::sync::Arc<
-            std::sync::Mutex<
-                std::collections::HashMap<
-                    String,
-                    tokio::sync::oneshot::Sender<PluginSessionPayload>,
-                >,
-            >,
-        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let mut request = tonic::Request::new(ReceiverStream::new(messages));
-        request
-            .metadata_mut()
-            .insert(SESSION_CREDENTIAL_HEADER, self.credential().clone());
-        let mut answers_in = self
-            .client()
-            .clone()
-            .session(request)
-            .await
-            .map_err(|status| status.to_string())?
-            .into_inner();
-
-        // The reader: one task for the host, because the kernel answers the calls
-        // this host makes and every answer names the call it answers.
-        let routing = std::sync::Arc::clone(&answers);
-        // Weak, because this reader is not what keeps the channel — and with it
-        // the kernel's session — alive: the host letting go of its end is the
-        // signal that ends the session, and a reader holding a sender would be
-        // holding that signal open.
-        let cancelling = outbound.downgrade();
-        let session = session_id.to_owned();
-        let ending = std::sync::Arc::clone(&ended);
-        tokio::spawn(async move {
-            // Every way out of this loop is the session's answers having stopped —
-            // the transport broke, or the kernel sent something this side cannot
-            // read. None of them leaves a call that is waiting for an answer in a
-            // state where an answer can still arrive.
-            while let Some(answer) = answers_in.next().await {
-                let Ok(answer) = answer else { break };
-                let Ok(answer) =
-                    nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
-                else {
-                    break;
-                };
-                // The stream an answer names, when the answer is one that
-                // creates a stream: an answer nobody receives has to leave
-                // nothing behind, and only this answer can name what it left.
-                let (call, opened) = match &answer.message {
-                    PluginSessionPayload::StreamOpened(opened) => {
-                        (opened.host_call_id.clone(), Some(opened.stream_id.clone()))
-                    }
-                    PluginSessionPayload::StreamOpenFailed(failed) => {
-                        (failed.host_call_id.clone(), None)
-                    }
-                    PluginSessionPayload::StreamItem(item) => (item.host_call_id.clone(), None),
-                    PluginSessionPayload::StreamEnd(end) => (end.host_call_id.clone(), None),
-                    PluginSessionPayload::StreamFailed(failed) => {
-                        (failed.host_call_id.clone(), None)
-                    }
-                    // Answers to calls this side did not make are not this side's
-                    // to route; a session that sent one is answered by ending the
-                    // channel.
-                    _ => break,
-                };
-                let waiting = routing
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&call);
-                let delivered = match waiting {
-                    Some(waiting) => waiting.send(answer.message).is_ok(),
-                    None => false,
-                };
-                if delivered {
-                    continue;
-                }
-                // The call that asked for this stream is gone: the consumer
-                // walked away while the open was in flight, so the kernel has
-                // made a stream this host cannot hand to anyone. It is cancelled
-                // here because this is the last place its identity exists — the
-                // owner that would have cancelled it no longer does — and a
-                // stream nothing names is one the kernel keeps producing for.
-                //
-                // Awaited rather than tried: a cancellation dropped because a
-                // buffer was full is the leak this is here to prevent, and this
-                // reader is a task of its own rather than a `poll_next`, so it is
-                // the one place in the channel that can afford to wait.
-                if let Some(stream_id) = opened
-                    && let Some(cancelling) = cancelling.upgrade()
-                {
-                    let cancellation = PluginSessionMessage {
-                        session_id: session.clone(),
-                        message: PluginSessionPayload::StreamCancel(PluginStreamControl {
-                            host_call_id: format!("cancel-{stream_id}"),
-                            stream_id,
-                        }),
-                    };
-                    let _ = cancelling
-                        .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
-                            &cancellation,
-                        ))
-                        .await;
-                }
-            }
-
-            // The session's answers have stopped. Every call still waiting for one
-            // is waiting for a session that is no longer there: dropping their
-            // senders is how they learn it, and the flag is how the calls that
-            // follow learn it without waiting at all. A stream that stopped because
-            // its session did is not a stream that finished.
-            ending.store(true, std::sync::atomic::Ordering::SeqCst);
-            routing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
-        });
-
-        Ok(SessionChannel {
-            outbound,
-            answers,
-            session_id: session_id.to_owned(),
-            calls: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            ended,
-        })
-    }
-}
-
 /// How many messages a host may have in flight to its kernel.
 ///
 /// One call at a time per stream is the ABI's rule, so this is room for several
@@ -500,6 +365,141 @@ impl Drop for PullStream {
                 );
             }
         }
+    }
+}
+
+impl KernelCallbacks {
+    /// Open the channel a host pulls its plugins' downstream streams over.
+    ///
+    /// # Errors
+    /// Returns the transport's words when the kernel cannot be reached, and the
+    /// kernel's when it refuses the channel — a credential that is not this
+    /// session's, a session this kernel does not serve.
+    pub async fn open_session(&self, session_id: &str) -> Result<SessionChannel, String> {
+        let (outbound, messages) = tokio::sync::mpsc::channel(SESSION_OUTBOUND_CAPACITY);
+        let answers: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    String,
+                    tokio::sync::oneshot::Sender<PluginSessionPayload>,
+                >,
+            >,
+        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut request = tonic::Request::new(ReceiverStream::new(messages));
+        request
+            .metadata_mut()
+            .insert(SESSION_CREDENTIAL_HEADER, self.credential().clone());
+        let mut answers_in = self
+            .client()
+            .clone()
+            .session(request)
+            .await
+            .map_err(|status| status.to_string())?
+            .into_inner();
+
+        // The reader: one task for the host, because the kernel answers the calls
+        // this host makes and every answer names the call it answers.
+        let routing = std::sync::Arc::clone(&answers);
+        // Weak, because this reader is not what keeps the channel — and with it
+        // the kernel's session — alive: the host letting go of its end is the
+        // signal that ends the session, and a reader holding a sender would be
+        // holding that signal open.
+        let cancelling = outbound.downgrade();
+        let session = session_id.to_owned();
+        let ending = std::sync::Arc::clone(&ended);
+        tokio::spawn(async move {
+            // Every way out of this loop is the session's answers having stopped —
+            // the transport broke, or the kernel sent something this side cannot
+            // read. None of them leaves a call that is waiting for an answer in a
+            // state where an answer can still arrive.
+            while let Some(answer) = answers_in.next().await {
+                let Ok(answer) = answer else { break };
+                let Ok(answer) =
+                    nemo_relay_plugin_proto::convert::session_message_from_wire(&answer)
+                else {
+                    break;
+                };
+                // The stream an answer names, when the answer is one that
+                // creates a stream: an answer nobody receives has to leave
+                // nothing behind, and only this answer can name what it left.
+                let (call, opened) = match &answer.message {
+                    PluginSessionPayload::StreamOpened(opened) => {
+                        (opened.host_call_id.clone(), Some(opened.stream_id.clone()))
+                    }
+                    PluginSessionPayload::StreamOpenFailed(failed) => {
+                        (failed.host_call_id.clone(), None)
+                    }
+                    PluginSessionPayload::StreamItem(item) => (item.host_call_id.clone(), None),
+                    PluginSessionPayload::StreamEnd(end) => (end.host_call_id.clone(), None),
+                    PluginSessionPayload::StreamFailed(failed) => {
+                        (failed.host_call_id.clone(), None)
+                    }
+                    // Answers to calls this side did not make are not this side's
+                    // to route; a session that sent one is answered by ending the
+                    // channel.
+                    _ => break,
+                };
+                let waiting = routing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&call);
+                let delivered = match waiting {
+                    Some(waiting) => waiting.send(answer.message).is_ok(),
+                    None => false,
+                };
+                if delivered {
+                    continue;
+                }
+                // The call that asked for this stream is gone: the consumer
+                // walked away while the open was in flight, so the kernel has
+                // made a stream this host cannot hand to anyone. It is cancelled
+                // here because this is the last place its identity exists — the
+                // owner that would have cancelled it no longer does — and a
+                // stream nothing names is one the kernel keeps producing for.
+                //
+                // Awaited rather than tried: a cancellation dropped because a
+                // buffer was full is the leak this is here to prevent, and this
+                // reader is a task of its own rather than a `poll_next`, so it is
+                // the one place in the channel that can afford to wait.
+                if let Some(stream_id) = opened
+                    && let Some(cancelling) = cancelling.upgrade()
+                {
+                    let cancellation = PluginSessionMessage {
+                        session_id: session.clone(),
+                        message: PluginSessionPayload::StreamCancel(PluginStreamControl {
+                            host_call_id: format!("cancel-{stream_id}"),
+                            stream_id,
+                        }),
+                    };
+                    let _ = cancelling
+                        .send(nemo_relay_plugin_proto::convert::session_message_to_wire(
+                            &cancellation,
+                        ))
+                        .await;
+                }
+            }
+
+            // The session's answers have stopped. Every call still waiting for one
+            // is waiting for a session that is no longer there: dropping their
+            // senders is how they learn it, and the flag is how the calls that
+            // follow learn it without waiting at all. A stream that stopped because
+            // its session did is not a stream that finished.
+            ending.store(true, std::sync::atomic::Ordering::SeqCst);
+            routing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        });
+
+        Ok(SessionChannel {
+            outbound,
+            answers,
+            session_id: session_id.to_owned(),
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ended,
+        })
     }
 }
 

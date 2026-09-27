@@ -23,7 +23,6 @@ __skip-implicit-config = ["nemo-relay/__skip-implicit-config"]
 nemo-relay = { workspace = true, features = ["atof-streaming", "worker-grpc"] }
 nemo-relay-adaptive = { workspace = true, features = ["redis-backend"] }
 nemo-relay-pii-redaction.workspace = true
-nemo-relay-native-loader.workspace = true
 nemo-relay-plugin-host = { workspace = true, features = ["worker-grpc"] }
 chrono = "0.4"
 libc = "0.2"

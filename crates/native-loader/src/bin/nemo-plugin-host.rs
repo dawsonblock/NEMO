@@ -17,8 +17,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use nemo_relay_plugin_host::InProcessPluginBackend;
-use nemo_relay_plugin_host::service::{ForwardedStep, PluginHostConfig, PluginHostService};
+use nemo_relay_native_loader::InProcessPluginBackend;
+use nemo_relay_native_loader::service::{ForwardedStep, PluginHostConfig, PluginHostService};
 use nemo_relay_plugin_proto::v1::plugin_host_server::PluginHostServer;
 use nemo_relay_plugin_protocol::PROTOCOL_VERSION;
 use tokio::net::UnixListener;

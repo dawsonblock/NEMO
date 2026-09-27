@@ -167,12 +167,12 @@ impl KernelCallbacks {
     }
 
     /// The client these calls travel on.
-    pub(crate) fn client(&self) -> &RelayRuntimeClient<Channel> {
+    pub fn client(&self) -> &RelayRuntimeClient<Channel> {
         &self.client
     }
 
     /// The credential every call has to carry.
-    pub(crate) fn credential(&self) -> &MetadataValue<Ascii> {
+    pub fn credential(&self) -> &MetadataValue<Ascii> {
         &self.credential
     }
 

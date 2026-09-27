@@ -35,13 +35,13 @@ use nemo_relay::api::registry::{
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, register_subscriber};
 use nemo_relay::error::Result as FlowResult;
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
     PluginRegistrationContext, active_plugin_report, clear_plugin_configuration, deregister_plugin,
     initialize_plugins, list_plugin_kinds, register_plugin, rollback_registrations,
     validate_plugin_config,
 };
-use nemo_relay_native_loader::DynamicPluginActivationSpec;
 use nemo_relay_plugin_host::activation::{
     ActivatedPluginRuntime, IsolationPolicy, PluginActivationError,
 };

@@ -82,7 +82,7 @@ enum HostSession {
         /// The credential authorises establishing the session; this authorises
         /// using it. Without it, naming the session would be enough to call it,
         /// and a session's name is what an attach announces.
-        capability: crate::capability::SessionCapability,
+        capability: nemo_relay_plugin_host::capability::SessionCapability,
     },
     /// After the session closed. Every later request is refused, including a
     /// handshake that would start another one.
@@ -105,13 +105,14 @@ pub struct PluginHostService {
     /// Needed by the classes that wrap a call: their continuation is the
     /// kernel's remainder of the chain, so a plugin's `next` is a call this side
     /// makes.
-    kernel: Option<crate::runtime_service::KernelCallbacks>,
+    kernel: Option<nemo_relay_plugin_host::runtime_service::KernelCallbacks>,
     /// The session channel this host pulls its plugins' downstream streams over.
     ///
     /// Created when the first streaming registration needs it, because a host
     /// that never serves one has no reason to hold a channel open.
-    session_channel:
-        tokio::sync::Mutex<Option<std::sync::Arc<crate::session_channel::SessionChannel>>>,
+    session_channel: tokio::sync::Mutex<
+        Option<std::sync::Arc<nemo_relay_plugin_host::session_channel::SessionChannel>>,
+    >,
     /// The one bridge this host's synchronous codec calls are answered on.
     ///
     /// Created when the first sanitizer resolves a codec, for the same reason the
@@ -120,7 +121,7 @@ pub struct PluginHostService {
     /// those are the resources it owns — a bridge per invocation would give a busy
     /// host as many of each as it has sanitizers in flight.
     codec_bridge: tokio::sync::Mutex<
-        Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
+        Option<Result<std::sync::Arc<nemo_relay_plugin_host::codec_context::CodecBridge>, String>>,
     >,
 }
 
@@ -268,7 +269,8 @@ impl PluginHostService {
     /// call on the failure path.
     async fn codec_bridge(
         &self,
-    ) -> Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>> {
+    ) -> Option<Result<std::sync::Arc<nemo_relay_plugin_host::codec_context::CodecBridge>, String>>
+    {
         let kernel = self.kernel.clone()?;
         let mut bridge = self.codec_bridge.lock().await;
         let started = bridge.get_or_insert_with(|| {
@@ -280,7 +282,7 @@ impl PluginHostService {
                 HostSession::Active { identity, .. } => identity.session_id.clone(),
                 HostSession::New | HostSession::Closed => String::new(),
             };
-            crate::codec_context::CodecBridge::start(kernel, session_id)
+            nemo_relay_plugin_host::codec_context::CodecBridge::start(kernel, session_id)
         });
         Some(started.clone())
     }
@@ -303,7 +305,7 @@ impl PluginHostService {
     /// to run.
     pub fn with_kernel_callbacks(
         mut self,
-        kernel: crate::runtime_service::KernelCallbacks,
+        kernel: nemo_relay_plugin_host::runtime_service::KernelCallbacks,
     ) -> Self {
         self.kernel = Some(kernel);
         self
@@ -894,7 +896,7 @@ fn refused(message: impl Into<String>) -> PluginProtocolError {
 fn presented_capability<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()
-        .get(crate::capability::SESSION_CAPABILITY_HEADER)
+        .get(nemo_relay_plugin_host::capability::SESSION_CAPABILITY_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
 }
@@ -1134,7 +1136,8 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         // The capability the kernel minted, which every operation after this one
         // has to present. A session established without one would be a session
         // any peer that learned its name could use.
-        let Some(capability) = crate::capability::SessionCapability::parse(presented.as_deref())
+        let Some(capability) =
+            nemo_relay_plugin_host::capability::SessionCapability::parse(presented.as_deref())
         else {
             return Ok(Response::new(handshake_outcome_to_wire(
                 LifecycleOutcome::Failed(
@@ -1771,7 +1774,7 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                         // The managed stream the callback receives: the same
                         // value an in-process plugin is handed, so a callback
                         // written against the ABI does not know the difference.
-                        .map(crate::session_channel::PullStream::into_managed)
+                        .map(nemo_relay_plugin_host::session_channel::PullStream::into_managed)
                         .map_err(|error| {
                             nemo_relay::error::FlowError::Internal(format!(
                                 "the wrapped stream could not be opened: {error}"
@@ -1920,9 +1923,10 @@ impl PluginHostService {
     /// second channel would be a second reader of the same session's answers.
     async fn session(
         &self,
-        kernel: &crate::runtime_service::KernelCallbacks,
+        kernel: &nemo_relay_plugin_host::runtime_service::KernelCallbacks,
         session_id: &str,
-    ) -> Result<std::sync::Arc<crate::session_channel::SessionChannel>, String> {
+    ) -> Result<std::sync::Arc<nemo_relay_plugin_host::session_channel::SessionChannel>, String>
+    {
         let mut slot = self.session_channel.lock().await;
         if let Some(session) = slot.as_ref() {
             return Ok(std::sync::Arc::clone(session));
@@ -2059,7 +2063,9 @@ fn codec_budget(
 /// the other is refused rather than adapted.
 async fn sanitized_llm_response(
     request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
-    bridge: Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
+    bridge: Option<
+        Result<std::sync::Arc<nemo_relay_plugin_host::codec_context::CodecBridge>, String>,
+    >,
     invocation: &nemo_relay_plugin_protocol::PluginExecutionContext,
 ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
     let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
@@ -2082,7 +2088,7 @@ async fn sanitized_llm_response(
     let id = call_context
         .get("codec_id")
         .and_then(serde_json::Value::as_str);
-    let identity = crate::codec_context::identity_from_wire(kind, id)
+    let identity = nemo_relay_plugin_host::codec_context::identity_from_wire(kind, id)
         .map_err(|error| refused(error.to_string()))?;
 
     let sanitize_context = match identity {
@@ -2115,13 +2121,15 @@ async fn sanitized_llm_response(
                 ));
             };
             nemo_relay::api::runtime::LlmSanitizeResponseContext::for_response_codec(Some(
-                std::sync::Arc::new(crate::codec_context::KernelResponseCodec::new(
-                    bridge,
-                    &invocation.operation_request_id,
-                    identity,
-                    reference,
-                    codec_budget(invocation),
-                )),
+                std::sync::Arc::new(
+                    nemo_relay_plugin_host::codec_context::KernelResponseCodec::new(
+                        bridge,
+                        &invocation.operation_request_id,
+                        identity,
+                        reference,
+                        codec_budget(invocation),
+                    ),
+                ),
             ))
         }
     };
@@ -2167,7 +2175,9 @@ async fn sanitized_llm_response(
 /// is a sanitizer that has been misled about what it is sanitizing.
 async fn sanitized_llm_request(
     request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
-    bridge: Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
+    bridge: Option<
+        Result<std::sync::Arc<nemo_relay_plugin_host::codec_context::CodecBridge>, String>,
+    >,
     invocation: &nemo_relay_plugin_protocol::PluginExecutionContext,
 ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
     let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
@@ -2193,7 +2203,7 @@ async fn sanitized_llm_request(
     let id = call_context
         .get("codec_id")
         .and_then(serde_json::Value::as_str);
-    let identity = crate::codec_context::identity_from_wire(kind, id)
+    let identity = nemo_relay_plugin_host::codec_context::identity_from_wire(kind, id)
         .map_err(|error| refused(error.to_string()))?;
 
     let sanitize_context = match identity {
@@ -2228,13 +2238,15 @@ async fn sanitized_llm_request(
                 ));
             };
             nemo_relay::api::runtime::LlmSanitizeRequestContext::for_request_codec(Some(
-                std::sync::Arc::new(crate::codec_context::KernelRequestCodec::new(
-                    bridge,
-                    &invocation.operation_request_id,
-                    identity,
-                    reference,
-                    codec_budget(invocation),
-                )),
+                std::sync::Arc::new(
+                    nemo_relay_plugin_host::codec_context::KernelRequestCodec::new(
+                        bridge,
+                        &invocation.operation_request_id,
+                        identity,
+                        reference,
+                        codec_budget(invocation),
+                    ),
+                ),
             ))
         }
     };
@@ -2516,7 +2528,7 @@ mod tests {
         use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
         use tonic::transport::Server;
 
-        let continuations = Arc::new(crate::continuations::Continuations::new());
+        let continuations = Arc::new(nemo_relay_plugin_host::continuations::Continuations::new());
         for (operation, chunks) in operations {
             let producer = producer.clone();
             let stream: nemo_relay::api::runtime::LlmStreamExecutionNextFn =
@@ -2566,15 +2578,19 @@ mod tests {
             ));
         }
 
-        let runtime = crate::runtime_service::RelayRuntimeService::new(
-            crate::runtime_service::RelayRuntimeConfig {
+        let runtime = nemo_relay_plugin_host::runtime_service::RelayRuntimeService::new(
+            nemo_relay_plugin_host::runtime_service::RelayRuntimeConfig {
                 session_id: session_id.to_owned(),
                 session_credential: KERNEL_CREDENTIAL.into(),
                 protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
                 runtime_binding_digest: "binding".into(),
-                operation_scopes: Arc::new(crate::operation_scopes::OperationScopes::new()),
+                operation_scopes: Arc::new(
+                    nemo_relay_plugin_host::operation_scopes::OperationScopes::new(),
+                ),
                 continuations,
-                codecs: Arc::new(crate::codec_capability::CodecCapabilities::new()),
+                codecs: Arc::new(
+                    nemo_relay_plugin_host::codec_capability::CodecCapabilities::new(),
+                ),
             },
         );
         let directory =
@@ -2614,7 +2630,7 @@ mod tests {
     fn with_capability<T>(message: T, capability: &str) -> Request<T> {
         let mut request = Request::new(message);
         request.metadata_mut().insert(
-            crate::capability::SESSION_CAPABILITY_HEADER,
+            nemo_relay_plugin_host::capability::SESSION_CAPABILITY_HEADER,
             capability
                 .parse()
                 .expect("a test capability is a header value"),
@@ -2750,8 +2766,7 @@ mod tests {
             .session_id;
 
             let (manifest_sha256, library_sha256) =
-                nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                    .expect("the fixture's identity");
+                crate::backend::artifact_digests(&artifact).expect("the fixture's identity");
             let loaded = service
                 .load(capable(v1::LoadRequest {
                     session_id: session_id.clone(),
@@ -3583,8 +3598,7 @@ mod tests {
             .session_id;
 
         let (manifest_sha256, library_sha256) =
-            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                .expect("the fixture's identity");
+            crate::backend::artifact_digests(&artifact).expect("the fixture's identity");
         service
             .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
@@ -3653,8 +3667,7 @@ mod tests {
         let service = PluginHostService::new(backend, config.clone());
         let session_id = establish(&service, &config).await;
         let (manifest_sha256, library_sha256) =
-            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                .expect("the fixture's identity");
+            crate::backend::artifact_digests(&artifact).expect("the fixture's identity");
         service
             .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
@@ -3778,8 +3791,7 @@ mod tests {
         // A load needs the identity the kernel approved, and the fixture is what
         // is loaded; activation is where the plugin's registrations appear.
         let (manifest_sha256, library_sha256) =
-            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                .expect("the fixture's identity");
+            crate::backend::artifact_digests(&artifact).expect("the fixture's identity");
         service
             .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
@@ -3886,8 +3898,7 @@ mod tests {
         .session_id;
 
         let (manifest_sha256, library_sha256) =
-            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                .expect("the fixture's identity");
+            crate::backend::artifact_digests(&artifact).expect("the fixture's identity");
         let load = service
             .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
@@ -4052,8 +4063,8 @@ mod tests {
             ],
         )
         .await;
-        let callbacks = crate::runtime_service::KernelCallbacks::new(
-            crate::runtime_service::connect_to_kernel(
+        let callbacks = nemo_relay_plugin_host::runtime_service::KernelCallbacks::new(
+            nemo_relay_plugin_host::runtime_service::connect_to_kernel(
                 &endpoint,
                 nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
             )
@@ -4065,8 +4076,7 @@ mod tests {
         let service = service.with_kernel_callbacks(callbacks);
 
         let (manifest_sha256, library_sha256) =
-            nemo_relay::plugin::dynamic::plugin_artifact_identity(&artifact)
-                .expect("the fixture's identity");
+            crate::backend::artifact_digests(&artifact).expect("the fixture's identity");
         service
             .load(capable(v1::LoadRequest {
                 session_id: session_id.clone(),
@@ -4252,8 +4262,8 @@ mod tests {
         session_id: &str,
         artifact: &str,
     ) -> PluginHostService {
-        let callbacks = crate::runtime_service::KernelCallbacks::new(
-            crate::runtime_service::connect_to_kernel(
+        let callbacks = nemo_relay_plugin_host::runtime_service::KernelCallbacks::new(
+            nemo_relay_plugin_host::runtime_service::connect_to_kernel(
                 endpoint,
                 nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
             )
@@ -4947,8 +4957,8 @@ mod tests {
         .await;
         // Kept for the test's lifetime, so the kernel's listener outlives the call.
         std::mem::forget(kernel);
-        let callbacks = crate::runtime_service::KernelCallbacks::new(
-            crate::runtime_service::connect_to_kernel(
+        let callbacks = nemo_relay_plugin_host::runtime_service::KernelCallbacks::new(
+            nemo_relay_plugin_host::runtime_service::connect_to_kernel(
                 &endpoint,
                 nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
             )

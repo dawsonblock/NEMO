@@ -11,6 +11,7 @@
 use chrono::Utc;
 use semver::{Comparator, Op, Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value as Json};
 use strum::{Display, IntoStaticStr};
 
 use crate::plugin::{
@@ -39,6 +40,31 @@ pub use manifest::*;
 pub use registry::*;
 #[cfg(feature = "worker-grpc")]
 pub use worker::*;
+
+/// One dynamic plugin component to load and activate in an embedding host.
+///
+/// This is the composition's input rather than either end's: a supervisor hands it
+/// to the process backend, and the in-process activation hands the same record to
+/// the loader. It lives in the kernel's control-plane vocabulary — beside
+/// [`DynamicPluginKind`], which it names — because that is what both ends already
+/// depend on, and because the crate the supervisor links must not be the crate that
+/// can load a library.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DynamicPluginActivationSpec {
+    /// Expected plugin identifier from the authored manifest.
+    pub plugin_id: String,
+    /// Plugin execution lane.
+    pub kind: DynamicPluginKind,
+    /// Path or reference to the authored `relay-plugin.toml`.
+    pub manifest_ref: String,
+    /// Relay-managed runtime environment used by Python workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_ref: Option<String>,
+    /// Component-local configuration passed to the dynamically loaded plugin.
+    #[serde(default)]
+    pub config: Map<String, Json>,
+}
 
 pub(super) fn deregister_tracked_registrations_checked(
     registrations: &mut Vec<(String, u64)>,

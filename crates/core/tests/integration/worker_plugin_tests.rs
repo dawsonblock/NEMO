@@ -27,6 +27,7 @@ use nemo_relay::observability::otel_logs::{OpenTelemetryLogConfig, OpenTelemetry
 use nemo_relay::observability::otel_metrics::{
     OpenTelemetryMetricConfig, OpenTelemetryMetricSubscriber,
 };
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use nemo_relay::plugin::dynamic::{
     DynamicPluginKind, WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins,
 };
@@ -34,7 +35,7 @@ use nemo_relay::plugin::{
     PluginComponentSpec, PluginConfig, clear_plugin_configuration, initialize_plugins_exact,
     list_plugin_kinds,
 };
-use nemo_relay_native_loader::{DynamicPluginActivationSpec, PluginHostActivation};
+use nemo_relay_native_loader::PluginHostActivation;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
 use serde_json::{Map, Value as Json, json};

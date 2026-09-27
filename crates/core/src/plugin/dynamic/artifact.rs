@@ -13,9 +13,17 @@
 //! loader next to it is the half that knows about `dlopen`, symbol tables and the
 //! native ABI, and the two are being separated so that the loader can leave the
 //! kernel's dependency graph without taking the kernel's own questions with it.
+//!
+//! Approval lives here too, and that placement is a decision rather than a
+//! convenience: what a load is allowed to open is a decision about the artifact
+//! rather than about loading it, so the composition that supervises a host makes it
+//! here and the loader consumes the result. A verifier that lived with the loader
+//! would be able to approve what it later opened, which is the thing the approval
+//! exists to prevent.
 
 use std::path::{Path, PathBuf};
 
+use nemo_relay_plugin_protocol::PluginArtifactIdentity;
 use sha2::{Digest, Sha256};
 
 use super::DYNAMIC_PLUGIN_MANIFEST_FILENAME;
@@ -185,5 +193,57 @@ mod tests {
         assert_eq!(hex_digest([0x00, 0xab, 0xff]), "00abff");
         assert_eq!(hex_digest([0x0f]), "0f");
         assert_eq!(hex_digest(Sha256::digest(b"")), sha256_hex(b""));
+    }
+}
+
+/// An artifact whose bytes this side has approved.
+///
+/// The loader takes one of these rather than a reference plus a pair of digests
+/// it may or may not have: what a load is allowed to open is decided by hashing
+/// the artifact, and this value is where that decision lives. Approving is the
+/// only way to make one, and the production load accepts nothing weaker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPluginArtifact {
+    identity: PluginArtifactIdentity,
+}
+
+impl ApprovedPluginArtifact {
+    /// Approve the artifact at `manifest_ref` by hashing it now.
+    pub fn approve(manifest_ref: &str) -> crate::plugin::Result<Self> {
+        let (manifest_sha256, library_sha256) = plugin_artifact_identity(manifest_ref)?;
+        Ok(Self {
+            identity: PluginArtifactIdentity {
+                manifest_sha256,
+                library_sha256,
+            },
+        })
+    }
+
+    /// Record an approval that was made elsewhere and travelled here.
+    ///
+    /// Recording is not trusting: the loader still confirms these digests
+    /// against the bytes of the manifest and of an open handle to the library
+    /// immediately before either is used, so an approval that does not describe
+    /// this artifact is a refused load rather than a load without a guarantee.
+    pub fn from_identity(identity: PluginArtifactIdentity) -> Self {
+        Self { identity }
+    }
+
+    /// What was approved.
+    pub fn identity(&self) -> &PluginArtifactIdentity {
+        &self.identity
+    }
+
+    /// The approved digests as the pair a load request carries them in.
+    ///
+    /// The boundary carries two fields rather than this struct, because the wire
+    /// contract is older than the approval type; a caller that has to fill them in
+    /// should not have to know which order they go in.
+    #[must_use]
+    pub fn digests(&self) -> (String, String) {
+        (
+            self.identity.manifest_sha256.clone(),
+            self.identity.library_sha256.clone(),
+        )
     }
 }

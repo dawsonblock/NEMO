@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use nemo_relay_plugin_host::conformance::LifecycleFixture;
+use nemo_relay_native_loader::conformance::LifecycleFixture;
 
 /// A fixture library, and the manifest written to describe it.
 ///

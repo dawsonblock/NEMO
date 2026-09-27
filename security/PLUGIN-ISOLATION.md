@@ -17,16 +17,17 @@ section was written):
   child in each direction resolving the call's codec through the kernel. Every attachment
   point the ABI exposes is served, and the match that installs proxies is exhaustive: a
   class added to the ABI fails to compile there rather than being refused at runtime.
-- **Kernel-process unsafe tokens: 27**, measured by `just tcb-report` — down from
+- **Kernel-process unsafe tokens: 26**, measured by `just tcb-report` — down from
   648 when the loader, the SDK and the ABI left the kernel's process. The loader's
   288 tokens are budgeted on the host side now, at 288, and the two numbers are
   recorded rather than one being inferred from the other.
-- **The kernel library reaches no loader at all.** `just tcb-report` checks the
-  property rather than the progress: the closure of `nemo-relay` alone intersects
+- **No root reaches the loader at all.** `just tcb-report` checks the property
+  rather than the progress, for the kernel library and for the composition surfaces
+  together: the closure of `{nemo-relay, nemo-relay-cli, nemo-relay-ffi}` intersects
   `{libloading, nemo-relay-native-loader, nemo-relay-native-abi, nemo-relay-plugin}`
-  in **nothing**, and any reach is a failure. The composition surfaces (the CLI and
-  the FFI) still reach the loader through `plugin-host`, which is the remaining
-  step rather than a leak — the child's own end has to become its own crate.
+  in **nothing**, and any reach is a failure. The child's own end is the loader
+  crate's now, so the supervisor's crate does not link it and a binary that runs the
+  kernel cannot open a library.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/native-abi`,
   re-exported by `crates/plugin` so every author-facing path is unchanged).
 - **Plugin compatibility:** the CLI, FFI, Python and Node serve plugins from
@@ -34,9 +35,9 @@ section was written):
   and that is pinned by the architecture test (`INDIRECT_LOAD_CALLERS` in
   `crates/plugin-host/tests/architecture.rs`) rather than recorded only here: the
   list is empty, and it stays in the test so the next consumer to reach for that
-  route fails the check instead of being grandfathered by a missing one. The
-  loader is still linked into the kernel until it moves, which is why the unsafe
-  count above has not moved with it.
+  route fails the check instead of being grandfathered by a missing one. The loader
+  is not linked into the kernel any more, which is why the unsafe count below is a
+  twenty-sixth of what it was.
 - **Claims: 28 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
@@ -44,13 +45,15 @@ section was written):
   gate red, so a sentence here cannot go on describing something nothing checks.
   The one that is asserted rather than enforced is named there, with why.
 
-What is left of the kernel's `unsafe` is nothing to do with loading: the loader's
-280 occurrences, the SDK's 220 and the ABI's 113 all live outside the kernel's
-process now, which is what the number below is measuring. `just tcb-report` prints
-the figure this milestone is judged on:
+What is left of the kernel's `unsafe` is nothing to do with loading. The loader's
+288 occurrences — the ABI adapter's signatures and witnesses — and the SDK's 220 and
+the ABI's 113 all live outside the kernel's process now, and `security/tcb.toml`
+records each of them where they are rather than restating them here, which is what a
+paragraph cannot be trusted to do. `just tcb-report` prints the figure this milestone
+is judged on:
 
 ```
-kernel-process unsafe tokens: 27
+kernel-process unsafe tokens: 26
 ```
 
 `just tcb-report` checks that figure against the measurement rather than
@@ -2798,58 +2801,41 @@ there is something to dispatch to.
    registry directly — a test of the kernel's obligation, which now says so in the
    crate whose obligation it is.
 4. The child endpoint crate: the host's own end of the protocol, depending on
-   `native-loader` and the wire crates.
-   *Remaining, and it is what the composition ratchet is waiting on.* The module
-   inventory is measured rather than guessed, because the two ends are interleaved
-   in one crate today and the split is a decision about which shared bookkeeping
-   belongs to whom:
-
-   | Role | Modules |
-   |---|---|
-   | child-only | `service`, `session_channel`, `confidentiality`, `conformance`, the `nemo-plugin-host` binary, and the in-process backend in `lib.rs` |
-   | supervisor-only | `attached`, `host_location`, `limits`, `observer` |
-   | shared by both | `capability`, `codec_capability`, `codec_context`, `continuations`, `operation_scopes`, `runtime_service`, `session`, `session_driver`, `off_path`, `supervisor`, `activation` |
-
-   The shared column is why this is a design step: ten of twenty-one modules are
-   reached from both ends, so a child crate either depends on `plugin-host` for them
-   — which is fine, the dependency direction allows it — or they move to a third
-   crate that both depend on, which is a decision about what "inert shared
-   vocabulary" means here that this document should not make by accident.
-
-   Two decisions have to be made before the move, and both are already implied by
-   what the seam and the artifact vocabulary are:
-
-   - **`DynamicPluginActivationSpec`** is the composition's *input* — a plugin id, a
-     kind, a manifest reference, an environment and a config map — and it is
-     currently in `native-loader`, which is what keeps `plugin-host`'s composition
-     depending on the loader. It belongs with the control-plane vocabulary the
-     kernel already publishes (`DynamicPluginKind` and its neighbours), and moving it
-     there is what lets the composition stop naming the loader.
-   - **Approval is a kernel operation, not a loader one.** The composition's only
-     other use of the loader is `NativePluginLoadSpec::approved(...)`, which hashes a
-     manifest before a host process starts. That is the artifact verifier the
-     definition of done already assigns to the kernel: it should be
-     `ApprovedPluginArtifact` in `plugin/dynamic/artifact.rs`, produced by the kernel
-     and *consumed* by the loader, with the approval travelling to the child as the
-     protocol's `PluginArtifactIdentity`, which is what it already travels as.
-
-   With those two moved, `plugin-host` has no edge to the loader at all, the child
-   binary moves to its own crate, and both `[kernel_closure]`'s recorded set and the
-   release binary's loader symbols become empty — at which point the symbol check
-   stops being a measurement and becomes the second property.
+   `native-loader` and the wire crates. *Done, by a different arrangement than the
+   one this step first described.* The inventory above is what decided it: ten of
+   twenty-one modules are shared, so the child's end does not want a crate of its
+   own — it wants the loader's. `native-loader` now carries the child backend, the
+   service the child serves, the child conformance suite and the `nemo-plugin-host`
+   binary, and depends on `plugin-host` for the shared session, codec, capability
+   and continuation bookkeeping. The direction is the one that matters: the
+   supervisor's crate does not depend on the loader, so nothing the CLI, the FFI,
+   Python or Node link can open a library.
 5. Move the in-process child implementation out of the crate the supervisor links.
-   *Remaining.* The in-process backend still lives in `plugin-host`, so the CLI and
-   the FFI reach the loader transitively through it; that is the whole of the
-   difference between the kernel library's closure, which is clean, and the
-   composition roots', which is not.
-6. The supervisor depends only on protocol, process and session layers.
+   *Done.* The backend, the service and the binary left `plugin-host`; what stayed
+   is the supervisor, the proxies, the composition and the shared modules. Two
+   smaller moves made the edge severable rather than merely moved:
+   `DynamicPluginActivationSpec` is in the kernel's control-plane vocabulary now
+   (beside `DynamicPluginKind`, which both ends already depend on), and approval is
+   the kernel's artifact verifier — `ApprovedPluginArtifact` in
+   `plugin/dynamic/artifact.rs`, produced by the composition and *consumed* by the
+   loader. A verifier that lived with the loader would be able to approve what it
+   later opened.
+6. The supervisor depends only on protocol, process and session layers. *Done:*
+   `plugin-host`'s dependencies are the kernel, the two wire crates and its own
+   infrastructure — the plugin SDK and the ABI left with the child.
 7. Remove the native loader path from `core`. *Done.* `core` names neither
    `libloading` nor the ABI nor the SDK; `plugin/dynamic/native.rs` and `host.rs`
    are gone from it, and the architecture test's grandfathered paths now name
    `native-loader` instead of `core`.
-8. Add the two proofs below.
+8. Add the two proofs below. *The dependency half is done and is a property now;
+   the symbol half is a measurement until a release build of the affected binary
+   can be taken with the tree in this state.*
 9. Delete the transitional re-exports, rather than leaving aliases that make the old
-   architecture look dead while an accidental dependency path survives.
+   architecture look dead while an accidental dependency path survives. *Done for
+   the two that existed:* `DynamicPluginTeardownOutcome` is gone (the control plane
+   spells `RegistrationTeardown`), and the ABI's re-export through the SDK is not
+   transitional — it is how one dependency serves an author, and it is documented as
+   that rather than as a compatibility shim.
 
 Two traps are named here because the split is where they would be walked into. There
 is no `plugin-common` crate: the shared layer is inert wire material — messages,
@@ -2886,12 +2872,17 @@ that loads plugins was carrying the crate plugins are written with. It depends o
 `nemo-relay-native-abi` now, and that is a change the dependency graph can check even
 though a symbol gate cannot yet be recorded honestly here.
 
-That is why the symbol check is a *measurement* rather than a gate in this revision,
-and the distinction is deliberate: the artifact is not clean yet, and a gate whose
-recorded baseline was taken before the last dependency change would be a number
-nobody re-measured — the failure mode this repository has already caught twice in
-its budget files. The gate lands with the child endpoint crate, when the expected
-sets are empty and the check is the property rather than a ratchet.
+The audit that produced these numbers found the SDK's 829 symbols, and the fix for
+that is in the tree: the loader depends on the ABI crate rather than the authoring
+SDK. What the numbers also showed is why the check was a measurement rather than a
+gate at that revision: the artifact still contained loader symbols, and a recorded
+baseline taken before the last dependency change would have been a number nobody
+re-measured — the failure mode this repository has caught twice in its budget files.
+
+That has changed with the child's move: the composition surfaces no longer reach the
+loader at all, so a release build of the CLI should now contain none of these. The
+next measurement is the gate's baseline, and it is taken with the tree in the state
+the dependency proof describes rather than in the state that had the defect.
 
 They answer different questions, and neither substitutes for the other.
 

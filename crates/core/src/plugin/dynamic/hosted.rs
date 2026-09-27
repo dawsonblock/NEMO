@@ -250,15 +250,6 @@ impl NativeHostRuntime {
         super::artifact::sha256_hex(bytes)
     }
 
-    /// The digests that name an artifact: its manifest and the library it names.
-    ///
-    /// One operation rather than two hashes, because an approval is a statement
-    /// about the pair: a manifest from one artifact and a library from another are
-    /// not an artifact anybody approved.
-    pub fn artifact_identity(&self, manifest_ref: &str) -> Result<(String, String)> {
-        super::artifact::plugin_artifact_identity(manifest_ref)
-    }
-
     /// The digest that names the bytes an open handle yields.
     ///
     /// A handle rather than a path, so the digest describes the instance that
