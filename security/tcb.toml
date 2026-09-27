@@ -329,11 +329,21 @@ transitive_dependency_digest = "1e5116e90ef0d74d6165fdbe239ac51fa536f8375be84749
 # is why this budget and its dependency set each lost the vocabulary without losing
 # any author-facing path. The plugin still carries the loader's ABI tables, so this
 # crate has not finished shrinking — the loader-removal milestone takes the rest.
+#
+# It moved down again, and by much more, when the tables followed the vocabulary:
+# the boundary structs, the callback signatures and the four versioned host tables
+# are the ABI crate's now, and this crate is what is left — the authoring SDK, the
+# typed trampolines, the scope and stream helpers and the export macros. The lines and
+# the textual `unsafe` tokens left together, because the tokens are the `extern "C"`
+# signatures and the `Send`/`Sync` witnesses that went with the types they belong to,
+# and the in-process total is unchanged at 648 — which is the check that nothing was
+# added or dropped on the way. No dependency moved: this crate already depended on the
+# ABI crate to re-export it.
 [limits.nemo-relay-plugin]
 max_direct_dependencies = 7
 max_transitive_packages = 40
-max_source_lines = 5417
-max_unsafe_occurrences = 333
+max_source_lines = 4234
+max_unsafe_occurrences = 220
 direct_dependency_digest = "7de9d3583263ba7f84f34797f12b247213d86407ab02b9287421ba466a86e169"
 transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a2825962a3c0607e938696"
 
@@ -345,16 +355,21 @@ transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a28259
 # milestone that moves the ABI across the boundary shows up as this crate leaving
 # the policy rather than as one number inside another.
 #
-# The budgets are zero for reach rather than merely low: the crate is revision
-# constants and one status enum, so a dependency, a second file, or an `unsafe`
-# token appearing here is a change to what the ABI *is*, not to how much of it
-# there happens to be. Both digests are the SHA-256 of the empty string, which is
-# what "no direct dependencies" and "no transitive packages" hash to.
+# Reach is the budget that stays at zero, and it is the point: the crate holds the
+# revision constants, the status codes, the opaque handles, the boundary structs and
+# the versioned host tables, and none of that may need anything else. A dependency
+# appearing here is a change to what the ABI *is* — the frozen table would stop being
+# freezable — which is why the mapping from the runtime's scope categories to the
+# ABI's discriminator lives in the SDK as a function rather than here as a `From`
+# impl. Both digests are the SHA-256 of the empty string, which is what "no direct
+# dependencies" and "no transitive packages" hash to. The `unsafe` budget is the
+# declarations themselves: `unsafe extern "C" fn` signatures and the `Send`/`Sync`
+# witnesses for the tables, counted textually as they are everywhere else.
 [limits.nemo-relay-native-abi]
 max_direct_dependencies = 0
 max_transitive_packages = 0
-max_source_lines = 67
-max_unsafe_occurrences = 0
+max_source_lines = 1282
+max_unsafe_occurrences = 113
 direct_dependency_digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 transitive_dependency_digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -734,7 +749,7 @@ must_fall_by = "loader-removal"
 [[temporary]]
 crate = "nemo-relay-plugin"
 field = "max_source_lines"
-raised_to = 5417
+raised_to = 4234
 target = 0
 reason = "the ABI crate is in the kernel's process only while the loader is"
 introduced = "2514f27..eb975ae"

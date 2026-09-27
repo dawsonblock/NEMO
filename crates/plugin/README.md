@@ -16,9 +16,16 @@ SPDX-License-Identifier: Apache-2.0
 
 # NeMo Relay Native Plugin SDK
 
-`nemo-relay-plugin` is the Rust authoring SDK and stable ABI for trusted,
-in-process NeMo Relay dynamic plugins. Use it to build a Rust `cdylib` that
-Relay loads through the versioned native plugin interface.
+`nemo-relay-plugin` is the Rust authoring SDK for trusted, in-process NeMo Relay
+dynamic plugins. Use it to build a Rust `cdylib` that Relay loads through the
+versioned native plugin interface.
+
+The ABI itself — the versioned host tables, the boundary structs, the callback
+signatures and the revision vocabulary — lives in `nemo-relay-native-abi` and is
+re-exported here in full, so one dependency still gives an author the whole
+surface. The split exists because a table inside the crate that implements its host
+side cannot be frozen independently of that code, and a frozen table is what an
+already-built plugin depends on.
 
 Native plugins run in the Relay process and are not sandboxed. They should
 depend on this crate rather than the host `nemo-relay` runtime crate, keeping

@@ -45,7 +45,7 @@ use nemo_relay_plugin::{
     NemoRelayNativeString, NemoRelayNativeToolConditionalCb, NemoRelayNativeToolExecutionCb,
     NemoRelayNativeToolJsonCb, NemoRelayNativeWithScopeStackCb, NemoRelayStatus, PendingMarkSpec,
     PluginContext, PluginRuntime, ScopeType, ToolExecutionInterceptOutcome, ToolExecutionResult,
-    ToolNext,
+    ToolNext, native_scope_type,
 };
 use serde_json::{Map, json};
 
@@ -3520,17 +3520,17 @@ fn scope_guard_drops_unclosed_scope_and_maps_scope_types() {
 
     assert_eq!(
         [
-            NemoRelayNativeScopeType::from(ScopeType::Agent),
-            NemoRelayNativeScopeType::from(ScopeType::Function),
-            NemoRelayNativeScopeType::from(ScopeType::Tool),
-            NemoRelayNativeScopeType::from(ScopeType::Llm),
-            NemoRelayNativeScopeType::from(ScopeType::Retriever),
-            NemoRelayNativeScopeType::from(ScopeType::Embedder),
-            NemoRelayNativeScopeType::from(ScopeType::Reranker),
-            NemoRelayNativeScopeType::from(ScopeType::Guardrail),
-            NemoRelayNativeScopeType::from(ScopeType::Evaluator),
-            NemoRelayNativeScopeType::from(ScopeType::Custom),
-            NemoRelayNativeScopeType::from(ScopeType::Unknown),
+            native_scope_type(ScopeType::Agent),
+            native_scope_type(ScopeType::Function),
+            native_scope_type(ScopeType::Tool),
+            native_scope_type(ScopeType::Llm),
+            native_scope_type(ScopeType::Retriever),
+            native_scope_type(ScopeType::Embedder),
+            native_scope_type(ScopeType::Reranker),
+            native_scope_type(ScopeType::Guardrail),
+            native_scope_type(ScopeType::Evaluator),
+            native_scope_type(ScopeType::Custom),
+            native_scope_type(ScopeType::Unknown),
         ],
         [
             NemoRelayNativeScopeType::Agent,

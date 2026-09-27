@@ -36,9 +36,10 @@ section was written):
   The one that is asserted rather than enforced is named there, with why.
 
 Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
-in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
-`nemo-relay-plugin`. Together that is roughly 96% of the measured in-process
-surface, and `just tcb-report` prints the number this milestone is judged on:
+in `crates/core/src/plugin/dynamic/native.rs`, 220 in `nemo-relay-plugin` and
+113 in `nemo-relay-native-abi`. Together that is roughly 95% of the measured
+in-process surface, and `just tcb-report` prints the number this milestone is
+judged on:
 
 ```
 kernel-process unsafe tokens: 648
@@ -2666,17 +2667,22 @@ remembering not to use it.
   plugin's code may ask this runtime to do. It is described below, because the
   mapping is the design.
 - **The ABI has a crate of its own** (`crates/native-abi`, `nemo-relay-native-abi`).
-  It holds the revision constants and the status codes both sides report, and
-  `crates/plugin` re-exports them, so an author's existing
+  It holds the versioned host tables, the boundary structs, the `extern "C"`
+  callback signatures, the revision constants and the status codes both sides
+  report, and `crates/plugin` re-exports all of it, so an author's existing
   `nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION` and
   `nemo_relay_plugin::NemoRelayStatus` still resolve where they always did. The
   point is not the size of the crate but the seam it creates: a table that lives
   inside the crate that also *implements* the host side cannot be frozen
   independently of the implementation, and a frozen table is what an
-  already-built plugin depends on. What has not moved yet is the versioned host
-  tables and boundary structs; they are entangled with SDK code in the same file
-  and need the loader's own seam before they can cross, which is why they are the
-  remainder of this step rather than a second commit's worth of moves.
+  already-built plugin depends on. It depends on nothing, and that is the property
+  the extraction was for rather than a coincidence: it is what makes the table
+  freezable. One conversion could not cross — the mapping from the runtime's
+  `ScopeType` to the ABI's `NemoRelayNativeScopeType` — because an implementation
+  of a foreign trait for the ABI's enum has to live in the crate that defines the
+  enum, which would have meant this crate depending on the runtime model it exists
+  to stay independent of. It is a function in the SDK now, in the same shape the
+  host side already used in the other direction.
 - **The launch decision has its own module** (`plugin-host:host_location.rs`), so
   the rule about *which* host to start and under what identity is one thing to read
   and one thing to move.
@@ -2760,11 +2766,19 @@ there is something to dispatch to.
    and the loader names no kernel item outside it. This step is first because it
    is the one that answers what the crate edge will carry; extracting code without
    it produces a green commit that is still blocked in the same place.
-2. `native-abi`: ABI definitions and compatibility validation only. *In progress:*
-   the crate exists with the revision vocabulary and status codes, the SDK
-   re-exports it, and the layer and TCB policies name it; the versioned tables and
-   the compatibility validators are the rest of this step. This is now mechanical
-   rather than exploratory, which is what the seam bought.
+2. `native-abi`: ABI definitions and compatibility validation only. *Done.* The
+   crate holds the layout — the opaque handles, the boundary structs, the callback
+   signatures, the four versioned host tables and the revision and status
+   vocabulary — and depends on nothing, which is what makes the tables freezable.
+   The move took the `unsafe` tokens of the declarations with it and left the
+   in-process total exactly where it was, which is the check that nothing was added
+   or dropped on the way. What remains of "compatibility validation" is a
+   follow-on rather than a gap: what this crate carries is the vocabulary a
+   compatibility check compares against — the revisions and the frozen tables — and
+   the checks themselves stay where they are, in the host's entry negotiation for
+   the plugin's declared revision and in the protocol crate for the host build
+   identity, which deliberately declares its own ceiling rather than importing one,
+   because a shared constant is not a check.
 3. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
    extraction.
 4. The child endpoint crate: the host's own end of the protocol, depending on
