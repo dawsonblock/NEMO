@@ -2834,8 +2834,26 @@ number moves when the loader leaves `core`, and nothing else has to move first.
 re-export while callers catch up, but the loader cannot: `core` re-exporting
 `native-loader` while `native-loader` depends on `core` is a cycle, and Cargo refuses
 it. The commit that moves `native.rs` and `host.rs` has to repoint every caller at
-once. That list is short and now known: `plugin-host`'s in-process host (the child's
-end), four test files under `crates/core/tests`, and two examples.
+once, and the list was re-measured rather than remembered when the ABI crate landed:
+
+- `crates/plugin-host/src/lib.rs` — the in-process backend, which is the child's own
+  end and becomes a consumer of `native-loader` rather than of the kernel's
+  re-export. This is the edge the architecture test names as the one that has to
+  move for the kernel to stop linking the loader.
+- `crates/plugin-host/src/activation.rs` — the shared composition, which names
+  `NativePluginLoadSpec` and the approved-artifact type.
+- `crates/plugin-host/tests/architecture.rs` — `LOAD_CALL_PATHS` and `LOADER_CRATES`
+  both say `core` today; a second crate in `LOADER_CRATES` is the decision that test
+  exists to force, and moving the loader is that decision made.
+- five files under `crates/core/tests` — the loader's own integration and unit
+  suites, the dynamic-host suite, the builtin-ownership suite and the worker suite.
+  Those are tests of the loader and of the composition; when the code moves they
+  move with it or become black-box tests of it.
+- `examples/rust-native-plugin/tests/lifecycle.rs` and
+  `examples/rust-grpc-worker-plugin/tests/lifecycle.rs` — still the only
+  non-test consumer of the kernel's `PluginHostActivation` left. Python is not one:
+  its `_PluginHostActivation` wraps `nemo_relay_plugin_host::activation`, which is
+  the composition that the process backend already uses.
 
 **The reachability metric counts what the artifact links.** `cargo tree` includes
 dev-dependencies by default, and a dev-dependency is not in the binary — counting it
