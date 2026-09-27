@@ -59,6 +59,15 @@ pub enum CodecRefusal {
     WrongCodecKind,
     /// The reference was issued for another codec of the same kind.
     WrongCodecIdentity,
+    /// The invocation the reference was issued for had run out of time.
+    ///
+    /// Kept apart from the other four because it is the one refusal that says
+    /// nothing is wrong with the call: the capability is this invocation's, for
+    /// this direction and this codec, and the invocation's deadline has passed
+    /// anyway. A codec call is part of the call that asked for it, so work it
+    /// starts after that call's deadline is work the caller has stopped waiting
+    /// for.
+    DeadlineExpired,
 }
 
 impl CodecRefusal {
@@ -70,6 +79,7 @@ impl CodecRefusal {
             Self::WrongDirection => "codec_capability_wrong_direction",
             Self::WrongCodecKind => "codec_capability_wrong_kind",
             Self::WrongCodecIdentity => "codec_capability_wrong_identity",
+            Self::DeadlineExpired => "codec_capability_deadline_expired",
         }
     }
 }
@@ -85,6 +95,13 @@ struct IssuedCodec {
     direction: CodecDirection,
     identity: LlmCodecIdentity,
     codec: CodecHandle,
+    /// When the invocation this capability belongs to runs out of time.
+    ///
+    /// Recorded here rather than read from a request for two reasons: the
+    /// deadline is the kernel's, so a plugin cannot extend it by asking; and the
+    /// capability is already the record of "what this invocation may do", which
+    /// is the same question "for how long" answers.
+    deadline_unix_ms: u64,
 }
 
 /// The codec an issued capability authorizes.
@@ -162,12 +179,14 @@ impl CodecCapabilities {
         self: &Arc<Self>,
         operation: impl Into<String>,
         codec: Arc<dyn LlmCodec>,
+        deadline_unix_ms: u64,
     ) -> (CodecRef, CodecCapabilityGuard) {
         self.issue(
             operation,
             CodecDirection::Request,
             codec.codec_identity(),
             CodecHandle::Request(codec),
+            deadline_unix_ms,
         )
     }
 
@@ -176,12 +195,14 @@ impl CodecCapabilities {
         self: &Arc<Self>,
         operation: impl Into<String>,
         codec: Arc<dyn LlmResponseCodec>,
+        deadline_unix_ms: u64,
     ) -> (CodecRef, CodecCapabilityGuard) {
         self.issue(
             operation,
             CodecDirection::Response,
             codec.codec_identity(),
             CodecHandle::Response(codec),
+            deadline_unix_ms,
         )
     }
 
@@ -191,6 +212,7 @@ impl CodecCapabilities {
         direction: CodecDirection,
         identity: LlmCodecIdentity,
         codec: CodecHandle,
+        deadline_unix_ms: u64,
     ) -> (CodecRef, CodecCapabilityGuard) {
         debug_assert_eq!(codec.direction(), direction);
         let reference = CodecRef::issue();
@@ -201,6 +223,7 @@ impl CodecCapabilities {
                 direction,
                 identity,
                 codec,
+                deadline_unix_ms,
             },
         );
         (
@@ -227,6 +250,7 @@ impl CodecCapabilities {
         operation: &str,
         direction: CodecDirection,
         expected: &LlmCodecIdentity,
+        now_unix_ms: u64,
     ) -> Result<CodecHandle, CodecRefusal> {
         let issued = self.issued();
         let Some(capability) = issued.get(reference.as_str()) else {
@@ -243,6 +267,12 @@ impl CodecCapabilities {
         }
         if capability.identity != *expected {
             return Err(CodecRefusal::WrongCodecIdentity);
+        }
+        // Last, because it is the only check that is about time rather than about
+        // identity: a caller that asked for the wrong codec is told that, and only
+        // a caller asking correctly is told the invocation has run out of time.
+        if nemo_relay_plugin_protocol::deadline_expired(capability.deadline_unix_ms, now_unix_ms) {
+            return Err(CodecRefusal::DeadlineExpired);
         }
         Ok(capability.codec.clone())
     }
@@ -307,6 +337,18 @@ mod tests {
     use nemo_relay::json::Json;
     use nemo_relay_plugin_protocol::BuiltinLlmCodec;
 
+    /// A deadline no test here outlives, so that the check under test is the one
+    /// the test is about. The deadline check has its own test, below, which does
+    /// not use this.
+    const LIVE: u64 = u64::MAX;
+
+    /// The instant the identity checks are made at.
+    ///
+    /// Stated rather than read from the clock, so that these stay tests about
+    /// identity: the deadline check is a test of its own, below, with instants of
+    /// its own.
+    const NOT_YET: u64 = 0;
+
     /// A request codec that answers with a fixed identity, so a test can tell which codec
     /// a capability resolves to without a provider.
     struct TestCodec {
@@ -368,7 +410,7 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat);
         let (reference, guard) =
-            store.issue_request("operation-1", request_codec(identity.clone()));
+            store.issue_request("operation-1", request_codec(identity.clone()), LIVE);
 
         let resolved = store
             .resolve(
@@ -376,6 +418,7 @@ mod tests {
                 "operation-1",
                 CodecDirection::Request,
                 &identity,
+                NOT_YET,
             )
             .expect("the capability it was issued for");
         assert_eq!(
@@ -390,7 +433,8 @@ mod tests {
                     &reference,
                     "operation-1",
                     CodecDirection::Request,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .is_ok()
         );
@@ -417,22 +461,36 @@ mod tests {
                     &never_issued,
                     "operation-1",
                     CodecDirection::Request,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .expect_err("nothing issued that"),
             CodecRefusal::Unknown
         );
 
-        let (finished, guard) = store.issue_request("operation-1", request_codec(identity.clone()));
+        let (finished, guard) =
+            store.issue_request("operation-1", request_codec(identity.clone()), LIVE);
         assert!(
             store
-                .resolve(&finished, "operation-1", CodecDirection::Request, &identity)
+                .resolve(
+                    &finished,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity,
+                    NOT_YET
+                )
                 .is_ok()
         );
         drop(guard);
         assert_eq!(
             store
-                .resolve(&finished, "operation-1", CodecDirection::Request, &identity)
+                .resolve(
+                    &finished,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity,
+                    NOT_YET
+                )
                 .expect_err("the invocation is over"),
             CodecRefusal::Unknown,
             "a capability does not outlive the invocation that held it"
@@ -446,7 +504,7 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::Runtime("runtime-chat".into());
         let (capability_a, guard_a) =
-            store.issue_request("operation-a", request_codec(identity.clone()));
+            store.issue_request("operation-a", request_codec(identity.clone()), LIVE);
 
         // Operation A has not finished, and B still cannot borrow its capability.
         assert_eq!(
@@ -455,7 +513,8 @@ mod tests {
                     &capability_a,
                     "operation-b",
                     CodecDirection::Request,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .expect_err("another call's capability"),
             CodecRefusal::WrongOperation
@@ -469,7 +528,8 @@ mod tests {
                     &capability_a,
                     "operation-b",
                     CodecDirection::Request,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .expect_err("the call that held it is over"),
             CodecRefusal::Unknown
@@ -478,14 +538,15 @@ mod tests {
         // Even handed the reference deliberately, B refuses it: this is the check that
         // makes it a capability rather than a token both calls can spend.
         let (capability_b, _guard_b) =
-            store.issue_request("operation-b", request_codec(identity.clone()));
+            store.issue_request("operation-b", request_codec(identity.clone()), LIVE);
         assert!(
             store
                 .resolve(
                     &capability_b,
                     "operation-b",
                     CodecDirection::Request,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .is_ok()
         );
@@ -499,9 +560,9 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages);
         let (capability_a, _guard_a) =
-            store.issue_request("operation-a", request_codec(identity.clone()));
+            store.issue_request("operation-a", request_codec(identity.clone()), LIVE);
         let (capability_b, _guard_b) =
-            store.issue_request("operation-b", request_codec(identity.clone()));
+            store.issue_request("operation-b", request_codec(identity.clone()), LIVE);
 
         let first = {
             let store = Arc::clone(&store);
@@ -515,7 +576,8 @@ mod tests {
                             &capability_a,
                             "operation-a",
                             CodecDirection::Request,
-                            &identity
+                            &identity,
+                            NOT_YET
                         )
                         .is_ok()
                 );
@@ -525,7 +587,8 @@ mod tests {
                             &capability_b,
                             "operation-a",
                             CodecDirection::Request,
-                            &identity
+                            &identity,
+                            NOT_YET
                         )
                         .expect_err("B's capability in A's call"),
                     CodecRefusal::WrongOperation
@@ -544,7 +607,8 @@ mod tests {
                             &capability_b,
                             "operation-b",
                             CodecDirection::Request,
-                            &identity
+                            &identity,
+                            NOT_YET
                         )
                         .is_ok()
                 );
@@ -554,7 +618,8 @@ mod tests {
                             &capability_a,
                             "operation-b",
                             CodecDirection::Request,
-                            &identity
+                            &identity,
+                            NOT_YET
                         )
                         .expect_err("A's capability in B's call"),
                     CodecRefusal::WrongOperation
@@ -572,7 +637,7 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiResponses);
         let (reference, _guard) =
-            store.issue_response("operation-1", response_codec(identity.clone()));
+            store.issue_response("operation-1", response_codec(identity.clone()), LIVE);
 
         assert_eq!(
             store
@@ -580,7 +645,8 @@ mod tests {
                     &reference,
                     "operation-1",
                     CodecDirection::Request,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .expect_err("a response capability"),
             CodecRefusal::WrongDirection
@@ -591,9 +657,64 @@ mod tests {
                     &reference,
                     "operation-1",
                     CodecDirection::Response,
-                    &identity
+                    &identity,
+                    NOT_YET
                 )
                 .is_ok()
+        );
+    }
+
+    /// A capability belongs to an invocation, and an invocation has a deadline. A
+    /// codec call that arrives after it is refused by name rather than served: the
+    /// work would belong to a call the kernel has stopped waiting for, and that is
+    /// a different fact from "this reference is not yours".
+    ///
+    /// The deadline is inclusive, because at the deadline there is no time left:
+    /// the call is refused rather than started and abandoned.
+    #[test]
+    fn a_capability_for_an_invocation_that_ran_out_of_time_is_refused() {
+        let store = store();
+        let identity = LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat);
+        let deadline = 1_000_u64;
+        let (reference, _guard) =
+            store.issue_request("operation-1", request_codec(identity.clone()), deadline);
+
+        assert!(
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity,
+                    deadline - 1,
+                )
+                .is_ok(),
+            "before the deadline the capability is what it always was"
+        );
+        assert_eq!(
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity,
+                    deadline,
+                )
+                .err(),
+            Some(CodecRefusal::DeadlineExpired),
+            "at the deadline there is no time left"
+        );
+        assert_eq!(
+            store
+                .resolve(
+                    &reference,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity,
+                    deadline + 1,
+                )
+                .err(),
+            Some(CodecRefusal::DeadlineExpired)
         );
     }
 
@@ -605,6 +726,7 @@ mod tests {
         let (reference, _guard) = store.issue_request(
             "operation-1",
             request_codec(LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat)),
+            LIVE,
         );
 
         assert_eq!(
@@ -613,7 +735,8 @@ mod tests {
                     &reference,
                     "operation-1",
                     CodecDirection::Request,
-                    &LlmCodecIdentity::Runtime("runtime-chat".into())
+                    &LlmCodecIdentity::Runtime("runtime-chat".into()),
+                    NOT_YET
                 )
                 .expect_err("a reference for a built-in is not one for a runtime codec"),
             CodecRefusal::WrongCodecKind
@@ -624,7 +747,8 @@ mod tests {
                     &reference,
                     "operation-1",
                     CodecDirection::Request,
-                    &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages)
+                    &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages),
+                    NOT_YET
                 )
                 .expect_err("a different codec of the same kind"),
             CodecRefusal::WrongCodecIdentity
@@ -635,7 +759,8 @@ mod tests {
                     &reference,
                     "operation-1",
                     CodecDirection::Request,
-                    &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat)
+                    &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+                    NOT_YET
                 )
                 .is_ok()
         );
@@ -647,20 +772,32 @@ mod tests {
         let store = store();
         let identity = LlmCodecIdentity::Opaque;
         let (first, guard_first) =
-            store.issue_request("operation-1", request_codec(identity.clone()));
+            store.issue_request("operation-1", request_codec(identity.clone()), LIVE);
         let (second, _guard_second) =
-            store.issue_request("operation-2", request_codec(identity.clone()));
+            store.issue_request("operation-2", request_codec(identity.clone()), LIVE);
 
         drop(guard_first);
         assert_eq!(
             store
-                .resolve(&first, "operation-1", CodecDirection::Request, &identity)
+                .resolve(
+                    &first,
+                    "operation-1",
+                    CodecDirection::Request,
+                    &identity,
+                    NOT_YET
+                )
                 .expect_err("the guard took it back"),
             CodecRefusal::Unknown
         );
         assert!(
             store
-                .resolve(&second, "operation-2", CodecDirection::Request, &identity)
+                .resolve(
+                    &second,
+                    "operation-2",
+                    CodecDirection::Request,
+                    &identity,
+                    NOT_YET
+                )
                 .is_ok(),
             "the other call's capability is untouched"
         );

@@ -536,7 +536,17 @@ max_transitive_packages = 240
 # package that ships a companion executable knows where it put it, and a security-critical one
 # should come from the thing that shipped it rather than from a search. No dependency moved and
 # no `unsafe` did.
-max_source_lines = 23401
+#
+# Raised by five hundred and eleven for the deadline a nested codec call now inherits. A codec
+# call is part of the invocation the plugin is answering, so the capability records that
+# invocation's deadline, the kernel refuses a call that arrives after it without asking the codec
+# to do anything, the host refuses one with nothing left before it reaches the queue, and the
+# bridge bounds the RPC by what the invocation had left when the job ran — the queue wait is
+# charged to the call rather than to the thread. Most of the raise is tests, including the one
+# that has to observe the refusal on the trusted side: a refusal before the work and one after it
+# are the same answer to the caller, so only the codec's own count can tell them apart. No
+# dependency moved and no `unsafe` did.
+max_source_lines = 23912
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"

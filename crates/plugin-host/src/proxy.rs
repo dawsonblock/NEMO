@@ -94,20 +94,35 @@ impl ProxyContext {
     /// Built from the stated observability budget rather than from the task-local
     /// one: the dispatcher does not run in the calling task, so a proxy that read
     /// the call's budget here would read nothing and refuse every sanitizer.
+    fn passive_budget_millis(&self) -> Result<u64, nemo_relay::error::FlowError> {
+        self.observability_budget_millis
+            .filter(|millis| *millis > 0)
+            .ok_or_else(|| {
+                nemo_relay::error::FlowError::InvalidArgument(
+                    "this runtime states no budget for work beside a call, so it cannot ask a \
+                     plugin to do any"
+                        .to_string(),
+                )
+            })
+    }
+
+    /// When work beside a call would have to be finished by.
+    ///
+    /// The same instant `passive_execution_context` puts in the invocation's
+    /// context, for the one caller that needs it *before* the context exists: the
+    /// codec capability is issued against the invocation and records the
+    /// invocation's deadline, so a codec call that arrives after it can be refused
+    /// rather than served.
+    fn passive_deadline_unix_ms(&self) -> Result<u64, nemo_relay::error::FlowError> {
+        let budget_millis = self.passive_budget_millis()?;
+        Ok(nemo_relay::api::runtime::budget_now_unix_ms().saturating_add(budget_millis))
+    }
+
     fn passive_execution_context(
         &self,
         operation_request_id: String,
     ) -> Result<PluginExecutionContext, nemo_relay::error::FlowError> {
-        let Some(budget_millis) = self
-            .observability_budget_millis
-            .filter(|millis| *millis > 0)
-        else {
-            return Err(nemo_relay::error::FlowError::InvalidArgument(
-                "this runtime states no budget for work beside a call, so it cannot ask a \
-                 plugin to do any"
-                    .to_string(),
-            ));
-        };
+        let budget_millis = self.passive_budget_millis()?;
         let now = nemo_relay::api::runtime::budget_now_unix_ms();
         Ok(PluginExecutionContext {
             operation_request_id,
@@ -1504,9 +1519,14 @@ fn install_llm_sanitize_response(
                 let recording = registration_id.clone();
                 let operation_request_id = nemo_relay_plugin_protocol::Uuid::now_v7().to_string();
                 let identity = sanitize.codec().clone();
-                let issued = sanitize
-                    .resolve_codec()
-                    .map(|codec| codecs.issue_response(&operation_request_id, codec));
+                // Same ordering as the request direction, for the same reason: the
+                // capability records the invocation's deadline, so the deadline is known
+                // before the capability is issued — and a runtime that states no budget
+                // grants the codec no time, with the invocation's own refusal unchanged.
+                let deadline_unix_ms = context.passive_deadline_unix_ms().unwrap_or(0);
+                let issued = sanitize.resolve_codec().map(|codec| {
+                    codecs.issue_response(&operation_request_id, codec, deadline_unix_ms)
+                });
                 let (reference, _capability) = match issued {
                     Some((reference, guard)) => (Some(reference), Some(guard)),
                     None => (None, None),
@@ -1675,9 +1695,20 @@ fn install_llm_sanitize_request(
                 // the kernel's: a plugin has no say in which codec its call is running under.
                 let operation_request_id = nemo_relay_plugin_protocol::Uuid::now_v7().to_string();
                 let identity = sanitize.codec().clone();
-                let issued = sanitize
-                    .resolve_codec()
-                    .map(|codec| codecs.issue_request(&operation_request_id, codec));
+                // The invocation's deadline is worked out before the capability is issued,
+                // because the capability records it: a codec call belongs to the call that
+                // asked for it, so one that arrives after this deadline is refused rather
+                // than served.
+                //
+                // A runtime that states no budget for work beside a call gets a capability
+                // whose deadline has already passed, which is what "no time stated" means for
+                // the codec. The invocation itself is refused a moment later by the same
+                // check, and this way that refusal is the one the caller sees: the reason
+                // recorded for it is unchanged.
+                let deadline_unix_ms = context.passive_deadline_unix_ms().unwrap_or(0);
+                let issued = sanitize.resolve_codec().map(|codec| {
+                    codecs.issue_request(&operation_request_id, codec, deadline_unix_ms)
+                });
                 let (reference, _capability) = match issued {
                     Some((reference, guard)) => (Some(reference), Some(guard)),
                     None => (None, None),

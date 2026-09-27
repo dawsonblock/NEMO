@@ -15,6 +15,7 @@
 //! spelling of the same fact is a second place for it to be wrong.
 
 use nemo_relay::api::llm::LlmRequest;
+use nemo_relay::api::runtime::ExecutionBudget;
 use std::sync::Arc;
 
 use nemo_relay::codec::request::AnnotatedLlmRequest;
@@ -265,6 +266,12 @@ struct CodecJob {
     operation_request_id: String,
     payload_json: String,
     reference: String,
+    /// What is left of the invocation that asked for this codec call.
+    ///
+    /// Carried on the job rather than read when the job runs, because the job
+    /// waits its turn: the budget belongs to the call that asked, not to the
+    /// moment a thread got to it.
+    budget: ExecutionBudget,
     answer: std::sync::mpsc::Sender<Result<String, String>>,
 }
 
@@ -332,15 +339,36 @@ impl CodecBridge {
                         let client = client.clone();
                         let session_id = session_id.clone();
                         tokio::spawn(async move {
-                            let answer = client
-                                .resolve_codec(
+                            // Bounded by what the plugin's own call had left, for the
+                            // reason the whole boundary is bounded: the kernel is asked to
+                            // do work on behalf of a call that may already be over, and a
+                            // kernel that does not answer is not an answer. The remaining
+                            // budget is read here rather than taken from the job unchanged,
+                            // because the time this job spent queued is time the call spent.
+                            let now = nemo_relay::api::runtime::budget_now_unix_ms();
+                            let remaining = job
+                                .budget
+                                .narrowed_to(u64::MAX, now)
+                                .remaining_budget_millis;
+                            let answer = match tokio::time::timeout(
+                                std::time::Duration::from_millis(remaining),
+                                client.resolve_codec(
                                     &session_id,
                                     &job.operation_request_id,
                                     job.operation,
                                     &job.payload_json,
                                     &job.reference,
-                                )
-                                .await;
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(answer) => answer,
+                                Err(_) => Err(
+                                    "the kernel did not answer this codec call within what was \
+                                     left of the operation's budget"
+                                        .to_string(),
+                                ),
+                            };
                             // A caller that gave up is the plugin's business, not this task's:
                             // the work was asked for and was done.
                             let _ = job.answer.send(answer);
@@ -362,7 +390,22 @@ impl CodecBridge {
         operation_request_id: &str,
         payload_json: String,
         reference: &str,
+        budget: ExecutionBudget,
     ) -> Result<String, String> {
+        // Refused before it is queued, and refused by name: a codec call that
+        // arrives with nothing left is not a transport failure and not a bad
+        // reference, it is work for a call the kernel has stopped waiting for.
+        // Sending it would ask the kernel to do it anyway, which is the thing the
+        // inherited budget exists to prevent.
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
+        let deadline = budget.deadline_unix_ms.unwrap_or(u64::MAX);
+        if nemo_relay_plugin_protocol::deadline_expired(deadline, now) {
+            return Err(
+                "the operation's deadline had already passed, so this codec call was refused \
+                 rather than sent"
+                    .to_string(),
+            );
+        }
         let (answer, received) = std::sync::mpsc::channel();
         let Some(jobs) = self.jobs.as_ref() else {
             return Err("this host's codec bridge has stopped".to_string());
@@ -372,6 +415,7 @@ impl CodecBridge {
             operation_request_id: operation_request_id.to_string(),
             payload_json,
             reference: reference.to_string(),
+            budget,
             answer,
         })
         .map_err(|error| match error {
@@ -409,6 +453,8 @@ pub struct KernelRequestCodec {
     operation_request_id: String,
     identity: LlmCodecIdentity,
     reference: String,
+    /// What is left of the invocation this codec belongs to.
+    budget: ExecutionBudget,
 }
 
 impl KernelRequestCodec {
@@ -423,12 +469,14 @@ impl KernelRequestCodec {
         operation_request_id: &str,
         identity: LlmCodecIdentity,
         reference: &str,
+        budget: ExecutionBudget,
     ) -> Self {
         Self {
             bridge,
             operation_request_id: operation_request_id.to_string(),
             identity,
             reference: reference.to_string(),
+            budget,
         }
     }
 
@@ -462,6 +510,7 @@ impl KernelRequestCodec {
                 &self.operation_request_id,
                 payload,
                 &self.reference,
+                self.budget,
             )
             .map_err(FlowError::Internal)
     }
@@ -477,6 +526,8 @@ pub struct KernelResponseCodec {
     operation_request_id: String,
     identity: LlmCodecIdentity,
     reference: String,
+    /// What is left of the invocation this codec belongs to.
+    budget: ExecutionBudget,
 }
 
 impl KernelResponseCodec {
@@ -486,12 +537,14 @@ impl KernelResponseCodec {
         operation_request_id: &str,
         identity: LlmCodecIdentity,
         reference: &str,
+        budget: ExecutionBudget,
     ) -> Self {
         Self {
             bridge,
             operation_request_id: operation_request_id.to_string(),
             identity,
             reference: reference.to_string(),
+            budget,
         }
     }
 }
@@ -522,6 +575,7 @@ impl nemo_relay::codec::traits::LlmResponseCodec for KernelResponseCodec {
                 &self.operation_request_id,
                 payload,
                 &self.reference,
+                self.budget,
             )
             .map_err(FlowError::Internal)?;
         serde_json::from_str(&output).map_err(|error| {
@@ -600,6 +654,42 @@ mod tests {
         CodecHandle::Request(Arc::new(RecordingCodec { identity }))
     }
 
+    /// A budget with time left in it, for the tests that are not about time.
+    fn live_budget() -> ExecutionBudget {
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
+        ExecutionBudget::new(now + 30_000, 30_000)
+    }
+
+    /// A request codec that answers the way `RecordingCodec` does, after taking
+    /// longer about it than the budget a caller states.
+    struct SlowRequestCodec {
+        identity: LlmCodecIdentity,
+        takes: std::time::Duration,
+    }
+
+    impl LlmCodec for SlowRequestCodec {
+        fn codec_identity(&self) -> LlmCodecIdentity {
+            self.identity.clone()
+        }
+
+        fn decode(&self, _request: &LlmRequest) -> Result<AnnotatedLlmRequest, FlowError> {
+            std::thread::sleep(self.takes);
+            Ok(AnnotatedLlmRequest::default())
+        }
+
+        fn encode(
+            &self,
+            _annotated: &AnnotatedLlmRequest,
+            original: &LlmRequest,
+        ) -> Result<LlmRequest, FlowError> {
+            Ok(original.clone())
+        }
+    }
+
+    /// A deadline no test here outlives, for issuing a capability a test is not
+    /// about the lifetime of.
+    const LIVE: u64 = u64::MAX;
+
     fn response_handle(identity: LlmCodecIdentity) -> CodecHandle {
         CodecHandle::Response(Arc::new(RecordingResponseCodec { identity }))
     }
@@ -630,6 +720,7 @@ mod tests {
             Arc::new(RecordingCodec {
                 identity: LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
             }),
+            LIVE,
         );
         let service = crate::runtime_service::RelayRuntimeService::new(
             crate::runtime_service::RelayRuntimeConfig {
@@ -673,6 +764,7 @@ mod tests {
             "operation-bridge",
             LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
             reference.as_str(),
+            live_budget(),
         );
 
         let decoded = tokio::task::spawn_blocking(move || {
@@ -685,6 +777,96 @@ mod tests {
         .expect("the blocking caller");
         let decoded = decoded.expect("a decoded request");
         assert_eq!(decoded.model.as_deref(), Some("example"));
+
+        serving.abort();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A codec call is bounded by what the invocation had left, and the bound is
+    /// the bridge's rather than the caller's: the connection, the service and the
+    /// codec are all live here — the codec deliberately takes longer than the
+    /// budget — and what the plugin's callback gets back is the deadline rather
+    /// than an answer that arrived when nobody was waiting for it.
+    ///
+    /// The socket is the same shape as the pair above, which is what makes this a
+    /// test of the budget rather than of the transport: the round trip works, and
+    /// it works for longer than the call it belongs to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_codec_call_that_outlives_its_invocations_budget_is_refused() {
+        use nemo_relay_plugin_proto::v1::relay_runtime_server::RelayRuntimeServer;
+        use tonic::transport::Server;
+
+        let codecs = Arc::new(super::super::codec_capability::CodecCapabilities::new());
+        let (reference, _guard) = codecs.issue_request(
+            "operation-bridge",
+            Arc::new(SlowRequestCodec {
+                identity: LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+                takes: std::time::Duration::from_millis(300),
+            }),
+            LIVE,
+        );
+        let service = crate::runtime_service::RelayRuntimeService::new(
+            crate::runtime_service::RelayRuntimeConfig {
+                session_id: "slow-bridge-session".into(),
+                session_credential: "slow-bridge-credential".into(),
+                protocol_version: nemo_relay_plugin_protocol::PROTOCOL_VERSION,
+                runtime_binding_digest: "slow-bridge-binding".into(),
+                operation_scopes: Arc::new(crate::operation_scopes::OperationScopes::new()),
+                continuations: Arc::new(crate::continuations::Continuations::new()),
+                codecs,
+            },
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "nemo-slow-bridge-{}",
+            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("a socket directory");
+        let endpoint = directory.join("k");
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("a kernel socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RelayRuntimeServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+        });
+
+        let client = crate::runtime_service::connect_to_kernel(
+            &endpoint,
+            nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+        )
+        .await
+        .expect("a client");
+        let callbacks =
+            crate::runtime_service::KernelCallbacks::new(client, "slow-bridge-credential")
+                .expect("the credential")
+                .with_reconnect(
+                    endpoint.clone(),
+                    nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
+                );
+        let millis = 50_u64;
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
+        let codec = KernelRequestCodec::new(
+            CodecBridge::start(callbacks, "slow-bridge-session".to_string()).expect("a bridge"),
+            "operation-bridge",
+            LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
+            reference.as_str(),
+            ExecutionBudget::new(now + millis, millis),
+        );
+
+        let refused = tokio::task::spawn_blocking(move || {
+            codec.decode(&LlmRequest {
+                headers: serde_json::Map::new(),
+                content: serde_json::json!({ "model": "example" }),
+            })
+        })
+        .await
+        .expect("the blocking caller")
+        .expect_err("a call the operation had no time left to wait for");
+        let message = refused.to_string();
+        assert!(
+            message.contains("within what was left of the operation's budget"),
+            "the refusal does not name the budget: {message}"
+        );
 
         serving.abort();
         let _ = std::fs::remove_dir_all(&directory);
@@ -706,6 +888,7 @@ mod tests {
             Arc::new(RecordingCodec {
                 identity: LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OpenAiChat),
             }),
+            LIVE,
         );
         let service = crate::runtime_service::RelayRuntimeService::new(
             crate::runtime_service::RelayRuntimeConfig {
@@ -861,6 +1044,39 @@ mod tests {
 
     /// The bridge admits a bounded number of calls and refuses the rest.
     ///
+    /// A codec call is part of the invocation that asked for it, so one that
+    /// arrives with nothing left of that invocation's budget is refused here:
+    /// before it is queued, and before the kernel is asked to do anything.
+    ///
+    /// The bridge's consumer is dropped, and that is what makes "before" the thing
+    /// being checked rather than a claim: a call that reached the queue would come
+    /// back with the bridge's own refusal instead of the deadline's, and this test
+    /// would read as the opposite of what it says.
+    #[test]
+    fn a_codec_call_with_no_budget_left_is_refused_before_it_is_sent() {
+        let (jobs, consumer) = tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
+        drop(consumer);
+        let bridge = CodecBridge {
+            jobs: Some(jobs),
+            thread: std::sync::Mutex::new(None),
+        };
+
+        let refused = bridge
+            .resolve(
+                nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+                "operation-1",
+                "{}".to_string(),
+                "reference",
+                ExecutionBudget::expired(),
+            )
+            .expect_err("a call with no time left is refused");
+
+        assert!(
+            refused.contains("deadline had already passed"),
+            "the refusal does not name the deadline: {refused}"
+        );
+    }
+
     /// The work behind a codec call is a plugin's, so a sanitizer that asks faster
     /// than the kernel answers must meet a refusal it can see rather than a queue
     /// this host grows for it. The bridge is built here with a consumer that never
@@ -880,6 +1096,7 @@ mod tests {
                 operation_request_id: operation_request_id.to_string(),
                 payload_json: "{}".to_string(),
                 reference: "reference".to_string(),
+                budget: live_budget(),
                 answer,
             }
         };

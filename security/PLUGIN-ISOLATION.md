@@ -497,6 +497,12 @@ path, so inspection leaves the process as it found it. Forwards of plugin marks
 travel on a bounded queue whose capacity is host configuration, and a full queue
 fails the mark rather than growing the host's heap.
 
+A plugin's codec call inherits the invocation's deadline rather than starting a
+clock: the capability the kernel issues records the deadline that invocation was
+given, so a call that arrives after it is refused without the codec being asked to
+do anything, and the host refuses one with nothing left before it reaches the
+kernel. See *The nested codec call inherits the invocation's deadline* below.
+
 **What is not true yet.** The three blockers, stated plainly:
 
 1. **The loader is still in the kernel's dependency graph.** Every consumer has
@@ -2102,6 +2108,46 @@ question should be answered by the same calculation against a *real* plugin — 
 of its registration sets contains no execution or stream intercept, it is servable
 without duplex work, and it should become the first cutover candidate rather than
 waiting for the last class.
+
+### The nested codec call inherits the invocation's deadline
+
+A codec call is not a call of its own. The plugin's sanitizer is answering an
+invocation the kernel sent with a deadline in it, and the codec work is part of that
+invocation, so it may spend what the invocation has left and nothing more. It did not:
+the reference was bound to the invocation, the direction, the codec identity and the
+guard's lifetime, and to no clock at all. The host blocked on the kernel's answer for
+as long as the kernel took, and the kernel ran the codec operation whenever the
+request arrived — including after the caller had stopped waiting, which is work
+nothing was left to use.
+
+The fix needed no protocol field, because the deadline is the kernel's: the capability
+is issued by the side that knows when the invocation must be over, so `IssuedCodec`
+records the deadline the invocation was given
+(`CodecCapabilities::issue_request`/`issue_response` take it, `resolve` checks it), and
+the kernel refuses a codec call that arrives after it with `DeadlineExceeded` naming
+the fact, rather than with the permission error the identity checks use. A plugin
+cannot extend its own deadline by asking, and a host that lies about what is left
+changes nothing, because this side never reads the host's claim.
+
+The host's half is the mirror of that, using the budget it was told: the codec object
+carries the invocation's `ExecutionBudget`, a call with nothing left is refused *before
+it is queued* rather than sent, and the bridge bounds the RPC by what remains of the
+invocation when the job runs — the queue wait is charged to the call, not to the
+thread. Four tests, each of which was confirmed to fail on its own when the guard it
+covers was removed and to pass when the others were:
+
+| test | what it holds |
+|---|---|
+| `a_capability_for_an_invocation_that_ran_out_of_time_is_refused` | the capability refuses at the deadline, not before it, and by name |
+| `a_codec_call_after_its_invocations_deadline_is_refused_without_the_work` | the kernel's handler refuses and the codec is not asked to read anything |
+| `a_codec_call_with_no_budget_left_is_refused_before_it_is_sent` | the host refuses before the queue, so a dead bridge cannot turn it into a transport error |
+| `a_codec_call_that_outlives_its_invocations_budget_is_refused` | the round trip works and takes longer than the call it belongs to, and the answer is the budget rather than the work |
+
+What this does not yet cover is the rest of the pair's acceptance list, unchanged by
+it: cancellation while a callback is inside `ResolveCodec`, a host crash during
+resolution, several codec calls inside one sanitize operation, and concurrent
+sanitizers. Those are about the nesting rather than about the clock, and they are
+still owed.
 
 ## Getting a plugin's registration set
 

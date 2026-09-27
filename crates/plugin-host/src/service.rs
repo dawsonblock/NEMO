@@ -534,7 +534,7 @@ impl PluginHostService {
                     sanitized_llm_request(
                         &request,
                         self.codec_bridge().await,
-                        &context.operation_request_id,
+                        &context,
                     )
                     .await
                 }
@@ -544,7 +544,7 @@ impl PluginHostService {
                     sanitized_llm_response(
                         &request,
                         self.codec_bridge().await,
-                        &context.operation_request_id,
+                        &context,
                     )
                     .await
                 }
@@ -2033,6 +2033,24 @@ async fn sanitized_tool_payload(
     }
 }
 
+/// What a codec call inherits from the invocation that asked for it.
+///
+/// The codec a sanitizer resolves is not a call of its own. It is part of the
+/// invocation the plugin is answering, so it spends that invocation's budget and
+/// never a fresh one: the runtime's own rule, that a nested call may spend what
+/// is left of the call it belongs to, applied to the one nested call the boundary
+/// makes in this direction. The budget travels with the codec object rather than
+/// being re-read at the call, so a codec reached after its invocation has ended
+/// cannot be given a clock by whatever happens to be in scope then.
+fn codec_budget(
+    invocation: &nemo_relay_plugin_protocol::PluginExecutionContext,
+) -> nemo_relay::api::runtime::ExecutionBudget {
+    nemo_relay::api::runtime::ExecutionBudget::new(
+        invocation.deadline_unix_ms,
+        invocation.remaining_budget_millis,
+    )
+}
+
 /// Run one LLM response sanitize registration over the payload a call would publish.
 ///
 /// The request direction's twin, and the difference between them is the direction of the codec
@@ -2042,7 +2060,7 @@ async fn sanitized_tool_payload(
 async fn sanitized_llm_response(
     request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
     bridge: Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
-    operation_request_id: &str,
+    invocation: &nemo_relay_plugin_protocol::PluginExecutionContext,
 ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
     let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
         refused(format!(
@@ -2099,9 +2117,10 @@ async fn sanitized_llm_response(
             nemo_relay::api::runtime::LlmSanitizeResponseContext::for_response_codec(Some(
                 std::sync::Arc::new(crate::codec_context::KernelResponseCodec::new(
                     bridge,
-                    operation_request_id,
+                    &invocation.operation_request_id,
                     identity,
                     reference,
+                    codec_budget(invocation),
                 )),
             ))
         }
@@ -2149,7 +2168,7 @@ async fn sanitized_llm_response(
 async fn sanitized_llm_request(
     request: &nemo_relay_plugin_protocol::PluginInvokeRequest,
     bridge: Option<Result<std::sync::Arc<crate::codec_context::CodecBridge>, String>>,
-    operation_request_id: &str,
+    invocation: &nemo_relay_plugin_protocol::PluginExecutionContext,
 ) -> Result<nemo_relay_plugin_protocol::PluginExecutionOutcome, PluginProtocolError> {
     let payload: serde_json::Value = serde_json::from_str(&request.arguments).map_err(|error| {
         refused(format!(
@@ -2211,9 +2230,10 @@ async fn sanitized_llm_request(
             nemo_relay::api::runtime::LlmSanitizeRequestContext::for_request_codec(Some(
                 std::sync::Arc::new(crate::codec_context::KernelRequestCodec::new(
                     bridge,
-                    operation_request_id,
+                    &invocation.operation_request_id,
                     identity,
                     reference,
+                    codec_budget(invocation),
                 )),
             ))
         }

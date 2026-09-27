@@ -416,16 +416,35 @@ impl RelayRuntime for RelayRuntimeService {
         };
         // Every refusal here is one fact: this kernel did not issue *this* capability for
         // *this* call. The refusal's own name says which check found that out, and the
-        // caller is told no.
+        // caller is told no — except the last one, which says the opposite about the
+        // capability and the same thing about the call: the reference is this invocation's,
+        // for this direction and this codec, and the invocation ran out of time. A codec
+        // call is part of the call that asked for it, so this side does not start work the
+        // caller has stopped waiting for, and it says which of the two it is rather than
+        // making a deadline look like a forged reference.
+        let now = nemo_relay::api::runtime::budget_now_unix_ms();
         let handle = self
             .config
             .codecs
-            .resolve(&reference, &wire.operation_request_id, direction, &identity)
-            .map_err(|refusal| {
-                Status::permission_denied(format!(
+            .resolve(
+                &reference,
+                &wire.operation_request_id,
+                direction,
+                &identity,
+                now,
+            )
+            .map_err(|refusal| match refusal {
+                crate::codec_capability::CodecRefusal::DeadlineExpired => {
+                    Status::deadline_exceeded(format!(
+                        "the call this codec capability belongs to ran out of time before the \
+                         codec call arrived, so no work was done ({})",
+                        refusal.as_str()
+                    ))
+                }
+                refusal => Status::permission_denied(format!(
                     "this kernel did not issue that codec capability for this call ({})",
                     refusal.as_str()
-                ))
+                )),
             })?;
         // The work happens here, against the codec object this side holds: the plugin
         // asked for a decode, not for the codec. A codec that cannot read what it was
@@ -815,6 +834,47 @@ mod tests {
     /// A request codec that answers with a recognizable annotation.
     struct TestRequestCodec;
 
+    /// A request codec that counts the payloads it was asked to read.
+    ///
+    /// A refusal that happens before the work and one that happens after it are the
+    /// same answer to the caller, so the difference has to be observed on this side
+    /// of it.
+    struct CountingRequestCodec {
+        decoded: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl nemo_relay::codec::traits::LlmCodec for CountingRequestCodec {
+        fn codec_identity(&self) -> nemo_relay_plugin_protocol::LlmCodecIdentity {
+            nemo_relay_plugin_protocol::LlmCodecIdentity::BuiltIn(
+                nemo_relay_plugin_protocol::BuiltinLlmCodec::OpenAiChat,
+            )
+        }
+
+        fn decode(
+            &self,
+            request: &nemo_relay::api::llm::LlmRequest,
+        ) -> nemo_relay::error::Result<nemo_relay::codec::request::AnnotatedLlmRequest> {
+            self.decoded
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(nemo_relay::codec::request::AnnotatedLlmRequest {
+                model: request
+                    .content
+                    .get("model")
+                    .and_then(nemo_relay::json::Json::as_str)
+                    .map(str::to_string),
+                ..Default::default()
+            })
+        }
+
+        fn encode(
+            &self,
+            _annotated: &nemo_relay::codec::request::AnnotatedLlmRequest,
+            original: &nemo_relay::api::llm::LlmRequest,
+        ) -> nemo_relay::error::Result<nemo_relay::api::llm::LlmRequest> {
+            Ok(original.clone())
+        }
+    }
+
     impl nemo_relay::codec::traits::LlmCodec for TestRequestCodec {
         fn codec_identity(&self) -> nemo_relay_plugin_protocol::LlmCodecIdentity {
             nemo_relay_plugin_protocol::LlmCodecIdentity::BuiltIn(
@@ -881,10 +941,11 @@ mod tests {
     #[tokio::test]
     async fn a_codec_call_is_served_for_the_invocation_its_capability_was_issued_to() {
         let (service, _scopes) = service();
-        let (reference, guard) = service
-            .config
-            .codecs
-            .issue_request("operation-1", Arc::new(TestRequestCodec));
+        let (reference, guard) = service.config.codecs.issue_request(
+            "operation-1",
+            Arc::new(TestRequestCodec),
+            u64::MAX,
+        );
 
         let served = service
             .resolve_codec(codec_call(
@@ -970,6 +1031,51 @@ mod tests {
             after.message().contains("unknown"),
             "a forgotten capability is unknown rather than expired: {}",
             after.message()
+        );
+    }
+
+    /// A codec capability belongs to one invocation, and an invocation has a
+    /// deadline. A codec call that arrives after it is refused, and refused
+    /// *before* the work: the codec this side holds is not asked to read anything
+    /// on behalf of a call whose caller has stopped waiting.
+    ///
+    /// The refusal is the deadline's, not the capability's: the reference is this
+    /// invocation's, for this direction and this codec, and the only thing wrong
+    /// with the call is when it arrived.
+    #[tokio::test]
+    async fn a_codec_call_after_its_invocations_deadline_is_refused_without_the_work() {
+        let (service, _scopes) = service();
+        let decoded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The deadline is the instant it is issued at, so it is already reached:
+        // the handler reads a clock that cannot be earlier than this one.
+        let deadline = nemo_relay::api::runtime::budget_now_unix_ms();
+        let (reference, _guard) = service.config.codecs.issue_request(
+            "operation-1",
+            Arc::new(CountingRequestCodec {
+                decoded: Arc::clone(&decoded),
+            }),
+            deadline,
+        );
+
+        let refused = service
+            .resolve_codec(codec_call(
+                reference.as_str(),
+                "operation-1",
+                v1::CodecOperation::LlmRequestDecode,
+            ))
+            .await
+            .expect_err("a codec call with no time left");
+
+        assert_eq!(refused.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            refused.message().contains("ran out of time"),
+            "the refusal does not name the deadline: {}",
+            refused.message()
+        );
+        assert_eq!(
+            decoded.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the codec read the payload anyway"
         );
     }
 
