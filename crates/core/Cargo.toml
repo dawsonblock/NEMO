@@ -126,6 +126,10 @@ name = "native_plugin_integration"
 path = "tests/integration/native_plugin_tests.rs"
 
 [[test]]
+name = "native_seam"
+path = "tests/integration/native_seam_tests.rs"
+
+[[test]]
 name = "plugin_host_builtin_ownership"
 path = "tests/integration/plugin_host_builtin_ownership_tests.rs"
 

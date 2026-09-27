@@ -275,13 +275,13 @@ struct WorkerPluginInstance {
 impl Drop for WorkerPluginInstance {
     fn drop(&mut self) {
         let outcome = self.shutdown_checked();
-        if !outcome.errors.is_empty() {
+        if !outcome.errors().is_empty() {
             log::error!(
                 target: "nemo_relay.worker",
                 event = "worker_cleanup_failed",
                 plugin_id = self.plugin_kind.as_str(),
-                failure_count = outcome.errors.len(),
-                safe_to_unload = outcome.safe_to_unload;
+                failure_count = outcome.errors().len(),
+                safe_to_unload = outcome.safe_to_unload();
                 "Worker plugin cleanup failed during drop"
             );
         }
@@ -357,7 +357,7 @@ impl WorkerPluginInstance {
         }
 
         self.stop_process_checked(&mut outcome);
-        if outcome.safe_to_unload
+        if outcome.safe_to_unload()
             && let Err(error) = std::fs::remove_dir_all(&self.activation_dir)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -370,7 +370,7 @@ impl WorkerPluginInstance {
                 true,
             );
         }
-        if outcome.errors.is_empty() {
+        if outcome.errors().is_empty() {
             log::info!(
                 target: "nemo_relay.worker",
                 event = "worker_stopped",

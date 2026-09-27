@@ -169,3 +169,21 @@ pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// The encoding rule every digest this module reports is written in.
+    ///
+    /// It is asserted here rather than in a consumer's suite because it is the
+    /// verifier's own vocabulary: lowercase, fixed width, and leading zeroes
+    /// kept — the last of which is the property a truncated hex writer loses.
+    #[test]
+    fn a_digest_is_lowercase_fixed_width_hex() {
+        assert_eq!(hex_digest([0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(hex_digest([0x0f]), "0f");
+        assert_eq!(hex_digest(Sha256::digest(b"")), sha256_hex(b""));
+    }
+}

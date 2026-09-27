@@ -212,14 +212,27 @@ max_transitive_packages = 266
 # This is the last upward movement before the loader leaves: the next change to this number
 # is the deletion of the loader and the ABI bridge, and it moves down.
 #
-# That claim has now been spent once, and recorded rather than quietly ignored: separating
-# the artifact vocabulary from the loader put the identity of an artifact, the digests that
-# name it and the path resolution its manifest needs in `plugin/dynamic/artifact.rs`, which
-# the kernel carries while the loader does. The raise is the measured 34 lines it cost, not
-# a round number, and the two files it is owed by are the loader (6760) and that vocabulary
-# (171). The remove-it milestone takes both, so this stays a temporary ceiling and its entry
-# below moves with it.
-max_source_lines = 74813
+# That claim has been spent twice now, and both times recorded rather than quietly ignored.
+#
+# Separating the artifact vocabulary from the loader put the identity of an artifact, the
+# digests that name it and the path resolution its manifest needs in
+# `plugin/dynamic/artifact.rs`: 34 lines the kernel carries while the loader does.
+#
+# The hosted-runtime seam is the second movement, and it is a different kind of line: a
+# boundary rather than a postponed move. The loader's kernel reach was twenty-odd private
+# names spread across five modules; rewriting it against `NativeHostRuntime` replaced those
+# with one handle whose operations are the vocabulary, and the kernel is where that
+# vocabulary belongs — it stays when the loader leaves, because the operations are the
+# kernel's decisions about its own registry, invocations and artifacts. The 309 lines are
+# the handle, its documentation and the module doc that says what the four responsibilities
+# are. No dependency moved and no `unsafe` did: the three extra `unsafe` tokens an earlier
+# draft of the seam's own test added were moved out of `src/` rather than budgeted, because
+# a keyword list is not kernel code.
+#
+# The two postponed files are still owed: the loader (6760) and the artifact vocabulary
+# (171, now 186 with its own test). The milestone takes those, so this stays temporary and
+# its entry below moves with it.
+max_source_lines = 75122
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -689,7 +702,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 74813
+raised_to = 75122
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"

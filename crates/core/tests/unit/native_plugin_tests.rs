@@ -619,18 +619,25 @@ fn assert_native_digest_edges() {
     let library = temp.path().join("plugin.bin");
     std::fs::write(&library, b"native plugin bytes").unwrap();
     assert_eq!(
-        resolve_manifest_relative_path(&manifest, "plugin.bin"),
+        host_runtime().resolve_manifest_relative(&manifest, "plugin.bin"),
         library
     );
     assert_eq!(
-        resolve_manifest_relative_path(&manifest, temp.path().to_str().unwrap()),
+        host_runtime().resolve_manifest_relative(&manifest, temp.path().to_str().unwrap()),
         temp.path()
     );
-    assert_eq!(hex_digest([0x00, 0xab, 0xff]), "00abff");
-    let digest = hex_digest(Sha256::digest(b"native plugin bytes"));
-    assert!(verify_sha256(&library, &format!("sha256:{}", digest.to_uppercase())).is_ok());
-    assert!(verify_sha256(&library, "sha256:00").is_err());
-    assert!(verify_sha256(&temp.path().join("missing"), "00").is_err());
+    let digest = host_runtime().hash_bytes(b"native plugin bytes");
+    assert!(
+        host_runtime()
+            .verify_path(&library, &format!("sha256:{}", digest.to_uppercase()))
+            .is_ok()
+    );
+    assert!(host_runtime().verify_path(&library, "sha256:00").is_err());
+    assert!(
+        host_runtime()
+            .verify_path(&temp.path().join("missing"), "00")
+            .is_err()
+    );
 }
 
 #[allow(clippy::cognitive_complexity)] // One assertion per field of four tables.
@@ -7285,7 +7292,7 @@ fn a_verified_artifact_is_loaded_from_a_private_copy_and_not_from_its_source_pat
     std::fs::create_dir_all(&directory).expect("a test directory");
     let source = directory.join("library");
     std::fs::write(&source, b"the approved bytes").expect("write the source");
-    let approved = super::sha256_hex(b"the approved bytes");
+    let approved = host_runtime().hash_bytes(b"the approved bytes");
 
     let stage = super::stage_verified_library(&source, &approved).expect("a matching artifact");
     let (staged_path, guard) = stage;
@@ -7326,7 +7333,7 @@ fn a_digest_mismatch_never_reaches_a_staging_directory() {
     std::fs::create_dir_all(&directory).expect("a test directory");
     let source = directory.join("library");
     std::fs::write(&source, b"the approved bytes").expect("write the source");
-    let approved = super::sha256_hex(b"the approved bytes");
+    let approved = host_runtime().hash_bytes(b"the approved bytes");
     // The file is not the approved one.
     std::fs::write(&source, b"not the approved bytes").expect("replace the source");
 
@@ -7367,7 +7374,7 @@ fn two_loads_of_one_artifact_are_staged_separately() {
     std::fs::create_dir_all(&directory).expect("a test directory");
     let source = directory.join("library");
     std::fs::write(&source, b"the approved bytes").expect("write the source");
-    let approved = super::sha256_hex(b"the approved bytes");
+    let approved = host_runtime().hash_bytes(b"the approved bytes");
 
     let (first_path, first_guard) =
         super::stage_verified_library(&source, &approved).expect("the first load");
@@ -7418,7 +7425,7 @@ fn concurrent_loads_of_one_artifact_each_get_their_own_copy() {
     let source = directory.join("library");
     let bytes: Vec<u8> = (0..4096u32).map(|value| (value % 251) as u8).collect();
     std::fs::write(&source, &bytes).expect("write the source");
-    let approved = super::sha256_hex(&bytes);
+    let approved = host_runtime().hash_bytes(&bytes);
 
     let loads: Vec<_> = (0..16)
         .map(|_| {
@@ -7475,7 +7482,7 @@ fn a_staged_copy_lives_in_a_directory_only_its_load_can_reach() {
         std::fs::create_dir_all(&directory).expect("a test directory");
         let source = directory.join("library");
         std::fs::write(&source, b"the approved bytes").expect("write the source");
-        let approved = super::sha256_hex(b"the approved bytes");
+        let approved = host_runtime().hash_bytes(b"the approved bytes");
 
         let (staged, guard) = super::stage_verified_library(&source, &approved).expect("a copy");
         let parent = staged.parent().expect("the copy's directory");
@@ -7514,23 +7521,25 @@ fn an_artifact_identity_describes_the_manifest_and_library_it_named() {
     );
     std::fs::write(&manifest, &manifest_source).expect("write the manifest");
 
-    let (manifest_sha256, library_sha256) =
-        super::plugin_artifact_identity(&manifest.to_string_lossy()).expect("an identity");
+    let (manifest_sha256, library_sha256) = host_runtime()
+        .artifact_identity(&manifest.to_string_lossy())
+        .expect("an identity");
     assert_eq!(
         manifest_sha256,
-        super::sha256_hex(manifest_source.as_bytes()),
+        host_runtime().hash_bytes(manifest_source.as_bytes()),
         "the manifest digest is the digest of the bytes that were read"
     );
     assert_eq!(
         library_sha256,
-        super::sha256_hex(b"the library bytes"),
+        host_runtime().hash_bytes(b"the library bytes"),
         "the library digest is the digest of the library the manifest named"
     );
 
     // A directory reference names the manifest inside it, as the loader does, so
     // the same artifact has one identity however it is named.
-    let (from_directory, _) =
-        super::plugin_artifact_identity(&directory.to_string_lossy()).expect("an identity");
+    let (from_directory, _) = host_runtime()
+        .artifact_identity(&directory.to_string_lossy())
+        .expect("an identity");
     assert_eq!(
         from_directory, manifest_sha256,
         "naming the directory and naming the manifest are the same artifact"

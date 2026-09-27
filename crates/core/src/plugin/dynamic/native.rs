@@ -50,19 +50,11 @@ use crate::codec::traits::{LlmCodec, LlmResponseCodec};
 use crate::error::{FlowError, Result as FlowResult};
 use crate::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginError, PluginRegistration,
-    PluginRegistrationContext, active_runtime_diagnostics_snapshot,
-    deregister_plugin_registration_checked, register_plugin_tracked,
+    PluginRegistrationContext,
 };
 use chrono::{DateTime, Utc};
 use libloading::{Library, Symbol};
 
-// The inert half of the artifact vocabulary lives next door: this module loads,
-// that one answers what an artifact is. Both the kernel and this loader ask it the
-// same question, which is why it is not here.
-use super::artifact::{
-    hex_digest, plugin_artifact_identity, resolve_manifest_relative_path, sha256_hex,
-    sha256_of_path, sha256_of_reader, verify_sha256,
-};
 use nemo_relay_plugin::{
     NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
     NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY, NemoRelayNativeAsyncCallbackState,
@@ -86,18 +78,25 @@ use nemo_relay_plugin::{
     NemoRelayNativeWithScopeStackCb, NemoRelayStatus,
 };
 use serde_json::{Map, Value as Json};
-use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
 use uuid::Uuid;
 
 use super::{
     DYNAMIC_PLUGIN_MANIFEST_FILENAME, DynamicPluginKind, DynamicPluginManifest,
-    DynamicPluginManifestLoad, DynamicPluginTeardownOutcome,
-    deregister_tracked_registrations_checked, validate_annotated_request_consumer_compatibility,
-    validate_dynamic_plugin_relay_compatibility,
+    DynamicPluginManifestLoad, NativeHostRuntime, RegistrationTeardown,
 };
 use nemo_relay_plugin_protocol::PluginArtifactIdentity;
+
+/// The runtime this host participates in.
+///
+/// The handle carries nothing — it is the name of the kernel services a hosted
+/// plugin may use — so the loader asks the runtime of the process it is running
+/// in, which is the runtime whose registry, invocation and artifact decisions its
+/// callbacks act on. Every kernel-touching operation below goes through it.
+fn host_runtime() -> NativeHostRuntime {
+    NativeHostRuntime::new()
+}
 
 /// An artifact whose bytes this side has approved.
 ///
@@ -113,7 +112,7 @@ pub struct ApprovedPluginArtifact {
 impl ApprovedPluginArtifact {
     /// Approve the artifact at `manifest_ref` by hashing it now.
     pub fn approve(manifest_ref: &str) -> crate::plugin::Result<Self> {
-        let (manifest_sha256, library_sha256) = plugin_artifact_identity(manifest_ref)?;
+        let (manifest_sha256, library_sha256) = host_runtime().artifact_identity(manifest_ref)?;
         Ok(Self {
             identity: PluginArtifactIdentity {
                 manifest_sha256,
@@ -319,8 +318,8 @@ impl NativePluginActivation {
     /// Consumes the activation and deregisters loaded plugin kinds.
     pub fn clear(self) {}
 
-    pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> DynamicPluginTeardownOutcome {
-        deregister_tracked_registrations_checked(&mut self.plugin_registrations, "native")
+    pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> RegistrationTeardown {
+        host_runtime().tear_down(&mut self.plugin_registrations, "native")
     }
 
     #[cfg(test)]
@@ -335,7 +334,7 @@ impl NativePluginActivation {
 impl Drop for NativePluginActivation {
     fn drop(&mut self) {
         for (plugin_kind, registration_id) in self.plugin_registrations.iter().rev() {
-            let _ = deregister_plugin_registration_checked(plugin_kind, *registration_id);
+            let _ = host_runtime().remove_plugin(plugin_kind, *registration_id);
         }
     }
 }
@@ -355,7 +354,7 @@ where
     for spec in specs {
         let instance = load_one_native_plugin(&spec)?;
         let plugin_kind = instance.plugin_kind.clone();
-        let registration_id = register_plugin_tracked(Arc::new(NativePluginAdapter {
+        let registration_id = host_runtime().install_plugin(Arc::new(NativePluginAdapter {
             plugin_kind: plugin_kind.clone(),
             allows_multiple_components: instance.allows_multiple_components,
             instance: instance.clone(),
@@ -640,7 +639,7 @@ pub(crate) fn stage_verified_library(
     // One handle, read twice: hashing consumes it, so it is rewound rather than
     // cloned — a clone would share the offset and the copy would then start at
     // the end of the file, which is exactly the bug this comment replaces.
-    let source_digest = sha256_of_reader(&mut source)?;
+    let source_digest = host_runtime().hash_open_file(&mut source)?;
     {
         use std::io::Seek;
         source.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
@@ -685,7 +684,6 @@ pub(crate) fn stage_verified_library(
             staged.display()
         ))
     })?;
-    let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = source.read(&mut buffer).map_err(|error| {
@@ -697,7 +695,6 @@ pub(crate) fn stage_verified_library(
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
         std::io::Write::write_all(&mut destination, &buffer[..read]).map_err(|error| {
             PluginError::Internal(format!("failed to write '{}': {error}", staged.display()))
         })?;
@@ -705,7 +702,12 @@ pub(crate) fn stage_verified_library(
     destination.sync_all().map_err(|error| {
         PluginError::Internal(format!("failed to flush '{}': {error}", staged.display()))
     })?;
-    let staged_digest = hex_digest(hasher.finalize());
+    drop(destination);
+    // The copy is re-hashed from the file that will be loaded rather than from
+    // the bytes as they were written: the guarantee is about the artifact the
+    // loader opens, and reading it back is how the digests describe the same
+    // instance the loader will get rather than the same buffer this loop held.
+    let staged_digest = host_runtime().hash_path(&staged)?;
     if staged_digest != approved_library_sha256 {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(PluginError::RegistrationFailed(format!(
@@ -774,7 +776,7 @@ fn load_one_native_plugin(
             manifest_path.display()
         ))
     })?;
-    let manifest_sha256 = sha256_hex(&manifest_bytes);
+    let manifest_sha256 = host_runtime().hash_bytes(&manifest_bytes);
     if let Some(approved) = spec.approval()
         && approved.identity().manifest_sha256 != manifest_sha256
     {
@@ -828,7 +830,7 @@ fn load_one_native_plugin(
         )));
     };
     let manifest_path = PathBuf::from(&manifest_ref);
-    let library_path = resolve_manifest_relative_path(
+    let library_path = host_runtime().resolve_manifest_relative(
         &manifest_path,
         load.library
             .as_deref()
@@ -845,7 +847,7 @@ fn load_one_native_plugin(
         .as_ref()
         .and_then(|integrity| integrity.sha256.as_deref())
     {
-        verify_sha256(&library_path, expected_digest)?;
+        host_runtime().verify_path(&library_path, expected_digest)?;
     }
     // The approved library identity is checked against the bytes of an open
     // handle, immediately before the loader is given the path: the digest and
@@ -883,7 +885,7 @@ fn load_one_native_plugin(
     if staging.is_none()
         && let Some(verified) = &verified_library_sha256
     {
-        let mapped = sha256_of_path(&library_path)?;
+        let mapped = host_runtime().hash_path(&library_path)?;
         if &mapped != verified {
             drop(library);
             return Err(PluginError::RegistrationFailed(format!(
@@ -941,7 +943,7 @@ fn load_one_native_plugin(
 }
 
 fn validate_relay_compatibility(relay: Option<&str>) -> crate::plugin::Result<()> {
-    validate_dynamic_plugin_relay_compatibility(relay, "native")
+    host_runtime().validate_relay_compatibility(relay, "native")
 }
 
 fn validate_plugin_descriptor(
@@ -1523,7 +1525,8 @@ unsafe extern "C" fn native_capture_mark_window_thread(
         return NemoRelayStatus::NullPointer;
     }
     clear_native_last_error();
-    let window = crate::plugin::execution::current_mark_forwarder()
+    let window = host_runtime()
+        .capture_mark_window()
         .map(|forwarder| Box::into_raw(Box::new(forwarder)) as *mut NemoRelayNativeMarkWindow)
         .unwrap_or(ptr::null_mut());
     unsafe { *out = window };
@@ -1597,7 +1600,10 @@ unsafe extern "C" fn native_emit_mark_in_window(
         .severity_opt(severity)
         .timestamp_opt(timestamp)
         .build();
-    match crate::api::scope::forwarded_mark(&params).and_then(|mark| forwarder.forward(&mark)) {
+    match host_runtime()
+        .forward_mark(&params)
+        .and_then(|mark| forwarder.forward(&mark))
+    {
         Ok(()) => NemoRelayStatus::Ok,
         Err(err) => status_from_flow_error(err),
     }
@@ -1971,7 +1977,7 @@ unsafe extern "C" fn native_get_runtime_diagnostics(
     out_json: *mut *mut NemoRelayNativeString,
 ) -> NemoRelayStatus {
     clear_native_last_error();
-    let diagnostics = active_runtime_diagnostics_snapshot();
+    let diagnostics = host_runtime().runtime_diagnostics();
     match serde_json::to_value(diagnostics) {
         Ok(entries) => {
             let value = Json::Object(Map::from_iter([("entries".into(), entries)]));
@@ -3143,7 +3149,7 @@ unsafe extern "C" fn native_async_next_invoke(
             }
             _ => unreachable!("native next invocation kind matched its continuation"),
         };
-    let continuation_context = match next.context.isolated_for_current_invocation() {
+    let continuation_context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -3423,7 +3429,7 @@ unsafe extern "C" fn native_async_next_invoke_result(
             return NemoRelayStatus::InvalidArg;
         }
     };
-    let continuation_context = match next.context.isolated_for_current_invocation() {
+    let continuation_context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -3512,7 +3518,7 @@ unsafe extern "C" fn native_async_next_invoke_stream(
         Ok(request) => request,
         Err(status) => return status,
     };
-    let continuation_context = match next.context.isolated_for_current_invocation() {
+    let continuation_context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -3664,7 +3670,7 @@ unsafe extern "C" fn native_async_next_open_llm_stream(
         Ok(request) => request,
         Err(status) => return status,
     };
-    let context = match next.context.isolated_for_current_invocation() {
+    let context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -4459,10 +4465,8 @@ unsafe extern "C" fn native_plugin_context_register_async_middleware(
         return NemoRelayStatus::InvalidArg;
     }
     if kind == NemoRelayNativeAsyncMiddlewareKind::LlmRequestIntercept
-        && let Err(error) = validate_annotated_request_consumer_compatibility(
-            &instance.relay_compat,
-            &instance.plugin_kind,
-        )
+        && let Err(error) = host_runtime()
+            .validate_request_consumer_compatibility(&instance.relay_compat, &instance.plugin_kind)
     {
         return status_from_plugin_error(error);
     }
@@ -4687,7 +4691,7 @@ unsafe extern "C" fn native_plugin_context_runtime(
     let namespace = context.qualify_name("");
     let runtime = Arc::new(NativeHostPluginRuntime {
         namespace,
-        encode_local_names: context.uses_plugin_component_namespace(),
+        encode_local_names: host_runtime().qualifies_component_names(context),
         instance: Arc::downgrade(&host_ctx.instance),
         active: AtomicBool::new(true),
         gates: Mutex::new(HashMap::new()),
@@ -4882,7 +4886,7 @@ fn register_native_owned_gate(
         format!(
             "{}{}",
             runtime.namespace,
-            crate::plugin::encode_plugin_component_field(&local_name)
+            host_runtime().qualify_component_field(&local_name)
         )
     } else {
         format!("{}{}", runtime.namespace, local_name)
@@ -5522,10 +5526,9 @@ unsafe extern "C" fn native_plugin_context_register_llm_request_intercept(
         Err(status) => return status,
     };
     let instance = host_ctx.instance.clone();
-    if let Err(error) = validate_annotated_request_consumer_compatibility(
-        &instance.relay_compat,
-        &instance.plugin_kind,
-    ) {
+    if let Err(error) = host_runtime()
+        .validate_request_consumer_compatibility(&instance.relay_compat, &instance.plugin_kind)
+    {
         return status_from_plugin_error(error);
     }
     let ctx = unsafe { &mut *host_ctx.ctx };

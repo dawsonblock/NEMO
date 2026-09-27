@@ -28,7 +28,7 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The
   loader is still linked into the kernel until it moves, which is why the unsafe
   count above has not moved with it.
-- **Claims: 26 enforced, 1 asserted and not yet.** Every claim this document makes
+- **Claims: 27 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
@@ -2654,6 +2654,17 @@ remembering not to use it.
 
 ### What already exists
 
+- **The loader speaks a seam rather than the kernel's internals.** The first
+  attempt at this split failed in a way that made the real boundary visible: the
+  loader is not coupled to ABI definitions, it is coupled to the *runtime model* —
+  registration ownership, mutation serialization, teardown semantics, invocation
+  context, publication context, diagnostics and compatibility validation. The
+  inventory of that attempt was around twenty kernel-private names, which is not
+  twenty APIs that wanted to be public; it is one missing abstraction that
+  currently exists as twenty implementation details. `plugin/dynamic/hosted.rs` is
+  that abstraction: `NativeHostRuntime`, whose operations are what a hosted
+  plugin's code may ask this runtime to do. It is described below, because the
+  mapping is the design.
 - **The ABI has a crate of its own** (`crates/native-abi`, `nemo-relay-native-abi`).
   It holds the revision constants and the status codes both sides report, and
   `crates/plugin` re-exports them, so an author's existing
@@ -2684,21 +2695,85 @@ remembering not to use it.
   full instead of being hidden behind the crate the loader still lives in. As the
   split lands the list shrinks; when it is empty, the check is the property.
 
+### The seam the loader speaks
+
+`NativeHostRuntime` is one handle with the operations a hosted plugin's code may
+use. It carries no state; it names *what* may be asked, and the kernel keeps the
+decision about *how* — which mutex, which lease, which continuation context, which
+event identity, which staging rule. Four responsibilities, deliberately not four
+traits, because one runtime answers all four and splitting the handle would only
+make callers hold more of it:
+
+| Responsibility | Operations |
+|---|---|
+| Registration ownership | `install_plugin`, `remove_plugin`, `tear_down`, `qualifies_component_names`, `qualify_component_field`, `run_owned_mutation` |
+| Invocation context | `capture_mark_window`, `forward_mark`, `isolate_invocation`, `runtime_diagnostics` |
+| Artifact verification | `artifact_identity`, `hash_bytes`, `hash_open_file`, `hash_path`, `verify_path`, `resolve_manifest_relative` |
+| Compatibility validation | `validate_relay_compatibility`, `validate_request_consumer_compatibility` |
+
+Every name the loader used to spell, and the operation that replaced it, is a table
+in `crates/core/tests/integration/native_seam_tests.rs`. Three tests hold it
+together, and they are the reason this is a boundary rather than a rename:
+
+1. **The hosted side cannot name what it replaced.** None of
+   `register_plugin_tracked`, `deregister_tracked_registrations_checked`,
+   `run_owned_plugin_mutation`, `current_mark_forwarder`, `forwarded_mark`,
+   `isolated_for_current_invocation`, `active_runtime_diagnostics_snapshot`,
+   `uses_plugin_component_namespace`, `encode_plugin_component_field`,
+   `plugin_artifact_identity`, `sha256_hex`, `sha256_of_reader`, `sha256_of_path`,
+   `verify_sha256`, `resolve_manifest_relative_path`,
+   `validate_dynamic_plugin_relay_compatibility`,
+   `validate_annotated_request_consumer_compatibility`,
+   `PluginDeregistrationOutcome` or `DynamicPluginTeardownOutcome` appears in
+   `native.rs` or `host.rs` any more.
+2. **Every mapped operation is called.** A table whose right-hand side is dead is a
+   description of a boundary that moved, so an operation nobody calls fails the
+   check.
+3. **Nothing unmapped gets through.** The scan re-derives, from the crate's own
+   sources, the set of module-level items that are not `pub`, and fails if the
+   hosted side names one that the mapping does not already explain. The
+   allow-list for that is empty, and it stays in the file so a future entry has to
+   be written down with a reason rather than arriving as a compile fix.
+
+Two limits are recorded rather than papered over, because a gate that overstates
+itself is worse than one that says what it covers. The completeness scan reads
+column-zero declarations, so a private item declared *inside* a module's nested
+scope is outside it — an indented `fn` is a method, and the hosted side reaches
+methods through types it already names. And it matches declarations the crate
+actually writes at module level; a declaration form nobody uses today adds no
+coverage and is not pretended otherwise.
+
+What the seam does *not* claim is substitutability. The handle is a name for the
+runtime of the process the code is running in, and the kernel is the only thing
+that implements those operations today — in the supervisor process and in the
+child, which links the same kernel. If an implementation ever has to vary, this
+type is the single place a trait slot goes, which is a change of one file rather
+than of every call site. That is the trade the seam makes deliberately: it buys
+the vocabulary and the encapsulation now, and leaves the dispatch question until
+there is something to dispatch to.
+
 ### The order it has to happen in
 
-1. `native-abi`: ABI definitions and compatibility validation only. *In progress:*
+1. **The seam.** `NativeHostRuntime` in `plugin/dynamic/hosted.rs`, with the
+   loader and the activation rewritten to use it *before* anything moves. *Done
+   for the operations the loader needs*: the mapping below is enforced by tests,
+   and the loader names no kernel item outside it. This step is first because it
+   is the one that answers what the crate edge will carry; extracting code without
+   it produces a green commit that is still blocked in the same place.
+2. `native-abi`: ABI definitions and compatibility validation only. *In progress:*
    the crate exists with the revision vocabulary and status codes, the SDK
    re-exports it, and the layer and TCB policies name it; the versioned tables and
-   the compatibility validators are the rest of this step.
-2. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
+   the compatibility validators are the rest of this step. This is now mechanical
+   rather than exploratory, which is what the seam bought.
+3. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
    extraction.
-3. The child endpoint crate: the host's own end of the protocol, depending on
+4. The child endpoint crate: the host's own end of the protocol, depending on
    `native-loader` and the wire crates.
-4. Move the in-process child implementation out of the crate the supervisor links.
-5. The supervisor depends only on protocol, process and session layers.
-6. Remove the native loader path from `core`.
-7. Add the two proofs below.
-8. Delete the transitional re-exports, rather than leaving aliases that make the old
+5. Move the in-process child implementation out of the crate the supervisor links.
+6. The supervisor depends only on protocol, process and session layers.
+7. Remove the native loader path from `core`.
+8. Add the two proofs below.
+9. Delete the transitional re-exports, rather than leaving aliases that make the old
    architecture look dead while an accidental dependency path survives.
 
 Two traps are named here because the split is where they would be walked into. There

@@ -19,12 +19,11 @@ use crate::plugin::{
     ConfigReport, PluginComponentSpec, PluginConfig, PluginHostLease, Result,
     acquire_plugin_host_lease, clear_plugin_configuration_for_host,
     ensure_builtin_plugins_registered, initialize_plugins_exact_for_host, resolve_plugin_config,
-    run_owned_plugin_mutation,
 };
 
 use super::{
-    DynamicPluginKind, DynamicPluginTeardownOutcome, NativePluginActivation, NativePluginLoadSpec,
-    load_native_plugins,
+    DynamicPluginKind, NativeHostRuntime, NativePluginActivation, NativePluginLoadSpec,
+    RegistrationTeardown, load_native_plugins,
 };
 
 #[cfg(feature = "worker-grpc")]
@@ -106,10 +105,11 @@ impl PluginHostActivation {
         dynamic_plugins: Vec<DynamicPluginActivationSpec>,
         diagnostics: Vec<crate::plugin::ConfigDiagnostic>,
     ) -> Result<(Self, ConfigReport)> {
-        run_owned_plugin_mutation("dynamic plugin activation", move || async move {
-            Self::activate_inner(config, dynamic_plugins, diagnostics).await
-        })
-        .await
+        NativeHostRuntime::new()
+            .run_owned_mutation("dynamic plugin activation", move || async move {
+                Self::activate_inner(config, dynamic_plugins, diagnostics).await
+            })
+            .await
     }
 
     async fn activate_inner(
@@ -303,7 +303,7 @@ impl PluginHostActivation {
             return Err(retained_runtime_error(errors));
         }
 
-        let mut runtime_outcome = DynamicPluginTeardownOutcome::success();
+        let mut runtime_outcome = RegistrationTeardown::success();
         if let Some(native) = &mut self.native {
             runtime_outcome.merge(native.deregister_plugin_kinds_checked());
         }
@@ -316,14 +316,14 @@ impl PluginHostActivation {
         // callable. Only begin process shutdown once every kind is known to be
         // absent from the registry.
         #[cfg(feature = "worker-grpc")]
-        if runtime_outcome.safe_to_unload
+        if runtime_outcome.safe_to_unload()
             && let Some(worker) = &self.worker
         {
             runtime_outcome.merge(worker.shutdown_plugins_checked());
         }
-        errors.extend(runtime_outcome.errors);
+        errors.extend(runtime_outcome.errors().iter().cloned());
 
-        if !runtime_outcome.safe_to_unload {
+        if !runtime_outcome.safe_to_unload() {
             self.retain_loaded_runtimes();
             return Err(retained_runtime_error(errors));
         }

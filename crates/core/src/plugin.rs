@@ -244,10 +244,13 @@ pub struct RuntimeDiagnostic {
 
 /// Read-only projection of runtime diagnostics exposed to dynamic plugins.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct RuntimeDiagnosticsSnapshotEntry {
-    pub(crate) code: String,
-    pub(crate) message: String,
-    pub(crate) count: u64,
+pub struct RuntimeDiagnosticsSnapshotEntry {
+    /// Stable failure classification.
+    pub code: String,
+    /// Latest human-readable failure detail.
+    pub message: String,
+    /// Number of failures aggregated into this entry.
+    pub count: u64,
 }
 
 const MAX_DYNAMIC_PLUGIN_RUNTIME_DIAGNOSTICS: usize = 32;

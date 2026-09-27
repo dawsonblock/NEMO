@@ -50,6 +50,16 @@ enforced_by = [
 ]
 
 [[claim]]
+id = "the-loader-speaks-the-hosted-runtime-seam"
+statement = "The native loader reaches the runtime only through the hosted-runtime seam: it names no kernel item the seam replaced, no mapped operation is dead, and no other module-level kernel item that is not public."
+status = "enforced"
+enforced_by = [
+  { rust_test = "the_hosted_side_speaks_the_seam_rather_than_the_items_behind_it" },
+  { rust_test = "every_operation_replaces_something" },
+  { rust_test = "the_hosted_side_names_no_kernel_internal_that_is_not_mapped" },
+]
+
+[[claim]]
 id = "no-execution-path-chooses-its-own-budget"
 statement = "A registration reached across the boundary inherits the managed action's budget; no plugin-execution path invents one."
 status = "enforced"

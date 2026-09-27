@@ -25,6 +25,7 @@ pub const DYNAMIC_PLUGIN_MANIFEST_FILENAME: &str = "relay-plugin.toml";
 
 mod artifact;
 mod host;
+mod hosted;
 mod manifest;
 mod native;
 mod registry;
@@ -36,36 +37,21 @@ mod worker;
 // without owning a way to run one.
 pub use artifact::*;
 pub use host::*;
+pub use hosted::*;
 pub use manifest::*;
 pub use native::*;
 pub use registry::*;
 #[cfg(feature = "worker-grpc")]
 pub use worker::*;
 
-#[derive(Debug)]
-pub(crate) struct DynamicPluginTeardownOutcome {
-    pub(crate) errors: Vec<String>,
-    pub(crate) safe_to_unload: bool,
-}
-
-impl DynamicPluginTeardownOutcome {
-    pub(crate) fn success() -> Self {
-        Self {
-            errors: Vec::new(),
-            safe_to_unload: true,
-        }
-    }
-
-    pub(crate) fn record_error(&mut self, error: impl Into<String>, safe_to_unload: bool) {
-        self.errors.push(error.into());
-        self.safe_to_unload &= safe_to_unload;
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.errors.extend(other.errors);
-        self.safe_to_unload &= other.safe_to_unload;
-    }
-}
+/// The teardown vocabulary, under the name the dynamic-plugin control plane uses
+/// for it.
+///
+/// It lives on the hosted-runtime seam now, because a teardown is something a
+/// hosted plugin's runtime reports rather than something private to this module.
+/// The alias keeps the control plane reading as it did; the type it names is
+/// [`RegistrationTeardown`].
+pub(crate) type DynamicPluginTeardownOutcome = RegistrationTeardown;
 
 pub(super) fn deregister_tracked_registrations_checked(
     registrations: &mut Vec<(String, u64)>,
