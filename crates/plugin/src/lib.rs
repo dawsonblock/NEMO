@@ -13,6 +13,11 @@ mod async_sdk;
 
 pub use async_sdk::{LlmJsonAsyncStream, LlmNext, LlmStreamNext, NativeExecutorConfig, ToolNext};
 
+// The ABI's own crate carries the revision vocabulary, and re-exporting it here
+// keeps every author-facing path — `nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION`,
+// `nemo_relay_plugin::NemoRelayStatus` — resolving exactly where it did.
+pub use nemo_relay_native_abi::*;
+
 use std::ffi::{c_char, c_void};
 use std::marker::{PhantomData, PhantomPinned};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -48,27 +53,6 @@ pub use nemo_relay_types::plugin::{ConfigDiagnostic, DiagnosticLevel};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Map;
 
-/// Native plugin ABI version supported by this crate.
-///
-/// Version 4 adds completion-scoped codecs, pull-based LLM streams, extended
-/// mark emission, runtime diagnostics, and activation-owned runtime-registration
-/// discovery and dynamic conditional middleware guardrail control. Version 5 adds
-/// the mark window: an invocation-scoped attribution context the host captures and
-/// a plugin carries across its own asynchronous work, so a mark raised outside the
-/// synchronous call that created a callback still belongs to the operation whose
-/// callback raised it. Hosts retain frozen version-4, version-3 and version-2
-/// tables for already-built plugins that target those layouts.
-pub const NEMO_RELAY_NATIVE_ABI_VERSION: u32 = 5;
-/// ABI version that introduced completion-based asynchronous middleware.
-pub const NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE: u32 = 3;
-/// ABI version that introduced the v4 host extension: completion-scoped codecs,
-/// pull-based LLM streams, extended mark emission, runtime diagnostics, and
-/// activation-owned dynamic gate control.
-pub const NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS: u32 = 4;
-
-/// Legacy native plugin ABI accepted by Relay hosts for compatibility.
-pub const NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY: u32 = 2;
-
 /// Per-call request codec context delivered to an LLM sanitizer.
 pub struct LlmSanitizeRequestContext<'a> {
     /// Identity of the active codec.
@@ -88,36 +72,6 @@ pub struct LlmSanitizeResponseContext<'a> {
 // SAFETY: this context is constructed only by the async SDK from a retained
 // completion capability; callback-scoped native contexts never construct it.
 unsafe impl Send for LlmSanitizeResponseContext<'_> {}
-
-/// Status codes returned by stable native ABI functions.
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NemoRelayStatus {
-    /// Operation completed successfully.
-    Ok = 0,
-    /// A resource with the given name already exists.
-    AlreadyExists = 1,
-    /// The requested resource was not found.
-    NotFound = 2,
-    /// The scope stack is empty.
-    ScopeStackEmpty = 3,
-    /// A guardrail rejected the operation.
-    GuardrailRejected = 4,
-    /// An internal runtime error occurred.
-    Internal = 5,
-    /// A required pointer argument was null.
-    NullPointer = 6,
-    /// A JSON string argument could not be parsed.
-    InvalidJson = 7,
-    /// A string argument contained invalid UTF-8.
-    InvalidUtf8 = 8,
-    /// A function argument had an invalid value.
-    InvalidArg = 9,
-    /// A stream reached end-of-stream and has no chunk to return.
-    StreamEnd = 10,
-    /// A bounded stream queue is full; retry this operation after it advances.
-    Backpressured = 11,
-}
 
 /// Opaque host-owned UTF-8 string or JSON byte buffer.
 #[repr(C)]

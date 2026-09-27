@@ -37,14 +37,19 @@ version = 1
 # added. The recorded list is the remaining work, and the target is an empty one,
 # at which point this becomes the property itself.
 #
-# `nemo-relay-plugin` stands here for the native ABI until the extraction gives
-# the ABI a crate of its own (`native-abi`), which is the first staged step. The
-# wire crates are deliberately absent: protocol types are what the kernel needs in
-# order to talk to a host, and reaching them is the design rather than a leak.
+# Both the loader's crate and the ABI are recorded. `nemo-relay-plugin` is the
+# plugin author's SDK and the crate `core` still calls into; `nemo-relay-native-abi`
+# is the revision vocabulary and the versioned tables that SDK re-exports. The ABI
+# crate exists so those two can be frozen independently, and it is listed from the
+# moment it exists rather than after it moves, so the recorded intersection names
+# every package the milestone still has to remove instead of hiding one behind a
+# crate that is expected to leave anyway. The wire crates are deliberately absent:
+# protocol types are what the kernel needs in order to talk to a host, and reaching
+# them is the design rather than a leak.
 [kernel_closure]
 roots = ["nemo-relay", "nemo-relay-cli", "nemo-relay-ffi"]
-forbidden = ["libloading", "nemo-relay-plugin"]
-reachable_now = ["libloading", "nemo-relay-plugin"]
+forbidden = ["libloading", "nemo-relay-plugin", "nemo-relay-native-abi"]
+reachable_now = ["libloading", "nemo-relay-plugin", "nemo-relay-native-abi"]
 
 [trusted]
 crates = [
@@ -69,6 +74,11 @@ crates = [
     # It stays out of the invariant-enforcing tier: it carries vocabulary, not
     # enforcement.
     "nemo-relay-plugin-protocol",
+    # The ABI vocabulary the plugin SDK re-exports: the revisions a host can carry
+    # and the status codes both sides report. Like the contract above it is
+    # declarations rather than enforcement, and it is named here rather than folded
+    # into the SDK's line so a reader can see the ABI's own reach.
+    "nemo-relay-native-abi",
     # The compatibility backend runs inside whichever process links it, which
     # today is the kernel's. It is counted here because that is physically true
     # now, and separately in [plugin_host] because that is where it belongs once
@@ -142,7 +152,11 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 
 [limits.nemo-relay]
 max_direct_dependencies = 40
-max_transitive_packages = 265
+# Raised by one package for the ABI's own crate, the same identity-not-reach raise
+# the other dependents of the plugin carry. The ABI is named on its own line below
+# rather than only here, so this is the count moving with the graph's shape rather
+# than the kernel reaching something new.
+max_transitive_packages = 266
 # Raised for the exact-registration entry points the process boundary calls —
 # `invoke_tool_execution_intercept_registration`,
 # `invoke_llm_execution_intercept_registration`, and the name-retaining registry
@@ -197,13 +211,21 @@ max_transitive_packages = 265
 #
 # This is the last upward movement before the loader leaves: the next change to this number
 # is the deletion of the loader and the ABI bridge, and it moves down.
-max_source_lines = 74779
+#
+# That claim has now been spent once, and recorded rather than quietly ignored: separating
+# the artifact vocabulary from the loader put the identity of an artifact, the digests that
+# name it and the path resolution its manifest needs in `plugin/dynamic/artifact.rs`, which
+# the kernel carries while the loader does. The raise is the measured 34 lines it cost, not
+# a round number, and the two files it is owed by are the loader (6760) and that vocabulary
+# (171). The remove-it milestone takes both, so this stays a temporary ceiling and its entry
+# below moves with it.
+max_source_lines = 74813
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
 max_unsafe_occurrences = 307
 direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
-transitive_dependency_digest = "29c5f4894bee672759b9201671ce983c07028040959080c48b4f6b9e6f2a3ade"
+transitive_dependency_digest = "b82895825eb3abbc9c6fb4b444aa2fc62386c6ed3635c13f052aff117a40e202"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
@@ -286,13 +308,40 @@ transitive_dependency_digest = "1e5116e90ef0d74d6165fdbe239ac51fa536f8375be84749
 # an opaque host handle), which is where the `unsafe` growth is, and it is the
 # same shape as the scope binding the SDK already carried rather than a second
 # context system beside it.
+#
+# This number moved down when the ABI's own crate arrived: the revision constants
+# and the status enum now live in `nemo-relay-native-abi` and are re-exported, which
+# is why this budget and its dependency set each lost the vocabulary without losing
+# any author-facing path. The plugin still carries the loader's ABI tables, so this
+# crate has not finished shrinking — the loader-removal milestone takes the rest.
 [limits.nemo-relay-plugin]
-max_direct_dependencies = 6
-max_transitive_packages = 39
-max_source_lines = 5463
+max_direct_dependencies = 7
+max_transitive_packages = 40
+max_source_lines = 5417
 max_unsafe_occurrences = 333
-direct_dependency_digest = "c86fd580622db0b895e08d9ac8092f41be20e3e1eb4767b7f1d6c22a989ab1ec"
-transitive_dependency_digest = "9bc8864a9ca6215adb9194008a652fee077ae25f65f56cd6a10e07b44c0ced92"
+direct_dependency_digest = "7de9d3583263ba7f84f34797f12b247213d86407ab02b9287421ba466a86e169"
+transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a2825962a3c0607e938696"
+
+# The native plugin ABI's own crate — the first staged step of the split, and the
+# reason the SDK's line above could lose its vocabulary without any caller noticing.
+#
+# It is in the in-process tier because the SDK that links it is. What is measured
+# here is the ABI as a name of its own rather than folded into the SDK, so the
+# milestone that moves the ABI across the boundary shows up as this crate leaving
+# the policy rather than as one number inside another.
+#
+# The budgets are zero for reach rather than merely low: the crate is revision
+# constants and one status enum, so a dependency, a second file, or an `unsafe`
+# token appearing here is a change to what the ABI *is*, not to how much of it
+# there happens to be. Both digests are the SHA-256 of the empty string, which is
+# what "no direct dependencies" and "no transitive packages" hash to.
+[limits.nemo-relay-native-abi]
+max_direct_dependencies = 0
+max_transitive_packages = 0
+max_source_lines = 67
+max_unsafe_occurrences = 0
+direct_dependency_digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+transitive_dependency_digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 [limits.nemo-relay-worker-proto]
 max_direct_dependencies = 5
@@ -304,19 +353,24 @@ transitive_dependency_digest = "f182378dd10c8c07d8544097889fd5fe3b308e626c30bf19
 
 [limits.nemo-relay-adaptive]
 max_direct_dependencies = 16
-max_transitive_packages = 224
+# Raised by one package for the ABI's own crate: an identity in the resolved set
+# rather than code the adaptive runtime reaches, which is why the digest moves and
+# nothing else does.
+max_transitive_packages = 225
 max_source_lines = 18355
 max_unsafe_occurrences = 3
 direct_dependency_digest = "331568db3de0a45bb18a65209ac977b74010caa4f161552c292e5f42b79e2663"
-transitive_dependency_digest = "85c902c98093122874f49ac21da4643225f11a1e8ef257143bb55c34a7b2e78d"
+transitive_dependency_digest = "c16c13b2702b3a5e02d576e038d159eb1d8371e23c0763148c3f4f1b61aa5408"
 
 [limits.nemo-relay-pii-redaction]
 max_direct_dependencies = 7
-max_transitive_packages = 215
+# Raised by one package for the ABI's own crate, the same identity-in-the-set raise
+# the other plugin dependents carry. The sanitizer's own reach did not move.
+max_transitive_packages = 216
 max_source_lines = 4869
 max_unsafe_occurrences = 0
 direct_dependency_digest = "53d627f83c8ce0f7e8da4fa458a586b8353029500ba62c880d6bf34638c1811d"
-transitive_dependency_digest = "025a0d74e4635ff33c29f9c97ce40364833fd8ba61262605b9d50b02efa40dbb"
+transitive_dependency_digest = "9ecb6f5935d35946b51735cb518b954ae653dbfb771763e576a2bef561e2a7f1"
 
 [limits.nemo-relay-dlp]
 max_direct_dependencies = 2
@@ -336,11 +390,15 @@ transitive_dependency_digest = "e0bbdf96638cc171acc2b9f7b95b4a34fb959a94d7084910
 
 [limits.nemo-effect-runtime]
 max_direct_dependencies = 3
-max_transitive_packages = 244
+# Raised by one package for the ABI's own crate. Counting is over resolved
+# identities, so splitting one crate into two raises every dependent's number by
+# exactly one while the code reachable through it is unchanged: the digest moves
+# with the identity set, not as the sign of anything new being pulled in.
+max_transitive_packages = 245
 max_source_lines = 589
 max_unsafe_occurrences = 0
 direct_dependency_digest = "59b383378c3be1f4d7e84e04ad1fc400c2233b2df975f3816d2d5948f5f73f98"
-transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c737afe4f65fafb6004"
+transitive_dependency_digest = "53b17d23100e6ab10fa39abf2b2295ad12addd5d1e9b03d1b7405436dffd6e7b"
 
 # The in-process plugin backend. Measured from the start so its growth is
 # visible, but it sits in neither tier: it is the compatibility bridge that the
@@ -473,7 +531,7 @@ transitive_dependency_digest = "03407ba0a20f0cea26b28aa5fa34a6f4bd25fab982c01c73
 # no `unsafe` did.
 [limits.nemo-relay-plugin-host]
 max_direct_dependencies = 15
-max_transitive_packages = 240
+max_transitive_packages = 241
 # Raised for the codec capability record: references bound to an invocation, a
 # direction and a codec, with a guard whose drop is the revocation, and the refusal
 # matrix that keeps one call's capability from being another's. No dependency moved and
@@ -578,10 +636,14 @@ max_transitive_packages = 240
 # Almost all of the raise is the tests — two are new, and the one that moved came with
 # the rule — and none of it is policy: the supervisor still decides when a host starts
 # and what happens when it dies. No dependency moved and no `unsafe` did.
+#
+# Raised by one package for the ABI's own crate: the host links the plugin SDK, so the
+# identity of the ABI the SDK re-exports is one more name in its resolved set. Nothing
+# the host can reach changed with it.
 max_source_lines = 23991
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
-transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"
+transitive_dependency_digest = "8f42d7fcf333c6c41ebaa82a741f26db7ecd32b27474496ee6057eac1eb16b7a"
 
 # The wire schema. Measured because it is shipped and because its transitive set
 # is dominated by the protobuf and gRPC toolchain, which is exactly the kind of
@@ -627,15 +689,20 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 74779
+raised_to = 74813
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"
 must_fall_by = "loader-removal"
-# The target is the current ceiling minus the 6825 lines of
+# The value the budget must fall to, not the value it will land on: the target was the
+# ceiling at the time this entry was written minus the 6825 lines of
 # crates/core/src/plugin/dynamic/native.rs, which is the file the milestone moves out of
-# the kernel's dependency closure. Measured at the time this entry was written; the
-# milestone should be measured again rather than trusted to this number.
+# the kernel's dependency closure. That arithmetic is now stale in both directions — the
+# loader has since been split, so `native.rs` is 6760 lines and the artifact vocabulary it
+# set down is another 171 in the same directory — which is why the target was deliberately
+# *not* re-derived when this ceiling was raised. A promise that moved with each measurement
+# would promise nothing; the milestone re-measures the whole thing instead of being handed
+# a number, and the two files above are what it starts from.
 
 [[temporary]]
 crate = "nemo-relay"
@@ -652,7 +719,7 @@ must_fall_by = "loader-removal"
 [[temporary]]
 crate = "nemo-relay-plugin"
 field = "max_source_lines"
-raised_to = 5463
+raised_to = 5417
 target = 0
 reason = "the ABI crate is in the kernel's process only while the loader is"
 introduced = "2514f27..eb975ae"

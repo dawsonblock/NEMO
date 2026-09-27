@@ -64,7 +64,7 @@ REVISION_DECLARATIONS = {
         r"pub const PROTOCOL_VERSION: u16 = (\d+);",
     ),
     "native_plugin_abi": (
-        "crates/plugin/src/lib.rs",
+        "crates/native-abi/src/lib.rs",
         r"pub const NEMO_RELAY_NATIVE_ABI_VERSION: u32 = (\d+);",
     ),
 }

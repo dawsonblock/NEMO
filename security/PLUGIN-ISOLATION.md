@@ -18,7 +18,8 @@ section was written):
   point the ABI exposes is served, and the match that installs proxies is exhaustive: a
   class added to the ABI fails to compile there rather than being refused at runtime.
 - **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
-- **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/plugin`).
+- **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/native-abi`,
+  re-exported by `crates/plugin` so every author-facing path is unchanged).
 - **Plugin compatibility:** the CLI, FFI, Python and Node serve plugins from
   another process. No consumer reaches the in-process activation path any more,
   and that is pinned by the architecture test (`INDIRECT_LOAD_CALLERS` in
@@ -2653,6 +2654,18 @@ remembering not to use it.
 
 ### What already exists
 
+- **The ABI has a crate of its own** (`crates/native-abi`, `nemo-relay-native-abi`).
+  It holds the revision constants and the status codes both sides report, and
+  `crates/plugin` re-exports them, so an author's existing
+  `nemo_relay_plugin::NEMO_RELAY_NATIVE_ABI_VERSION` and
+  `nemo_relay_plugin::NemoRelayStatus` still resolve where they always did. The
+  point is not the size of the crate but the seam it creates: a table that lives
+  inside the crate that also *implements* the host side cannot be frozen
+  independently of the implementation, and a frozen table is what an
+  already-built plugin depends on. What has not moved yet is the versioned host
+  tables and boundary structs; they are entangled with SDK code in the same file
+  and need the loader's own seam before they can cross, which is why they are the
+  remainder of this step rather than a second commit's worth of moves.
 - **The launch decision has its own module** (`plugin-host:host_location.rs`), so
   the rule about *which* host to start and under what identity is one thing to read
   and one thing to move.
@@ -2660,18 +2673,23 @@ remembering not to use it.
   kernel's own process can still reach among the packages that load native code:
 
   ```text
-  kernel closure reaches (target: nothing): libloading, nemo-relay-plugin
+  kernel closure reaches (target: nothing): libloading, nemo-relay-native-abi, nemo-relay-plugin
   ```
 
   The intersection is *recorded* in `security/tcb.toml` rather than demanded empty,
   because a gate that is red on arrival enforces nothing. What fails the gate is the
   closure gaining a package that is not recorded — an edge somebody added — and the
-  recorded list is the remaining work. As the split lands the list shrinks; when it
-  is empty, the check is the property.
+  recorded list is the remaining work. The ABI crate is listed from the moment it
+  exists rather than after it moves, so the milestone's remaining work is named in
+  full instead of being hidden behind the crate the loader still lives in. As the
+  split lands the list shrinks; when it is empty, the check is the property.
 
 ### The order it has to happen in
 
-1. `native-abi`: ABI definitions and compatibility validation only.
+1. `native-abi`: ABI definitions and compatibility validation only. *In progress:*
+   the crate exists with the revision vocabulary and status codes, the SDK
+   re-exports it, and the layer and TCB policies name it; the versioned tables and
+   the compatibility validators are the rest of this step.
 2. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
    extraction.
 3. The child endpoint crate: the host's own end of the protocol, depending on
@@ -2737,7 +2755,7 @@ figure is therefore taken over normal and build edges, and what only the test tr
 reaches is printed beside it rather than folded in or left out:
 
 ```text
-kernel closure reaches (target: nothing): libloading, nemo-relay-plugin
+kernel closure reaches (target: nothing): libloading, nemo-relay-native-abi, nemo-relay-plugin
 ```
 
 Both still appear in the build graph today, so the number is unchanged — what

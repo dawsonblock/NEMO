@@ -16,7 +16,7 @@ version = 1
 [layers]
 # Stable vocabulary: identity, fingerprints, execution classes, receipts, and
 # the message contract for plugin execution across a process boundary.
-contracts = ["nemo-relay-types", "nemo-relay-plugin-protocol"]
+contracts = ["nemo-relay-types", "nemo-relay-plugin-protocol", "nemo-relay-native-abi"]
 
 # The trusted core. It should know contracts and interfaces, and nothing about
 # PostgreSQL, HTTP, providers, the CLI, or a language binding.
