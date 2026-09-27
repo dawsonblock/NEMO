@@ -2799,7 +2799,44 @@ there is something to dispatch to.
    crate whose obligation it is.
 4. The child endpoint crate: the host's own end of the protocol, depending on
    `native-loader` and the wire crates.
-   *Remaining, and it is what the composition ratchet is waiting on.*
+   *Remaining, and it is what the composition ratchet is waiting on.* The module
+   inventory is measured rather than guessed, because the two ends are interleaved
+   in one crate today and the split is a decision about which shared bookkeeping
+   belongs to whom:
+
+   | Role | Modules |
+   |---|---|
+   | child-only | `service`, `session_channel`, `confidentiality`, `conformance`, the `nemo-plugin-host` binary, and the in-process backend in `lib.rs` |
+   | supervisor-only | `attached`, `host_location`, `limits`, `observer` |
+   | shared by both | `capability`, `codec_capability`, `codec_context`, `continuations`, `operation_scopes`, `runtime_service`, `session`, `session_driver`, `off_path`, `supervisor`, `activation` |
+
+   The shared column is why this is a design step: ten of twenty-one modules are
+   reached from both ends, so a child crate either depends on `plugin-host` for them
+   — which is fine, the dependency direction allows it — or they move to a third
+   crate that both depend on, which is a decision about what "inert shared
+   vocabulary" means here that this document should not make by accident.
+
+   Two decisions have to be made before the move, and both are already implied by
+   what the seam and the artifact vocabulary are:
+
+   - **`DynamicPluginActivationSpec`** is the composition's *input* — a plugin id, a
+     kind, a manifest reference, an environment and a config map — and it is
+     currently in `native-loader`, which is what keeps `plugin-host`'s composition
+     depending on the loader. It belongs with the control-plane vocabulary the
+     kernel already publishes (`DynamicPluginKind` and its neighbours), and moving it
+     there is what lets the composition stop naming the loader.
+   - **Approval is a kernel operation, not a loader one.** The composition's only
+     other use of the loader is `NativePluginLoadSpec::approved(...)`, which hashes a
+     manifest before a host process starts. That is the artifact verifier the
+     definition of done already assigns to the kernel: it should be
+     `ApprovedPluginArtifact` in `plugin/dynamic/artifact.rs`, produced by the kernel
+     and *consumed* by the loader, with the approval travelling to the child as the
+     protocol's `PluginArtifactIdentity`, which is what it already travels as.
+
+   With those two moved, `plugin-host` has no edge to the loader at all, the child
+   binary moves to its own crate, and both `[kernel_closure]`'s recorded set and the
+   release binary's loader symbols become empty — at which point the symbol check
+   stops being a measurement and becomes the second property.
 5. Move the in-process child implementation out of the crate the supervisor links.
    *Remaining.* The in-process backend still lives in `plugin-host`, so the CLI and
    the FFI reach the loader transitively through it; that is the whole of the
