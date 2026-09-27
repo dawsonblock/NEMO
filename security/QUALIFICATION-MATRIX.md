@@ -14,6 +14,13 @@ resolved against the tree by `just qualification-matrix`, so a test that is
 renamed or deleted turns that gate red instead of leaving this table asserting
 something that is no longer checked.
 
+What this proves is that the evidence exists and that exactly one thing
+answers to each name; it does not prove that the evidence still asserts what
+the claim says. A test can be weakened while keeping its name, and nothing
+here would notice. That limit is stated rather than left implicit, because a
+reader who takes this table for coverage of the *meaning* of a claim would be
+reading more into it than any name can carry.
+
 ## Enforced
 
 | claim | enforced by |
