@@ -5782,10 +5782,12 @@ async fn a_named_upstream_redirect_is_not_followed() {
 
 /// The native fixture the CLI can load through a host process.
 ///
-/// `None` when the fixture or the host binary is not built, which is a run that
-/// says so rather than one that passes for the wrong reason — the same shape the
-/// plugin-host suite uses for its own fixture.
-fn native_intercept_fixture() -> Option<(std::path::PathBuf, String)> {
+/// Required rather than optional. This test is what the qualification matrix names
+/// as the evidence for the CLI's boundary claim, so a run that quietly skipped it
+/// because a fixture was missing would be a run where the claim held nothing. Both
+/// failures below name what to build, which is what `just test-rust` builds before
+/// the suite runs.
+fn native_intercept_fixture() -> (std::path::PathBuf, String) {
     let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -5795,22 +5797,25 @@ fn native_intercept_fixture() -> Option<(std::path::PathBuf, String)> {
             )
         });
     if !library.exists() {
-        eprintln!("the native intercept fixture is missing; skipping the CLI host case");
-        return None;
+        panic!(
+            "the native intercept fixture is missing at '{}'; build it with `just \
+             build-test-plugin-fixtures`",
+            library.display()
+        );
     }
     // The composition resolves this the same way in production; asking it here
-    // means the test skips for the same reason a deployment would fail, rather
-    // than asserting a path this file chose.
+    // means the test fails for the same reason a deployment would, rather than
+    // asserting a path this file chose.
     let supervisor =
         nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig::beside_this_executable(
             "cli-test-binding",
         );
     if !supervisor.executable.exists() {
-        eprintln!(
-            "the plugin host binary is missing at '{}'; skipping the CLI host case",
+        panic!(
+            "the plugin host binary is missing at '{}'; build it with `cargo build -p \
+             nemo-relay-plugin-host`",
             supervisor.executable.display()
         );
-        return None;
     }
     let directory = tempfile::tempdir().expect("a manifest directory");
     let manifest = directory.path().join("relay-plugin.toml");
@@ -5830,7 +5835,7 @@ fn native_intercept_fixture() -> Option<(std::path::PathBuf, String)> {
     let artifact = manifest.to_string_lossy().into_owned();
     // The temporary directory is kept alive by the returned guard alongside the
     // artifact it describes.
-    Some((directory.keep(), artifact))
+    (directory.keep(), artifact)
 }
 
 /// A production consumer now uses the isolated backend.
@@ -5844,9 +5849,7 @@ fn native_intercept_fixture() -> Option<(std::path::PathBuf, String)> {
 async fn cli_activation_serves_a_native_plugin_from_another_process() {
     let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
     let _ = nemo_relay::plugin::clear_plugin_configuration();
-    let Some((directory, artifact)) = native_intercept_fixture() else {
-        return;
-    };
+    let (directory, artifact) = native_intercept_fixture();
 
     let activation = PluginActivation::initialize(
         None,
@@ -5873,9 +5876,16 @@ async fn cli_activation_serves_a_native_plugin_from_another_process() {
         !kinds.iter().any(|kind| kind == "fixture_intercept"),
         "the CLI process must not have loaded the plugin: {kinds:?}"
     );
-    assert!(
-        runtime.native_process_id().is_some(),
-        "the plugin lives in a host process"
+    // And it is a process of its own. The kind being absent says the library is
+    // not mapped into this one; the pid says where the work happened, which is
+    // the other half of the same claim and the half a registry cannot state.
+    let host_pid = runtime
+        .native_process_id()
+        .expect("the plugin lives in a host process");
+    assert_ne!(
+        host_pid,
+        std::process::id(),
+        "the plugin must not run in the CLI's own process"
     );
     assert!(
         !runtime

@@ -43,11 +43,30 @@ ROOT = Path(__file__).resolve().parents[2]
 POLICY = ROOT / "security" / "qualification-matrix.toml"
 GENERATED = ROOT / "security" / "QUALIFICATION-MATRIX.md"
 MILESTONE = ROOT / "security" / "PLUGIN-ISOLATION.md"
+#: Documents a reader takes as the release's own account of itself. A claim the
+#: matrix records as unverified may be discussed in them; it may not be described
+#: there in the words that mean covered.
+RELEASE_TEXT = (MILESTONE, ROOT / "README.md")
+
+#: Wording that asserts coverage, matched as stems so that "qualified",
+#: "qualification" and "qualifies" all count as the same assertion.
+QUALITY_WORDS = ("guarantee", "enforce", "qualif", "support")
+
+#: Wording that says the sentence is about the gap rather than about coverage.
+#: Without it the invariant would fire on the honest sentences that exist to
+#: record what is *not* enforced, which is the opposite of the intent.
+HEDGES = ("not ", "no test", "unverified", "asserted", "never", "cannot")
 
 STATUSES = ("enforced", "unverified")
 
 # Directories that hold no evidence: build output, vendored packages, generated
 # release qualification, and the caches tools keep beside their inputs.
+#
+# The names are pruned wherever they appear except directly under a `tests`
+# directory, because a test tree is sources rather than build output: the CLI's
+# own suite lives in `crates/cli/tests/coverage/`, and a name-based skip that
+# could not tell those two apart hid the evidence for every claim the CLI
+# enforces. That is how this exemption came to exist.
 SKIP_DIRECTORIES = {
     ".cache",
     ".claude",
@@ -105,6 +124,9 @@ class Claim:
     status: str
     enforced_by: tuple[tuple[str, str], ...]
     note: str | None
+    #: Phrases a reader would use to refer to this claim. Required for an
+    #: unverified claim, because it is what the invariant below searches for.
+    terms: tuple[str, ...]
 
 
 def read_claims(policy: Path) -> list[Claim]:
@@ -152,6 +174,16 @@ def read_claims(policy: Path) -> list[Claim]:
                 raise MatrixError(f"claim '{claim_id}' has an evidence entry with no name")
             evidence.append((str(kind), name))
         note = text_field(entry, "note")
+        listed_terms = entry.get("terms")
+        if listed_terms is None:
+            listed_terms = []
+        if not isinstance(listed_terms, list):
+            raise MatrixError(f"claim '{claim_id}' has a terms entry that is not a phrase")
+        terms: list[str] = []
+        for term in listed_terms:
+            if not isinstance(term, str) or not term.strip():
+                raise MatrixError(f"claim '{claim_id}' has a terms entry that is not a phrase")
+            terms.append(term.strip())
         claims.append(
             Claim(
                 id=claim_id,
@@ -159,6 +191,7 @@ def read_claims(policy: Path) -> list[Claim]:
                 status=status,
                 enforced_by=tuple(evidence),
                 note=note or None,
+                terms=tuple(terms),
             )
         )
     return claims
@@ -182,7 +215,10 @@ def candidate_files(root: Path, pattern: str) -> list[Path]:
         return _CANDIDATES[key]
     found: list[Path] = []
     for directory, subdirectories, filenames in os.walk(root):
-        subdirectories[:] = sorted(name for name in subdirectories if name not in SKIP_DIRECTORIES)
+        under_test_sources = Path(directory).name == "tests"
+        subdirectories[:] = sorted(
+            name for name in subdirectories if name not in SKIP_DIRECTORIES or under_test_sources
+        )
         found.extend(Path(directory) / name for name in sorted(filenames) if fnmatch.fnmatch(name, pattern))
     _CANDIDATES[key] = found
     return found
@@ -225,6 +261,11 @@ def problems(claims: list[Claim], root: Path) -> list[str]:
                 f"claim '{claim.id}' is unverified and says nothing about why: a gap that "
                 f"is recorded is fixable, and a gap that is not is invisible"
             )
+        if claim.status == "unverified" and not claim.terms:
+            found.append(
+                f"claim '{claim.id}' is unverified and names no terms: the invariant that "
+                f"keeps release text from calling it covered has nothing to look for"
+            )
         if claim.status == "unverified" and claim.enforced_by:
             found.append(f"claim '{claim.id}' is unverified and names evidence: one of the two is wrong")
         for kind, name in claim.enforced_by:
@@ -256,6 +297,61 @@ def documented_counts(milestone: Path) -> tuple[int, int] | None:
     if found is None:
         return None
     return int(found.group(1)), int(found.group(2))
+
+
+def paragraphs(document: str) -> list[str]:
+    """Return a document's paragraphs, which is the unit the invariant reads.
+
+    Paragraphs rather than lines: the prose in these documents is wrapped, and a
+    check that read line by line would be evaded by a sentence that happened to
+    break across one.
+    """
+    return [block for block in re.split(r"\n\s*\n", document) if block.strip()]
+
+
+def coverage_claims(claims: list[Claim], documents: tuple[Path, ...]) -> list[str]:
+    """Return release text that calls an unverified claim covered.
+
+    A claim the matrix records as unverified may be discussed in these documents —
+    that is what the section is for — but a paragraph that names it and also uses
+    the wording of coverage has collapsed the distinction the matrix draws, and a
+    reader has no way to tell. The hedge list is what keeps this from firing on the
+    honest sentences that exist to record the gap.
+    """
+    found: list[str] = []
+    for document in documents:
+        if not document.is_file():
+            continue
+        for block in paragraphs(document.read_text()):
+            lowered = block.lower()
+            if any(hedge in lowered for hedge in HEDGES):
+                continue
+            asserted = asserted_wording(lowered)
+            if asserted is None:
+                continue
+            for claim in claims:
+                if claim.status != "unverified":
+                    continue
+                named = [term for term in claim.terms if term.lower() in lowered]
+                if named:
+                    found.append(
+                        f"{document.name} calls '{claim.id}' {asserted!r} while the matrix "
+                        f"records it unverified (the paragraph names {named[0]!r})"
+                    )
+    return found
+
+
+def asserted_wording(lowered: str) -> str | None:
+    """Return the word that asserts coverage in this text, when there is one.
+
+    The stem is matched and the word itself is reported, so the message quotes what
+    the document says — "supported" rather than the stem it was found by.
+    """
+    for stem in QUALITY_WORDS:
+        found = re.search(rf"{stem}\w*", lowered)
+        if found is not None:
+            return found.group(0)
+    return None
 
 
 def render(claims: list[Claim], root: Path) -> str:
@@ -341,7 +437,10 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
-    found = problems(claims, root)
+    found = problems(claims, root) + coverage_claims(
+        claims,
+        tuple(root / document.relative_to(ROOT) for document in RELEASE_TEXT if document.is_relative_to(ROOT)),
+    )
     if found:
         for problem in found:
             print(f"error: {problem}", file=sys.stderr)

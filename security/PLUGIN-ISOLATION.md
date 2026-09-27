@@ -27,12 +27,12 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The
   loader is still linked into the kernel until it moves, which is why the unsafe
   count above has not moved with it.
-- **Claims: 24 enforced, 2 asserted and not yet.** Every claim this document makes
+- **Claims: 25 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
   gate red, so a sentence here cannot go on describing something nothing checks.
-  The two that are asserted rather than enforced are named there, with why.
+  The one that is asserted rather than enforced is named there, with why.
 
 Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
 in `crates/core/src/plugin/dynamic/native.rs` and another 315 in
@@ -2527,3 +2527,40 @@ below has not moved.
 This increment does not move `kernel-process unsafe tokens`, which is 622. The
 number falls when native loading physically crosses the process boundary, and a
 reduction achieved by reclassifying crates would not mean anything.
+
+## The matrix is what found the gap in the matrix
+
+The first revision of `security/qualification-matrix.toml` listed the CLI's boundary
+as *asserted and not yet enforced*, on the strength of a search that looked for the
+host's name in the CLI's test tree and for the assertions the other bindings make.
+Both searches missed the same file:
+`crates/cli/tests/coverage/shared/server_tests.rs` has held
+`cli_activation_serves_a_native_plugin_from_another_process` since the CLI cut over,
+and that test activates a native plugin through the CLI's own composition, requires
+the plugin's kind to be absent from this process's registry, and drives a managed
+tool call whose rewrite comes back from the child.
+
+The claim was wrong, and so was the gate that was supposed to check it: the matrix's
+walk pruned every directory named `coverage`, so it could not see the CLI's test
+sources at all. A skip list that cannot tell a coverage report from a test tree
+named after one hides evidence instead of checking it, and the direction of that
+failure is the dangerous one — the gate reports a claim as unverified and somebody
+believes it.
+
+What was *actually* missing from the claim was smaller than "no test": the test
+asserted `native_process_id().is_some()` and never compared that pid to the CLI's
+own, so a host started for the plugin and a plugin still running here would have
+read the same. It compares the two now, and the negative control — asserting they
+are equal — fails with `52168` against `52167`, which is what says the comparison is
+of two live values rather than of one.
+
+The lesson is the one the matrix exists for, turned on itself: a claim is only as
+good as the search behind it, and a gate that silently narrows its own search
+reports absence as a fact. The narrowing is a test now —
+`a_test_tree_named_coverage_is_searched` — so the exemption is checked rather than
+remembered.
+
+The gate also refuses to let release text collapse the distinction it draws: a
+paragraph that names an unverified claim and uses the wording of coverage
+(`guaranteed`, `enforced`, `qualified`, `supported`) fails, unless it also carries
+the wording that marks the sentence as being about the gap.

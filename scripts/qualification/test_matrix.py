@@ -26,10 +26,17 @@ def tree(tmp_path: pathlib.Path, files: dict[str, str], policy: str) -> pathlib.
     return tmp_path
 
 
-def claim(claim_id: str, status: str, evidence: str = "", note: str = "") -> str:
+def claim(
+    claim_id: str,
+    status: str,
+    evidence: str = "",
+    note: str = "",
+    terms: str = "",
+) -> str:
     """Return one claim table, with the evidence and note written as they are given."""
     return (
-        f'[[claim]]\nid = "{claim_id}"\nstatement = "the claim {claim_id} makes"\nstatus = "{status}"\n{evidence}{note}'
+        f'[[claim]]\nid = "{claim_id}"\nstatement = "the claim {claim_id} makes"\n'
+        f'status = "{status}"\n{evidence}{note}{terms}'
     )
 
 
@@ -114,10 +121,73 @@ def test_an_enforced_claim_with_no_evidence_is_reported(tmp_path: pathlib.Path) 
 
 def test_an_unverified_claim_needs_a_note(tmp_path: pathlib.Path) -> None:
     """A gap that is recorded is fixable, and a gap that is not is invisible."""
-    root = tree(tmp_path, {}, claim("an-unrecorded-gap", "unverified"))
+    root = tree(
+        tmp_path,
+        {},
+        claim("an-unrecorded-gap", "unverified", terms='terms = ["a phrase"]\n'),
+    )
     problems = check(root)
     assert len(problems) == 1
     assert "says nothing about why" in problems[0]
+
+
+def test_an_unverified_claim_names_the_terms_release_text_would_use(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Without terms the coverage invariant has nothing to look for."""
+    root = tree(tmp_path, {}, claim("a-gap", "unverified", note='note = "why"\n'))
+    problems = check(root)
+    assert len(problems) == 1
+    assert "names no terms" in problems[0]
+
+
+def test_release_text_may_not_call_an_unverified_claim_covered(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A paragraph that names a gap and asserts coverage has collapsed the two."""
+    root = tree(
+        tmp_path,
+        {},
+        claim(
+            "a-gap",
+            "unverified",
+            note='note = "why"\n',
+            terms='terms = ["host discovery"]\n',
+        ),
+    )
+    claims = matrix.read_claims(root / "security" / "qualification-matrix.toml")
+    document = tmp_path / "PLUGIN-ISOLATION.md"
+    document.write_text("# Milestone\n\nHost discovery from the installed package is supported by every binding.\n")
+    problems = matrix.coverage_claims(claims, (document,))
+    assert len(problems) == 1
+    assert "a-gap" in problems[0]
+    assert "host discovery" in problems[0]
+
+
+def test_release_text_recording_the_gap_is_not_reported(tmp_path: pathlib.Path) -> None:
+    """The honest sentence about a gap uses the words that mean "not covered"."""
+    root = tree(
+        tmp_path,
+        {},
+        claim(
+            "a-gap",
+            "unverified",
+            note='note = "why"\n',
+            terms='terms = ["host discovery"]\n',
+        ),
+    )
+    claims = matrix.read_claims(root / "security" / "qualification-matrix.toml")
+    document = tmp_path / "PLUGIN-ISOLATION.md"
+    document.write_text(
+        "# Milestone\n\nHost discovery from the installed package is not supported yet, and no test asserts it.\n"
+    )
+    assert matrix.coverage_claims(claims, (document,)) == []
+
+
+def test_the_repository_release_text_does_not_call_open_claims_covered() -> None:
+    """The milestone as written does not describe its gaps as covered."""
+    claims = matrix.read_claims(matrix.POLICY)
+    assert matrix.coverage_claims(claims, matrix.RELEASE_TEXT) == []
 
 
 def test_an_unverified_claim_with_evidence_is_reported(tmp_path: pathlib.Path) -> None:
@@ -130,6 +200,7 @@ def test_an_unverified_claim_with_evidence_is_reported(tmp_path: pathlib.Path) -
             "unverified",
             'enforced_by = [\n  { rust_test = "a_test" },\n]\n',
             'note = "why"\n',
+            'terms = ["a phrase"]\n',
         ),
     )
     problems = check(root)
@@ -174,6 +245,26 @@ def test_a_comment_that_names_a_test_is_not_evidence(tmp_path: pathlib.Path) -> 
     problems = check(root)
     assert len(problems) == 1
     assert "nothing in the tree defines it" in problems[0]
+
+
+def test_a_test_tree_named_coverage_is_searched(tmp_path: pathlib.Path) -> None:
+    """A skipped *name* under a tests directory is sources, not build output.
+
+    The CLI's own suite lives in `crates/cli/tests/coverage/`, so a name-based skip
+    that could not tell that tree from a coverage report hid the evidence for every
+    claim the CLI enforces — including the boundary claim the gate then reported as
+    unverified.
+    """
+    root = tree(
+        tmp_path,
+        {"crates/cli/tests/coverage/shared/server_tests.rs": "async fn a_test() {}\n"},
+        claim(
+            "cli-evidence",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_test" },\n]\n',
+        ),
+    )
+    assert check(root) == []
 
 
 def test_the_document_records_what_the_policy_says(tmp_path: pathlib.Path) -> None:

@@ -42,6 +42,7 @@ something that is no longer checked.
 | An installed Node metapackage resolves the host its platform package ships, runs the plugin there, and refuses rather than searching when the package carries none. | just recipe `verify-installed-node-plugin` — `justfile` |
 | The kernel-process `unsafe` surface is measured against a ceiling that only an explicit edit can raise. | just recipe `tcb-report` — `justfile` |
 | The dependency layers hold, and a new upward edge fails the gate. | just recipe `layer-report` — `justfile` |
+| The CLI's server runs a plugin in the host process: the plugin answers a managed call from here, its kind is not registered here, and the host is a process of its own. | Rust test `cli_activation_serves_a_native_plugin_from_another_process` — `crates/cli/tests/coverage/shared/server_tests.rs` |
 
 ## Asserted, not yet enforced
 
@@ -50,5 +51,4 @@ left out, because a gap that is written down is one somebody can close.
 
 | claim | why it is not enforced |
 |---|---|
-| The CLI's server starts plugins in the host process. | The CLI composes the shared activation in `crates/cli/src/server/mod.rs`, so it is the same path the shared tests drive and the same composition the architecture check keeps singular. What is missing is a CLI test that asserts the boundary from the CLI: its own suite covers plugin lifecycle, snapshots and trust, and none of those would notice if the server went back to loading in process. |
 | Every consumer that hosts plugins finds the host its installation shipped, rather than searching for one. | Node resolves the host from the package that carries the addon, and its verifier installs an npm metapackage with nothing in the environment naming one. Python finds it beside the interpreter, which is where a wheel's script lands in a virtual environment, and its verifier runs an installed wheel the same way. The FFI and the CLI have no packaging step of their own, so for those there is nothing to find yet — and Python's rule is the interpreter's directory rather than the package's, which is the same place for a virtual environment and not for every installation. That difference is what the deterministic-discovery work is for. |
