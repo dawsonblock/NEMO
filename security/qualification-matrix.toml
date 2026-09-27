@@ -43,7 +43,7 @@ enforced_by = [
 
 [[claim]]
 id = "kernel-does-not-depend-on-the-loader"
-statement = "The kernel does not depend on the loader's implementation, and the dynamic loader is a dependency of one crate."
+statement = "The dynamic loader is a dependency of exactly one crate, and the kernel does not depend on that crate at all: `libloading` appears in one manifest, and no kernel root reaches it."
 status = "enforced"
 enforced_by = [
   { rust_test = "the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the_implementation" },
@@ -59,7 +59,7 @@ enforced_by = [
 
 [[claim]]
 id = "the-loader-speaks-the-hosted-runtime-seam"
-statement = "The native loader reaches the runtime only through the hosted-runtime seam: it names no kernel item the seam replaced, no mapped operation is dead, and no other module-level kernel item that is not public."
+statement = "The hosted side's reach into kernel-private runtime implementation is mediated by the hosted-runtime seam: it names none of the kernel items the seam replaced, every operation in that mapping is still called, and no kernel item it names is non-public. Its remaining reach is the kernel's public API, which is the boundary rather than a leak."
 status = "enforced"
 enforced_by = [
   { rust_test = "the_hosted_side_speaks_the_seam_rather_than_the_items_behind_it" },
@@ -77,7 +77,7 @@ enforced_by = [
 
 [[claim]]
 id = "native-plugin-loads-only-in-the-child"
-statement = "A native plugin's library is loaded in the host process and nowhere else."
+statement = "Every shipping composition loads a native plugin's library in the host process and nowhere else: a real child loads it, and the test that says so runs the composition the four bindings use."
 status = "enforced"
 enforced_by = [
   { rust_test = "a_real_native_plugin_loads_in_the_child_and_only_there" },

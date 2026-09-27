@@ -102,7 +102,19 @@ KINDS = {
     # `fn name(` matches a commented-out test, and a gate that a comment can satisfy
     # is a gate that reports what nobody is checking. The TCB report deliberately
     # overcounts tokens for an upper bound; evidence has to go the other way.
-    "rust_test": EvidenceKind("*.rs", r"(?m)^\s*(?:pub\s+)?(?:async\s+)?fn {name}\s*\(", "Rust test"),
+    # A test is a function *with a test attribute above it*. Matching the name alone
+    # was an evidence bug an audit found by deleting `#[test]` from a referenced test
+    # and watching the matrix stay green: the gate proved a function existed, not that
+    # anything ran it. Other attributes may sit between the attribute and the function
+    # (`#[should_panic]`, `#[ignore]`, `#[serial]`), and the attribute itself may carry
+    # arguments — `#[tokio::test(flavor = "multi_thread")]` is one of the forms this
+    # repository uses.
+    "rust_test": EvidenceKind(
+        "*.rs",
+        r"(?m)^\s*#\[(?:[\w:]+::)?test\b[^\]]*\]\s*\n(?:\s*#\[[^\]]*\]\s*\n)*\s*"
+        r"(?:pub\s+)?(?:async\s+)?fn {name}\s*\(",
+        "Rust test",
+    ),
     "python_test": EvidenceKind("*.py", r"(?m)^\s*(?:async\s+)?def {name}\s*\(", "Python test"),
     "node_test": EvidenceKind("*.mjs", r"(?m)^\s*it\(\s*['\"]{name}['\"]", "Node test"),
     # A recipe's line is its name and then either its parameters or the colon, so the

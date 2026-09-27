@@ -258,6 +258,16 @@ pub struct CodecBridge {
     /// `recv` returns nothing only once no sender is left, and joining first is a hang of the
     /// dropper's own making — which is exactly what this cost once.
     jobs: Option<tokio::sync::mpsc::Sender<CodecJob>>,
+    /// The real bound: one permit per codec call that may exist at once.
+    ///
+    /// The channel bounds what is *waiting to be received*, which is not the same
+    /// number, and that was the defect an audit found here: the consumer receives as
+    /// fast as it can and hands each job to a task, so a slow kernel could leave a
+    /// full queue behind and any number of running calls behind that. A permit is
+    /// taken at admission and travels with the job, so it is released when the call
+    /// *ends* rather than when it starts — which is what "calls in flight" has to
+    /// mean for the refusal to be a bound rather than a coincidence.
+    in_flight: Arc<tokio::sync::Semaphore>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -273,6 +283,8 @@ struct CodecJob {
     /// moment a thread got to it.
     budget: ExecutionBudget,
     answer: std::sync::mpsc::Sender<Result<String, String>>,
+    /// Held from admission until the answer is sent, so the call counts as in flight.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for CodecBridge {
@@ -379,8 +391,27 @@ impl CodecBridge {
             .map_err(|error| format!("the codec bridge thread could not start: {error}"))?;
         Ok(Arc::new(Self {
             jobs: Some(jobs),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY)),
             thread: std::sync::Mutex::new(Some(thread)),
         }))
+    }
+
+    /// Take one in-flight permit, or refuse the call by name.
+    ///
+    /// The refusal names the bound rather than the transport, because the two are
+    /// different facts to a plugin: a full bridge is this host asking the plugin to
+    /// slow down, and a stopped bridge is this host telling it that nothing will be
+    /// answered.
+    fn try_admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        Arc::clone(&self.in_flight)
+            .try_acquire_owned()
+            .map_err(|_| {
+                format!(
+                    "this host's codec bridge is at its limit of {} calls in flight, so this \
+                     plugin's codec call was refused rather than queued",
+                    CODEC_BRIDGE_QUEUE_CAPACITY
+                )
+            })
     }
 
     /// Run one codec operation on the bridge, blocking the calling thread for the answer.
@@ -407,6 +438,10 @@ impl CodecBridge {
             );
         }
         let (answer, received) = std::sync::mpsc::channel();
+        // Admission is the bound, and it happens before the job exists: a call that
+        // cannot be admitted is refused to the plugin's callback rather than queued
+        // for a thread that is already as busy as it is allowed to be.
+        let permit = self.try_admit()?;
         let Some(jobs) = self.jobs.as_ref() else {
             return Err("this host's codec bridge has stopped".to_string());
         };
@@ -417,6 +452,7 @@ impl CodecBridge {
             reference: reference.to_string(),
             budget,
             answer,
+            _permit: permit,
         })
         .map_err(|error| match error {
             tokio::sync::mpsc::error::TrySendError::Full(_) => format!(
@@ -1058,6 +1094,7 @@ mod tests {
         drop(consumer);
         let bridge = CodecBridge {
             jobs: Some(jobs),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY)),
             thread: std::sync::Mutex::new(None),
         };
 
@@ -1077,18 +1114,62 @@ mod tests {
         );
     }
 
-    /// The work behind a codec call is a plugin's, so a sanitizer that asks faster
-    /// than the kernel answers must meet a refusal it can see rather than a queue
-    /// this host grows for it. The bridge is built here with a consumer that never
-    /// drains, which is the state the bound exists for.
+    /// The bridge admits a bounded number of calls, and the bound is the calls
+    /// themselves rather than the queue they pass through.
+    ///
+    /// This is the property an audit found to be false: the channel was bounded, but
+    /// its consumer received as fast as it could and handed each job to a task, so a
+    /// slow kernel could leave a full queue behind and any number of running calls
+    /// behind that. Admission is what `resolve` does before it builds a job, so
+    /// holding the permits here is the same state a slow kernel produces — sixteen
+    /// calls in flight, and a seventeenth that has to be refused rather than queued.
     #[test]
-    fn the_codec_bridge_refuses_work_beyond_its_bound() {
+    fn the_codec_bridge_admits_only_its_bound_worth_of_calls() {
         let (jobs, _never_drained) =
             tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
         let bridge = CodecBridge {
             jobs: Some(jobs),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY)),
             thread: std::sync::Mutex::new(None),
         };
+
+        let held: Vec<_> = (0..CODEC_BRIDGE_QUEUE_CAPACITY)
+            .map(|_| bridge.try_admit().expect("within the bound"))
+            .collect();
+        let refused = bridge
+            .try_admit()
+            .expect_err("one more than the bound is refused");
+        assert!(
+            refused.contains(&format!(
+                "limit of {CODEC_BRIDGE_QUEUE_CAPACITY} calls in flight"
+            )),
+            "the refusal does not name the bound: {refused}"
+        );
+
+        // A call that finishes gives its permit back, so the next one is admitted:
+        // the bound is a limit on concurrency rather than a budget for a lifetime.
+        drop(held);
+        let _ = bridge.try_admit().expect("a finished call makes room");
+    }
+
+    /// The queue is bounded too, and by the same number.
+    ///
+    /// This is the weaker of the two: it proves the channel's capacity, which is not
+    /// the property the bridge claims — see the admission test above for that. It is
+    /// kept because the two bounds are separate facts and a future change could keep
+    /// one while losing the other.
+    #[test]
+    fn the_codec_bridge_queue_is_bounded() {
+        let (jobs, _never_drained) =
+            tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
+        let bridge = CodecBridge {
+            jobs: Some(jobs),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY)),
+            thread: std::sync::Mutex::new(None),
+        };
+        // The jobs carry permits this test hands out generously: the property here is
+        // the channel's capacity, and admission is the test above's subject.
+        let permits = Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY + 1));
         let job = |operation_request_id: &str| {
             let (answer, _received) = std::sync::mpsc::channel();
             CodecJob {
@@ -1098,6 +1179,9 @@ mod tests {
                 reference: "reference".to_string(),
                 budget: live_budget(),
                 answer,
+                _permit: Arc::clone(&permits)
+                    .try_acquire_owned()
+                    .expect("a permit for the test's own bookkeeping"),
             }
         };
 
@@ -1115,14 +1199,9 @@ mod tests {
             .expect("a bridge")
             .try_send(job("one-too-many"))
             .expect_err("the queue is full");
-        let reason = match refused {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => format!(
-                "this host's codec bridge is at its limit of {} calls in flight, so this \
-                 plugin's codec call was refused rather than queued",
-                CODEC_BRIDGE_QUEUE_CAPACITY
-            ),
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => unreachable!("the queue is open"),
-        };
-        assert!(reason.contains("refused rather than queued"), "{reason}");
+        assert!(
+            matches!(refused, tokio::sync::mpsc::error::TrySendError::Full(_)),
+            "the queue refused for a reason other than being full"
+        );
     }
 }

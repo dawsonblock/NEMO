@@ -2651,6 +2651,40 @@ and the third is that child's end, and the entry that has to move for the metric
 move is the third. Until it does, `kernel-process unsafe tokens` stays where it is,
 and it is not made to move by reclassifying anything.
 
+## The codec bridge's bound is a bound now
+
+An audit of this milestone found a real defect behind a passing test, and it is worth
+recording because the failure was in the evidence rather than in the intent.
+
+The bridge that answers a plugin's synchronous codec call is one per host, and its
+queue is bounded at sixteen — but the consumer received as fast as the channel gave it
+work and handed each job to its own task, so the sixteen was a bound on what was
+*waiting to be received* and not on what was *executing*. A kernel slow enough to
+answer after the next sixteen arrived could leave a full queue and any number of
+running calls behind it, while the source and the test both said "calls in flight".
+The test proved Tokio's channel capacity by never draining it; the production path
+drained it into tasks.
+
+The fix is a permit: `CodecBridge` holds a semaphore of the same size, admission takes
+one *before* a job exists, and the permit travels with the job so it is released when
+the call ends rather than when it starts. A call that cannot be admitted is refused by
+name — "at its limit of 16 calls in flight" — which is what the plugin's callback
+sees. The channel bound stays as a second, weaker fact.
+
+The evidence is now the admission itself: `the_codec_bridge_admits_only_its_bound_worth_of_calls`
+holds the bound's worth of permits through the same function `resolve` calls first, and
+requires the next admission to be refused; the old synthetic test is kept under a name
+that says what it actually proves (`the_codec_bridge_queue_is_bounded`).
+
+What is *not* yet written, and is named here rather than implied: a slow-kernel
+concurrency qualification — a real kernel service whose codec does not answer, sixteen
+real calls in flight, and a seventeenth refused. An attempt at it exists in this
+revision's history and was dropped rather than committed with a timing assumption in
+it: the gated codec held the calls past their own budget, which made the seventeenth
+arrive at a bridge that had already given the permits back. Writing it properly needs a
+gate the call's budget does not walk past, and that is the next qualification this
+area owes.
+
 ## The loader extraction, staged
 
 What remains is dependency-graph surgery rather than a refactor, and the property it

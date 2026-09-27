@@ -97,8 +97,8 @@ def test_a_name_two_places_define_is_reported(tmp_path: pathlib.Path) -> None:
     root = tree(
         tmp_path,
         {
-            "crates/plugin-host/tests/one.rs": "fn a_shared_name() {}\n",
-            "crates/plugin-host/tests/two.rs": "fn a_shared_name() {}\n",
+            "crates/plugin-host/tests/one.rs": "#[test]\nfn a_shared_name() {}\n",
+            "crates/plugin-host/tests/two.rs": "#[test]\nfn a_shared_name() {}\n",
         },
         claim(
             "an-ambiguous-test",
@@ -109,6 +109,44 @@ def test_a_name_two_places_define_is_reported(tmp_path: pathlib.Path) -> None:
     problems = check(root)
     assert len(problems) == 1
     assert "2 places define it" in problems[0]
+
+
+def test_a_function_without_a_test_attribute_is_not_evidence(tmp_path: pathlib.Path) -> None:
+    """A function is not a test: the attribute is what makes anything run it.
+
+    An audit found this by deleting `#[test]` from a referenced test and watching the
+    matrix stay green, which is the failure mode this asserts against.
+    """
+    root = tree(
+        tmp_path,
+        {"crates/plugin-host/tests/one.rs": "fn a_referenced_test() {}\n"},
+        claim(
+            "an-unrun-test",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_referenced_test" },\n]\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "nothing in the tree defines it" in problems[0]
+
+
+def test_an_attribute_with_arguments_is_still_a_test(tmp_path: pathlib.Path) -> None:
+    """`#[tokio::test(flavor = "multi_thread")]` is one of the forms used here."""
+    root = tree(
+        tmp_path,
+        {
+            "crates/plugin-host/tests/one.rs": (
+                '#[tokio::test(flavor = "multi_thread")]\nasync fn a_parameterized_test() {}\n'
+            ),
+        },
+        claim(
+            "a-parameterized-test",
+            "enforced",
+            'enforced_by = [\n  { rust_test = "a_parameterized_test" },\n]\n',
+        ),
+    )
+    assert check(root) == []
 
 
 def test_an_enforced_claim_with_no_evidence_is_reported(tmp_path: pathlib.Path) -> None:
@@ -194,7 +232,7 @@ def test_an_unverified_claim_with_evidence_is_reported(tmp_path: pathlib.Path) -
     """A claim cannot be both recorded as a gap and enforced."""
     root = tree(
         tmp_path,
-        {"crates/plugin-host/tests/one.rs": "fn a_test() {}\n"},
+        {"crates/plugin-host/tests/one.rs": "#[test]\nfn a_test() {}\n"},
         claim(
             "both-at-once",
             "unverified",
@@ -257,7 +295,7 @@ def test_a_test_tree_named_coverage_is_searched(tmp_path: pathlib.Path) -> None:
     """
     root = tree(
         tmp_path,
-        {"crates/cli/tests/coverage/shared/server_tests.rs": "async fn a_test() {}\n"},
+        {"crates/cli/tests/coverage/shared/server_tests.rs": "#[tokio::test]\nasync fn a_test() {}\n"},
         claim(
             "cli-evidence",
             "enforced",
@@ -271,7 +309,7 @@ def test_the_document_records_what_the_policy_says(tmp_path: pathlib.Path) -> No
     """The render carries each claim, its evidence and the place it was found."""
     root = tree(
         tmp_path,
-        {"crates/plugin-host/tests/one.rs": "fn a_test() {}\n"},
+        {"crates/plugin-host/tests/one.rs": "#[test]\nfn a_test() {}\n"},
         claim(
             "rendered",
             "enforced",
