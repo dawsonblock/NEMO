@@ -60,8 +60,8 @@ use libloading::{Library, Symbol};
 // that one answers what an artifact is. Both the kernel and this loader ask it the
 // same question, which is why it is not here.
 use super::artifact::{
-    hex_digest, plugin_artifact_identity, resolve_manifest_relative_path,
-    sha256_hex, sha256_of_path, sha256_of_reader, verify_sha256,
+    hex_digest, plugin_artifact_identity, resolve_manifest_relative_path, sha256_hex,
+    sha256_of_path, sha256_of_reader, verify_sha256,
 };
 use nemo_relay_plugin::{
     NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
@@ -966,7 +966,6 @@ fn validate_plugin_descriptor(
     }
     Ok(())
 }
-
 
 #[repr(C)]
 struct NativeHostPluginContext {

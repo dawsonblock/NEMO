@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::manifest::{DynamicPluginManifest, DynamicPluginManifestLoad};
 use super::DYNAMIC_PLUGIN_MANIFEST_FILENAME;
+use super::manifest::{DynamicPluginManifest, DynamicPluginManifestLoad};
 use crate::plugin::PluginError;
 
 /// The identity of one plugin artifact: its manifest and the library it names.
