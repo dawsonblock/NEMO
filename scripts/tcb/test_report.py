@@ -319,6 +319,31 @@ def test_a_policy_without_a_closure_section_checks_nothing() -> None:
     assert report.find_closure_problems({}, {"libloading"}) == []
 
 
+LIBRARY_CLOSURE_POLICY = {
+    "kernel_library_closure": {
+        "roots": ["nemo-relay"],
+        "forbidden": ["libloading", "nemo-relay-plugin", "native-loader"],
+    }
+}
+
+
+def test_the_kernel_library_may_not_reach_a_loader_at_all() -> None:
+    # This is the property rather than the ratchet: the kernel library reaching a
+    # package that loads native code is a failure, and there is no entry a policy
+    # can record to make it a passing debt. A clean closure is the only pass.
+    clean = {"nemo-relay", "nemo-relay-types", "serde"}
+    assert report.find_library_closure_problems(LIBRARY_CLOSURE_POLICY, clean) == []
+
+    reaching = {"nemo-relay", "libloading", "serde"}
+    problems = report.find_library_closure_problems(LIBRARY_CLOSURE_POLICY, reaching)
+    assert len(problems) == 1
+    assert "libloading" in problems[0]
+
+
+def test_a_policy_without_a_library_closure_section_checks_nothing() -> None:
+    assert report.find_library_closure_problems({}, {"libloading"}) == []
+
+
 def test_the_surface_renders_what_the_closure_reaches() -> None:
     policy = {
         "trusted": {"crates": []},

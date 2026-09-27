@@ -19,37 +19,54 @@
 # Providers, transports, bindings, the CLI, DLP and isolation implementations,
 # qualification tooling, tests, and docs stay outside both tiers. The kernel
 # must not know what PostgreSQL, Gmail, GitHub, or a language binding is.
+#
+# The native loader, the plugin SDK and the ABI left the in-process tier when the
+# kernel stopped depending on them, and they are measured under `[plugin_host]`
+# instead: they are the attack surface the kernel is protected *from*, not code
+# that shares its process.
 
 version = 1
 
-# What the kernel's own process may be able to reach.
+# The kernel library's closure, which is the property rather than the progress.
 #
-# The isolation milestone has an architectural claim and a structural one. The
-# architectural claim is that plugins run in another process, and it holds. The
-# structural claim is that the kernel cannot link the loader at all:
+#     kernel library closure ∩ {libloading, native ABI, native loader, plugin SDK} = ∅
 #
-#     kernel closure ∩ {libloading, native ABI, native loader} = ∅
+# It holds, and it is checked as a property: any reach at all is a failure. The
+# kernel is the crate whose invariants the milestone protects, and it no longer
+# names the loader, the ABI, the SDK or `dlopen` — not directly and not
+# transitively. This is the difference between an architectural claim ("plugins run
+# elsewhere") and a structural one ("the kernel cannot load a library even if
+# somebody writes the code to").
 #
-# It does not hold yet — the loader still runs in the kernel's address space — and
-# until it does, this records the intersection rather than demanding it be empty,
-# because a gate that is red on arrival enforces nothing. What the check fails on
-# is the closure gaining something that is not recorded here: an edge somebody
-# added. The recorded list is the remaining work, and the target is an empty one,
-# at which point this becomes the property itself.
+# `nemo-relay-plugin-protocol` and `nemo-relay-types` are deliberately absent from
+# the forbidden list: protocol types are what the kernel needs in order to talk to a
+# host, and reaching them is the design rather than a leak.
+[kernel_library_closure]
+roots = ["nemo-relay"]
+forbidden = ["libloading", "nemo-relay-native-loader", "nemo-relay-native-abi", "nemo-relay-plugin"]
+
+# The composition surfaces, which still reach the loader.
 #
-# Both the loader's crate and the ABI are recorded. `nemo-relay-plugin` is the
-# plugin author's SDK and the crate `core` still calls into; `nemo-relay-native-abi`
-# is the revision vocabulary and the versioned tables that SDK re-exports. The ABI
-# crate exists so those two can be frozen independently, and it is listed from the
-# moment it exists rather than after it moves, so the recorded intersection names
-# every package the milestone still has to remove instead of hiding one behind a
-# crate that is expected to leave anyway. The wire crates are deliberately absent:
-# protocol types are what the kernel needs in order to talk to a host, and reaching
-# them is the design rather than a leak.
+# The CLI and the FFI link `plugin-host` to supervise a host process, and that crate
+# still carries the child's own end of the protocol inside the same library — so
+# they reach the loader transitively. That is the remaining step, not a mistake:
+# the child's end has to become its own crate before these roots stop reaching it.
+# Until then the intersection is recorded rather than demanded empty, and what
+# fails is the closure gaining a package that is not recorded here.
 [kernel_closure]
 roots = ["nemo-relay", "nemo-relay-cli", "nemo-relay-ffi"]
-forbidden = ["libloading", "nemo-relay-plugin", "nemo-relay-native-abi"]
-reachable_now = ["libloading", "nemo-relay-plugin", "nemo-relay-native-abi"]
+forbidden = [
+    "libloading",
+    "nemo-relay-native-loader",
+    "nemo-relay-native-abi",
+    "nemo-relay-plugin",
+]
+reachable_now = [
+    "libloading",
+    "nemo-relay-native-loader",
+    "nemo-relay-native-abi",
+    "nemo-relay-plugin",
+]
 
 [trusted]
 crates = [
@@ -69,16 +86,10 @@ crates = [
     "nemo-relay-dlp",
     "nemo-relay-isolation",
     "nemo-relay-pii-redaction",
-    "nemo-relay-plugin",
     # Core depends on the plugin contract, so it is in the kernel's process.
     # It stays out of the invariant-enforcing tier: it carries vocabulary, not
     # enforcement.
     "nemo-relay-plugin-protocol",
-    # The ABI vocabulary the plugin SDK re-exports: the revisions a host can carry
-    # and the status codes both sides report. Like the contract above it is
-    # declarations rather than enforcement, and it is named here rather than folded
-    # into the SDK's line so a reader can see the ABI's own reach.
-    "nemo-relay-native-abi",
     # The compatibility backend runs inside whichever process links it, which
     # today is the kernel's. It is counted here because that is physically true
     # now, and separately in [plugin_host] because that is where it belongs once
@@ -93,11 +104,21 @@ crates = [
     "nemo-relay-worker-proto",
 ]
 
-# The process that will host native plugins once the boundary exists. This is a
-# target classification, not a current one: `nemo-relay-plugin-host` is also
-# listed in [in_process] because that is where its code actually runs today.
+# The process that hosts native plugins: the supervisor and the child's own end of
+# the protocol, the loader the child runs, the SDK a hosted plugin is built
+# against, and the ABI tables both sides speak. None of it is in the kernel's
+# address space any more, and all of it is what the kernel's boundaries exist to
+# contain, so it is measured as its own role rather than as kernel code.
+#
+# `nemo-relay-plugin-host` is also listed in [in_process] because that is where its
+# code runs today: the CLI and the FFI link it to supervise a host process.
 [plugin_host]
-crates = ["nemo-relay-plugin-host"]
+crates = [
+    "nemo-relay-plugin-host",
+    "nemo-relay-native-loader",
+    "nemo-relay-plugin",
+    "nemo-relay-native-abi",
+]
 
 # Packages that must never appear in a trusted crate's resolved tree.
 #
@@ -151,12 +172,12 @@ nemo-relay-ledger = ["sqlx", "napi", "pyo3"]
 # strip comments. Both are upper bounds and never undercount.
 
 [limits.nemo-relay]
-max_direct_dependencies = 40
-# Raised by one package for the ABI's own crate, the same identity-not-reach raise
-# the other dependents of the plugin carry. The ABI is named on its own line below
-# rather than only here, so this is the count moving with the graph's shape rather
-# than the kernel reaching something new.
-max_transitive_packages = 266
+max_direct_dependencies = 38
+# The kernel's dependency set is smaller than it has ever been in this milestone:
+# two direct dependencies (`libloading` and the plugin SDK) and the loader's whole
+# transitive set left with the loader, and the closure no longer reaches the ABI.
+# The digest moved with them, which is the same fact written as an identity.
+max_transitive_packages = 267
 # Raised for the exact-registration entry points the process boundary calls —
 # `invoke_tool_execution_intercept_registration`,
 # `invoke_llm_execution_intercept_registration`, and the name-retaining registry
@@ -231,16 +252,22 @@ max_transitive_packages = 266
 # three extra `unsafe` tokens an earlier draft of the seam's own test added were moved out
 # of `src/` rather than budgeted, because a keyword list is not kernel code.
 #
-# The two postponed files are still owed: the loader (6760) and the artifact vocabulary
-# (171, now 186 with its own test). The milestone takes those, so this stays temporary and
-# its entry below moves with it.
-max_source_lines = 75123
+# The two postponed files are owed no longer, and the movement is what the milestone was
+# for: the loader left the kernel, and this figure fell by more than seven thousand lines
+# without a line being deleted. What is left is the kernel's own code plus the seam and the
+# artifact vocabulary, which are the kernel's half of the boundary. The target below is
+# still above this number by less than a hundred lines, which is the honest state: the
+# composition surface grew slightly while the loader was leaving.
+max_source_lines = 67926
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
-max_unsafe_occurrences = 307
-direct_dependency_digest = "bb90785e6dc5da6b7e66084bb4994ddd51503d2773f1c739c7dcbcdac62ad3d8"
-transitive_dependency_digest = "b82895825eb3abbc9c6fb4b444aa2fc62386c6ed3635c13f052aff117a40e202"
+# Nineteen, which is the number the temporary ceiling promised, so that entry is gone: the
+# kernel's `unsafe` is now what it contains rather than what it borrowed, and the loader's
+# 288 tokens left with the loader.
+max_unsafe_occurrences = 19
+direct_dependency_digest = "dd962de4535f5b463a4a20e68897424b53654a497eed52627da8706402a0754f"
+transitive_dependency_digest = "64e650e5adaeb51ed9eca4d81055c0ce8d7c71e0aaa30c9f5439772e1d5f1ed8"
 
 [limits.nemo-relay-types]
 max_direct_dependencies = 7
@@ -347,6 +374,25 @@ max_unsafe_occurrences = 220
 direct_dependency_digest = "7de9d3583263ba7f84f34797f12b247213d86407ab02b9287421ba466a86e169"
 transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a2825962a3c0607e938696"
 
+# The loader, measured as the host-side crate it is.
+#
+# This is the number that left the kernel: 7227 lines, 288 textual `unsafe` tokens
+# and eleven direct dependencies, none of which the kernel can reach any more. It is
+# budgeted here so that the crate the milestone moved is still watched — a loader
+# that grows without a review is exactly what this file exists to prevent — and so
+# that the two figures a reader compares (`kernel-process unsafe tokens`, and this)
+# are both recorded rather than one being inferred from the other.
+#
+# `libloading` is its own direct dependency here, which is the whole point: the
+# crate that opens a library is the only one that names the crate that can.
+[limits.nemo-relay-native-loader]
+max_direct_dependencies = 14
+max_transitive_packages = 243
+max_source_lines = 7227
+max_unsafe_occurrences = 288
+direct_dependency_digest = "5f9571b5361a6e20d9fb0d1f383ff9035cc0d61dabe3ff19b4392f3add9b5fb1"
+transitive_dependency_digest = "fa94d7b698f131052403bf65c768cd21e27d991926edaf258ba540be8a6502aa"
+
 # The native plugin ABI's own crate — the first staged step of the split, and the
 # reason the SDK's line above could lose its vocabulary without any caller noticing.
 #
@@ -386,21 +432,21 @@ max_direct_dependencies = 16
 # Raised by one package for the ABI's own crate: an identity in the resolved set
 # rather than code the adaptive runtime reaches, which is why the digest moves and
 # nothing else does.
-max_transitive_packages = 225
+max_transitive_packages = 222
 max_source_lines = 18355
 max_unsafe_occurrences = 3
 direct_dependency_digest = "331568db3de0a45bb18a65209ac977b74010caa4f161552c292e5f42b79e2663"
-transitive_dependency_digest = "c16c13b2702b3a5e02d576e038d159eb1d8371e23c0763148c3f4f1b61aa5408"
+transitive_dependency_digest = "9b7c6e591881bbb70ac6c5abcbebaf05195b8067c04350df90d1b6aa464b1c57"
 
 [limits.nemo-relay-pii-redaction]
 max_direct_dependencies = 7
 # Raised by one package for the ABI's own crate, the same identity-in-the-set raise
 # the other plugin dependents carry. The sanitizer's own reach did not move.
-max_transitive_packages = 216
+max_transitive_packages = 213
 max_source_lines = 4869
 max_unsafe_occurrences = 0
 direct_dependency_digest = "53d627f83c8ce0f7e8da4fa458a586b8353029500ba62c880d6bf34638c1811d"
-transitive_dependency_digest = "9ecb6f5935d35946b51735cb518b954ae653dbfb771763e576a2bef561e2a7f1"
+transitive_dependency_digest = "1018fe8a463907024cde35e3bccee242ea4cf638704523e0476ae16c7dea7220"
 
 [limits.nemo-relay-dlp]
 max_direct_dependencies = 2
@@ -424,11 +470,11 @@ max_direct_dependencies = 3
 # identities, so splitting one crate into two raises every dependent's number by
 # exactly one while the code reachable through it is unchanged: the digest moves
 # with the identity set, not as the sign of anything new being pulled in.
-max_transitive_packages = 245
+max_transitive_packages = 241
 max_source_lines = 589
 max_unsafe_occurrences = 0
 direct_dependency_digest = "59b383378c3be1f4d7e84e04ad1fc400c2233b2df975f3816d2d5948f5f73f98"
-transitive_dependency_digest = "53b17d23100e6ab10fa39abf2b2295ad12addd5d1e9b03d1b7405436dffd6e7b"
+transitive_dependency_digest = "03dfa17ddf48b5111eb62b22b30891faef5425cac267555f87527ab45c4309e9"
 
 # The in-process plugin backend. Measured from the start so its growth is
 # visible, but it sits in neither tier: it is the compatibility bridge that the
@@ -560,8 +606,8 @@ transitive_dependency_digest = "53b17d23100e6ab10fa39abf2b2295ad12addd5d1e9b03d1
 # the decision to be made on the child's side of the boundary. No dependency moved and
 # no `unsafe` did.
 [limits.nemo-relay-plugin-host]
-max_direct_dependencies = 15
-max_transitive_packages = 241
+max_direct_dependencies = 16
+max_transitive_packages = 242
 # Raised for the codec capability record: references bound to an invocation, a
 # direction and a codec, with a guard whose drop is the revocation, and the refusal
 # matrix that keeps one call's capability from being another's. No dependency moved and
@@ -670,10 +716,10 @@ max_transitive_packages = 241
 # Raised by one package for the ABI's own crate: the host links the plugin SDK, so the
 # identity of the ABI the SDK re-exports is one more name in its resolved set. Nothing
 # the host can reach changed with it.
-max_source_lines = 23991
+max_source_lines = 23990
 max_unsafe_occurrences = 2
-direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
-transitive_dependency_digest = "8f42d7fcf333c6c41ebaa82a741f26db7ecd32b27474496ee6057eac1eb16b7a"
+direct_dependency_digest = "96438ae43a9c7a99706427279915abc458c13e41e719646c71099dd728513f86"
+transitive_dependency_digest = "3ccca612f78d562e1986b2c2fc210b9f9d608f64bb999d8843ec145e828590d2"
 
 # The wire schema. Measured because it is shipped and because its transitive set
 # is dominated by the protobuf and gRPC toolchain, which is exactly the kind of
@@ -719,7 +765,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 75123
+raised_to = 67926
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"
@@ -733,27 +779,3 @@ must_fall_by = "loader-removal"
 # *not* re-derived when this ceiling was raised. A promise that moved with each measurement
 # would promise nothing; the milestone re-measures the whole thing instead of being handed
 # a number, and the two files above are what it starts from.
-
-[[temporary]]
-crate = "nemo-relay"
-field = "max_unsafe_occurrences"
-raised_to = 307
-target = 19
-reason = "288 of the kernel's 307 textual unsafe tokens are the native loader's"
-introduced = "2514f27..eb975ae"
-must_fall_by = "loader-removal"
-# A memory-corruption bug in the loader corrupts the kernel today because the loader is
-# in the kernel's address space. This is the number the isolation milestone is judged on,
-# and it is the one that has to move.
-
-[[temporary]]
-crate = "nemo-relay-plugin"
-field = "max_source_lines"
-raised_to = 4234
-target = 0
-reason = "the ABI crate is in the kernel's process only while the loader is"
-introduced = "2514f27..eb975ae"
-must_fall_by = "loader-removal"
-# Zero rather than a smaller number: when the loader moves, this crate belongs to the
-# host's side of the boundary, and the kernel's policy should stop listing it at all
-# rather than listing a smaller amount of code that should not be there.

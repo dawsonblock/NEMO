@@ -56,7 +56,6 @@ unstable-hardening = [
 
 [dependencies]
 nemo-relay-types.workspace = true
-nemo-relay-plugin.workspace = true
 nemo-relay-plugin-protocol.workspace = true
 nemo-relay-worker-proto = { workspace = true, optional = true }
 nemo-relay-authority = { workspace = true, optional = true, features = ["unstable-hardening"] }
@@ -79,7 +78,6 @@ opentelemetry = { workspace = true, features = ["trace", "logs", "metrics"] }
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["trace", "logs", "metrics", "internal-logs"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
-libloading = "0.8"
 semver = "1"
 sha2 = "0.11"
 serde_json_canonicalizer = "0.3"
@@ -102,6 +100,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
+nemo-relay-native-loader.workspace = true
 tokio = { version = "1", features = ["rt", "macros", "sync", "test-util", "rt-multi-thread", "time"] }
 futures = "0.3"
 opentelemetry_sdk = { workspace = true, features = ["trace", "logs", "metrics", "testing"] }
@@ -120,10 +119,6 @@ path = "tests/integration/codec_tests.rs"
 [[test]]
 name = "context_isolation_integration"
 path = "tests/integration/context_isolation_tests.rs"
-
-[[test]]
-name = "native_plugin_integration"
-path = "tests/integration/native_plugin_tests.rs"
 
 [[test]]
 name = "native_seam"

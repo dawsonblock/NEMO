@@ -17,7 +17,16 @@ section was written):
   child in each direction resolving the call's codec through the kernel. Every attachment
   point the ABI exposes is served, and the match that installs proxies is exhaustive: a
   class added to the ABI fails to compile there rather than being refused at runtime.
-- **Kernel-process unsafe tokens: 648**, measured by `just tcb-report`.
+- **Kernel-process unsafe tokens: 27**, measured by `just tcb-report` — down from
+  648 when the loader, the SDK and the ABI left the kernel's process. The loader's
+  288 tokens are budgeted on the host side now, at 288, and the two numbers are
+  recorded rather than one being inferred from the other.
+- **The kernel library reaches no loader at all.** `just tcb-report` checks the
+  property rather than the progress: the closure of `nemo-relay` alone intersects
+  `{libloading, nemo-relay-native-loader, nemo-relay-native-abi, nemo-relay-plugin}`
+  in **nothing**, and any reach is a failure. The composition surfaces (the CLI and
+  the FFI) still reach the loader through `plugin-host`, which is the remaining
+  step rather than a leak — the child's own end has to become its own crate.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/native-abi`,
   re-exported by `crates/plugin` so every author-facing path is unchanged).
 - **Plugin compatibility:** the CLI, FFI, Python and Node serve plugins from
@@ -28,21 +37,20 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The
   loader is still linked into the kernel until it moves, which is why the unsafe
   count above has not moved with it.
-- **Claims: 27 enforced, 1 asserted and not yet.** Every claim this document makes
+- **Claims: 28 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
   gate red, so a sentence here cannot go on describing something nothing checks.
   The one that is asserted rather than enforced is named there, with why.
 
-Almost all of the kernel's `unsafe` is the native plugin path: 280 occurrences
-in `crates/core/src/plugin/dynamic/native.rs`, 220 in `nemo-relay-plugin` and
-113 in `nemo-relay-native-abi`. Together that is roughly 95% of the measured
-in-process surface, and `just tcb-report` prints the number this milestone is
-judged on:
+What is left of the kernel's `unsafe` is nothing to do with loading: the loader's
+280 occurrences, the SDK's 220 and the ABI's 113 all live outside the kernel's
+process now, which is what the number below is measuring. `just tcb-report` prints
+the figure this milestone is judged on:
 
 ```
-kernel-process unsafe tokens: 648
+kernel-process unsafe tokens: 27
 ```
 
 `just tcb-report` checks that figure against the measurement rather than
@@ -2780,12 +2788,28 @@ there is something to dispatch to.
    identity, which deliberately declares its own ceiling rather than importing one,
    because a shared constant is not a check.
 3. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
-   extraction.
+   extraction. *Done.* `crates/native-loader` holds the loader and the activation
+   transaction; it is the only crate that declares `libloading`; the kernel does not
+   depend on it and does not reach it. Its `unsafe` — 288 tokens, 280 of them the
+   loader's — is budgeted on the host side now, and the kernel's own figure fell
+   from 648 to 27 with the code that owns it. Two things moved with it that are
+   worth naming: the activation transaction (which is a composition, not a loader),
+   and one kernel test that had to be re-expressed because it read the kernel's
+   registry directly — a test of the kernel's obligation, which now says so in the
+   crate whose obligation it is.
 4. The child endpoint crate: the host's own end of the protocol, depending on
    `native-loader` and the wire crates.
+   *Remaining, and it is what the composition ratchet is waiting on.*
 5. Move the in-process child implementation out of the crate the supervisor links.
+   *Remaining.* The in-process backend still lives in `plugin-host`, so the CLI and
+   the FFI reach the loader transitively through it; that is the whole of the
+   difference between the kernel library's closure, which is clean, and the
+   composition roots', which is not.
 6. The supervisor depends only on protocol, process and session layers.
-7. Remove the native loader path from `core`.
+7. Remove the native loader path from `core`. *Done.* `core` names neither
+   `libloading` nor the ABI nor the SDK; `plugin/dynamic/native.rs` and `host.rs`
+   are gone from it, and the architecture test's grandfathered paths now name
+   `native-loader` instead of `core`.
 8. Add the two proofs below.
 9. Delete the transitional re-exports, rather than leaving aliases that make the old
    architecture look dead while an accidental dependency path survives.

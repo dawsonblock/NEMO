@@ -7,6 +7,7 @@ members = [
     "crates/types",
     "crates/plugin",
     "crates/native-abi",
+    "crates/native-loader",
     "crates/plugin-protocol",
     "crates/plugin-host",
     "crates/plugin-proto",
@@ -41,6 +42,7 @@ nemo-relay = { version = "0.9.1-rc.4", path = "crates/core", default-features = 
 nemo-relay-types = { version = "0.9.1-rc.4", path = "crates/types" }
 nemo-relay-plugin = { version = "0.9.1-rc.4", path = "crates/plugin" }
 nemo-relay-native-abi = { version = "0.9.1-rc.4", path = "crates/native-abi" }
+nemo-relay-native-loader = { version = "0.9.1-rc.4", path = "crates/native-loader" }
 nemo-relay-plugin-protocol = { version = "0.9.1-rc.4", path = "crates/plugin-protocol" }
 nemo-relay-plugin-host = { version = "0.9.1-rc.4", path = "crates/plugin-host" }
 nemo-relay-plugin-proto = { version = "0.9.1-rc.4", path = "crates/plugin-proto" }

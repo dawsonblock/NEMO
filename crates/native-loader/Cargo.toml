@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-native-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Loads native NeMo Relay plugins: dlopen, symbol acquisition, registration extraction and the in-process activation."
+
+[lints]
+workspace = true
+
+[dependencies]
+nemo-relay.workspace = true
+nemo-relay-plugin.workspace = true
+nemo-relay-plugin-protocol.workspace = true
+chrono = "0.4"
+futures-util = "0.3"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
+log = { version = "0.4", features = ["kv"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
+
+[features]
+# The worker lane: a plugin whose code runs in a process the kernel starts.
+worker-grpc = ["nemo-relay/worker-grpc"]
+# JSON schema generation for the activation spec.
+schema = ["dep:schemars", "nemo-relay/schema"]
+
+[[test]]
+name = "native_plugin_integration"
+path = "tests/integration/native_plugin_tests.rs"
+
+[dev-dependencies]
+futures = "0.3"
+sha2 = "0.11"
+spdlog-rs = { version = "0.5", features = ["log", "multi-thread"] }
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+toml = "0.9"

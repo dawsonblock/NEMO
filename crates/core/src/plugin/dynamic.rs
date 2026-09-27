@@ -24,10 +24,8 @@ pub type DynamicPluginId = String;
 pub const DYNAMIC_PLUGIN_MANIFEST_FILENAME: &str = "relay-plugin.toml";
 
 mod artifact;
-mod host;
 mod hosted;
 mod manifest;
-mod native;
 mod registry;
 #[cfg(feature = "worker-grpc")]
 mod worker;
@@ -36,10 +34,8 @@ mod worker;
 // manifest-relative resolution, which the kernel asks about a plugin artifact
 // without owning a way to run one.
 pub use artifact::*;
-pub use host::*;
 pub use hosted::*;
 pub use manifest::*;
-pub use native::*;
 pub use registry::*;
 #[cfg(feature = "worker-grpc")]
 pub use worker::*;

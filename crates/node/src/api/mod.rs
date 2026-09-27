@@ -58,9 +58,7 @@ use nemo_relay::api::tool::ToolAttributes;
 use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::codec::response::Usage;
 use nemo_relay::error::{FlowError, Result as FlowResult};
-use nemo_relay::plugin::dynamic::{
-    DynamicPluginActivationSpec as CoreDynamicPluginActivationSpec, DynamicPluginKind,
-};
+use nemo_relay::plugin::dynamic::DynamicPluginKind;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
     PluginRegistrationContext, active_plugin_report as active_plugin_report_impl,
@@ -76,6 +74,7 @@ use nemo_relay_adaptive::acg::{
 use nemo_relay_adaptive::context_helpers::set_latency_sensitivity as adaptive_set_latency_sensitivity;
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_adaptive::{AdaptiveConfig, AdaptiveRuntime as CoreAdaptiveRuntime};
+use nemo_relay_native_loader::DynamicPluginActivationSpec as CoreDynamicPluginActivationSpec;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
 use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 

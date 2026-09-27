@@ -28,25 +28,21 @@
 use std::path::{Path, PathBuf};
 
 /// `<crate>:<crate-relative path>` that may still load a dynamic library.
-const LOADER_PATHS: &[&str] = &["core:plugin/dynamic/native.rs"];
+///
+/// One file, and it is not in the kernel any more: `native-loader` owns opening an
+/// approved artifact, and it is the only crate that declares `libloading`.
+const LOADER_PATHS: &[&str] = &["native-loader:native.rs"];
 
 /// `<crate>:<crate-relative path>` that may still call the loader entry point.
 ///
-/// `plugin-host` is not a grandfather but the destination: reaching the loader
-/// is what that crate exists to do, and the entry is the seam implementation the
-/// process backend replaces.
-///
 /// `plugin-host:lib.rs` is the child's own end of the protocol — the host process
 /// loads the plugin there and serves its registrations over the wire — and it is
-/// the last entry here that has to move for the kernel to stop linking the loader:
-/// while this crate carries it, every consumer of the supervision surface carries
-/// `dlopen` and the ABI with it. The two `core` entries are the loader itself. The
-/// *decision* about which host to start and under what identity already has a
-/// module of its own (`plugin-host:host_location.rs`), so what remains is a move
-/// rather than a design.
+/// the one entry left that is not the loader crate itself. It calls the loader
+/// because that is what the child does, and the kernel does not, which is the
+/// property this list exists to keep true: no entry in it is a `core` path.
 const LOAD_CALL_PATHS: &[&str] = &[
-    "core:plugin/dynamic/native.rs",
-    "core:plugin/dynamic/host.rs",
+    "native-loader:host.rs",
+    "native-loader:native.rs",
     "plugin-host:lib.rs",
 ];
 
@@ -57,7 +53,12 @@ const LOAD_CALL_PATHS: &[&str] = &[
 /// declaring a signature is not loading anything.
 const LOADER_TOKENS: &[&str] = &["libloading", "dlopen", "LoadLibraryW", "Library::new"];
 
-/// Core API that loads native plugins inside whichever process calls it.
+/// The crate that owns the in-process activation, which is the API the token
+/// below recognizes.
+///
+/// It used to be `core`: the kernel's activation assembled the boundary on behalf
+/// of whichever binding called it, and the point of moving the activation out is
+/// that the kernel no longer offers that route at all.
 ///
 /// Checking for direct calls to the loader alone missed the real path: Node,
 /// Python, and FFI do not call `load_native_plugins`, they call this, and core
@@ -65,16 +66,17 @@ const LOADER_TOKENS: &[&str] = &["libloading", "dlopen", "LoadLibraryW", "Librar
 /// composes the process backend, and it stays here rather than being deleted
 /// with the entry: an empty grandfather list stops the *next* consumer from
 /// adopting the in-process route, which a deleted check would not.
-const INDIRECT_LOAD_CALLERS: &[&str] = &[];
+const INDIRECT_LOAD_CALLERS: &[&str] = &["native-loader"];
 
 /// The token that identifies a call through that API.
 const INDIRECT_LOAD_TOKEN: &str = "PluginHostActivation::";
 
 /// Crates that may declare the dynamic loader as a dependency.
 ///
-/// One entry, and it shrinks when the loader moves — a second crate appearing
-/// here is the decision this test exists to force.
-const LOADER_CRATES: &[&str] = &["core"];
+/// One entry, and it is the loader's own crate: the kernel's removal from this
+/// list is what the split was for, and a second crate appearing here is the
+/// decision this test exists to force.
+const LOADER_CRATES: &[&str] = &["native-loader"];
 
 /// Crates the kernel may not depend on, because the edge would point upward.
 const KERNEL_FORBIDDEN_DEPENDENCIES: &[&str] = &["nemo-relay-plugin-host"];

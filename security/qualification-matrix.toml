@@ -50,6 +50,14 @@ enforced_by = [
 ]
 
 [[claim]]
+id = "the-kernel-library-cannot-load-a-library"
+statement = "The kernel library's dependency closure intersects the packages that load native code in nothing, and any reach is a failure rather than a recorded debt."
+status = "enforced"
+enforced_by = [
+  { recipe = "tcb-report" },
+]
+
+[[claim]]
 id = "the-loader-speaks-the-hosted-runtime-seam"
 statement = "The native loader reaches the runtime only through the hosted-runtime seam: it names no kernel item the seam replaced, no mapped operation is dead, and no other module-level kernel item that is not public."
 status = "enforced"

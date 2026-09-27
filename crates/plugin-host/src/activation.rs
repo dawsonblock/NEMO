@@ -28,9 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use nemo_relay::plugin::dynamic::{
-    DynamicPluginActivationSpec, DynamicPluginKind, NativePluginLoadSpec,
-};
+use nemo_relay::plugin::dynamic::DynamicPluginKind;
 #[cfg(feature = "worker-grpc")]
 use nemo_relay::plugin::dynamic::{
     WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins,
@@ -40,6 +38,7 @@ use nemo_relay::plugin::{
     PluginHostLease, acquire_plugin_host_lease, clear_plugin_configuration_for_host,
     ensure_builtin_plugins_registered, initialize_plugins_exact_for_host,
 };
+use nemo_relay_native_loader::{DynamicPluginActivationSpec, NativePluginLoadSpec};
 use nemo_relay_plugin_protocol::PluginProtocolError;
 
 use crate::ProcessLoadedPlugins;

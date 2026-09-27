@@ -224,6 +224,26 @@ def find_closure_problems(policy: dict, reachable: set[str]) -> list[str]:
     ]
 
 
+def find_library_closure_problems(policy: dict, reachable: set[str]) -> list[str]:
+    """Return a loader package the kernel *library* can still reach.
+
+    This is the milestone's property rather than its progress: the kernel library
+    reaching a package that loads native code means the boundary is architectural
+    only. It is a separate block from the composition ratchet because it is a
+    different question — the library may not reach the loader at all, while the
+    composition surfaces still do until the child moves out of them — and because a
+    property that is allowed to grow is not a property.
+    """
+    library = policy.get("kernel_library_closure")
+    if not library:
+        return []
+    reached = kernel_closure_reachability({"kernel_closure": library}, reachable)
+    return [
+        f"the kernel library reaches '{name}', which loads native code; the kernel must not link the loader at all"
+        for name in sorted(reached)
+    ]
+
+
 def dependency_digest(names: set[str]) -> str:
     """Return a stable digest over a dependency set."""
     return hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest()
@@ -441,6 +461,7 @@ def render_surface(
     policy: dict,
     reachable: set[str] | None = None,
     test_only: set[str] | None = None,
+    library_reached: set[str] | None = None,
 ) -> str:
     """Render the two-tier surface: invariant enforcers, then everything in-process."""
     rows = [
@@ -482,6 +503,11 @@ def render_surface(
         if test_only:
             extra = ", ".join(sorted(test_only))
             rows.append(f"  and the test tree alone reaches: {extra}")
+    library = policy.get("kernel_library_closure")
+    if library and library_reached is not None:
+        reached = sorted(kernel_closure_reachability({"kernel_closure": library}, library_reached))
+        rendered = ", ".join(reached) if reached else "nothing"
+        rows.append(f"  kernel library reaches (property, not a target): {rendered}")
     return "\n".join(rows)
 
 
@@ -559,10 +585,15 @@ def main(argv: list[str] | None = None) -> int:
         # test still names it, and that is worth being able to see.
         everything = kernel_closure_names(arguments.repo_root, kernel_closure["roots"], edges="all")
         test_only = kernel_closure_reachability(policy, everything) - kernel_closure_reachability(policy, reachable)
+    library_closure = policy.get("kernel_library_closure")
+    library_reachable: set[str] | None = None
+    if library_closure:
+        library_reachable = kernel_closure_names(arguments.repo_root, library_closure["roots"])
+        problems.extend(find_library_closure_problems(policy, library_reachable))
 
     print(render(reports))
     print()
-    surface = render_surface(metadata, identities, policy, reachable, test_only)
+    surface = render_surface(metadata, identities, policy, reachable, test_only, library_reachable)
     print(surface)
     print()
     print(render_temporary(policy))

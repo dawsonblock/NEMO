@@ -31,10 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
-use nemo_relay::plugin::dynamic::{
-    NativePluginActivation, NativePluginLoadSpec, load_native_plugins,
-};
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFuture, PluginManager};
+use nemo_relay_native_loader::{NativePluginActivation, NativePluginLoadSpec, load_native_plugins};
 use nemo_relay_plugin_protocol::{
     PROTOCOL_VERSION, PluginArtifactIdentity, PluginDescriptor, PluginExecutionContext,
     PluginFailure, PluginFailureCode, PluginHandle, PluginHostHealth, PluginInspectRequest,
@@ -110,7 +108,7 @@ impl LoadedPlugin {
 /// shape is derived from the attachment point rather than reported separately
 /// and allowed to disagree with it.
 fn registration_descriptors(
-    plugins: &[nemo_relay::plugin::dynamic::NativeLoadedPlugin],
+    plugins: &[nemo_relay_native_loader::NativeLoadedPlugin],
 ) -> Vec<PluginRegistrationDescriptor> {
     let mut descriptors = Vec::new();
     for plugin in plugins {
@@ -837,7 +835,7 @@ mod tests {
     #[test]
     fn a_recorded_registration_becomes_a_descriptor_that_says_where_it_attaches() {
         use nemo_relay::api::registry::RuntimeRegistrationKind;
-        use nemo_relay::plugin::dynamic::{NativeLoadedPlugin, NativePluginRegistration};
+        use nemo_relay_native_loader::{NativeLoadedPlugin, NativePluginRegistration};
         use nemo_relay_plugin_protocol::{PluginExecutionShape, PluginRegistrationOperation};
 
         let plugins = vec![NativeLoadedPlugin {

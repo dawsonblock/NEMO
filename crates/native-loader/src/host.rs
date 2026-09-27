@@ -15,19 +15,19 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
-use crate::plugin::{
+use nemo_relay::plugin::{
     ConfigReport, PluginComponentSpec, PluginConfig, PluginHostLease, Result,
     acquire_plugin_host_lease, clear_plugin_configuration_for_host,
     ensure_builtin_plugins_registered, initialize_plugins_exact_for_host, resolve_plugin_config,
 };
 
-use super::{
-    DynamicPluginKind, NativeHostRuntime, NativePluginActivation, NativePluginLoadSpec,
-    RegistrationTeardown, load_native_plugins,
-};
+use crate::{NativePluginActivation, NativePluginLoadSpec, load_native_plugins};
+use nemo_relay::plugin::dynamic::{DynamicPluginKind, NativeHostRuntime, RegistrationTeardown};
 
 #[cfg(feature = "worker-grpc")]
-use super::{WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins};
+use nemo_relay::plugin::dynamic::{
+    WorkerPluginActivation, WorkerPluginLoadSpec, load_worker_plugins,
+};
 
 /// One dynamic plugin component to load and activate in an embedding host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,7 +103,7 @@ impl PluginHostActivation {
     async fn activate_validated(
         config: PluginConfig,
         dynamic_plugins: Vec<DynamicPluginActivationSpec>,
-        diagnostics: Vec<crate::plugin::ConfigDiagnostic>,
+        diagnostics: Vec<nemo_relay::plugin::ConfigDiagnostic>,
     ) -> Result<(Self, ConfigReport)> {
         NativeHostRuntime::new()
             .run_owned_mutation("dynamic plugin activation", move || async move {
@@ -115,7 +115,7 @@ impl PluginHostActivation {
     async fn activate_inner(
         mut config: PluginConfig,
         dynamic_plugins: Vec<DynamicPluginActivationSpec>,
-        diagnostics: Vec<crate::plugin::ConfigDiagnostic>,
+        diagnostics: Vec<nemo_relay::plugin::ConfigDiagnostic>,
     ) -> Result<(Self, ConfigReport)> {
         let dynamic_plugin_count = dynamic_plugins.len();
         log::info!(
@@ -131,7 +131,7 @@ impl PluginHostActivation {
             .iter()
             .find(|plugin| plugin.kind == DynamicPluginKind::Worker)
         {
-            return Err(crate::plugin::PluginError::InvalidConfig(format!(
+            return Err(nemo_relay::plugin::PluginError::InvalidConfig(format!(
                 "worker dynamic plugin '{}' requires the 'worker-grpc' feature",
                 plugin.plugin_id
             )));
@@ -156,7 +156,7 @@ impl PluginHostActivation {
                 NativePluginLoadSpec::approved(&plugin.plugin_id, &plugin.manifest_ref)
                     .map_err(|error| plugin_error_context("native plugin load failed", error))
             })
-            .collect::<crate::plugin::Result<Vec<_>>>()?;
+            .collect::<nemo_relay::plugin::Result<Vec<_>>>()?;
         let native = (!native_specs.is_empty())
             .then(|| {
                 load_native_plugins(native_specs)
@@ -203,7 +203,7 @@ impl PluginHostActivation {
         ))
         .await
         .map_err(|error| {
-            crate::plugin::PluginError::Internal(format!(
+            nemo_relay::plugin::PluginError::Internal(format!(
                 "dynamic plugin initialization task failed: {error}"
             ))
         });
@@ -234,14 +234,16 @@ impl PluginHostActivation {
                     std::mem::forget(worker);
                 }
                 std::mem::forget(claim);
-                return Err(crate::plugin::PluginError::RegistrationFailed(format!(
-                    concat!(
-                        "{}; activation rollback was incomplete: {}; the loaded runtimes ",
-                        "were retained because callbacks may remain registered"
+                return Err(nemo_relay::plugin::PluginError::RegistrationFailed(
+                    format!(
+                        concat!(
+                            "{}; activation rollback was incomplete: {}; the loaded runtimes ",
+                            "were retained because callbacks may remain registered"
+                        ),
+                        error,
+                        failures.join("; ")
                     ),
-                    error,
-                    failures.join("; ")
-                )));
+                ));
             }
         };
 
@@ -286,7 +288,7 @@ impl PluginHostActivation {
             .claim
             .as_ref()
             .map(|claim| clear_plugin_configuration_for_host(claim.owner_id()))
-            .unwrap_or(crate::plugin::PluginHostClearOutcome {
+            .unwrap_or(nemo_relay::plugin::PluginHostClearOutcome {
                 result: Ok(()),
                 callbacks_cleared: true,
             });
@@ -344,10 +346,9 @@ impl PluginHostActivation {
             );
             Ok(())
         } else {
-            Err(crate::plugin::PluginError::RegistrationFailed(format!(
-                "dynamic plugin teardown failed: {}",
-                errors.join("; ")
-            )))
+            Err(nemo_relay::plugin::PluginError::RegistrationFailed(
+                format!("dynamic plugin teardown failed: {}", errors.join("; ")),
+            ))
         }
     }
 
@@ -367,7 +368,7 @@ impl PluginHostActivation {
 
 fn validate_dynamic_plugin_specs(dynamic_plugins: &[DynamicPluginActivationSpec]) -> Result<()> {
     if dynamic_plugins.is_empty() {
-        return Err(crate::plugin::PluginError::InvalidConfig(
+        return Err(nemo_relay::plugin::PluginError::InvalidConfig(
             concat!(
                 "dynamic plugin activation requires at least one dynamic plugin; ",
                 "use plugin initialization for a static-only configuration"
@@ -378,7 +379,7 @@ fn validate_dynamic_plugin_specs(dynamic_plugins: &[DynamicPluginActivationSpec]
     let mut plugin_ids = HashSet::with_capacity(dynamic_plugins.len());
     for plugin in dynamic_plugins {
         if !plugin_ids.insert(plugin.plugin_id.as_str()) {
-            return Err(crate::plugin::PluginError::InvalidConfig(format!(
+            return Err(nemo_relay::plugin::PluginError::InvalidConfig(format!(
                 "duplicate dynamic plugin id '{}'",
                 plugin.plugin_id
             )));
@@ -387,8 +388,8 @@ fn validate_dynamic_plugin_specs(dynamic_plugins: &[DynamicPluginActivationSpec]
     Ok(())
 }
 
-fn retained_runtime_error(errors: Vec<String>) -> crate::plugin::PluginError {
-    crate::plugin::PluginError::RegistrationFailed(format!(
+fn retained_runtime_error(errors: Vec<String>) -> nemo_relay::plugin::PluginError {
+    nemo_relay::plugin::PluginError::RegistrationFailed(format!(
         concat!(
             "{}; the loaded runtimes and activation owner were retained because safe ",
             "unloading could not be proven"
@@ -403,9 +404,9 @@ fn retained_runtime_error(errors: Vec<String>) -> crate::plugin::PluginError {
 
 fn plugin_error_context(
     prefix: &str,
-    error: crate::plugin::PluginError,
-) -> crate::plugin::PluginError {
-    use crate::plugin::PluginError;
+    error: nemo_relay::plugin::PluginError,
+) -> nemo_relay::plugin::PluginError {
+    use nemo_relay::plugin::PluginError;
 
     match error {
         PluginError::InvalidConfig(message) => {
@@ -440,5 +441,5 @@ impl Drop for PluginHostActivation {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/plugin_dynamic_host_tests.rs"]
+#[path = "../tests/unit/plugin_dynamic_host_tests.rs"]
 mod tests;

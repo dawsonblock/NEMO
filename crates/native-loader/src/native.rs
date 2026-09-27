@@ -21,13 +21,15 @@ use std::task::{Context, Poll};
 
 use futures_util::FutureExt;
 
-use crate::api::event::{DataSchema, Event, EventSanitizeFields, LogSeverity};
-use crate::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
-use crate::api::registry::{
+use chrono::{DateTime, Utc};
+use libloading::{Library, Symbol};
+use nemo_relay::api::event::{DataSchema, Event, EventSanitizeFields, LogSeverity};
+use nemo_relay::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
+use nemo_relay::api::registry::{
     RuntimeRegistrationKind, deregister_conditional_middleware_guardrail,
     list_runtime_registrations, register_conditional_middleware_guardrail,
 };
-use crate::api::runtime::{
+use nemo_relay::api::runtime::{
     ConditionalMiddlewareGuardrailFn, EventMetadataInjectorFn, EventSanitizeFn, EventSubscriberFn,
     LlmCodecIdentity, LlmConditionalFn, LlmExecutionFn, LlmExecutionNextFn, LlmJsonStream,
     LlmRequestInterceptFn, LlmSanitizeRequestContext, LlmSanitizeRequestFn,
@@ -35,25 +37,23 @@ use crate::api::runtime::{
     LlmStreamExecutionNextFn, MiddlewareContinuationContext, ToolConditionalFn, ToolExecutionFn,
     ToolExecutionNextFn, ToolInterceptFn, ToolSanitizeFn,
 };
-use crate::api::runtime::{
+use nemo_relay::api::runtime::{
     ScopeStackHandle, ThreadScopeStackBinding, capture_thread_scope_stack, create_scope_stack,
     current_scope_stack, restore_thread_scope_stack, scope_stack_active, set_thread_scope_stack,
     sync_thread_scope_stack, with_scope_stack,
 };
-use crate::api::scope::{
+use nemo_relay::api::scope::{
     EmitMarkEventParams, PopScopeParams, PushScopeParams, ScopeAttributes, ScopeHandle, ScopeType,
 };
-use crate::api::scope::{event as emit_scope_mark, get_handle, pop_scope, push_scope};
-use crate::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
-use crate::codec::request::AnnotatedLlmRequest;
-use crate::codec::traits::{LlmCodec, LlmResponseCodec};
-use crate::error::{FlowError, Result as FlowResult};
-use crate::plugin::{
+use nemo_relay::api::scope::{event as emit_scope_mark, get_handle, pop_scope, push_scope};
+use nemo_relay::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
+use nemo_relay::codec::request::AnnotatedLlmRequest;
+use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
+use nemo_relay::error::{FlowError, Result as FlowResult};
+use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginError, PluginRegistration,
     PluginRegistrationContext,
 };
-use chrono::{DateTime, Utc};
-use libloading::{Library, Symbol};
 
 use nemo_relay_plugin::{
     NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
@@ -82,7 +82,7 @@ use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
 use uuid::Uuid;
 
-use super::{
+use nemo_relay::plugin::dynamic::{
     DYNAMIC_PLUGIN_MANIFEST_FILENAME, DynamicPluginKind, DynamicPluginManifest,
     DynamicPluginManifestLoad, NativeHostRuntime, RegistrationTeardown,
 };
@@ -111,7 +111,7 @@ pub struct ApprovedPluginArtifact {
 
 impl ApprovedPluginArtifact {
     /// Approve the artifact at `manifest_ref` by hashing it now.
-    pub fn approve(manifest_ref: &str) -> crate::plugin::Result<Self> {
+    pub fn approve(manifest_ref: &str) -> nemo_relay::plugin::Result<Self> {
         let (manifest_sha256, library_sha256) = host_runtime().artifact_identity(manifest_ref)?;
         Ok(Self {
             identity: PluginArtifactIdentity {
@@ -163,7 +163,7 @@ impl NativePluginLoadSpec {
     pub fn approved(
         plugin_id: impl Into<String>,
         manifest_ref: impl Into<String>,
-    ) -> crate::plugin::Result<Self> {
+    ) -> nemo_relay::plugin::Result<Self> {
         let manifest_ref = manifest_ref.into();
         let artifact = ApprovedPluginArtifact::approve(&manifest_ref)?;
         Ok(Self {
@@ -321,14 +321,6 @@ impl NativePluginActivation {
     pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> RegistrationTeardown {
         host_runtime().tear_down(&mut self.plugin_registrations, "native")
     }
-
-    #[cfg(test)]
-    pub(super) fn with_plugin_kind_for_test(plugin_kind: impl Into<String>) -> Self {
-        Self {
-            plugins: Vec::new(),
-            plugin_registrations: vec![(plugin_kind.into(), 0)],
-        }
-    }
 }
 
 impl Drop for NativePluginActivation {
@@ -343,7 +335,7 @@ impl Drop for NativePluginActivation {
 ///
 /// The returned activation must be kept alive until after active plugin
 /// configuration has been cleared.
-pub fn load_native_plugins<I>(specs: I) -> crate::plugin::Result<NativePluginActivation>
+pub fn load_native_plugins<I>(specs: I) -> nemo_relay::plugin::Result<NativePluginActivation>
 where
     I: IntoIterator<Item = NativePluginLoadSpec>,
 {
@@ -436,7 +428,7 @@ impl Plugin for NativePluginAdapter {
         &'a self,
         plugin_config: &Map<String, Json>,
         ctx: &'a mut PluginRegistrationContext,
-    ) -> Pin<Box<dyn Future<Output = crate::plugin::Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = nemo_relay::plugin::Result<()>> + Send + 'a>> {
         let plugin_config = plugin_config.clone();
         Box::pin(async move {
             let plugin = self.instance.plugin.lock().map_err(|err| {
@@ -627,7 +619,7 @@ impl Drop for StagedArtifact {
 pub(crate) fn stage_verified_library(
     library_path: &Path,
     approved_library_sha256: &str,
-) -> crate::plugin::Result<(PathBuf, StagedArtifact)> {
+) -> nemo_relay::plugin::Result<(PathBuf, StagedArtifact)> {
     use std::io::Read;
 
     let mut source = std::fs::File::open(library_path).map_err(|error| {
@@ -728,7 +720,7 @@ pub(crate) fn stage_verified_library(
 /// property that makes it possible for another process running as the same user
 /// to put something there first. A retry is not a workaround for that: the first
 /// name is unavailable, so another is chosen rather than reusing it.
-fn create_staging_directory() -> crate::plugin::Result<PathBuf> {
+fn create_staging_directory() -> nemo_relay::plugin::Result<PathBuf> {
     for _ in 0..16 {
         let dir =
             std::env::temp_dir().join(format!("nemo-native-artifacts-{}", Uuid::new_v4().simple()));
@@ -758,7 +750,7 @@ fn create_staging_directory() -> crate::plugin::Result<PathBuf> {
 
 fn load_one_native_plugin(
     spec: &NativePluginLoadSpec,
-) -> crate::plugin::Result<Arc<NativePluginInstance>> {
+) -> nemo_relay::plugin::Result<Arc<NativePluginInstance>> {
     // The manifest is read once and parsed from the bytes that were hashed, so
     // the identity and the content are the same object rather than two lookups
     // of one path.
@@ -942,14 +934,14 @@ fn load_one_native_plugin(
     }))
 }
 
-fn validate_relay_compatibility(relay: Option<&str>) -> crate::plugin::Result<()> {
+fn validate_relay_compatibility(relay: Option<&str>) -> nemo_relay::plugin::Result<()> {
     host_runtime().validate_relay_compatibility(relay, "native")
 }
 
 fn validate_plugin_descriptor(
     plugin_id: &str,
     plugin: &NemoRelayNativePluginV1,
-) -> crate::plugin::Result<()> {
+) -> nemo_relay::plugin::Result<()> {
     if plugin.struct_size < std::mem::size_of::<NemoRelayNativePluginV1>() {
         return Err(PluginError::InvalidConfig(format!(
             "native plugin '{plugin_id}' returned incompatible plugin descriptor size {}",
@@ -989,7 +981,7 @@ struct NativeOwnedGate {
 }
 
 impl NativeHostPluginRuntime {
-    fn cleanup(&self) -> crate::plugin::Result<()> {
+    fn cleanup(&self) -> nemo_relay::plugin::Result<()> {
         self.active.store(false, Ordering::Release);
         let mut gates = match self.gates.lock() {
             Ok(gates) => gates,
@@ -1509,7 +1501,7 @@ fn build_native_host_api_v4() -> NemoRelayNativeHostApiV4 {
 /// work outlives the call: a stream the callback returns is polled long after the
 /// invocation that created it returned, and the marks it raises then belong to the
 /// same operation as the ones raised during the call.
-type MarkWindowHandle = Arc<dyn crate::plugin::execution::MarkForwarder>;
+type MarkWindowHandle = Arc<dyn nemo_relay::plugin::execution::MarkForwarder>;
 
 /// Captures the mark window the calling invocation runs under.
 ///
@@ -1609,7 +1601,7 @@ unsafe extern "C" fn native_emit_mark_in_window(
     }
 }
 
-fn read_native_string(value: *const NemoRelayNativeString) -> crate::plugin::Result<String> {
+fn read_native_string(value: *const NemoRelayNativeString) -> nemo_relay::plugin::Result<String> {
     if value.is_null() {
         return Ok(String::new());
     }
@@ -6759,5 +6751,5 @@ fn write_native_json(value: &Json, out: *mut *mut NemoRelayNativeString) -> Nemo
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/native_plugin_tests.rs"]
+#[path = "../tests/unit/native_plugin_tests.rs"]
 mod tests;

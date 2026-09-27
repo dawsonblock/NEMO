@@ -101,8 +101,9 @@ use crate::plugin::{
 
 use super::{
     DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad,
-    DynamicPluginTeardownOutcome, WorkerRuntime, deregister_tracked_registrations_checked,
-    validate_annotated_request_consumer_compatibility, validate_dynamic_plugin_relay_compatibility,
+    DynamicPluginTeardownOutcome, RegistrationTeardown, WorkerRuntime,
+    deregister_tracked_registrations_checked, validate_annotated_request_consumer_compatibility,
+    validate_dynamic_plugin_relay_compatibility,
 };
 
 const JSON_SCHEMA: &str = "nemo.relay.Json@1";
@@ -164,12 +165,23 @@ impl WorkerPluginActivation {
     /// Consumes the activation; deregistration runs from `Drop`.
     pub fn clear(self) {}
 
-    pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> DynamicPluginTeardownOutcome {
+    /// Remove every plugin kind this activation registered, newest first.
+    ///
+    /// A composition that owns more than one lane runs this before releasing the
+    /// host claim, so a kind that could not be removed is reported rather than
+    /// silently left behind — and the outcome says whether the worker may be
+    /// unloaded, which is a different question from whether every removal worked.
+    pub fn deregister_plugin_kinds_checked(&mut self) -> RegistrationTeardown {
         deregister_tracked_registrations_checked(&mut self.plugin_registrations, "worker")
     }
 
-    pub(crate) fn shutdown_plugins_checked(&self) -> DynamicPluginTeardownOutcome {
-        let mut outcome = DynamicPluginTeardownOutcome::success();
+    /// Stop the worker processes this activation started.
+    ///
+    /// Only meaningful once every kind is known to be absent from the registry: a
+    /// worker stopped while its adapter is still callable would turn a live call
+    /// into a crash.
+    pub fn shutdown_plugins_checked(&self) -> RegistrationTeardown {
+        let mut outcome = RegistrationTeardown::success();
         for plugin in self.plugins.iter().rev() {
             outcome.merge(plugin.shutdown_checked());
         }

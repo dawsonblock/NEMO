@@ -22,7 +22,9 @@ pub use callbacks::{
 };
 #[doc(hidden)]
 pub use continuation_context::MiddlewareContinuationContext;
-#[cfg(test)]
+// The worker lane's own tests drive a continuation through the same lease the
+// native lane's continuations use, and they reach it from another module.
+#[cfg(all(test, feature = "worker-grpc"))]
 pub(crate) use continuation_context::MiddlewareContinuationLease;
 pub use execution_budget::{
     ExecutionBudget, ManagedBudget, ManagedCall, ManagedExecutionConfiguration,

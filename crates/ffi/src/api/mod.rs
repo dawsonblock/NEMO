@@ -62,13 +62,13 @@ use nemo_relay::api::subscriber as core_subscriber_api;
 use nemo_relay::api::tool as core_tool_api;
 use nemo_relay::api::tool::ToolAttributes;
 use nemo_relay::error::{FlowError, Result as FlowResult};
-use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError,
     PluginRegistrationContext, active_plugin_report, clear_plugin_configuration, deregister_plugin,
     initialize_plugins, list_plugin_kinds, register_plugin, validate_plugin_config,
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
+use nemo_relay_native_loader::DynamicPluginActivationSpec;
 use tokio::runtime::Runtime;
 
 mod adaptive;

@@ -19,12 +19,13 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, DynamicPluginKind};
+use nemo_relay::plugin::dynamic::DynamicPluginKind;
 use nemo_relay::plugin::{
     PluginConfig, clear_plugin_configuration, ensure_builtin_plugins_registered,
     initialize_plugins_exact,
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
+use nemo_relay_native_loader::DynamicPluginActivationSpec;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
 use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 use nemo_relay_plugin_host::supervisor::PluginHostSupervisorConfig;

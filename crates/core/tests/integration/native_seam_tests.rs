@@ -4,11 +4,15 @@
 //! The hosted-plugin seam, checked as the boundary it claims to be.
 //!
 //! `plugin/dynamic/hosted.rs` says what a hosted plugin's code may ask this
-//! runtime to do, and `native.rs`/`host.rs` are the code that does the asking.
-//! These tests hold the two together: the loader must not spell a kernel item the
-//! seam replaced, every operation in the mapping must still be called, and — the
-//! one that catches what nobody anticipated — the hosted side must not name any
-//! other module-level kernel item that is not `pub` at all.
+//! runtime to do, and the loader crate's `native.rs`/`host.rs` are the code that
+//! does the asking. These tests hold the two together: the loader must not spell a
+//! kernel item the seam replaced, every operation in the mapping must still be
+//! called, and — the one that catches what nobody anticipated — the hosted side
+//! must not name any other module-level kernel item that is not `pub` at all.
+//!
+//! They stayed in the kernel's crate on purpose when the loader moved out: the
+//! seam and the operations are the kernel's, and a boundary is best checked from
+//! the side that has to keep it.
 //!
 //! They live outside `src/` on purpose. A scan that has to write down declaration
 //! keywords is a scan whose keyword list would otherwise be counted as part of the
@@ -75,18 +79,25 @@ const REPLACED_TYPES: &[(&str, &str)] = &[
 /// reason instead of arriving as a compile fix.
 const ALLOWED_INTERNALS: &[(&str, &str)] = &[];
 
-/// The files that make up the hosted side, by path within the crate.
-const HOSTED_SIDE_PATHS: &[&str] = &["plugin/dynamic/native.rs", "plugin/dynamic/host.rs"];
+/// The files that make up the hosted side, relative to this crate's root.
+///
+/// They are in another crate now — that is what the move was — so the scan reaches
+/// across the workspace rather than into `src/`. A test that reads a sibling
+/// crate's source is the price of checking a boundary from the side that owns it.
+const HOSTED_SIDE_PATHS: &[&str] = &[
+    "../native-loader/src/native.rs",
+    "../native-loader/src/host.rs",
+];
 
 /// The file that carries the seam.
-const SEAM_PATH: &str = "plugin/dynamic/hosted.rs";
+const SEAM_PATH: &str = "src/plugin/dynamic/hosted.rs";
 
 fn crate_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
 fn read_relative(relative: &str) -> String {
-    std::fs::read_to_string(crate_root().join("src").join(relative))
+    std::fs::read_to_string(crate_root().join(relative))
         .unwrap_or_else(|error| panic!("read {relative}: {error}"))
 }
 

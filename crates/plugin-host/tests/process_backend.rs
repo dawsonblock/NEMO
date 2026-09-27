@@ -1762,7 +1762,7 @@ async fn killing_the_host_does_not_kill_the_kernel() {
 #[tokio::test]
 async fn the_shared_composition_runs_a_native_plugin_in_another_process() {
     use nemo_relay::plugin::ConfigReport;
-    use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+    use nemo_relay_native_loader::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
     // The composition every binding and the CLI share. What a binding needs to
@@ -1825,7 +1825,7 @@ async fn the_shared_composition_runs_a_native_plugin_in_another_process() {
 
 #[tokio::test]
 async fn a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwards() {
-    use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+    use nemo_relay_native_loader::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
     let fixture = support::PreparedFixture::write(
@@ -1875,7 +1875,7 @@ async fn a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwa
 
 #[tokio::test]
 async fn a_caller_that_stops_waiting_does_not_leave_a_half_applied_activation() {
-    use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+    use nemo_relay_native_loader::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
     // The defect this pins: an activation claims process-wide ownership, registers

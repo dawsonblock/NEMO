@@ -1798,12 +1798,11 @@ dependencies = [
  "futures",
  "futures-util",
  "hyper-util",
- "libloading",
  "log",
  "nemo-relay-authority",
  "nemo-relay-executor",
  "nemo-relay-ledger",
- "nemo-relay-plugin",
+ "nemo-relay-native-loader",
  "nemo-relay-plugin-protocol",
  "nemo-relay-types",
  "nemo-relay-worker-proto",
@@ -1895,6 +1894,7 @@ dependencies = [
  "log",
  "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-native-loader",
  "nemo-relay-pii-redaction",
  "nemo-relay-plugin-host",
  "nemo-relay-plugin-protocol",
@@ -1956,6 +1956,7 @@ dependencies = [
  "libc",
  "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-native-loader",
  "nemo-relay-pii-redaction",
  "nemo-relay-plugin-host",
  "serde",
@@ -1995,6 +1996,31 @@ name = "nemo-relay-native-abi"
 version = "0.9.1-rc.4"
 
 [[package]]
+name = "nemo-relay-native-loader"
+version = "0.9.1-rc.4"
+dependencies = [
+ "chrono",
+ "futures",
+ "futures-util",
+ "libloading",
+ "log",
+ "nemo-relay",
+ "nemo-relay-plugin",
+ "nemo-relay-plugin-protocol",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spdlog-rs",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nemo-relay-node"
 version = "0.9.1-rc.4"
 dependencies = [
@@ -2005,6 +2031,7 @@ dependencies = [
  "napi-derive",
  "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-native-loader",
  "nemo-relay-pii-redaction",
  "nemo-relay-plugin-host",
  "serde",
@@ -2055,6 +2082,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hyper-util",
  "nemo-relay",
+ "nemo-relay-native-loader",
  "nemo-relay-plugin",
  "nemo-relay-plugin-proto",
  "nemo-relay-plugin-protocol",
@@ -2099,6 +2127,7 @@ dependencies = [
  "chrono",
  "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-native-loader",
  "nemo-relay-pii-redaction",
  "nemo-relay-plugin-host",
  "pyo3",

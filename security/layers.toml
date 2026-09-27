@@ -28,6 +28,7 @@ adapters = [
     "nemo-relay-executor",
     "nemo-relay-ledger",
     "nemo-relay-plugin",
+    "nemo-relay-native-loader",
     "nemo-relay-plugin-host",
     "nemo-relay-plugin-proto",
     "nemo-relay-worker",
@@ -65,6 +66,5 @@ qualification = ["nemo-effect-qualification"]
     "nemo-relay-authority",
     "nemo-relay-executor",
     "nemo-relay-ledger",
-    "nemo-relay-plugin",
     "nemo-relay-worker-proto",
 ]
