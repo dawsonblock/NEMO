@@ -149,6 +149,68 @@ def identity_names(identities: list[str]) -> set[str]:
     return {identity.split("@", 1)[0] for identity in identities}
 
 
+def kernel_closure_names(repo_root: pathlib.Path, roots: list[str]) -> set[str]:
+    """Return every package name the kernel's own process can reach.
+
+    The kernel's roots are asked together, so the answer is the union of what any
+    of them links: a crate that only the CLI pulls in is still in the kernel's
+    process when the CLI runs, and the question this answers is what that process
+    can reach rather than what one library of it can.
+    """
+    completed = subprocess.run(
+        [
+            "cargo",
+            "tree",
+            *[f"-p{root}" for root in roots],
+            "--all-features",
+            "--locked",
+            "--prefix",
+            "none",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    names = set()
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if fields:
+            names.add(fields[0])
+    return names
+
+
+def kernel_closure_reachability(policy: dict, reachable: set[str]) -> set[str]:
+    """Return the packages the closure may not reach but still does.
+
+    The milestone's decisive property is structural: the kernel's resolved closure
+    and the things that load native code must not intersect. Today they do, because
+    the loader still runs in the kernel's address space, and a gate that is red on
+    arrival enforces nothing — so the intersection is *recorded*, and this returns
+    what the closure reaches rather than what the policy says it should.
+    """
+    forbidden = set(policy.get("kernel_closure", {}).get("forbidden", []))
+    return forbidden.intersection(reachable)
+
+
+def find_closure_problems(policy: dict, reachable: set[str]) -> list[str]:
+    """Return a forbidden package the kernel's closure gained.
+
+    A package on the recorded list is the known remaining work; one that is not is
+    a dependency edge somebody added, which is the failure this check exists for.
+    """
+    closure = policy.get("kernel_closure")
+    if not closure:
+        return []
+    recorded = set(closure.get("reachable_now", []))
+    reached = kernel_closure_reachability(policy, reachable)
+    return [
+        f"the kernel's closure reaches '{name}', which is not one of the loader "
+        f"packages the policy records as still reachable"
+        for name in sorted(reached - recorded)
+    ]
+
+
 def dependency_digest(names: set[str]) -> str:
     """Return a stable digest over a dependency set."""
     return hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest()
@@ -360,7 +422,12 @@ def render(reports: list[Metrics]) -> str:
     return "\n".join(rows)
 
 
-def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dict) -> str:
+def render_surface(
+    metadata: dict,
+    identities: dict[str, list[str]],
+    policy: dict,
+    reachable: set[str] | None = None,
+) -> str:
     """Render the two-tier surface: invariant enforcers, then everything in-process."""
     rows = [
         "surface",
@@ -387,6 +454,14 @@ def render_surface(metadata: dict, identities: dict[str, list[str]], policy: dic
     # crates. The question is what can corrupt the kernel, and a loader in a
     # different crate inside the same process still can.
     rows.extend(["", f"  kernel-process unsafe tokens: {kernel_process_unsafe}"])
+    # And the figure that has to become zero: what the kernel can still reach that
+    # loads native code. This is a dependency-graph fact rather than a line count,
+    # which is why it is the one the split is judged on.
+    closure = policy.get("kernel_closure")
+    if closure and reachable is not None:
+        reached = sorted(kernel_closure_reachability(policy, reachable))
+        rendered = ", ".join(reached) if reached else "nothing"
+        rows.append(f"  kernel closure reaches (target: nothing): {rendered}")
     return "\n".join(rows)
 
 
@@ -453,10 +528,15 @@ def main(argv: list[str] | None = None) -> int:
     identities = {crate: dependency_identities(arguments.repo_root, crate) for crate in crates}
     reports, problems = find_violations(metadata, identities, policy)
     problems.extend(find_temporary_problems(policy, reports))
+    kernel_closure = policy.get("kernel_closure")
+    reachable: set[str] | None = None
+    if kernel_closure:
+        reachable = kernel_closure_names(arguments.repo_root, kernel_closure["roots"])
+        problems.extend(find_closure_problems(policy, reachable))
 
     print(render(reports))
     print()
-    surface = render_surface(metadata, identities, policy)
+    surface = render_surface(metadata, identities, policy, reachable)
     print(surface)
     print()
     print(render_temporary(policy))

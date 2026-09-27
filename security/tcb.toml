@@ -22,6 +22,30 @@
 
 version = 1
 
+# What the kernel's own process may be able to reach.
+#
+# The isolation milestone has an architectural claim and a structural one. The
+# architectural claim is that plugins run in another process, and it holds. The
+# structural claim is that the kernel cannot link the loader at all:
+#
+#     kernel closure ∩ {libloading, native ABI, native loader} = ∅
+#
+# It does not hold yet — the loader still runs in the kernel's address space — and
+# until it does, this records the intersection rather than demanding it be empty,
+# because a gate that is red on arrival enforces nothing. What the check fails on
+# is the closure gaining something that is not recorded here: an edge somebody
+# added. The recorded list is the remaining work, and the target is an empty one,
+# at which point this becomes the property itself.
+#
+# `nemo-relay-plugin` stands here for the native ABI until the extraction gives
+# the ABI a crate of its own (`native-abi`), which is the first staged step. The
+# wire crates are deliberately absent: protocol types are what the kernel needs in
+# order to talk to a host, and reaching them is the design rather than a leak.
+[kernel_closure]
+roots = ["nemo-relay", "nemo-relay-cli", "nemo-relay-ffi"]
+forbidden = ["libloading", "nemo-relay-plugin"]
+reachable_now = ["libloading", "nemo-relay-plugin"]
+
 [trusted]
 crates = [
     "nemo-relay",

@@ -274,3 +274,74 @@ def test_repository_policy_measures_every_crate_it_trusts() -> None:
         assert crate in policy["limits"], f"{crate} shares the kernel's process but is unmeasured"
     for crate in policy["plugin_host"]["crates"]:
         assert crate in policy["limits"], f"{crate} hosts native plugins but is unmeasured"
+
+
+# ---- the kernel closure, and what it can still reach ----
+
+CLOSURE_POLICY = {
+    "kernel_closure": {
+        "roots": ["nemo-relay"],
+        "forbidden": ["libloading", "nemo-relay-plugin", "native-loader"],
+        "reachable_now": ["libloading", "nemo-relay-plugin"],
+    }
+}
+
+
+def test_a_recorded_loader_package_is_the_remaining_work_and_not_a_failure() -> None:
+    # The list is a record, not a permission: these are the crates the split still
+    # has to move, and the gate stays green while the closure reaches them and no
+    # further.
+    reachable = {"nemo-relay", "libloading", "nemo-relay-plugin", "serde"}
+
+    assert report.kernel_closure_reachability(CLOSURE_POLICY, reachable) == {
+        "libloading",
+        "nemo-relay-plugin",
+    }
+    assert report.find_closure_problems(CLOSURE_POLICY, reachable) == []
+
+
+def test_a_loader_package_the_policy_does_not_record_fails() -> None:
+    # A crate that loads native code reaching the kernel is the failure this check
+    # exists for, and it is a dependency edge somebody added rather than the work
+    # the policy already knows about.
+    reachable = {"nemo-relay", "libloading", "nemo-relay-plugin", "native-loader"}
+
+    problems = report.find_closure_problems(CLOSURE_POLICY, reachable)
+
+    assert len(problems) == 1
+    assert "native-loader" in problems[0]
+    assert "not one of the loader packages the policy records" in problems[0]
+
+
+def test_a_policy_without_a_closure_section_checks_nothing() -> None:
+    # A crate that has not been split yet has nothing to record, and the check says
+    # so rather than reporting an empty closure as a pass.
+    assert report.find_closure_problems({}, {"libloading"}) == []
+
+
+def test_the_surface_renders_what_the_closure_reaches() -> None:
+    policy = {
+        "trusted": {"crates": []},
+        "in_process": {"crates": []},
+        "plugin_host": {"crates": []},
+        **CLOSURE_POLICY,
+    }
+
+    rendered = report.render_surface({"packages": []}, {}, policy, {"libloading", "serde"})
+
+    assert "kernel closure reaches (target: nothing): libloading" in rendered
+
+
+def test_the_repository_policy_records_what_the_kernel_still_reaches() -> None:
+    # The policy's own record has to be the measurement: a recorded list that no
+    # longer matches would make the ratchet pass by describing a graph that is not
+    # there.
+    policy = report.load_policy(report.DEFAULT_POLICY)
+    closure = policy["kernel_closure"]
+    reachable = report.kernel_closure_names(report.REPO_ROOT, closure["roots"])
+
+    assert report.find_closure_problems(policy, reachable) == []
+    assert set(closure["reachable_now"]) <= set(closure["forbidden"]), (
+        "the recorded work is a subset of what the closing target forbids"
+    )
+    assert "libloading" in reachable, "the loader is still in the kernel's graph, which is what the split moves"

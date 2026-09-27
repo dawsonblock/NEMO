@@ -2637,3 +2637,88 @@ that: of the three entries in `LOAD_CALL_PATHS`, two are the loader inside `core
 and the third is that child's end, and the entry that has to move for the metric to
 move is the third. Until it does, `kernel-process unsafe tokens` stays where it is,
 and it is not made to move by reclassifying anything.
+
+## The loader extraction, staged
+
+What remains is dependency-graph surgery rather than a refactor, and the property it
+establishes is structural:
+
+```text
+kernel crate closure ∩ {dlopen, native ABI, plugin entrypoint, registration loader} = ∅
+```
+
+Until that intersection is empty, the isolation is architectural. After it is, the
+kernel cannot link the loader at all, and the claim stops depending on anybody
+remembering not to use it.
+
+### What already exists
+
+- **The launch decision has its own module** (`plugin-host:host_location.rs`), so
+  the rule about *which* host to start and under what identity is one thing to read
+  and one thing to move.
+- **The closure is measured, not asserted.** `just tcb-report` now prints what the
+  kernel's own process can still reach among the packages that load native code:
+
+  ```text
+  kernel closure reaches (target: nothing): libloading, nemo-relay-plugin
+  ```
+
+  The intersection is *recorded* in `security/tcb.toml` rather than demanded empty,
+  because a gate that is red on arrival enforces nothing. What fails the gate is the
+  closure gaining a package that is not recorded — an edge somebody added — and the
+  recorded list is the remaining work. As the split lands the list shrinks; when it
+  is empty, the check is the property.
+
+### The order it has to happen in
+
+1. `native-abi`: ABI definitions and compatibility validation only.
+2. `native-loader`: `dlopen`, symbol acquisition, plugin lifetime, registration
+   extraction.
+3. The child endpoint crate: the host's own end of the protocol, depending on
+   `native-loader` and the wire crates.
+4. Move the in-process child implementation out of the crate the supervisor links.
+5. The supervisor depends only on protocol, process and session layers.
+6. Remove the native loader path from `core`.
+7. Add the two proofs below.
+8. Delete the transitional re-exports, rather than leaving aliases that make the old
+   architecture look dead while an accidental dependency path survives.
+
+Two traps are named here because the split is where they would be walked into. There
+is no `plugin-common` crate: the shared layer is inert wire material — messages,
+identifiers, error shapes, capability tokens, serialization, limits, pure validation
+— and a shared crate that knows anything about loading plugins is a trust-boundary
+leak wearing a neutral name. And moving `core::plugin::dynamic::native.rs` is not
+enough on its own: if a kernel-side type still carries raw ABI pointers, native
+callback representations, ABI-shaped symbol names or loader handles, the split is
+incomplete even with `libloading` gone. The kernel talks about registrations,
+invocations and remote endpoints; the ABI is a child-side vocabulary.
+
+### The two proofs
+
+They answer different questions, and neither substitutes for the other.
+
+- **Dependency proof.** Walk the resolved graph from the kernel's roots and fail if
+  any closure member is a loader or ABI crate. This is what `just tcb-report` now
+  reports as a ratchet, and it is what has to reach zero.
+- **Symbol proof.** After a release build, inspect the kernel artifact and assert
+  that loader and ABI symbols are absent. The kernel cannot link the loader through
+  Cargo; the binary does not contain it anyway.
+
+### One decision to settle during the split
+
+The child↔plugin ABI version and the kernel↔child protocol version are separate
+compatibility domains. A protocol-compatible host must be able to reject an
+ABI-incompatible plugin without implying that the kernel/host protocol is itself
+incompatible. Conflating the two numbers would make that distinction unavailable
+exactly when it is needed.
+
+### The definition of done
+
+The dependency graph proves the kernel cannot reach the native loader; the release
+kernel artifact contains no loader or ABI symbols; the child binary alone owns the
+ABI and the dynamic loading; the enforced claims in the qualification matrix are
+still green, with the new structural ones matrix-backed; and the TCB report is split
+by trust role rather than by tier alone — kernel authority, host supervisor, child
+endpoint, artifact verifier, package resolver and the ABI/loader — so that a
+structural improvement is visible as a movement between roles rather than as one
+line count going down for reasons nobody can read.
