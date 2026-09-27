@@ -35,6 +35,15 @@ const LOADER_PATHS: &[&str] = &["core:plugin/dynamic/native.rs"];
 /// `plugin-host` is not a grandfather but the destination: reaching the loader
 /// is what that crate exists to do, and the entry is the seam implementation the
 /// process backend replaces.
+///
+/// `plugin-host:lib.rs` is the child's own end of the protocol — the host process
+/// loads the plugin there and serves its registrations over the wire — and it is
+/// the last entry here that has to move for the kernel to stop linking the loader:
+/// while this crate carries it, every consumer of the supervision surface carries
+/// `dlopen` and the ABI with it. The two `core` entries are the loader itself. The
+/// *decision* about which host to start and under what identity already has a
+/// module of its own (`plugin-host:host_location.rs`), so what remains is a move
+/// rather than a design.
 const LOAD_CALL_PATHS: &[&str] = &[
     "core:plugin/dynamic/native.rs",
     "core:plugin/dynamic/host.rs",

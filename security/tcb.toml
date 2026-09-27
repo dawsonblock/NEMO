@@ -546,7 +546,15 @@ max_transitive_packages = 240
 # that has to observe the refusal on the trusted side: a refusal before the work and one after it
 # are the same answer to the caller, so only the codec's own count can tell them apart. No
 # dependency moved and no `unsafe` did.
-max_source_lines = 23912
+#
+# Raised by seventy-nine for the launch decision's own module. Which host to start and
+# under what identity used to live inside the supervisor, beside the session lifecycle,
+# the transport and the failure reporting that make up supervising a process; it is now
+# `host_location.rs`, with the rule, its two failure modes and three tests in one place.
+# Almost all of the raise is the tests — two are new, and the one that moved came with
+# the rule — and none of it is policy: the supervisor still decides when a host starts
+# and what happens when it dies. No dependency moved and no `unsafe` did.
+max_source_lines = 23991
 max_unsafe_occurrences = 2
 direct_dependency_digest = "12574ebadc0d79460aaccd72a23e04c5c9a842d1b42b2c36514ecef24e8cce99"
 transitive_dependency_digest = "c5573f18444e258ce9d112811b4f7ae0ea7ef1b133ca4f522948e37a400acfcc"

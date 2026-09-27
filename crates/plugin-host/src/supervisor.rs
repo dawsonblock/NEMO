@@ -102,105 +102,12 @@ impl PluginHostSupervisorConfig {
 
 /// Environment variable naming the host executable, for deployments that do not
 /// install it beside the process that starts it.
-pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
-
-/// The identity a runtime's plugin sessions are bound to.
 ///
-/// Bound to the implementation that asked and to the process it asked from, so a
-/// host started for one runtime is refused by another and a host started by a
-/// process that has since exited cannot be adopted. Built here rather than in
-/// each consumer because the binding is the *host's* check: four consumers
-/// computing four spellings of it is four ways to get it wrong.
-///
-/// An identity rather than a hash: the value is compared and never parsed, the
-/// facts it carries are the whole of what a peer can check, and hashing them
-/// would add a digest dependency to a crate whose job is to hold no more than it
-/// needs. The separators are characters no field can contain, because the value
-/// has to be unambiguous as well as unique.
-pub fn plugin_runtime_binding(implementation: &str) -> String {
-    format!(
-        "{implementation}/{version}/{protocol}/{process}",
-        implementation = implementation,
-        version = env!("CARGO_PKG_VERSION"),
-        protocol = PROTOCOL_VERSION,
-        process = std::process::id(),
-    )
-}
+/// Re-exported from [`crate::host_location`], which owns the decision, so the
+/// path this variable has always been reachable at keeps working.
+pub use crate::host_location::{EXECUTABLE_ENV, plugin_runtime_binding};
 
-/// Where the host executable is, given where this process is.
-///
-/// An environment variable that names a host is authoritative: a deployment that
-/// said which host to use gets that host or a failure, never a quiet fallback to
-/// whichever executable happens to sit beside the process. A typo in an override
-/// is a configuration mistake, and discovering it at startup as "the host is not
-/// there" is the only reading that keeps the operator's choice meaningful.
-fn resolve_executable() -> PathBuf {
-    resolve_from(
-        std::env::var_os(EXECUTABLE_ENV),
-        &directory_holding_this_process(),
-    )
-}
-
-/// The same decision, with the two things it reads passed in.
-///
-/// Split out so the rule can be tested as a rule: reading the environment and
-/// asking where this process lives are the parts a test cannot vary without
-/// touching process-wide state, and the part that matters — which input wins —
-/// is neither of them.
-fn resolve_from(configured: Option<std::ffi::OsString>, beside: &Path) -> PathBuf {
-    if let Some(configured) = configured {
-        return PathBuf::from(configured);
-    }
-    for candidate in beside_this_process(beside) {
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    beside.join(executable_name())
-}
-
-/// The directory holding the executable that started this process.
-///
-/// It is the interpreter's own directory for a binding loaded into Python or
-/// Node rather than a plugin host's, which is what makes an installation beside
-/// the interpreter an installation beside the thing that starts the host.
-fn directory_holding_this_process() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .unwrap_or_default()
-}
-
-/// The places a host is looked for once nothing has named one.
-fn beside_this_process(beside: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![beside.join(executable_name())];
-    if let Some(above) = beside.parent() {
-        candidates.push(above.join(executable_name()));
-    }
-    candidates
-}
-
-/// Where a host would have been found, in the order it was looked for.
-///
-/// Read by the failure below rather than by the resolution above, so a
-/// deployment that received a runtime without the host is told which locations
-/// it was expected to fill instead of only which file was missing.
-fn host_search_locations() -> Vec<PathBuf> {
-    let mut locations = Vec::new();
-    if let Some(configured) = std::env::var_os(EXECUTABLE_ENV) {
-        locations.push(PathBuf::from(configured));
-    }
-    locations.extend(beside_this_process(&directory_holding_this_process()));
-    locations
-}
-
-fn executable_name() -> &'static str {
-    if cfg!(windows) {
-        "nemo-plugin-host.exe"
-    } else {
-        "nemo-plugin-host"
-    }
-}
+use crate::host_location::{host_search_locations, resolve_executable};
 
 /// A running plugin host process.
 pub struct PluginHostSupervisor {
@@ -1308,6 +1215,7 @@ async fn handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_location::executable_name;
 
     #[tokio::test]
     async fn a_missing_host_is_reported_with_the_places_it_was_looked_for() {
@@ -1336,29 +1244,9 @@ mod tests {
         assert!(message.contains(executable_name()), "{message}");
     }
 
-    #[test]
-    fn an_override_that_names_a_host_is_the_host_that_is_used() {
-        // A deployment that said which host to use gets that host or a failure.
-        // Falling back to whichever executable happens to sit beside the process
-        // would make the operator's choice advisory, and a typo in it invisible
-        // until the mismatched host answered a handshake.
-        let directory = std::env::temp_dir();
-        let beside = directory.join(format!("nemo-ph-override-{}", Uuid::now_v7().simple()));
-        std::fs::create_dir_all(&beside).expect("a directory for the beside case");
-        let neighbour = beside.join(executable_name());
-        std::fs::write(&neighbour, b"a host this deployment did not ask for").expect("a neighbour");
-
-        let configured = PathBuf::from("/nonexistent/by/override/nemo-plugin-host");
-        let resolved = resolve_from(Some(configured.clone().into_os_string()), &beside);
-
-        std::fs::remove_dir_all(&beside).ok();
-        assert_eq!(
-            resolved, configured,
-            "the override has to be authoritative even when it does not exist"
-        );
-        assert!(
-            !neighbour.exists(),
-            "the neighbour a fallback would have found was removed with its directory"
-        );
-    }
+    // Where a host is found is `host_location`'s rule, and its tests live with it:
+    // `an_override_that_names_a_host_is_the_host_that_is_used`,
+    // `a_host_beside_the_process_is_found_when_nothing_names_one` and
+    // `a_host_that_is_nowhere_is_named_rather_than_invented`. What stays here is
+    // what the supervisor does with the answer, which is the test above.
 }

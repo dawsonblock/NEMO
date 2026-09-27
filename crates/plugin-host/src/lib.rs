@@ -24,6 +24,7 @@
 //! leaves the kernel's dependency graph.
 
 pub mod activation;
+pub mod host_location;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

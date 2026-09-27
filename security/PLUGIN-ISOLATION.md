@@ -2611,3 +2611,29 @@ looked in the shim's directory and found nothing. The Python activation reports
 `host_pid` now, so the installed check asserts *where* the plugin ran rather than
 only that it ran, which is the difference between a test that proves the boundary
 and one that proves the call succeeded.
+
+## The launch decision has a module of its own now
+
+The loader extraction has two halves, and this is the first. The *decision* about
+which host to start and under what identity used to live inside the supervisor's
+module, beside the session lifecycle, the transport and the failure reporting that
+make up supervising a process. It is now
+`crates/plugin-host/src/host_location.rs`: `NEMO_RELAY_PLUGIN_HOST` is
+authoritative, a host beside the process that starts it is the fallback, and
+nothing is invented when neither is there — the rule, its failure modes and three
+tests, in one file that decides nothing else.
+
+That is the separation rather than a redesign: the supervisor still decides *when*
+a host starts and what happens when it dies, and the module it calls decides *what*
+starts. The public paths are unchanged — `supervisor` re-exports `EXECUTABLE_ENV`
+and `plugin_runtime_binding`, which is where every consumer already names them — and
+no policy moved.
+
+What has *not* moved is the loader. The kernel still links `dlopen` and the native
+ABI, because the child's own end of the protocol — `plugin-host`'s in-process host,
+which loads the plugin and serves its registrations over the wire — is built from
+the crate the kernel links for supervision. The architecture test names exactly
+that: of the three entries in `LOAD_CALL_PATHS`, two are the loader inside `core`
+and the third is that child's end, and the entry that has to move for the metric to
+move is the third. Until it does, `kernel-process unsafe tokens` stays where it is,
+and it is not made to move by reclassifying anything.
