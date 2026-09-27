@@ -238,13 +238,23 @@ enforced_by = [
 ]
 
 [[claim]]
-id = "every-consumer-declares-where-its-host-is"
-statement = "Every consumer that hosts plugins finds the host its installation shipped, rather than searching for one."
+id = "python-derives-its-host-from-its-own-installation"
+statement = "The Python binding resolves the host from the package it was installed as, rather than from the interpreter that happens to be running, and runs the plugin there."
+status = "enforced"
+enforced_by = [
+  { rust_test = "a_virtual_environment_resolves_the_host_in_its_own_bin" },
+  { rust_test = "a_user_install_resolves_the_users_bin_and_not_the_interpreters" },
+  { rust_test = "a_distribution_package_tree_resolves_its_own_prefix" },
+  { recipe = "verify-installed-python-plugin" },
+]
+
+[[claim]]
+id = "every-hosting-consumer-carries-its-own-host"
+statement = "Every consumer that hosts plugins ships the host in the artifact that carries the binding, so a deployment never looks for one."
 status = "unverified"
 terms = [
-  "resolves the host",
-  "host discovery",
-  "deterministic discovery",
-  "package-resolved companion",
+  "host resolution",
+  "carries the host",
+  "every consumer",
 ]
-note = "Node resolves the host from the package that carries the addon, and its verifier installs an npm metapackage with nothing in the environment naming one. Python finds it beside the interpreter, which is where a wheel's script lands in a virtual environment, and its verifier runs an installed wheel the same way. The FFI and the CLI have no packaging step of their own, so for those there is nothing to find yet — and Python's rule is the interpreter's directory rather than the package's, which is the same place for a virtual environment and not for every installation. That difference is what the deterministic-discovery work is for."
+note = "The Python wheel, the Node platform package and the CLI wheel each carry the host and each resolves it from its own installation. What is missing is the FFI: the Go binding crosses the C ABI and has no packaging step of its own, so a Go deployment names a host in `NEMO_RELAY_PLUGIN_HOST` or has one beside its process — which is a search of exactly the kind this row exists to remove."

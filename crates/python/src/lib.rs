@@ -19,6 +19,7 @@
 //! - `py_context` — Notes on scope propagation between sync/async contexts
 //! - `py_adaptive` — Python-facing adaptive helpers (`set_latency_sensitivity`)
 //! - `py_plugin` — Python-facing generic plugin config/registration helpers
+//! - `plugin_host_location` — where this installation's plugin host is
 //! - `convert` — JSON ↔ Python conversion utilities
 use nemo_relay::shared_runtime::initialize_shared_runtime_binding;
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
@@ -27,6 +28,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 mod convert;
+mod plugin_host_location;
 #[doc(hidden)]
 pub mod py_adaptive;
 #[doc(hidden)]
@@ -51,6 +53,16 @@ const PYTHON_FUTURE_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Where this extension was loaded from, recorded before anything can ask for
+    // the host: the package's own location is what decides which companion runs
+    // native plugin code, and after init there is no way to ask again. A module
+    // without a `__file__` records nothing, which leaves the runtime's own
+    // resolution in place rather than inventing a location.
+    if let Ok(file) = m.filename() {
+        plugin_host_location::remember_module_file(std::path::Path::new(
+            file.to_string_lossy().as_ref(),
+        ));
+    }
     // The runtime that drives every Python-facing future, sized before anything
     // can be spawned on it.
     //

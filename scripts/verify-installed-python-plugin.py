@@ -35,6 +35,7 @@ PLUGIN_TOOL = "installed-python-native"
 RUNNER = """
 import asyncio
 import json
+import os
 import sys
 
 from nemo_relay import plugin
@@ -59,8 +60,21 @@ async def main() -> int:
     # process. A local registry holding it would mean the runtime had loaded the
     # plugin itself, which is the thing that must not happen.
     local_kinds = plugin.list_kinds()
+    # And the host is a process of its own: the kind being absent says the library
+    # is not mapped here, and the pid says where the work happened.
+    host_pid = activation.host_pid
+    pid = os.getpid()
     await activation.close()
-    print(json.dumps({"result": result.result, "local_kinds": local_kinds}))
+    print(
+        json.dumps(
+            {
+                "result": result.result,
+                "local_kinds": local_kinds,
+                "host_pid": host_pid,
+                "pid": pid,
+            }
+        )
+    )
     return 0
 
 
@@ -142,16 +156,21 @@ def main() -> int:
         raise SystemExit(f"plugin fixture does not exist: {args.fixture}")
     if args.host is not None and not args.host.is_file():
         raise SystemExit(f"plugin host does not exist: {args.host}")
+    # The runner is started from a temporary workspace, so every path the
+    # manifest carries has to be absolute: a relative one would resolve against
+    # the workspace rather than against where the fixture was named from.
+    fixture = args.fixture.resolve()
+    host = None if args.host is None else args.host.resolve()
 
     with tempfile.TemporaryDirectory() as temporary:
         workspace = Path(temporary)
-        manifest = write_manifest(workspace, args.fixture, checkout_version())
+        manifest = write_manifest(workspace, fixture, checkout_version())
         runner = workspace / "runner.py"
         runner.write_text(RUNNER.replace("__PLUGIN_ID__", PLUGIN_ID).replace("__PLUGIN_TOOL__", PLUGIN_TOOL))
         env = dict(os.environ)
         env.pop("NEMO_RELAY_PLUGIN_HOST", None)
-        if args.host is not None:
-            env["NEMO_RELAY_PLUGIN_HOST"] = str(args.host)
+        if host is not None:
+            env["NEMO_RELAY_PLUGIN_HOST"] = str(host)
         completed = subprocess.run(
             [str(args.python), str(runner), str(manifest)],
             capture_output=True,
@@ -183,7 +202,16 @@ def main() -> int:
         raise SystemExit(f"the plugin did not answer the call: {report}")
     if PLUGIN_ID in report["local_kinds"]:
         raise SystemExit(f"the runtime loaded the plugin into its own process: {report['local_kinds']}")
-    print("the installed runtime ran the plugin out of process and did not load it here")
+    # And where it did load is a process of its own, which is the claim the
+    # registry check above can only imply.
+    if report["host_pid"] is None:
+        raise SystemExit(f"the activation reported no host process: {report}")
+    if report["host_pid"] == report["pid"]:
+        raise SystemExit(f"the plugin ran in the process that asked for it: {report}")
+    print(
+        "the installed runtime ran the plugin out of process "
+        f"(host {report['host_pid']}, runtime {report['pid']}) and did not load it here"
+    )
     return 0
 
 

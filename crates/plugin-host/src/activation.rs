@@ -77,11 +77,11 @@ impl IsolationPolicy {
     /// Point this policy at a host the caller resolved itself.
     ///
     /// The caller is the package that shipped the host — a Node platform package
-    /// knows where its own `bin/` is, and a Python wheel knows what it installed
-    /// beside the interpreter — and a security-critical executable should come
-    /// from the thing that shipped it rather than from a search. What the runtime
-    /// keeps is the authority to refuse: it confirms the build it was told to
-    /// expect and refuses anything else.
+    /// knows where its own `bin/` is, and the Python extension derives the
+    /// environment it is installed into from its own path — and a security-critical
+    /// executable should come from the thing that shipped it rather than from a
+    /// search. What the runtime keeps is the authority to refuse: it confirms the
+    /// build it was told to expect and refuses anything else.
     pub fn with_host(mut self, executable: impl Into<std::path::PathBuf>) -> Self {
         self.supervisor.executable = executable.into();
         self

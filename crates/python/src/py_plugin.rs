@@ -932,6 +932,19 @@ impl PluginHostCloseState {
         }
     }
 
+    fn host_pid(&self) -> Option<u32> {
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*status {
+            PluginHostCloseStatus::Active(activation) => activation
+                .as_ref()
+                .and_then(ActivatedPluginRuntime::native_process_id),
+            PluginHostCloseStatus::Closing | PluginHostCloseStatus::Closed => None,
+        }
+    }
+
     fn begin_close(self: &Arc<Self>) {
         let activation = {
             let mut status = self
@@ -1113,6 +1126,18 @@ impl PyPluginHostActivation {
         Ok(self.close_state.is_active())
     }
 
+    /// Return the process the native plugins are running in.
+    ///
+    /// ``None`` when this activation holds no host: it started none, or it has
+    /// closed and the process it started is gone. It is the isolation claim as a
+    /// value rather than a description — the plugins did not run in the process
+    /// that asked for them, and a caller comparing this to its own pid is what
+    /// says so.
+    #[getter]
+    fn host_pid(&self) -> PyResult<Option<u32>> {
+        Ok(self.close_state.host_pid())
+    }
+
     /// Clear callbacks and unload the dynamic plugin host.
     #[pyo3(signature = () -> "None", text_signature = "($self) -> None")]
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1153,10 +1178,20 @@ fn initialize_with_dynamic_plugins_py<'py>(
         // it resolves the discovered configuration, activates what this process
         // runs, starts the native plugins in a host process, and rolls the whole
         // thing back if any stage fails.
+        // The host is resolved from this installation rather than from the
+        // interpreter that happens to be running: a package that carries the
+        // companion is the thing that decides which one runs, and the runtime
+        // keeps the authority to refuse a build it did not expect. A deployment
+        // that named a host in the environment is still the one in charge.
+        let policy = IsolationPolicy::for_runtime("nemo-relay-python");
+        let policy = match crate::plugin_host_location::resolved_host() {
+            Some(host) => policy.with_host(host),
+            None => policy,
+        };
         let activation = ActivatedPluginRuntime::activate_with_discovered_config(
             config,
             dynamic_plugins,
-            IsolationPolicy::for_runtime("nemo-relay-python"),
+            policy,
         )
         .await
         .map_err(activation_error_to_py_err)?;

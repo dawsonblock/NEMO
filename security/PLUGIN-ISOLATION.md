@@ -27,7 +27,7 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The
   loader is still linked into the kernel until it moves, which is why the unsafe
   count above has not moved with it.
-- **Claims: 25 enforced, 1 asserted and not yet.** Every claim this document makes
+- **Claims: 26 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
@@ -2564,3 +2564,50 @@ The gate also refuses to let release text collapse the distinction it draws: a
 paragraph that names an unverified claim and uses the wording of coverage
 (`guaranteed`, `enforced`, `qualified`, `supported`) fails, unless it also carries
 the wording that marks the sentence as being about the gap.
+
+## The Python binding derives its host from its own installation
+
+The wheel installs `nemo-plugin-host` into the environment's scripts directory, and
+the binding used to let the runtime find it the way the runtime finds a host with
+nothing named: beside the executable that started the process, which for a binding
+loaded into Python is `sys.executable`'s directory. That is the right directory in
+exactly one layout. A virtual environment puts its interpreter and its scripts in
+the same place, so it worked there and nowhere else. A user install puts the
+package's scripts in the user's `bin` and the interpreter in the system's; a
+`pyenv` shim, a wrapper script, an embedded interpreter or a distribution's
+`dist-packages` tree name a directory that has nothing to do with this package —
+and a security-critical executable that runs plugin code should not be found by
+asking a directory that merely happens to be next to the interpreter.
+
+What replaces it needs no interpreter at all. The extension records where it was
+loaded from at module init (`__file__`), and the candidates follow from that: the
+package's own `bin/`, and the scripts directory of the installation prefix the
+package sits inside. The prefix is the nearest ancestor that *is* an installation
+prefix — it has a scripts directory — searched at most four levels up, which is
+what a derivation needs and a search cannot have. A deployment that names a host in
+`NEMO_RELAY_PLUGIN_HOST` is still the one in charge, and when nothing exists the
+path the installation would have used is passed anyway: the failure then names the
+deployment's own environment rather than the interpreter's directory.
+
+Two kinds of evidence, because the resolver returning a path is not the claim. Five
+layout tests build the directory shapes an installation produces — a virtual
+environment, a user install, a distribution tree, a wheel that carries the host
+inside the package, and an installation with no host at all — and assert which
+companion each resolves to. Then the artifact itself:
+
+```text
+built:    nemo_relay-0.9.1rc4-cp311-abi3-macosx_11_0_arm64.whl
+bundled:  nemo_relay-0.9.1rc4.data/scripts/nemo-plugin-host  (mode 0o100755)
+installed into a fresh virtual environment, run with no NEMO_RELAY_PLUGIN_HOST:
+the installed runtime ran the plugin out of process (host 62096, runtime 62095)
+and did not load it here
+```
+
+The same wheel, imported by an interpreter whose own directory holds no host at
+all — the package reached through `PYTHONPATH`, `sys.executable` in
+`~/.pyenv/shims` — still ran the plugin out of process (host 62143, runtime
+62129). That layout is the one the old rule could not have served: it would have
+looked in the shim's directory and found nothing. The Python activation reports
+`host_pid` now, so the installed check asserts *where* the plugin ran rather than
+only that it ran, which is the difference between a test that proves the boundary
+and one that proves the call succeeded.

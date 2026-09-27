@@ -34,3 +34,8 @@ uuid = { workspace = true, features = ["v7"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 chrono = "0.4"
+
+[dev-dependencies]
+# The layout tests build the directory shapes an installation produces, which is
+# the only way to check what the binding resolves against them.
+tempfile = "3"

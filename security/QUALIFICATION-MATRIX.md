@@ -50,6 +50,7 @@ reading more into it than any name can carry.
 | The kernel-process `unsafe` surface is measured against a ceiling that only an explicit edit can raise. | just recipe `tcb-report` — `justfile` |
 | The dependency layers hold, and a new upward edge fails the gate. | just recipe `layer-report` — `justfile` |
 | The CLI's server runs a plugin in the host process: the plugin answers a managed call from here, its kind is not registered here, and the host is a process of its own. | Rust test `cli_activation_serves_a_native_plugin_from_another_process` — `crates/cli/tests/coverage/shared/server_tests.rs` |
+| The Python binding resolves the host from the package it was installed as, rather than from the interpreter that happens to be running, and runs the plugin there. | Rust test `a_virtual_environment_resolves_the_host_in_its_own_bin` — `crates/python/tests/unit/plugin_host_location_tests.rs`<br>Rust test `a_user_install_resolves_the_users_bin_and_not_the_interpreters` — `crates/python/tests/unit/plugin_host_location_tests.rs`<br>Rust test `a_distribution_package_tree_resolves_its_own_prefix` — `crates/python/tests/unit/plugin_host_location_tests.rs`<br>just recipe `verify-installed-python-plugin` — `justfile` |
 
 ## Asserted, not yet enforced
 
@@ -58,4 +59,4 @@ left out, because a gap that is written down is one somebody can close.
 
 | claim | why it is not enforced |
 |---|---|
-| Every consumer that hosts plugins finds the host its installation shipped, rather than searching for one. | Node resolves the host from the package that carries the addon, and its verifier installs an npm metapackage with nothing in the environment naming one. Python finds it beside the interpreter, which is where a wheel's script lands in a virtual environment, and its verifier runs an installed wheel the same way. The FFI and the CLI have no packaging step of their own, so for those there is nothing to find yet — and Python's rule is the interpreter's directory rather than the package's, which is the same place for a virtual environment and not for every installation. That difference is what the deterministic-discovery work is for. |
+| Every consumer that hosts plugins ships the host in the artifact that carries the binding, so a deployment never looks for one. | The Python wheel, the Node platform package and the CLI wheel each carry the host and each resolves it from its own installation. What is missing is the FFI: the Go binding crosses the C ABI and has no packaging step of its own, so a Go deployment names a host in `NEMO_RELAY_PLUGIN_HOST` or has one beside its process — which is a search of exactly the kind this row exists to remove. |
