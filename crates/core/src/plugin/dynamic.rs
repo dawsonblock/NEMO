@@ -23,6 +23,7 @@ pub type DynamicPluginId = String;
 /// Canonical filename for authored Relay plugin manifests.
 pub const DYNAMIC_PLUGIN_MANIFEST_FILENAME: &str = "relay-plugin.toml";
 
+mod artifact;
 mod host;
 mod manifest;
 mod native;
@@ -30,6 +31,10 @@ mod registry;
 #[cfg(feature = "worker-grpc")]
 mod worker;
 
+// The inert half of the artifact vocabulary: identity, hashing and
+// manifest-relative resolution, which the kernel asks about a plugin artifact
+// without owning a way to run one.
+pub use artifact::*;
 pub use host::*;
 pub use manifest::*;
 pub use native::*;
