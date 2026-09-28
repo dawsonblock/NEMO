@@ -8,7 +8,6 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-
 import symbols
 
 
@@ -46,9 +45,7 @@ def test_a_clean_artifact_passes() -> None:
 
 
 def test_a_recorded_token_over_its_budget_fails() -> None:
-    recorded = artifact(
-        recorded=[{"token": "dlsym", "budget": 1, "why": "a dependency's lookup"}]
-    )
+    recorded = artifact(recorded=[{"token": "dlsym", "budget": 1, "why": "a dependency's lookup"}])
 
     assert symbols.problems_for(recorded, [], ["_dlsym"]) == []
     problems = symbols.problems_for(recorded, ["_dlsym_helper"], ["_dlsym"])
@@ -83,11 +80,7 @@ def test_a_policy_with_no_artifacts_is_refused(tmp_path: pathlib.Path) -> None:
 def test_an_artifact_entry_missing_its_claim_is_refused(tmp_path: pathlib.Path) -> None:
     policy = tmp_path / "symbols.toml"
     policy.write_text(
-        "version = 1\n"
-        "[[artifact]]\n"
-        'name = "incomplete"\n'
-        'package = "a-package"\n'
-        'path = "target/release/a-binary"\n'
+        'version = 1\n[[artifact]]\nname = "incomplete"\npackage = "a-package"\npath = "target/release/a-binary"\n'
     )
 
     with pytest.raises(symbols.SymbolsError) as error:

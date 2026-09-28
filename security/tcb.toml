@@ -45,16 +45,25 @@ version = 1
 roots = ["nemo-relay"]
 forbidden = ["libloading", "nemo-relay-native-loader", "nemo-relay-native-abi", "nemo-relay-plugin"]
 
-# The composition surfaces, which still reach the loader.
+# The composition surfaces, every one that makes the isolation claim.
 #
-# The CLI and the FFI link `plugin-host` to supervise a host process, and that crate
-# still carries the child's own end of the protocol inside the same library — so
-# they reach the loader transitively. That is the remaining step, not a mistake:
-# the child's end has to become its own crate before these roots stop reaching it.
-# Until then the intersection is recorded rather than demanded empty, and what
-# fails is the closure gaining a package that is not recorded here.
+# All four shipping bindings are roots, not only the CLI and the FFI. The manifest that
+# reintroduces the loader would name its own crate, and a root set that stopped at the
+# CLI would stay green while Python linked it — which is the regression this list
+# exists to catch. `nemo-relay-python` and `nemo-relay-node` are the names their
+# manifests use; the C API is reached through `nemo-relay-ffi`, and the library through
+# `nemo-relay`.
+#
+# The recorded set is empty and the intersection is required to be, so a composition
+# that reaches any of these fails rather than being grandfathered.
 [kernel_closure]
-roots = ["nemo-relay", "nemo-relay-cli", "nemo-relay-ffi"]
+roots = [
+    "nemo-relay",
+    "nemo-relay-cli",
+    "nemo-relay-ffi",
+    "nemo-relay-python",
+    "nemo-relay-node",
+]
 forbidden = [
     "libloading",
     "nemo-relay-native-loader",
@@ -389,7 +398,7 @@ transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a28259
 [limits.nemo-relay-native-loader]
 max_direct_dependencies = 16
 max_transitive_packages = 241
-max_source_lines = 15276
+max_source_lines = 15282
 max_unsafe_occurrences = 288
 direct_dependency_digest = "aadc974282ee74c89349bd65d088fccd8cab0c1160e9aa51f95ab06d467dec28"
 transitive_dependency_digest = "8d8284c7bdae72cd3dc1f9a6c636062828405de64446e6589a52f119a4058fa3"

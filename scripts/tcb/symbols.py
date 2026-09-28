@@ -93,9 +93,7 @@ def symbol_table(artifact: pathlib.Path) -> tuple[list[str], list[str]]:
     # `nm` lists undefined entries too, marked `U`; the defined list is what is left.
     # Keeping them apart matters because the same name would otherwise be counted
     # twice — once as a definition nobody has and once as a reference to it.
-    defined = [
-        line for line in _nm(tool, ["-C", str(artifact)]) if not _is_undefined(line)
-    ]
+    defined = [line for line in _nm(tool, ["-C", str(artifact)]) if not _is_undefined(line)]
     undefined = _nm(tool, ["-uC", str(artifact)])
     return defined, undefined
 
@@ -162,10 +160,7 @@ def render(artifact: Artifact, defined: list[str], undefined: list[str]) -> str:
         rows.append(f"  forbidden '{token}': {len(matches(every_symbol, token))}")
     for entry in artifact.recorded:
         token = str(entry.get("token", ""))
-        rows.append(
-            f"  recorded '{token}': {len(matches(every_symbol, token))} "
-            f"(budget {entry.get('budget')})"
-        )
+        rows.append(f"  recorded '{token}': {len(matches(every_symbol, token))} (budget {entry.get('budget')})")
     return "\n".join(rows)
 
 

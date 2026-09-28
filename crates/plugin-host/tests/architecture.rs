@@ -35,11 +35,11 @@ const LOADER_PATHS: &[&str] = &["native-loader:native.rs"];
 
 /// `<crate>:<crate-relative path>` that may still call the loader entry point.
 ///
-/// `plugin-host:lib.rs` is the child's own end of the protocol — the host process
-/// loads the plugin there and serves its registrations over the wire — and it is
-/// the one entry left that is not the loader crate itself. It calls the loader
-/// because that is what the child does, and the kernel does not, which is the
-/// property this list exists to keep true: no entry in it is a `core` path.
+/// Every entry is inside the loader crate, which is the point: the child's own end of
+/// the protocol lives there — the host process loads the plugin and serves its
+/// registrations over the wire — and no supervisor-side file calls the loader any more.
+/// The list exists to keep that true, and what it would catch is an entry appearing in
+/// `core`, in `plugin-host`, or in either binding.
 const LOAD_CALL_PATHS: &[&str] = &[
     "native-loader:backend.rs",
     "native-loader:host.rs",
@@ -80,6 +80,18 @@ const LOADER_CRATES: &[&str] = &["native-loader"];
 
 /// Crates the kernel may not depend on, because the edge would point upward.
 const KERNEL_FORBIDDEN_DEPENDENCIES: &[&str] = &["nemo-relay-plugin-host"];
+
+/// Crates that may depend on the loader for a build.
+///
+/// None, and that is the strongest form of the claim rather than an oversight: the
+/// child's own end of the protocol lives inside the loader crate, and every composition
+/// reaches a host through the supervisor. A crate that named the loader as a
+/// dependency would be linking a library that can open one — which is what the split
+/// moved out of the kernel and the CLI, and what would come back here first if a
+/// manifest changed by accident. Dev-dependencies are not counted, because the scan
+/// reads only the tables a build links; a test that drives the loader is the test
+/// tree, which the TCB report measures separately.
+const LOADER_DEPENDENTS: &[&str] = &[];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -497,6 +509,21 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
             problems.push(format!(
                 "{crate_name} declares the dynamic loader, which only {} may",
                 LOADER_CRATES.join(", ")
+            ));
+        }
+
+        // The loader itself, not only the crate it opens libraries with. A crate that
+        // depends on the loader without naming `libloading` would link the same
+        // ability one edge further away, which is why the check is about both.
+        if dependencies
+            .iter()
+            .any(|name| name == "nemo-relay-native-loader")
+            && !LOADER_DEPENDENTS.contains(&crate_name.as_str())
+        {
+            problems.push(format!(
+                "{crate_name} depends on the native loader, which no crate may do: the \
+                 child's end of the protocol is inside it, and a composition reaches a \
+                 host through the supervisor"
             ));
         }
 

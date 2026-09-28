@@ -612,14 +612,22 @@ pub(crate) fn stage_verified_library(
         )));
     }
 
-    // Nothing an attacker controls decides where the copy lands: the directory
-    // is this load's own, its mode denies other users, and its name is random
-    // rather than derived from the digest, so two loads of one artifact cannot
-    // land on each other. The digest-derived name this replaces mapped every
-    // load of one artifact to one path, which is exactly the case that collides
-    // — and a second load truncating the file the first is running from is the
-    // collision that matters.
-    let dir = create_staging_directory()?;
+    // Nothing another user controls decides where the copy lands: the directory is
+    // this load's own, its mode denies other users, and its name is random rather than
+    // derived from the digest, so two loads of one artifact cannot land on each other.
+    // The digest-derived name this replaces mapped every load of one artifact to one
+    // path, which is exactly the case that collides — and a second load truncating the
+    // file the first is running from is the collision that matters.
+    //
+    // The guard is built *before* anything can fail, so every path from here — a failed
+    // open, a short read, a write error, a digest that does not match — takes the
+    // directory with it. Creating it and returning the guard only at the end left the
+    // private directory behind on the paths in between, which is litter rather than a
+    // vulnerability, and litter is what a guard removes by construction.
+    let guard = StagedArtifact {
+        dir: create_staging_directory()?,
+    };
+    let dir = guard.dir.clone();
 
     let staged = dir.join("library");
     // Exclusive creation, so a destination that already exists is an error
@@ -633,7 +641,6 @@ pub(crate) fn stage_verified_library(
         options.mode(0o600);
     }
     let mut destination = options.open(&staged).map_err(|error| {
-        let _ = std::fs::remove_dir_all(&dir);
         PluginError::Internal(format!(
             "failed to create the staged artifact '{}': {error}",
             staged.display()
@@ -664,14 +671,13 @@ pub(crate) fn stage_verified_library(
     // instance the loader will get rather than the same buffer this loop held.
     let staged_digest = host_runtime().hash_path(&staged)?;
     if staged_digest != approved_library_sha256 {
-        let _ = std::fs::remove_dir_all(&dir);
         return Err(PluginError::RegistrationFailed(format!(
             "the staged copy of '{}' hashes to {staged_digest}, while \
              {approved_library_sha256} was approved",
             library_path.display()
         )));
     }
-    Ok((staged, StagedArtifact { dir }))
+    Ok((staged, guard))
 }
 
 /// Create the private directory one staged artifact lives in.

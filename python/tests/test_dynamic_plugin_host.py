@@ -440,6 +440,15 @@ async def test_native_activation_context_owns_callbacks_and_close_is_idempotent(
     activation = await plugin.initialize_with_dynamic_plugins(plugin.PluginConfig(), [native_dynamic_plugin.spec()])
     assert activation.is_active
     assert activation.report == {"diagnostics": []}
+    # The isolation claim as a value: the plugin's code runs in a process this one
+    # started, and the registration reached the kernel from there. The behavioural half
+    # is asserted below — the result carries the plugin's marker — and this is the half
+    # a behavioural assertion cannot give, because an in-process load would produce the
+    # same marker with the same process id.
+    assert activation.host_pid is not None, "the activation started a host"
+    assert activation.host_pid != os.getpid(), (
+        f"the native plugin must not run in this process (host {activation.host_pid}, caller {os.getpid()})"
+    )
 
     async with activation as active:
         result = await tools.execute(

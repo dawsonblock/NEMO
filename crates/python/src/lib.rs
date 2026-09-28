@@ -56,8 +56,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Where this extension was loaded from, recorded before anything can ask for
     // the host: the package's own location is what decides which companion runs
     // native plugin code, and after init there is no way to ask again. A module
-    // without a `__file__` records nothing, which leaves the runtime's own
-    // resolution in place rather than inventing a location.
+    // without a `__file__` records nothing, and the activation then refuses rather
+    // than falling back to a search beside the interpreter — see
+    // `py_plugin.rs`, where that decision is taken.
     if let Ok(file) = m.filename() {
         plugin_host_location::remember_module_file(std::path::Path::new(
             file.to_string_lossy().as_ref(),

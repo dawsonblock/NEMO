@@ -3007,7 +3007,9 @@ number moves when the loader leaves `core`, and nothing else has to move first.
 re-export while callers catch up, but the loader cannot: `core` re-exporting
 `native-loader` while `native-loader` depends on `core` is a cycle, and Cargo refuses
 it. The commit that moves `native.rs` and `host.rs` has to repoint every caller at
-once, and the list was re-measured rather than remembered when the ABI crate landed:
+once. The list below is what the reconnaissance found *before* that commit; the move
+has since happened, and the staged plan above records where each entry ended up — read
+this as the shape of the problem, not as the state of the tree:
 
 - `crates/plugin-host/src/lib.rs` — the in-process backend, which is the child's own
   end and becomes a consumer of `native-loader` rather than of the kernel's

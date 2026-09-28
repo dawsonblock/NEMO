@@ -122,6 +122,12 @@ jobs:
       - name: Enforce the dependency-layer rules
         run: python3 scripts/tcb/layers.py
 
+      # The claims a milestone makes and what enforces them. It runs here as well as in
+      # pre-commit because a change to release prose is exactly the change that can
+      # invalidate a claim without touching any file the hook's filter watches.
+      - name: Check the qualification matrix
+        run: python3 scripts/qualification/matrix.py
+
   python:
     name: Python dependency gate
     runs-on: ubuntu-latest

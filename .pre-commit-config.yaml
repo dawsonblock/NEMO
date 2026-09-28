@@ -77,7 +77,11 @@ repos:
         entry: python3 scripts/qualification/matrix.py
         language: system
         pass_filenames: false
-        files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/qualification/.*\.py|justfile|security/qualification-matrix\.toml|security/QUALIFICATION-MATRIX\.md)$'
+        # Release prose included, because the check reads it: a commit that only edits
+        # `security/PLUGIN-ISOLATION.md` or `README.md` can invalidate the wording the
+        # gate exists to keep honest, and a filter that skipped those files would let
+        # that change through without running the check at all.
+        files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/qualification/.*\.py|justfile|README\.md|security/(qualification-matrix\.toml|QUALIFICATION-MATRIX\.md|PLUGIN-ISOLATION\.md))$'
 
   # Trusted surface — the budgets and the dependency layers
   #
