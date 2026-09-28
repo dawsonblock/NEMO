@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The second proof: what a release artifact of the kernel's own process contains.
+#
+# The dependency proof (`[kernel_library_closure]` in `security/tcb.toml`) says the
+# kernel cannot *reach* a loader through Cargo. This says the artifact does not carry
+# one anyway — the graph could be right and a symbol could still be there through a
+# path nobody modelled, and the two facts are checked differently on purpose.
+#
+# The forbidden list is the claim and it has no budget: one occurrence fails. The
+# recorded list is the ratchet for everything else, because an artifact this size
+# contains thousands of symbols from crates that have nothing to do with plugins, and
+# a gate that demanded an empty symbol table would be red on arrival and enforce
+# nothing.
+
+version = 1
+
+[[artifact]]
+name = "the CLI release binary"
+# The process that runs the kernel: it composes the process backend and the
+# supervisor, which is why it is the artifact the property is stated about.
+package = "nemo-relay-cli"
+path = "target/release/nemo-relay"
+
+# Tokens a symbol may not contain. `nemo_relay_plugin::` is the authoring SDK with the
+# `::` that separates it from the protocol crate's `nemo_relay_plugin_protocol::`; the
+# loader and the ABI are named exactly; `libloading` and the two platform entry points
+# are the crates and calls that open a library at runtime.
+forbidden = [
+    "nemo_relay_native_loader::",
+    "nemo_relay_native_abi::",
+    "nemo_relay_plugin::",
+    "libloading",
+    "dlopen",
+    "LoadLibraryW",
+]
+
+[[artifact.recorded]]
+# One undefined `dlsym` remains, and it is not the loader's: libloading's Unix
+# implementation references `dlopen` and `dlsym` together, and `dlopen` is absent, as
+# are every symbol of the loader and the ABI. It comes from a dependency of the TLS
+# stack, which does runtime feature detection. Attribution is not recorded because it
+# was not established; what is recorded is the ceiling, which may only shrink.
+token = "dlsym"
+budget = 1
+why = "an unattributed dynamic lookup from the TLS stack; the loader's own lookup is absent with it"

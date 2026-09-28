@@ -58,6 +58,24 @@ enforced_by = [
 ]
 
 [[claim]]
+id = "a-codec-bridge-admits-only-its-bound"
+statement = "A host's codec bridge admits at most its bound's worth of calls: a call takes a permit before it exists, the permit lives until the call is answered, and a call that cannot be admitted is refused by name rather than queued."
+status = "enforced"
+enforced_by = [
+  { rust_test = "the_codec_bridge_admits_only_its_bound_worth_of_calls" },
+  { rust_test = "the_admission_bound_survives_the_task_boundary" },
+  { rust_test = "the_codec_bridge_queue_is_bounded" },
+]
+
+[[claim]]
+id = "the-release-artifact-carries-no-loader"
+statement = "The release binary a deployment runs contains no symbol of the loader, the native ABI or the plugin SDK, and no dynamic-library entry point; the one dynamic lookup it does carry is recorded with its ceiling and its reason."
+status = "enforced"
+enforced_by = [
+  { recipe = "symbol-report" },
+]
+
+[[claim]]
 id = "the-loader-speaks-the-hosted-runtime-seam"
 statement = "The hosted side's reach into kernel-private runtime implementation is mediated by the hosted-runtime seam: it names none of the kernel items the seam replaced, every operation in that mapping is still called, and no kernel item it names is non-public. Its remaining reach is the kernel's public API, which is the boundary rather than a leak."
 status = "enforced"

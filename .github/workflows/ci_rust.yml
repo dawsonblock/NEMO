@@ -311,6 +311,18 @@ jobs:
           fi
           # SONAR_IGNORE_END
 
+      # The release binary is the artifact a deployment runs, so the symbol proof is
+      # taken here rather than in a test: the dependency graph can be right and a
+      # symbol can still arrive by a path the graph does not model.
+      - name: Prove the release binary carries no loader
+        if: ${{ matrix.build_image == '' && runner.os != 'Windows' }}
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -e
+          python3 scripts/tcb/symbols.py \
+            --no-build \
+            --artifact "${{ env.NEMO_RELAY_CI_WORKSPACE }}/target/${{ matrix.target }}/release/nemo-relay"
+
       - name: Build CLI release binary in manylinux
         if: ${{ matrix.build_image != '' }}
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}

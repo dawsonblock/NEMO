@@ -1152,6 +1152,47 @@ mod tests {
         let _ = bridge.try_admit().expect("a finished call makes room");
     }
 
+    /// The bound holds across the boundary the real path crosses.
+    ///
+    /// The property is not only that one thread can count to sixteen: a call's permit
+    /// is taken on the plugin's thread and lives until the *task* that answers it
+    /// finishes, so the assertion has to survive the permit being moved to another
+    /// thread and held there. This is the deterministic shape of that, and it is what
+    /// the slow-kernel qualification would show if a harness could hold the window
+    /// open: see the note in the milestone document for why that one is not here yet.
+    #[test]
+    fn the_admission_bound_survives_the_task_boundary() {
+        let (jobs, _never_drained) =
+            tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
+        let bridge = CodecBridge {
+            jobs: Some(jobs),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY)),
+            thread: std::sync::Mutex::new(None),
+        };
+
+        let held: Vec<_> = (0..CODEC_BRIDGE_QUEUE_CAPACITY)
+            .map(|_| bridge.try_admit().expect("within the bound"))
+            .collect();
+        // The bridge's consumer hands each permit to the task that answers the call, on
+        // its own runtime. Handing them to a thread of this test's own is the same move
+        // without the kernel: what crosses is the permit, and the bound crosses with it.
+        let held = std::thread::spawn(move || held)
+            .join()
+            .expect("the permits moved to another thread and back");
+        assert_eq!(
+            bridge.in_flight.available_permits(),
+            0,
+            "sixteen live calls must hold every permit"
+        );
+        assert!(
+            bridge.try_admit().is_err(),
+            "a seventeenth call is refused while sixteen permits are held elsewhere"
+        );
+
+        drop(held);
+        let _ = bridge.try_admit().expect("a finished call makes room");
+    }
+
     /// The queue is bounded too, and by the same number.
     ///
     /// This is the weaker of the two: it proves the channel's capacity, which is not

@@ -38,7 +38,7 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The loader
   is not linked into the kernel any more, which is why the unsafe count below is a
   twenty-sixth of what it was.
-- **Claims: 28 enforced, 1 asserted and not yet.** Every claim this document makes
+- **Claims: 30 enforced, 1 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
@@ -2693,13 +2693,17 @@ verify-installed-python-plugin` and `just verify-installed-node-plugin` drive a 
 fixture through an *installed* wheel or npm package and check the child ran the plugin;
 both are named as evidence by matrix claims. No workflow invokes either, so what the
 matrix proves today is that the recipe exists rather than that an accepted build ran it.
-Closing it is a packaging-lane change rather than a code change, and it is written down
-here rather than half-wired: the Python lane needs a job that has a Rust toolchain, the
-built fixture (`just build-test-plugin-fixtures`), `just` itself installed beside it, and
-the installed wheel — the `source-and-plugin` package-smoke job has the first and the
-fourth, so it is one tool-install step and one recipe invocation away. The Node lane
-needs the same, and its package-smoke job has no Rust toolchain at all today, so it is
-the larger of the two.
+
+Closing it is a packaging-lane change, and the lanes are not one step apart. The Python
+wheel jobs install the artifact but have no Rust toolchain, and the recipe needs one to
+build the fixture; the `source-and-plugin` job has the toolchain and installs the
+*sdist*, which carries no bundled host — the host arrives with the wheel. So that lane
+would run the recipe with `host=` naming the host the job builds, which is the
+"a deployment names its host" path rather than the "the package carries its host" one,
+and the wheel jobs would need a toolchain before they could prove the stronger fact.
+The Node package-smoke job has no Rust toolchain at all. This is written down rather
+than half-wired: an untested workflow edit that fails the lane it was added to is worse
+than a recorded gap.
 
 ## The codec bridge's bound is a bound now
 
@@ -2726,14 +2730,25 @@ holds the bound's worth of permits through the same function `resolve` calls fir
 requires the next admission to be refused; the old synthetic test is kept under a name
 that says what it actually proves (`the_codec_bridge_queue_is_bounded`).
 
-What is *not* yet written, and is named here rather than implied: a slow-kernel
-concurrency qualification — a real kernel service whose codec does not answer, sixteen
-real calls in flight, and a seventeenth refused. An attempt at it exists in this
-revision's history and was dropped rather than committed with a timing assumption in
-it: the gated codec held the calls past their own budget, which made the seventeenth
-arrive at a bridge that had already given the permits back. Writing it properly needs a
-gate the call's budget does not walk past, and that is the next qualification this
-area owes.
+What is written is the admission itself, in two shapes: the same thread taking the
+bound's worth of permits through the function `resolve` calls first and finding the
+next refused, and a variant where the permits are moved to another thread and held
+there, so the bound is shown to cross the boundary the real path crosses. What is *not*
+written is the end-to-end qualification — a real kernel whose codec answers slowly,
+sixteen real calls in flight, and a seventeenth refused — and it is recorded here with
+the reason rather than implied.
+
+The harness was attempted and removed twice, and the second attempt left an
+observation that has to be settled before the qualification is claimed: with all
+sixteen calls demonstrably inside the kernel service (the codec had been entered
+sixteen times) the bridge's semaphore read back as though every permit were free, and
+a trace of the permits showed *no* permit dropped for the life of the test. Those two
+readings contradict each other, so one of the instruments was wrong — and until which
+one is known, the end-to-end claim is not written. The deterministic tests are
+unaffected by it: they take and release permits in one place and cannot be misread.
+The next step is a gate held on the *kernel* side of the call (a codec that waits on
+something the test controls, with the invocation's budget extended past the wait), so
+that the window is held open by the kernel rather than by a counter the test polls.
 
 ## The loader extraction, staged
 
@@ -2933,40 +2948,32 @@ invocations and remote endpoints; the ABI is a child-side vocabulary.
 
 ### The two proofs
 
-**The dependency proof now holds for the kernel library, and the symbol proof has a
-measured baseline.** A release build of the CLI — the process that runs the kernel —
-was inspected with `nm`, and it contains what the dependency graph says it should:
+**Both proofs hold now, and each is checked where it can be.** The dependency proof is
+`[kernel_library_closure]` and `[kernel_closure]` in `security/tcb.toml`: the kernel
+library and the composition surfaces both reach `nothing`. The symbol proof is
+`security/symbols.toml`, read by `just symbol-report` against a release build — and it
+was the artifact, not the graph, that found the SDK the loader was built against:
 
 ```text
-nemo_relay_native_loader   0 undefined, 10 defined
-nemo_relay_native_abi      0 undefined,  0 defined
-libloading                 0 undefined,  0 defined
-dlsym                      1 undefined
-nemo_relay_plugin        829 defined          (before the loader dropped the SDK)
+the CLI release binary: target/release/nemo-relay
+  defined symbols:   79895
+  undefined symbols: 279
+  forbidden 'nemo_relay_native_loader::': 0
+  forbidden 'nemo_relay_native_abi::': 0
+  forbidden 'nemo_relay_plugin::': 0
+  forbidden 'libloading': 0
+  forbidden 'dlopen': 0
+  forbidden 'LoadLibraryW': 0
+  recorded 'dlsym': 1 (budget 1)
 ```
 
-The 10 loader symbols are drop-glue and two constructors reachable through the
-composition — `DynamicPluginActivationSpec`'s destructor and
-`ApprovedPluginArtifact::approve` — and they are there because `plugin-host` still
-carries the child's own end inside the library the CLI links. The one undefined
-`dlsym` is the same fact: a process that links the loader can resolve a symbol at
-runtime. The 829 SDK symbols were the finding worth acting on immediately: the
-loader was built against the authoring SDK when it only needs the ABI, so a binary
-that loads plugins was carrying the crate plugins are written with. It depends on
-`nemo-relay-native-abi` now, and that is a change the dependency graph can check even
-though a symbol gate cannot yet be recorded honestly here.
-
-The audit that produced these numbers found the SDK's 829 symbols, and the fix for
-that is in the tree: the loader depends on the ABI crate rather than the authoring
-SDK. What the numbers also showed is why the check was a measurement rather than a
-gate at that revision: the artifact still contained loader symbols, and a recorded
-baseline taken before the last dependency change would have been a number nobody
-re-measured — the failure mode this repository has caught twice in its budget files.
-
-That has changed with the child's move: the composition surfaces no longer reach the
-loader at all, so a release build of the CLI should now contain none of these. The
-next measurement is the gate's baseline, and it is taken with the tree in the state
-the dependency proof describes rather than in the state that had the defect.
+The forbidden list is the claim and carries no budget. The one recorded token is an
+unattributed `dlsym` from the TLS stack's runtime feature detection: libloading's Unix
+implementation references `dlopen` and `dlsym` together, and `dlopen` is absent — as is
+every symbol of the loader, the ABI and the SDK — so the remaining lookup is not the
+plugin loader's. Attribution was not established, which is why the entry records the
+ceiling rather than a cause. The gate runs in the release lane against the binary that
+lane builds, so the proof is executed rather than described.
 
 They answer different questions, and neither substitutes for the other.
 

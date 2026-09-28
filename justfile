@@ -1809,6 +1809,11 @@ test-qualification-scripts:
 tcb-report:
     python3 scripts/tcb/report.py
 
+# Prove the release artifact a deployment runs carries no loader, ABI or SDK symbols.
+# This is a milestone gate rather than a hook: it reads a release build.
+symbol-report:
+    python3 scripts/tcb/symbols.py
+
 # Enforce the dependency-layer rules and fail on a new upward edge.
 layer-report:
     python3 scripts/tcb/layers.py
