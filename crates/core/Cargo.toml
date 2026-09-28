@@ -100,7 +100,13 @@ rustix = { version = "1.1.4", features = ["fs"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
-nemo-relay-native-loader.workspace = true
+# The loader owns the activation the worker lane's tests drive, and a feature is
+# per-crate: a test that asks for `worker-grpc` is asking this crate's lane, and the
+# loader has to be built with its own or the activation refuses a worker spec with
+# "requires the 'worker-grpc' feature" — which is what these tests did until the
+# loader's feature was forwarded here. A dev-dependency, so the kernel itself still
+# reaches neither the loader nor the lane's transport.
+nemo-relay-native-loader = { workspace = true, features = ["worker-grpc"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "test-util", "rt-multi-thread", "time"] }
 futures = "0.3"
 opentelemetry_sdk = { workspace = true, features = ["trace", "logs", "metrics", "testing"] }

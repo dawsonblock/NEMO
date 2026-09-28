@@ -195,10 +195,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-native-abi"
+version = "0.9.1-rc.4"
+
+[[package]]
 name = "nemo-relay-plugin"
 version = "0.9.1-rc.4"
 dependencies = [
  "futures",
+ "nemo-relay-native-abi",
  "nemo-relay-types",
  "serde",
  "serde_json",

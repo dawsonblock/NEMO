@@ -307,7 +307,7 @@ jobs:
           # there is no host to build there and the wheel says so instead of
           # promising one.
           if [ "${{ runner.os }}" != "Windows" ]; then
-            cargo build --locked --offline --release --target "${{ matrix.target }}" -p nemo-relay-plugin-host
+            cargo build --locked --offline --release --target "${{ matrix.target }}" -p nemo-relay-native-loader
           fi
           # SONAR_IGNORE_END
 
@@ -326,7 +326,7 @@ jobs:
                 sh -s -- -y --profile minimal --default-toolchain "$NEMO_RELAY_RUST_VERSION"
               export PATH="$HOME/.cargo/bin:$PATH"
               cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-cli
-              cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-plugin-host
+              cargo build --locked --release --target "${{ matrix.target }}" -p nemo-relay-native-loader
             '
 
       - name: Stage CLI binary artifact

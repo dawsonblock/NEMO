@@ -130,7 +130,7 @@ fn start_http_status_server(
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || -> std::io::Result<()> {
         listener.set_nonblocking(true)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::observability::TEST_SERVER_WAIT;
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -147,7 +147,7 @@ fn start_http_status_server(
             }
         };
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(crate::observability::TEST_SERVER_WAIT))?;
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
         while !request.ends_with(b"\r\n\r\n") {
@@ -183,14 +183,18 @@ fn start_http_status_server(
 
 #[cfg(feature = "atof-streaming")]
 fn wait_for_captures(captures: &Arc<Mutex<Vec<HttpCapture>>>, expected: usize) -> Vec<HttpCapture> {
-    for _ in 0..100 {
+    // Waits rather than measures. The captures arrive on a background sink, so how
+    // long they take is a fact about the machine — which is why this polls against a
+    // generous deadline instead of counting a fixed number of twenty-millisecond
+    // sleeps, a bound that was really a statement about an idle one.
+    let deadline = std::time::Instant::now() + crate::observability::TEST_SERVER_WAIT;
+    loop {
         let snapshot = captures.lock().unwrap().clone();
-        if snapshot.len() >= expected {
+        if snapshot.len() >= expected || std::time::Instant::now() >= deadline {
             return snapshot;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    captures.lock().unwrap().clone()
 }
 
 fn reset_runtime() {
@@ -209,7 +213,7 @@ fn start_otlp_capture_server() -> (String, mpsc::Receiver<Vec<u8>>) {
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::observability::TEST_SERVER_WAIT))
             .unwrap();
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
@@ -3925,7 +3929,7 @@ fn opentelemetry_endpoints_fan_out_to_heterogeneous_and_repeated_types() {
 
     for request in [full_request, gen_ai_request, repeated_request] {
         let body = request
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::observability::TEST_SERVER_WAIT)
             .expect("each configured endpoint should receive the exported span");
         assert!(!body.is_empty());
     }
@@ -4148,7 +4152,7 @@ fn opentelemetry_endpoint_delivery_failure_does_not_block_other_endpoints() {
     let _ = clear_plugin_configuration();
 
     let body = healthy_request
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::observability::TEST_SERVER_WAIT)
         .expect("healthy endpoint should receive spans despite another endpoint failing");
     assert!(!body.is_empty());
 }

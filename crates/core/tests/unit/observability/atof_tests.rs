@@ -317,14 +317,18 @@ fn start_http_capture_server(expected_requests: usize) -> (String, Arc<Mutex<Vec
 
 #[cfg(feature = "atof-streaming")]
 fn wait_for_captures(captures: &Arc<Mutex<Vec<String>>>, expected: usize) -> Vec<String> {
-    for _ in 0..100 {
+    // Waits rather than measures. The captures arrive on a background sink, so how
+    // long they take is a fact about the machine — which is why this polls against a
+    // generous deadline instead of counting a fixed number of twenty-millisecond
+    // sleeps, a bound that was really a statement about an idle one.
+    let deadline = std::time::Instant::now() + crate::observability::TEST_SERVER_WAIT;
+    loop {
         let snapshot = captures.lock().unwrap().clone();
-        if snapshot.len() >= expected {
+        if snapshot.len() >= expected || std::time::Instant::now() >= deadline {
             return snapshot;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    captures.lock().unwrap().clone()
 }
 
 #[cfg(feature = "atof-streaming")]
@@ -1682,7 +1686,7 @@ fn http_endpoint_worker_acknowledges_flush_close_and_logs_http_errors() {
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::observability::TEST_SERVER_WAIT))
             .unwrap();
         let _ = read_http_request(&mut stream);
         stream
@@ -1713,12 +1717,12 @@ fn http_endpoint_worker_acknowledges_flush_close_and_logs_http_errors() {
     let (flush_tx, flush_rx) = std::sync::mpsc::channel();
     tx.try_send(EndpointMessage::Flush(flush_tx)).unwrap();
     flush_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(crate::observability::TEST_SERVER_WAIT)
         .unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel();
     tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     close_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(crate::observability::TEST_SERVER_WAIT)
         .unwrap();
     worker.join().unwrap();
     server.join().unwrap();
@@ -1752,7 +1756,7 @@ fn http_endpoint_worker_reports_request_transport_failure() {
     let (close_tx, close_rx) = std::sync::mpsc::channel();
     tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     close_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(crate::observability::TEST_SERVER_WAIT)
         .unwrap();
     worker.join().unwrap();
 }
@@ -1766,7 +1770,7 @@ fn ndjson_endpoint_worker_streams_events_flushes_and_closes() {
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::observability::TEST_SERVER_WAIT))
             .unwrap();
         let body = read_http_request(&mut stream);
         assert_eq!(body, "{\"kind\":\"mark\"}\n");
@@ -1787,12 +1791,12 @@ fn ndjson_endpoint_worker_streams_events_flushes_and_closes() {
     let (flush_tx, flush_rx) = std::sync::mpsc::channel();
     tx.try_send(EndpointMessage::Flush(flush_tx)).unwrap();
     flush_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(crate::observability::TEST_SERVER_WAIT)
         .unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel();
     tx.try_send(EndpointMessage::Close(close_tx)).unwrap();
     close_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(crate::observability::TEST_SERVER_WAIT)
         .unwrap();
     worker.join().unwrap();
     server.join().unwrap();

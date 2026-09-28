@@ -116,15 +116,22 @@ fn lock_cwd() -> MutexGuard<'static, ()> {
     guard
 }
 
+/// How long a test waits for a connection or a request of its own making.
+///
+/// Generous on purpose: it bounds the test's patience rather than the behaviour under
+/// test, and these tests spawn gateways and child processes while the rest of the
+/// suite runs beside them. A five-second bound is a statement about an idle machine.
+pub(crate) const WAIT_FOR_TEST_TRAFFIC: Duration = Duration::from_secs(60);
+
 pub(crate) fn accept_bounded(listener: &TcpListener) -> std::net::TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT_FOR_TEST_TRAFFIC;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout(Some(WAIT_FOR_TEST_TRAFFIC))
                     .unwrap();
                 return stream;
             }

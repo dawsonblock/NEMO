@@ -1473,7 +1473,7 @@ test-python:
     # builds. It is the same escape hatch a source deployment uses, used here for
     # the same reason — and a native plugin activation without it still fails
     # closed with the message that says where the host was looked for.
-    cargo build --locked -p nemo-relay-plugin-host
+    cargo build --locked -p nemo-relay-native-loader
     export NEMO_RELAY_PLUGIN_HOST="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-plugin-host"
     pytest_cmd+=(--durations=25)
     "$python_executable" -m "${pytest_cmd[@]}" --ignore=python/tests/integrations
@@ -1645,6 +1645,15 @@ test-go:
     export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
     cargo build $flag -p nemo-relay-ffi --features __skip-implicit-config
     prepare_test_plugin_fixtures
+    # The binding starts native plugins in a host process, and a checkout has no
+    # installed host: this names the one the checkout builds. It is the same escape
+    # hatch a source deployment uses, used here for the same reason — and an
+    # activation without it still fails closed with the message that says where the
+    # host was looked for. The FFI is the one consumer with no packaging step of its
+    # own, so naming the host *is* how its deployments reach one, which is why the
+    # suite exercises that path rather than assuming an installed companion.
+    cargo build $flag -p nemo-relay-native-loader
+    export NEMO_RELAY_PLUGIN_HOST="$lib_dir/nemo-plugin-host"
 
     if [[ "$is_windows" == true ]]; then
         export CC=clang
@@ -1712,7 +1721,7 @@ test-node:
     # is the same escape hatch a source deployment uses, used here for the same
     # reason — and a native plugin activation without it still fails closed with
     # the message that says where the host was looked for.
-    cargo build --locked -p nemo-relay-plugin-host
+    cargo build --locked -p nemo-relay-native-loader
     export NEMO_RELAY_PLUGIN_HOST="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-plugin-host"
     if is_true "{{ ci }}"; then
         coverage_out="$(prepare_artifact node-coverage.xml)"
@@ -2028,7 +2037,7 @@ package-node:
             ;;
         *)
     host_directory="target/release"
-    host_build=(cargo build --release -p nemo-relay-plugin-host)
+    host_build=(cargo build --release -p nemo-relay-native-loader)
     if [[ "$(uname -s)" == "Linux" ]]; then
         host_target="${node_target:-$(rustc -vV | sed -n 's/^host: //p')}"
         host_target="$(printf '%s\n' "$host_target" | sed 's/-gnu$/-musl/')"
@@ -2051,7 +2060,7 @@ package-node:
             export "$host_cc_var=musl-gcc"
         fi
         host_directory="target/${host_target}/release"
-        host_build=(cargo build --release -p nemo-relay-plugin-host --target "$host_target")
+        host_build=(cargo build --release -p nemo-relay-native-loader --target "$host_target")
     fi
     "${host_build[@]}"
     host_executable="nemo-plugin-host"
@@ -2175,7 +2184,7 @@ package-python:
             ;;
         *)
     host_binary="$NEMO_RELAY_REPO_ROOT/target/release/nemo-plugin-host"
-    host_build=(cargo build --release -p nemo-relay-plugin-host)
+    host_build=(cargo build --release -p nemo-relay-native-loader)
     if [[ "$(uname -s)" == "Linux" ]]; then
         # Static, so the host runs on the oldest glibc this wheel's tag promises
         # rather than on the one the build machine happens to have. The extension
@@ -2201,7 +2210,7 @@ package-python:
             fi
             export "$host_cc_var=musl-gcc"
         fi
-        host_build=(cargo build --release -p nemo-relay-plugin-host --target "$host_target")
+        host_build=(cargo build --release -p nemo-relay-native-loader --target "$host_target")
         host_binary="$NEMO_RELAY_REPO_ROOT/target/${host_target}/release/nemo-plugin-host"
     fi
     "${host_build[@]}"

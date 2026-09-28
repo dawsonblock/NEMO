@@ -25,8 +25,14 @@ fn gateway_bin() -> &'static str {
 
 const ACTIVE_GENERATION_TOKEN: &str = "active-generation";
 const BOOTSTRAP_PROTOCOL_VERSION: u64 = 3;
-const CHILD_PROCESS_TIMEOUT_SECONDS: u64 = 5;
-const SIDECAR_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a test waits for a process, a socket or a publication of its own making.
+///
+/// Generous on purpose: it bounds the test's patience rather than the behaviour under
+/// test, and these tests spawn gateways and children while the rest of the suite runs
+/// beside them.
+const TEST_WAIT: Duration = Duration::from_secs(60);
+const CHILD_PROCESS_TIMEOUT_SECONDS: u64 = 60;
+const SIDECAR_PUBLICATION_TIMEOUT: Duration = TEST_WAIT;
 
 struct ImplicitConfigEnvScope(Option<std::ffi::OsString>);
 
@@ -438,13 +444,11 @@ fn run_claude_startup_probe(log_level: Option<&str>) -> String {
     let child = ChildGuard::new(command.spawn().unwrap());
 
     let body = r#"{"model":"claude-sonnet-4-5","max_tokens":1,"messages":[{"role":"user","content":"test"}]}"#;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     loop {
         match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
                 stream
                     .write_all(
                         format!(
@@ -470,7 +474,7 @@ fn run_claude_startup_probe(log_level: Option<&str>) -> String {
         }
     }
 
-    let upstream_request = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let upstream_request = received.recv_timeout(TEST_WAIT).unwrap();
     assert!(upstream_request.starts_with("POST /v1/messages "));
     String::from_utf8(child.finish().stderr).unwrap()
 }
@@ -801,7 +805,7 @@ fn cli_mcp_rejects_an_unauthenticated_transparent_gateway() {
     assert!(output.stdout.is_empty());
     assert!(
         received
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(TEST_WAIT)
             .unwrap()
             .starts_with("GET /healthz ")
     );
@@ -862,7 +866,7 @@ fn start_mcp_client_with_generation(
             .map(|_| response);
         let _ = response_tx.send(result);
     });
-    let response = match response_rx.recv_timeout(Duration::from_secs(5)) {
+    let response = match response_rx.recv_timeout(TEST_WAIT) {
         Ok(response) => response.unwrap(),
         Err(error) => {
             let _ = child.kill();
@@ -1027,9 +1031,7 @@ fn run_fake_bootstrap_listener_with_options(
                 Err(error) => panic!("fake bootstrap listener failed: {error}"),
             };
             stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
             let request = read_http_request(&mut stream);
             server_requests.lock().unwrap().push(request.clone());
             if request.starts_with("GET /healthz ") {
@@ -1387,7 +1389,7 @@ fn cli_codex_hook_launch_resolution_error_retains_default_payload_cap() {
 }
 
 fn sidecar_address(temp: &std::path::Path) -> SocketAddr {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     loop {
         for path in find_runtime_files_matching(temp, "sidecar-", ".owner.json") {
             if let Ok(raw) = std::fs::read(path)
@@ -1602,7 +1604,7 @@ fn run_persistent_hook_with_token(
 }
 
 fn wait_for_port_closed(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     loop {
         if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err() {
             return;
@@ -1616,7 +1618,7 @@ fn wait_for_port_closed(address: SocketAddr) {
 }
 
 fn wait_for_port_open(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     loop {
         if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
             return;
@@ -1661,9 +1663,7 @@ fn stop_owned_sidecar(owner: &serde_json::Value) {
         .unwrap();
     let token = owner["shutdown_token"].as_str().unwrap();
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -1682,9 +1682,7 @@ fn stop_owned_sidecar(owner: &serde_json::Value) {
 
 fn relay_health(address: SocketAddr) -> serde_json::Value {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
     stream
         .write_all(
             format!("GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
@@ -4742,7 +4740,7 @@ fn assert_non_tty_signal_forwarding(
 
 #[cfg(unix)]
 fn wait_for_agent_pid_file(relay: &mut std::process::Child, pids: &Path, signal_name: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     while !pids.is_file() {
         if Instant::now() >= deadline {
             // SAFETY: Relay's PID is live and owned by this test; SIGTERM exercises its registered
@@ -4758,7 +4756,7 @@ fn wait_for_agent_pid_file(relay: &mut std::process::Child, pids: &Path, signal_
 
 #[cfg(unix)]
 fn assert_process_exits(pid: i32, signal_name: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     loop {
         // SAFETY: Signal zero is a read-only existence check for the recorded child PID.
         let result = unsafe { libc::kill(pid, 0) };
@@ -4801,7 +4799,7 @@ fn cli_hook_forward_posts_payload_headers_and_prints_response() {
         .write_all(br#"{"hook_event_name":"sessionStart"}"#)
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    let request = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let request = received.recv_timeout(TEST_WAIT).unwrap();
 
     assert!(output.status.success());
     assert_eq!(
@@ -4861,9 +4859,7 @@ fn cli_forward_only_never_reconnects_payload_after_authenticated_connection_clos
         listener.set_nonblocking(true).unwrap();
         let mut stream = accept_bootstrap_connection(&listener, &server_stopped)?;
         stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
         let mut request = read_http_request(&mut stream);
         server_requests.lock().unwrap().push(request.clone());
         if request.starts_with("GET /healthz ") {
@@ -4871,9 +4867,7 @@ fn cli_forward_only_never_reconnects_payload_after_authenticated_connection_clos
             drop(stream);
             stream = accept_bootstrap_connection(&listener, &server_stopped)?;
             stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
             request = read_http_request(&mut stream);
             server_requests.lock().unwrap().push(request.clone());
         }
@@ -4994,14 +4988,12 @@ fn collect_replacement_requests(
     stopped: &AtomicBool,
     requests: &Mutex<Vec<String>>,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + TEST_WAIT;
     while !stopped.load(Ordering::Relaxed) && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(TEST_WAIT)).unwrap();
                 requests
                     .lock()
                     .unwrap()
@@ -5074,7 +5066,7 @@ fn cli_transparent_run_suppresses_persistent_hooks_and_rejects_a_foreign_gateway
         "{}",
         String::from_utf8_lossy(&owned.stderr)
     );
-    let request = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let request = received.recv_timeout(TEST_WAIT).unwrap();
     assert!(request.starts_with("GET /bootstrap/tunnel "));
     assert!(!request.contains(r#"{"session_id":"owned"}"#));
 }
@@ -5103,7 +5095,7 @@ fn cli_hook_forward_bypasses_ambient_proxies_for_loopback_delivery() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(received.recv_timeout(Duration::from_secs(2)).is_ok());
+    assert!(received.recv_timeout(TEST_WAIT).is_ok());
 }
 
 #[test]
@@ -5119,7 +5111,7 @@ fn cli_hook_forward_reports_http_failure_when_fail_closed() {
         .unwrap();
     child.stdin.take().unwrap().write_all(b"{}").unwrap();
     let output = child.wait_with_output().unwrap();
-    let request = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let request = received.recv_timeout(TEST_WAIT).unwrap();
 
     assert!(!output.status.success());
     assert!(request.contains("POST /hooks/codex HTTP/1.1"));
@@ -5142,7 +5134,7 @@ fn cli_hook_forward_exits_two_for_guardrail_rejection() {
         .unwrap();
     child.stdin.take().unwrap().write_all(b"{}").unwrap();
     let output = child.wait_with_output().unwrap();
-    let request = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let request = received.recv_timeout(TEST_WAIT).unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     assert!(request.contains("POST /hooks/codex HTTP/1.1"));
@@ -5192,7 +5184,7 @@ fn cli_hook_forward_bounds_responses_under_both_failure_policies() {
             String::from_utf8_lossy(&output.stderr)
                 .contains("hook forward response exceeds the 1048576-byte limit")
         );
-        assert!(received.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(received.recv_timeout(TEST_WAIT).is_ok());
     }
 }
 

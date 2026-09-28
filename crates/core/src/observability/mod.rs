@@ -38,6 +38,17 @@ pub(crate) fn test_mutex() -> &'static Mutex<()> {
     crate::shared_runtime::runtime_owner_test_mutex()
 }
 
+/// How long a test waits for a worker or a server that another thread serves.
+///
+/// Generous on purpose, because it bounds a *test's* patience rather than a
+/// behavior: this suite runs fifteen hundred tests in one process, and a
+/// five-second bound on "the background worker delivered this" is a statement
+/// about an idle machine. Waits that pin behavior — a budget, a deadline, a
+/// transport that must fail — keep their own, tighter bounds; this one is only
+/// ever used where the assertion is that the work happened, not when.
+#[cfg(test)]
+pub(crate) const TEST_SERVER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub mod atif;
 pub mod atof;
 mod confined_fs;

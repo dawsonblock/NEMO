@@ -285,7 +285,7 @@ async fn mcp_session_serves_stdio_and_stops_heartbeat_on_eof() {
     let mut client_reader = BufReader::new(client_reader);
     let mut response = String::new();
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::test_support::WAIT_FOR_TEST_TRAFFIC,
         client_reader.read_line(&mut response),
     )
     .await
@@ -297,7 +297,7 @@ async fn mcp_session_serves_stdio_and_stops_heartbeat_on_eof() {
     );
 
     client_writer.shutdown().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, task)
         .await
         .expect("MCP session did not stop after stdin EOF")
         .unwrap()
@@ -325,7 +325,7 @@ async fn heartbeat_keeps_a_differently_configured_gateway_session_alive() {
         Some(shutdown_rx),
     ));
     let url = format!("http://{bind}");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, async {
         loop {
             let probe_url = url.clone();
             if tokio::task::spawn_blocking(move || {
@@ -387,10 +387,13 @@ async fn heartbeat_keeps_a_differently_configured_gateway_session_alive() {
         },
     ));
 
-    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
-        .await
-        .expect("heartbeat did not complete three compatible health checks")
-        .expect("heartbeat stopped before completing three compatible health checks");
+    tokio::time::timeout(
+        crate::test_support::WAIT_FOR_TEST_TRAFFIC,
+        observed_rx.recv(),
+    )
+    .await
+    .expect("heartbeat did not complete three compatible health checks")
+    .expect("heartbeat stopped before completing three compatible health checks");
     assert!(!heartbeat.is_finished());
     assert!(health_calls.load(Ordering::SeqCst) >= 3);
     assert_eq!(restart_calls.load(Ordering::SeqCst), 0);
@@ -398,7 +401,7 @@ async fn heartbeat_keeps_a_differently_configured_gateway_session_alive() {
     assert!(heartbeat.await.unwrap_err().is_cancelled());
 
     let _ = shutdown_tx.send(());
-    tokio::time::timeout(Duration::from_secs(5), gateway)
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, gateway)
         .await
         .expect("compatible gateway did not stop")
         .unwrap()
@@ -427,7 +430,7 @@ async fn borrowed_transparent_gateway_is_authenticated_and_monitored() {
         crate::provider_auth::TransparentProxyCredential::generate().unwrap(),
         Some(shutdown_rx),
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, async {
         loop {
             let probe_url = url.clone();
             let probe_fingerprint = fingerprint.clone();
@@ -450,13 +453,13 @@ async fn borrowed_transparent_gateway_is_authenticated_and_monitored() {
             .await
             .expect("authenticated gateway should be borrowable");
     let _ = shutdown_tx.send(());
-    tokio::time::timeout(Duration::from_secs(5), gateway)
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, gateway)
         .await
         .expect("transparent gateway did not stop")
         .unwrap()
         .unwrap();
 
-    let error = tokio::time::timeout(Duration::from_secs(5), lease.wait())
+    let error = tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, lease.wait())
         .await
         .expect("borrowed gateway heartbeat did not detect shutdown")
         .unwrap_err()
@@ -505,10 +508,13 @@ async fn heartbeat_performs_one_restart_and_tracks_the_recovered_gateway() {
         },
     ));
 
-    tokio::time::timeout(Duration::from_secs(5), recovered_rx.recv())
-        .await
-        .expect("heartbeat did not observe the recovered gateway")
-        .expect("heartbeat stopped before observing the recovered gateway");
+    tokio::time::timeout(
+        crate::test_support::WAIT_FOR_TEST_TRAFFIC,
+        recovered_rx.recv(),
+    )
+    .await
+    .expect("heartbeat did not observe the recovered gateway")
+    .expect("heartbeat stopped before observing the recovered gateway");
     assert!(!heartbeat.is_finished());
     assert_eq!(restart_calls.load(Ordering::SeqCst), 1);
     assert!(
@@ -559,10 +565,13 @@ async fn heartbeat_ignores_isolated_transient_health_failures() {
         },
     ));
 
-    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
-        .await
-        .expect("heartbeat did not complete three transient-failure cycles")
-        .expect("heartbeat stopped before completing three transient-failure cycles");
+    tokio::time::timeout(
+        crate::test_support::WAIT_FOR_TEST_TRAFFIC,
+        observed_rx.recv(),
+    )
+    .await
+    .expect("heartbeat did not complete three transient-failure cycles")
+    .expect("heartbeat stopped before completing three transient-failure cycles");
     assert!(!heartbeat.is_finished());
     assert!(health_calls.load(Ordering::SeqCst) >= 9);
     assert_eq!(restart_calls.load(Ordering::SeqCst), 0);
@@ -699,7 +708,7 @@ async fn old_mcp_maintenance_loop_exits_when_install_generation_is_replaced() {
         },
     ));
 
-    tokio::time::timeout(Duration::from_secs(5), observed_rx)
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, observed_rx)
         .await
         .expect("old MCP maintenance loop did not perform its first health check")
         .expect("old MCP maintenance loop stopped before its first health check");
@@ -718,7 +727,7 @@ async fn old_mcp_maintenance_loop_exits_when_install_generation_is_replaced() {
     retirement.commit_replacement();
     drop(retirement);
 
-    let error = tokio::time::timeout(Duration::from_secs(5), heartbeat)
+    let error = tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, heartbeat)
         .await
         .expect("old MCP maintenance loop did not observe generation replacement")
         .unwrap()

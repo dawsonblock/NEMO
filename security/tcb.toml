@@ -253,7 +253,7 @@ max_transitive_packages = 268
 # artifact vocabulary, which are the kernel's half of the boundary. The target below is
 # still above this number by less than a hundred lines, which is the honest state: the
 # composition surface grew slightly while the loader was leaving.
-max_source_lines = 67993
+max_source_lines = 68004
 # Raised for the three exact-registration entry points the event sanitize classes
 # need: one public entry per class over a private shared helper, which is how a host
 # is asked to run exactly the registration a proxy names rather than the family.
@@ -766,7 +766,7 @@ transitive_dependency_digest = "401a728fc4fb6961f3fdba36266db809e584d90c893dec0f
 [[temporary]]
 crate = "nemo-relay"
 field = "max_source_lines"
-raised_to = 67993
+raised_to = 68004
 target = 67832
 reason = "the native loader and the ABI bridge are still compiled into the kernel"
 introduced = "2514f27..eb975ae"
