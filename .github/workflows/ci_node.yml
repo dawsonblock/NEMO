@@ -483,3 +483,82 @@ jobs:
                 }
               "
             '
+
+  # The Node package-smoke lane proves the split packages load. It does not
+  # prove the addon finds the host its platform package ships and runs a plugin
+  # there, and it has no Rust toolchain to build the fixture that would show it.
+  # This lane has one, so it runs the installed-artifact recipes against the
+  # package the build just produced.
+  InstalledArtifact:
+    name: Installed artifact hosts a plugin (linux-amd64)
+    needs: [Package]
+    if: ${{ inputs.run_package && !cancelled() && needs.Package.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load CI tool versions
+        id: ci-config
+        uses: ./.github/actions/load-ci-tool-versions
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+          toolchain: ${{ steps.ci-config.outputs.rust_version }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: nemo-relay-rust-linux-amd64-${{ steps.ci-config.outputs.rust_version }}-release
+          workspaces: . -> target
+          cache-all-crates: true
+          cache-bin: false
+          save-if: false
+
+      - uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        with:
+          tool: just@${{ steps.ci-config.outputs.just_version }}
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
+        with:
+          version: ${{ steps.ci-config.outputs.uv_version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ env.NEMO_RELAY_CI_WORKSPACE }}/uv.lock
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.ci-config.outputs.node_version }}
+
+      - name: Download Node package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: node-npm-package-linux-amd64
+          path: node-packages/
+
+      - name: Build the native plugin fixture
+        run: just build-test-plugin-fixtures
+
+      - name: Prove an installed Node package hosts a native plugin out of process
+        run: |
+          set -euo pipefail
+          metapackage="$(find node-packages -maxdepth 1 -name 'nemo-relay-node-npm-[0-9]*.tgz' -print -quit)"
+          native="$(find node-packages -maxdepth 1 -name 'nemo-relay-node-npm-*-*-[0-9]*.tgz' -print -quit)"
+          test -n "$metapackage"
+          test -n "$native"
+          # Nothing in the environment names a host, so what runs the plugin is
+          # the host the platform package installed beside the addon.
+          just verify-installed-node-plugin "$metapackage" "$native" runs
+
+      - name: Prove a platform package that carries no host says where it looked
+        run: |
+          set -euo pipefail
+          metapackage="$(find node-packages -maxdepth 1 -name 'nemo-relay-node-npm-[0-9]*.tgz' -print -quit)"
+          native="$(find node-packages -maxdepth 1 -name 'nemo-relay-node-npm-*-*-[0-9]*.tgz' -print -quit)"
+          test -n "$metapackage"
+          test -n "$native"
+          just verify-installed-node-plugin "$metapackage" "$native" refused

@@ -68,6 +68,7 @@ status = "enforced"
 enforced_by = [
   { rust_test = "the_codec_bridge_admits_only_its_bound_worth_of_calls" },
   { rust_test = "the_admission_bound_survives_the_task_boundary" },
+  { rust_test = "a_consumer_that_drains_the_channel_does_not_remove_the_bound" },
   { rust_test = "the_codec_bridge_queue_is_bounded" },
 ]
 

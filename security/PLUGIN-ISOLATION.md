@@ -2673,7 +2673,7 @@ and it is not made to move by reclassifying anything.
 
 The qualification matrix resolves every claim against evidence in the tree, and an audit
 of that machinery found three places where the evidence was weaker than the claim's
-reach. Two are closed in this revision and one is recorded rather than guessed at.
+reach. All three are closed in this revision.
 
 **A `rust_test` was resolved by name alone.** Deleting `#[test]` from a referenced test
 left the matrix green, because the gate matched `fn name(` and a function is not a test.
@@ -2688,22 +2688,47 @@ crate and no kernel root reaches it; and the host-process claim is scoped to the
 compositions that ship. A claim that overstates its evidence is the thing this matrix
 exists to prevent, and the fix is the statement rather than a test widened to match it.
 
-**The installed-artifact recipes exist but no lane runs them.** `just
+**The installed-artifact recipes exist but no lane ran them.** `just
 verify-installed-python-plugin` and `just verify-installed-node-plugin` drive a real
 fixture through an *installed* wheel or npm package and check the child ran the plugin;
-both are named as evidence by matrix claims. No workflow invokes either, so what the
-matrix proves today is that the recipe exists rather than that an accepted build ran it.
+both are named as evidence by matrix claims, and no workflow invoked either — so what
+the matrix proved was that the recipe existed rather than that an accepted build ran it.
 
-Closing it is a packaging-lane change, and the lanes are not one step apart. The Python
-wheel jobs install the artifact but have no Rust toolchain, and the recipe needs one to
-build the fixture; the `source-and-plugin` job has the toolchain and installs the
-*sdist*, which carries no bundled host — the host arrives with the wheel. So that lane
-would run the recipe with `host=` naming the host the job builds, which is the
-"a deployment names its host" path rather than the "the package carries its host" one,
-and the wheel jobs would need a toolchain before they could prove the stronger fact.
-The Node package-smoke job has no Rust toolchain at all. This is written down rather
-than half-wired: an untested workflow edit that fails the lane it was added to is worse
-than a recorded gap.
+A lane runs them now, and the lane that can is the one with both halves of the
+requirement. The recipes build the plugin fixture from source, so they need a Rust
+toolchain, and the stronger of their two cases needs the artifact that carries the host.
+The Python `source-and-plugin` job in `ci_python.yml` is the one place both are present:
+it already builds the sdist with the toolchain, and it now also downloads the
+linux-amd64 wheel — the artifact whose host the claim is about — installs it into a
+fresh virtual environment, and runs `just verify-installed-python-plugin` twice with
+nothing naming a host in the environment: once against the wheel, where the host the
+wheel installed beside the interpreter must run the plugin out of process, and once
+against the sdist, which carries no host and must refuse by saying where one was
+expected. The Node package-smoke job has no Rust toolchain and proved only that the
+split packages load, so the Node side gets a lane of its own: `InstalledArtifact` in
+`ci_node.yml` downloads the linux-amd64 package the build just produced, builds the
+fixture, and runs `just verify-installed-node-plugin` the same two ways — the platform
+package's own host must run the plugin, and a copy with the host removed must refuse
+rather than search.
+
+What that leaves is the shape of the evidence, not its absence: the lanes are named
+here, but the matrix still resolves the claims against the *recipes*, because a
+workflow is not a kind of evidence this gate knows how to resolve by name. The recipes
+are what the lanes invoke, so a rename that broke a lane would also break the matrix.
+What the matrix cannot see is whether a lane was deleted; that is the same class of gap
+as any other untested workflow edit, and it is bounded by these lanes being the only
+callers of the two recipes.
+
+Both lanes run the same commands this checkout has already run by hand, against
+artifacts it built: the Python wheel, bundled with its host and installed into a fresh
+virtual environment, and the Node platform package beside its metapackage, installed
+into an empty project. Each printed the success line for its `runs` case
+(`the installed runtime ran the plugin out of process … and did not load it here`) and
+the one for its `refused` case
+(`an installation without a host refused the plugin and said where it looked`), with
+nothing naming a host in the environment. What the lanes add is an accepted build on
+Linux running them without a hand present; the commands themselves are the ones
+measured here.
 
 ## The codec bridge's bound is a bound now
 
@@ -2730,25 +2755,33 @@ holds the bound's worth of permits through the same function `resolve` calls fir
 requires the next admission to be refused; the old synthetic test is kept under a name
 that says what it actually proves (`the_codec_bridge_queue_is_bounded`).
 
-What is written is the admission itself, in two shapes: the same thread taking the
-bound's worth of permits through the function `resolve` calls first and finding the
-next refused, and a variant where the permits are moved to another thread and held
-there, so the bound is shown to cross the boundary the real path crosses. What is *not*
-written is the end-to-end qualification — a real kernel whose codec answers slowly,
-sixteen real calls in flight, and a seventeenth refused — and it is recorded here with
-the reason rather than implied.
+What is written is the admission itself, in three shapes. The first takes the bound's
+worth of permits through the function `resolve` calls first and finds the next refused.
+The second moves the permits to another thread and holds them there, so the bound is
+shown to cross the boundary the real path crosses. The third reproduces the production
+shape that defeated the old design, without a kernel: a consumer thread drains the
+channel and *holds* every job it takes — exactly the state the old bridge could not
+survive — so sixteen held jobs hold every permit and the seventeenth call is refused
+while the receive that would have blocked instead returns immediately. That third
+shape (`a_consumer_that_drains_the_channel_does_not_remove_the_bound`) is the one the
+defect lived in, and it is what makes the bound mean "in flight" rather than "waiting
+to be received."
 
-The harness was attempted and removed twice, and the second attempt left an
-observation that has to be settled before the qualification is claimed: with all
-sixteen calls demonstrably inside the kernel service (the codec had been entered
-sixteen times) the bridge's semaphore read back as though every permit were free, and
-a trace of the permits showed *no* permit dropped for the life of the test. Those two
-readings contradict each other, so one of the instruments was wrong — and until which
-one is known, the end-to-end claim is not written. The deterministic tests are
-unaffected by it: they take and release permits in one place and cannot be misread.
-The next step is a gate held on the *kernel* side of the call (a codec that waits on
-something the test controls, with the invocation's budget extended past the wait), so
-that the window is held open by the kernel rather than by a counter the test polls.
+What is *not* written is the end-to-end qualification against a real kernel whose
+codec answers slowly — sixteen real calls in flight and a seventeenth refused — and it
+is recorded here with its reason rather than implied. The harness was attempted and
+removed twice, and the second attempt left an observation that has to be settled before
+that particular qualification is claimed: with all sixteen calls demonstrably inside
+the kernel service (the codec had been entered sixteen times) the bridge's semaphore
+read back as though every permit were free, and a trace of the permits showed *no*
+permit dropped for the life of the test. Those two readings contradict each other, so
+one of the instruments was wrong — and until which one is known, the *real-kernel*
+claim is not written. The drain-holding test does not lean on that instrument: it
+drives the same production shape directly, and it is the qualification the bounded
+channel alone could not be. Settling the contradiction, if it is ever wanted, is a gate
+held on the *kernel* side of the call (a codec that waits on something the test
+controls, with the invocation's budget extended past the wait), so that the window is
+held open by the kernel rather than by a counter the test polls.
 
 ## The loader extraction, staged
 

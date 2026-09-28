@@ -441,6 +441,11 @@ jobs:
           cache-bin: false
           save-if: false
 
+      - uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        if: ${{ matrix.platform == 'source-and-plugin' }}
+        with:
+          tool: just@${{ steps.ci-config.outputs.just_version }}
+
       - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8
         if: ${{ !contains(matrix.platform, 'musl') }}
         with:
@@ -538,6 +543,16 @@ jobs:
           name: python-sdist
           path: python-sdist/
 
+      # The wheel is what carries the plugin host, so the stronger half of the
+      # installed-artifact claim needs the wheel even though this lane builds the
+      # sdist. It is the linux-amd64 wheel, which is the runner this lane uses.
+      - name: Download matching Python wheel artifact
+        if: ${{ matrix.platform == 'source-and-plugin' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wheel-linux-amd64
+          path: python-wheel/
+
       - name: Download Python plugin SDK wheel artifact
         if: ${{ matrix.platform == 'source-and-plugin' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -574,3 +589,32 @@ jobs:
           # SONAR_IGNORE_END
           "${RUNNER_TEMP}/nemo-relay-plugin-venv/bin/python" -c \
             "import nemo_relay_plugin._proto.plugin_worker_pb2_grpc"
+
+      - name: Build the native plugin fixture
+        if: ${{ matrix.platform == 'source-and-plugin' }}
+        run: just build-test-plugin-fixtures
+
+      # The installed-artifact recipes drive a real plugin through an *installed*
+      # runtime. This lane is where they run, because it is the one with both a
+      # Rust toolchain (the fixture is built from source) and the built wheel.
+      - name: Prove the installed wheel hosts a native plugin out of process
+        if: ${{ matrix.platform == 'source-and-plugin' }}
+        run: |
+          set -euo pipefail
+          wheel="$(find python-wheel -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          uv venv --python "$(uv python find)" "${RUNNER_TEMP}/nemo-relay-installed-venv"
+          # SONAR_IGNORE_START: local wheel with no dependencies or index access.
+          uv pip install --python "${RUNNER_TEMP}/nemo-relay-installed-venv/bin/python" --no-deps --no-index "$wheel"
+          # SONAR_IGNORE_END
+          # Nothing in the environment names a host, so what runs the plugin is
+          # the host the wheel installed beside the interpreter.
+          just verify-installed-python-plugin "${RUNNER_TEMP}/nemo-relay-installed-venv/bin/python" runs
+
+      - name: Prove a source install that carries no host says where it looked
+        if: ${{ matrix.platform == 'source-and-plugin' }}
+        run: |
+          set -euo pipefail
+          # The sdist carries no bundled host — the host arrives with the wheel —
+          # so this installation must refuse rather than search beside the process.
+          just verify-installed-python-plugin "${RUNNER_TEMP}/nemo-relay-sdist-venv/bin/python" refused

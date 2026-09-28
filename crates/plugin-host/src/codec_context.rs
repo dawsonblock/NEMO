@@ -1193,6 +1193,125 @@ mod tests {
         let _ = bridge.try_admit().expect("a finished call makes room");
     }
 
+    /// A consumer that drains the channel does not remove the bound.
+    ///
+    /// This is the v13 defect in one test, without a kernel. The old bridge bounded a
+    /// channel and then received as fast as it could, handing each job to a task — so
+    /// the channel's capacity said nothing about how many calls were running, and a slow
+    /// kernel could leave the queue empty and any number of calls behind it. The consumer
+    /// here does exactly that: it drains every job and *holds* it, which is the state the
+    /// old design could not survive. Sixteen calls are admitted and wait, the seventeenth
+    /// is refused, and the refusal comes back immediately — a call that was admitted
+    /// instead would block here, and the receive below is what says it did not.
+    ///
+    /// The end-to-end variant — a real kernel whose codec answers slowly — was attempted
+    /// and is recorded in the milestone document rather than committed: its two
+    /// instruments contradicted each other, and this shape tests the same property
+    /// without depending on which of them was wrong.
+    #[test]
+    fn a_consumer_that_drains_the_channel_does_not_remove_the_bound() {
+        let (jobs, mut queue) = tokio::sync::mpsc::channel::<CodecJob>(CODEC_BRIDGE_QUEUE_CAPACITY);
+        let bridge = Arc::new(CodecBridge {
+            jobs: Some(jobs),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(CODEC_BRIDGE_QUEUE_CAPACITY)),
+            thread: std::sync::Mutex::new(None),
+        });
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let consumer = {
+            let received = Arc::clone(&received);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match queue.try_recv() {
+                        Ok(job) => {
+                            received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            held.push(job);
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                // Dropped here rather than returned: a thread's return value lives in its
+                // `JoinHandle` until somebody joins it, and a caller waiting on an answer
+                // would wait for that too. Dropping the jobs *in* the thread is what makes
+                // the release independent of when the test gets around to joining.
+                drop(held);
+            })
+        };
+
+        let callers: Vec<_> = (0..CODEC_BRIDGE_QUEUE_CAPACITY)
+            .map(|_| {
+                let bridge = Arc::clone(&bridge);
+                std::thread::spawn(move || {
+                    bridge.resolve(
+                        nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+                        "operation-drained",
+                        "{}".to_string(),
+                        "reference",
+                        live_budget(),
+                    )
+                })
+            })
+            .collect();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while received.load(std::sync::atomic::Ordering::SeqCst) < CODEC_BRIDGE_QUEUE_CAPACITY
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            CODEC_BRIDGE_QUEUE_CAPACITY,
+            "the consumer did not take the whole bound"
+        );
+        assert_eq!(
+            bridge.in_flight.available_permits(),
+            0,
+            "sixteen held jobs must hold every permit"
+        );
+
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        {
+            let bridge = Arc::clone(&bridge);
+            std::thread::spawn(move || {
+                let outcome = bridge.resolve(
+                    nemo_relay_plugin_proto::v1::CodecOperation::LlmRequestDecode,
+                    "operation-drained",
+                    "{}".to_string(),
+                    "reference",
+                    live_budget(),
+                );
+                let _ = outcome_tx.send(outcome);
+            });
+        }
+        let outcome = outcome_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a call beyond the bound is refused rather than made to wait");
+        let refused = outcome.expect_err("a call beyond the bound is refused");
+        assert!(
+            refused.contains(&format!(
+                "limit of {CODEC_BRIDGE_QUEUE_CAPACITY} calls in flight"
+            )),
+            "the refusal does not name the bound: {refused}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        for caller in callers {
+            let joined = caller.join().expect("a joined caller");
+            assert!(
+                joined.is_err(),
+                "a call whose consumer let go must fail rather than answer: {joined:?}"
+            );
+        }
+        let _ = consumer.join();
+    }
+
     /// The queue is bounded too, and by the same number.
     ///
     /// This is the weaker of the two: it proves the channel's capacity, which is not
