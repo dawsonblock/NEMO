@@ -578,7 +578,13 @@ impl Drop for StagedArtifact {
 ///
 /// The copy exists because an approved load never executes the approved path: a
 /// path can be repointed between the moment it was approved and the moment it is
-/// opened, and a copy nothing else can reach cannot be.
+/// opened, and a copy that no *other user* can write and that nothing can name in
+/// advance cannot be. That is the guarantee, stated as what it is: the directory is
+/// the load's own, its mode denies other users, and its name is random rather than
+/// derived from the digest. It is not a statement about another process running as
+/// the same user — Unix permissions do not make that one a boundary, and a threat
+/// model that includes a hostile process under this account needs a mechanism this
+/// one does not claim, such as loading through a retained descriptor.
 pub(crate) fn stage_verified_library(
     library_path: &Path,
     approved_library_sha256: &str,
