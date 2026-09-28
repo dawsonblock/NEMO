@@ -77,6 +77,40 @@ def test_dependency_digest_distinguishes_versions() -> None:
     assert report.dependency_digest({"foo@1.0.0"}) != report.dependency_digest({"foo@2.0.0"})
 
 
+def test_the_measurement_names_a_target_instead_of_taking_the_host(tmp_path: pathlib.Path, monkeypatch) -> None:
+    # `cargo tree` answers for the machine it runs on unless a target is named, and
+    # the platform-specific tail of a graph is real — Linux resolves `openssl-sys`
+    # where macOS resolves `security-framework`, and a build-dependency is resolved
+    # for the machine doing the building. A baseline recorded on one host and enforced
+    # on another therefore disagrees with itself, which is how this gate came to fail
+    # in CI while passing locally. The flag is asserted here rather than trusted to
+    # review, because dropping it makes the gate depend on who ran it again and the
+    # failure would land on whoever pushed from the other platform.
+    calls: list[list[str]] = []
+
+    class Completed:
+        stdout = "nemo-relay v0.1.0\n"
+
+    def run(argv, **_kwargs):  # noqa: ANN001 - stands in for subprocess.run
+        calls.append(list(argv))
+        return Completed()
+
+    monkeypatch.setattr(report.subprocess, "run", run)
+    report.dependency_identities(tmp_path, "nemo-relay")
+    report.kernel_closure_names(tmp_path, ["nemo-relay"])
+
+    def target_of(argv: list[str]) -> str:
+        return argv[argv.index("--target") + 1]
+
+    assert target_of(calls[0]) == report.BUDGET_TARGET
+    assert target_of(calls[1]) == report.CLOSURE_TARGET
+    # The budgets are the union, because a budget has to be the same number wherever
+    # it is computed; the closure names the platform it is enforced on, because it
+    # asks what one process can reach rather than how large a resolved set is.
+    assert report.BUDGET_TARGET == "all"
+    assert report.CLOSURE_TARGET != report.BUDGET_TARGET
+
+
 def test_a_transitive_version_change_fails_the_gate(tmp_path: pathlib.Path) -> None:
     policy = {
         "forbidden": {},

@@ -3076,6 +3076,30 @@ kernel closure reaches (target: nothing): libloading, nemo-relay-native-abi, nem
 Both still appear in the build graph today, so the number is unchanged — what
 changed is that it is now measured against the right graph.
 
+**And the measurement names its target instead of the machine.** `cargo tree`
+resolves for the host platform unless it is told otherwise, which made every number
+in `security/tcb.toml` a fact about the maintainer who recorded it: Linux resolves
+`openssl-sys` where macOS resolves `security-framework`, a build-dependency resolves
+for the machine doing the building, and the two crates whose entries were recorded
+here disagreed with the ones the Linux gate computed for the same lockfile. The gate
+passed where it was recorded and failed where it was enforced, which is the opposite
+of what a budget is for.
+
+Two targets are named now, and they are named differently on purpose. The per-crate
+budgets and digests are resolved for every platform at once (`--target all`), so the
+number is the same wherever it is computed and a package cannot hide behind a target
+either — that is the conservative direction, and the ceilings that moved with it
+moved because the number was wrong rather than because a dependency was added. The
+closure checks are resolved for the platform CI enforces on, because they answer a
+different question: what the kernel's own process can reach rather than how large a
+resolved set is. Measuring the union there would make the milestone's central claim
+platform-false, and the reason is worth recording rather than losing: under
+`--target all` the Node binding's `napi-sys` pulls `libloading` on Windows, which is a
+fact about that platform's binding — it loads the Node runtime — and not about the
+composition this milestone closes. A Windows-only reach through a binding's own
+loader is not the plugin loader coming back, and the platform the claim is checked on
+says which of the two is being measured.
+
 ### The definition of done
 
 The dependency graph proves the kernel cannot reach the native loader; the release

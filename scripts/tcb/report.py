@@ -21,6 +21,17 @@ package cannot hide behind a feature flag. ``cargo metadata`` alone is not
 enough: it resolves optional dependencies whether or not a build activates
 them, which reports coupling that no build actually links.
 
+Every dependency measurement is also resolved for a named target rather than for
+whichever machine runs the gate. ``cargo tree`` answers for the host platform
+(``--target`` aside), and the platform-specific tail of a graph is real — Linux and
+macOS resolve different TLS, entropy and certificate-store crates, and a
+build-dependency is resolved for the machine that builds — so a baseline recorded on
+one host and enforced on another disagrees with itself. A budget that passes where it
+was recorded and fails where it is enforced is not a budget, and the fix is to name
+the target rather than to keep re-recording whatever the last machine saw. The two
+questions this script asks name different targets, and ``BUDGET_TARGET`` and
+``CLOSURE_TARGET`` say why.
+
 Two resolution properties are pinned rather than only counted. The transitive
 metric counts *resolved identities* (name and version), so two versions of one
 package are two entries instead of collapsing to one name. Each crate's direct
@@ -52,6 +63,30 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = REPO_ROOT / "security" / "tcb.toml"
 
 UNSAFE = re.compile(r"\bunsafe\b")
+
+#: The target the per-crate budgets and digests are resolved for: every one.
+#:
+#: A budget is a number somebody compares against, so it has to be the same number
+#: wherever it is computed. Resolving for the host made it the recorder's platform
+#: instead: Linux pulls `openssl-sys` where macOS pulls `security-framework`, and a
+#: build-dependency is resolved for the machine doing the building, so two machines
+#: disagreed about the same lockfile. ``all`` is the union over every platform cargo
+#: knows, which contains the host's own resolve on any of them and therefore does not
+#: depend on which one is asking. It is also the conservative direction: a package
+#: that only one platform's build would resolve is still a package this crate's build
+#: can resolve, and the budgets are upper bounds rather than per-artifact counts.
+BUDGET_TARGET = "all"
+
+#: The target the closure checks are resolved for: the platform CI enforces on.
+#:
+#: Not the union, because the closure asks a different question — what the kernel's
+#: own process can reach — and the answer for a composed platform is not the union of
+#: the answers for each one. The union is how `napi-sys`'s Windows-only `libloading`
+#: becomes visible under the Node root, which is a fact about that platform's binding
+#: rather than about the composition this milestone closes. Naming the enforced
+#: platform keeps the property checkable rather than host-dependent, and the reach the
+#: union would show is recorded in the milestone document instead of being lost here.
+CLOSURE_TARGET = "x86_64-unknown-linux-gnu"
 
 # Budget keys mapped to the measurement they cap.
 LIMIT_FIELDS = {
@@ -116,7 +151,8 @@ def dependency_identities(repo_root: pathlib.Path, crate: str) -> list[str]:
 
     Counting names instead would collapse two resolved versions of one package
     into a single entry, so a graph could gain a duplicate version without the
-    metric moving.
+    metric moving. The set is resolved for ``BUDGET_TARGET`` rather than for the
+    host, so two machines recording the same lockfile record the same numbers.
     """
     completed = subprocess.run(
         [
@@ -126,6 +162,8 @@ def dependency_identities(repo_root: pathlib.Path, crate: str) -> list[str]:
             crate,
             "--all-features",
             "--locked",
+            "--target",
+            BUDGET_TARGET,
             "--prefix",
             "none",
         ],
@@ -167,6 +205,9 @@ def kernel_closure_names(
     would make the target unreachable for a reason the symbol proof already covers.
     Callers that want to know about the test tree as well pass `edges="all"` and
     report the difference rather than hiding it.
+
+    The closure is resolved for ``CLOSURE_TARGET`` rather than for the host, so the
+    answer does not depend on the machine that asked for it.
     """
     completed = subprocess.run(
         [
@@ -175,6 +216,8 @@ def kernel_closure_names(
             *[f"-p{root}" for root in roots],
             "--all-features",
             "--locked",
+            "--target",
+            CLOSURE_TARGET,
             "--edges",
             edges,
             "--prefix",

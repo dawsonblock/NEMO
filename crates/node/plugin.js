@@ -27,7 +27,11 @@ function resolvePluginHost() {
   if (process.env.NEMO_RELAY_PLUGIN_HOST) {
     return process.env.NEMO_RELAY_PLUGIN_HOST;
   }
-  const candidate = path.join(__dirname, 'bin', process.platform === 'win32' ? 'nemo-plugin-host.exe' : 'nemo-plugin-host');
+  const candidate = path.join(
+    __dirname,
+    'bin',
+    process.platform === 'win32' ? 'nemo-plugin-host.exe' : 'nemo-plugin-host',
+  );
   return require('node:fs').existsSync(candidate) ? candidate : undefined;
 }
 
