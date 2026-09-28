@@ -5813,7 +5813,7 @@ fn native_intercept_fixture() -> (std::path::PathBuf, String) {
     if !supervisor.executable.exists() {
         panic!(
             "the plugin host binary is missing at '{}'; build it with `cargo build -p \
-             nemo-relay-plugin-host`",
+             nemo-relay-native-loader`",
             supervisor.executable.display()
         );
     }

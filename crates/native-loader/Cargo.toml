@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Loads native NeMo Relay plugins: dlopen, symbol acquisition, registration extraction and the in-process activation."
+description = "Loads native NeMo Relay plugins: the loader, the host process's own end of the protocol, and the nemo-plugin-host binary."
 
 [lints]
 workspace = true
@@ -23,7 +23,6 @@ futures-util = "0.3"
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["io-util", "net", "process", "rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
@@ -34,8 +33,6 @@ tonic = { version = "0.14.2", default-features = false, features = ["codegen", "
 [features]
 # The worker lane: a plugin whose code runs in a process the kernel starts.
 worker-grpc = ["nemo-relay/worker-grpc"]
-# JSON schema generation for the activation spec.
-schema = ["dep:schemars", "nemo-relay/schema"]
 
 [[test]]
 name = "native_plugin_integration"

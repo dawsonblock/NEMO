@@ -387,12 +387,12 @@ transitive_dependency_digest = "b4aac64fe31431ed41389152737c48eea6a321efa6a28259
 # moved one direct dependency and shrank the transitive set by one; what it really
 # removed is what the release binary linked.
 [limits.nemo-relay-native-loader]
-max_direct_dependencies = 17
-max_transitive_packages = 244
+max_direct_dependencies = 16
+max_transitive_packages = 241
 max_source_lines = 15276
 max_unsafe_occurrences = 288
-direct_dependency_digest = "04d7663aa5ae9bc79610a93ef4662e269cc8fb67e659793f1403296b5f526487"
-transitive_dependency_digest = "ce53943fe8b0d1701b7896134312de67109a1c3ef4ebdaafdfcb918a1421820f"
+direct_dependency_digest = "aadc974282ee74c89349bd65d088fccd8cab0c1160e9aa51f95ab06d467dec28"
+transitive_dependency_digest = "8d8284c7bdae72cd3dc1f9a6c636062828405de64446e6589a52f119a4058fa3"
 
 # The native plugin ABI's own crate — the first staged step of the split, and the
 # reason the SDK's line above could lose its vocabulary without any caller noticing.
@@ -607,8 +607,8 @@ transitive_dependency_digest = "03dfa17ddf48b5111eb62b22b30891faef5425cac267555f
 # the decision to be made on the child's side of the boundary. No dependency moved and
 # no `unsafe` did.
 [limits.nemo-relay-plugin-host]
-max_direct_dependencies = 16
-max_transitive_packages = 243
+max_direct_dependencies = 15
+max_transitive_packages = 240
 # Raised for the codec capability record: references bound to an invocation, a
 # direction and a codec, with a guard whose drop is the revocation, and the refusal
 # matrix that keeps one call's capability from being another's. No dependency moved and
@@ -719,8 +719,8 @@ max_transitive_packages = 243
 # the host can reach changed with it.
 max_source_lines = 23990
 max_unsafe_occurrences = 2
-direct_dependency_digest = "200c503436a1544381aa952e24cc8f427ad05869a4de850490c4f1bdfc0f680c"
-transitive_dependency_digest = "b8bcf05c38c4724d6621d890634461d108b21a193879dad30dfb61a51c19254c"
+direct_dependency_digest = "860f647bef245db99fdaae4cdac0794e3b63703fc39937fd902bfbbeb0d65b5d"
+transitive_dependency_digest = "27ef063a5b76f93bfb9020d96c4d7fdbc4a1ae2eba5edebc62db899208d3af6f"
 
 # The wire schema. Measured because it is shipped and because its transitive set
 # is dominated by the protobuf and gRPC toolchain, which is exactly the kind of

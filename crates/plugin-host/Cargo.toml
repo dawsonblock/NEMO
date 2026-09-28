@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Plugin execution backends, including the in-process compatibility backend."
+description = "The kernel's side of the native plugin boundary: the process backend, its supervisor, and the proxies that serve a host's registrations."
 
 [lints]
 workspace = true
@@ -39,7 +39,6 @@ tonic = { version = "0.14.2", default-features = false, features = [
     "transport",
 ] }
 tower = { version = "0.5", features = ["util"] }
-schemars = { version = "0.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["process", "thread"] }
@@ -49,8 +48,6 @@ rustix = { version = "1.1.4", features = ["process", "thread"] }
 # whose adapter lives here. Off by default because most consumers do not run
 # worker plugins, and the error a consumer without it gets says so.
 worker-grpc = ["nemo-relay/worker-grpc"]
-# JSON schema generation for the activation spec a composition is handed.
-schema = ["dep:schemars", "nemo-relay/schema"]
 
 [dev-dependencies]
 nemo-relay-native-loader.workspace = true
