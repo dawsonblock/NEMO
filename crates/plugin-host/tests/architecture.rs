@@ -142,15 +142,47 @@ fn package_name(crate_dir: &Path) -> String {
         .unwrap_or_else(|| panic!("{} declares no package name", crate_dir.display()))
 }
 
-/// Dependencies a manifest declares, as written.
+/// Dependencies a manifest declares for a build, as written.
+///
+/// The dependency sections that a build links, and not the others. The distinction is
+/// the one the TCB report makes explicitly — a dev-dependency is not in the artifact —
+/// and reading every `key = value` line in the file conflated them: a crate that
+/// dev-depends on the loader "declared" it here, which is the opposite of what the
+/// check wants to know, and `[features]` entries were counted as dependencies too.
+/// Only the dependency tables count now: `[dependencies]`, `[build-dependencies]`, and
+/// the same two under `[target.'…'.…]`.
 fn declared_dependencies(crate_dir: &Path) -> Vec<String> {
     let manifest =
         std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("a member manifest");
-    manifest
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(name, _)| name.trim().trim_matches('"').to_owned())
-        .collect()
+    let mut dependencies = Vec::new();
+    let mut in_dependency_table = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_dependency_table = is_dependency_table(trimmed);
+            continue;
+        }
+        if !in_dependency_table {
+            continue;
+        }
+        if let Some((name, _)) = line.split_once('=') {
+            dependencies.push(name.trim().trim_matches('"').to_owned());
+        }
+    }
+    dependencies
+}
+
+/// Whether a manifest section header names a table a build links.
+fn is_dependency_table(header: &str) -> bool {
+    let name = header
+        .trim()
+        .trim_matches(|character| character == '[' || character == ']');
+    if name == "dependencies" || name == "build-dependencies" {
+        return true;
+    }
+    // `target.'cfg(unix)'.dependencies` and its build-dependency sibling.
+    name.starts_with("target.")
+        && (name.ends_with(".dependencies") || name.ends_with(".build-dependencies"))
 }
 
 fn rust_sources(root: &Path, into: &mut Vec<(String, String)>) {
