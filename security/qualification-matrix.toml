@@ -43,10 +43,14 @@ enforced_by = [
 
 [[claim]]
 id = "kernel-does-not-depend-on-the-loader"
-statement = "The dynamic loader is a dependency of exactly one crate, and the kernel does not depend on that crate at all: `libloading` appears in one manifest, and no kernel root reaches it."
+statement = "The dynamic loader is a dependency of exactly one crate and no shipping composition depends on that crate: `libloading` appears in one manifest, the loader appears as a build dependency of none, and no root of the closure reaches either."
 status = "enforced"
+# Two facts, two kinds of evidence: the manifest scan reads declarations, and the
+# closure report walks the resolved graph. Attaching only the first would leave the
+# transitive half of the statement resting on a test that does not check it.
 enforced_by = [
   { rust_test = "the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the_implementation" },
+  { recipe = "tcb-report" },
 ]
 
 [[claim]]
