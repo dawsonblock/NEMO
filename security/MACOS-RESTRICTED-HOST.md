@@ -13,12 +13,17 @@ the sections below say which is which):
   a name, and `restricted-macos`. A level this build cannot deliver is refused at
   startup, before anything is created, rather than served with a host that runs
   without the confinement the configuration states.
-- **A confined host is a bundle.** `scripts/package-plugin-host-app.py` produces
-  `nemo-plugin-host.app` from the built executable, with `Contents/Info.plist` and
-  the entitlements in `security/entitlements/`, signed ad hoc. macOS applies App
-  Sandbox from a signed bundle's entitlements, and a bare executable carrying the
-  same entitlement is refused at launch: the confinement is a packaging fact
-  rather than a flag.
+- **A confined host is a verified bundle.** `scripts/package-plugin-host-app.py`
+  produces `nemo-plugin-host.app` from the built executable, with
+  `Contents/Info.plist` and the entitlements in `security/entitlements/`. It signs
+  with Hardened Runtime. Before launch, the supervisor asks `codesign` to verify
+  the bundle and checks its bundle identifier, App Sandbox entitlement, and
+  CodeDirectory runtime flag. Restricted launch requires the expected signing
+  Team ID in `NEMO_RELAY_PLUGIN_HOST_TEAM_ID`; the macOS CI qualification
+  explicitly uses `not set` for its ad hoc test signature. Production deployments
+  must set the Developer ID Team ID. The development ad hoc signature is for local
+  qualification only; distribution still needs Developer ID signing and
+  notarization.
 - **The resolver knows the bundle.** Where a host is looked for now includes
   `nemo-plugin-host.app/Contents/MacOS/nemo-plugin-host` beside the runtime, and a
   path a caller supplied is used only when it is already that shape.
@@ -41,6 +46,20 @@ the sections below say which is which):
   outside the sandbox. The signed-bundle process test completes transfer, load,
   and a real registration, while the focused probe verifies the same entitlements'
   filesystem and network denials.
+
+## Selecting the policy
+
+The CLI and Python, Node.js, and FFI activation entry points share one policy
+parser. Leave `NEMO_RELAY_NATIVE_ISOLATION` unset for the compatible
+`trusted-process` default, or set it to `restricted-macos` to require the verified
+App Sandbox bundle. Unknown values fail activation; they do not fall back to the
+trusted policy. The setting applies to native plugin hosting in that process.
+
+```sh
+export NEMO_RELAY_NATIVE_ISOLATION=restricted-macos
+# The Team ID is required; use the literal `not set` only for ad hoc qualification.
+export NEMO_RELAY_PLUGIN_HOST_TEAM_ID=TEAMID1234
+```
 
 ## Target
 
@@ -142,11 +161,11 @@ and they belong with the capability types (`ReadFile(bookmark)`,
 | The confinement denies what it must and permits what the host is for | `just verify-macos-sandbox` in the macOS lane |
 | The parent removes only quarantine from the kernel-approved staged dylib | `macos_quarantine::tests::clears_only_quarantine_after_rechecking_the_approved_digest`, plus the signed-bundle process test |
 
-The bundle layout, entitlements and resolver have structural tests. The actual
-host's sandboxed launch, transfer and load are exercised by the opt-in
-`a_restricted_bundle_loads_only_the_transferred_approved_copy` process-backend
-test when supplied a signed app-bundle executable. The focused probe establishes
-the operating-system denial behavior; neither result substitutes for the other.
+The bundle layout, entitlements and resolver have structural tests. The macOS CI
+lane runs `just test-macos-restricted-host`: the strict bundle refuses the ad hoc
+plugin signature, then the third-party bundle loads that same approved plugin and
+executes its registration. The focused probe separately establishes the
+operating-system denial behavior; neither result substitutes for the other.
 
 ## What is implemented, and what still needs qualification
 
@@ -175,9 +194,10 @@ the operating-system denial behavior; neither result substitutes for the other.
    Each needs its install layout decided rather than assumed — a wheel's
    `.data/scripts` is a directory pip fills, and npm's `bin` is one flat
    directory — and that is why it is a step of its own.
-4. **The macOS qualification lanes.** The real signed-bundle process test covers
-   transfer, load and registration. `just verify-macos-sandbox` covers these
-   filesystem and network denials with a probe signed using the same entitlements:
+4. **The macOS qualification lanes.** `just test-macos-restricted-host` checks
+   strict library-validation refusal and the third-party bundle's transfer, load
+   and registration path. `just verify-macos-sandbox` covers filesystem and
+   network denials with a probe signed using the strict entitlements:
 
    ```text
    ✓ the plugin loads from the host's container
@@ -190,13 +210,24 @@ the operating-system denial behavior; neither result substitutes for the other.
    ✗ cannot load a library that is not the staged one
    ```
 
-   These are complementary checks: the host process test verifies the plugin path,
-   and the probe verifies the OS denials imposed by the same signed entitlements.
-   The approved digest is also rechecked by the supervisor before quarantine is
-   removed and by the loader after `dlopen`.
+   These are complementary checks: the process tests verify signature-policy and
+   plugin-loading behavior, and the probe verifies OS denials. The approved digest
+   is rechecked by the supervisor before quarantine is removed and by the loader
+   after `dlopen`. A same-Team-ID plugin load remains unqualified because CI uses
+   ad hoc identities.
 5. **Capabilities.** A way for a plugin to declare what it needs and for the
    runtime to grant exactly that, rather than widening the bundle every plugin
    runs inside.
+
+## Resource use on macOS
+
+App Sandbox limits access to resources; it does not provide a memory or CPU
+budget. The host currently applies the open-file ceiling, while the shipped
+address-space ceiling is Linux-only and process-count limits are unset by default.
+Operation deadlines kill a host that fails to answer in time, but they are not a
+hard CPU quota. Restricted macOS reduces ambient access and contains a crashing
+process; it does not bound resource exhaustion by hostile native code. That threat
+still requires a VM boundary or an independently enforced resource controller.
 
 ## Signing, in three separate things
 

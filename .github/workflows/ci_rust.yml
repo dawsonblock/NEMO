@@ -312,11 +312,7 @@ jobs:
           # SONAR_IGNORE_END
 
       # A confined host is a bundle, and a bundle is the only thing macOS applies
-      # App Sandbox to. This lane proves the confinement rather than declaring it:
-      # the release host is packaged and signed, and the operations a plugin must
-      # not perform have to fail. The transfer path has a local authenticated-RPC
-      # integration test; combining it with the applied sandbox remains a separate
-      # qualification item.
+      # App Sandbox to. Check the OS-level denials on the signed release host.
       - name: Probe macOS App Sandbox restrictions
         if: ${{ matrix.build_image == '' && runner.os == 'macOS' }}
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
@@ -324,6 +320,16 @@ jobs:
           set -euo pipefail
           just verify-macos-sandbox \
             "${{ env.NEMO_RELAY_CI_WORKSPACE }}/target/${{ matrix.target }}/release/nemo-plugin-host"
+
+      - name: Run the signed restricted-host transfer and load test
+        if: ${{ matrix.build_image == '' && runner.os == 'macOS' }}
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          just test-macos-restricted-host \
+            "${{ env.NEMO_RELAY_CI_WORKSPACE }}/target/${{ matrix.target }}/release/nemo-plugin-host" \
+            "${RUNNER_TEMP}/nemo-restricted-host-e2e" \
+            "$NEMO_RELAY_CLI_PACKAGE_VERSION"
 
       # The release binary is the artifact a deployment runs, so the symbol proof is
       # taken here rather than in a test: the dependency graph can be right and a

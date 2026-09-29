@@ -2920,9 +2920,7 @@ mod tests {
         }
 
         let library = b"deliberately not a loadable library".to_vec();
-        let manifest = format!(
-            "manifest_version = 1\n\n[plugin]\nid = \"transfer-fixture\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \">=0.9,<1.0\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"libfixture.dylib\"\nsymbol = \"nemo_relay_plugin_entry\"\n"
-        );
+        let manifest = "manifest_version = 1\n\n[plugin]\nid = \"transfer-fixture\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \">=0.9,<1.0\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"libfixture.dylib\"\nsymbol = \"nemo_relay_plugin_entry\"\n".to_owned();
         let manifest_sha256 = crate::staging::hash_bytes(manifest.as_bytes());
         let library_sha256 = crate::staging::hash_bytes(&library);
         let artifact_id = Uuid::now_v7().to_string();

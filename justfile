@@ -1834,6 +1834,32 @@ test-packaging-scripts:
 verify-macos-sandbox host_binary:
     uv run --no-project python scripts/qualification/macos_sandbox_probe.py --host-binary "{{ host_binary }}"
 
+# Exercise strict library validation and the approved third-party plugin load path.
+test-macos-restricted-host host_binary output_directory version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just build-test-plugin-fixtures
+    codesign --force --sign - \
+        "{{ NEMO_RELAY_REPO_ROOT }}/target/test-plugin-fixtures/debug/libnemo_relay_native_intercept_fixture.dylib"
+    python3 scripts/package-plugin-host-app.py \
+        --host-binary "{{ host_binary }}" \
+        --output-directory "{{ output_directory }}" \
+        --version "{{ version }}" \
+        --variant restricted
+    NEMO_RELAY_PLUGIN_HOST_TEAM_ID="not set" \
+    NEMO_RELAY_STRICT_HOST_EXECUTABLE="{{ output_directory }}/nemo-plugin-host.app/Contents/MacOS/nemo-plugin-host" \
+        cargo test --locked -p nemo-relay-plugin-host --test process_backend \
+            a_strict_restricted_bundle_rejects_a_different_plugin_signer -- --ignored --exact
+    python3 scripts/package-plugin-host-app.py \
+        --host-binary "{{ host_binary }}" \
+        --output-directory "{{ output_directory }}" \
+        --version "{{ version }}" \
+        --variant third-party
+    NEMO_RELAY_PLUGIN_HOST_TEAM_ID="not set" \
+    NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE="{{ output_directory }}/nemo-plugin-host.app/Contents/MacOS/nemo-plugin-host" \
+        cargo test --locked -p nemo-relay-plugin-host --test process_backend \
+            a_restricted_bundle_loads_only_the_transferred_approved_copy -- --ignored --exact
+
 # Check that every claim the qualification matrix makes names what enforces it.
 qualification-matrix:
     python3 scripts/qualification/matrix.py

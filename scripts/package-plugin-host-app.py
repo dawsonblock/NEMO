@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import os
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -140,6 +141,8 @@ def sign_bundle(
         "--force",
         "--sign",
         "-",
+        "--options",
+        "runtime",
         "--identifier",
         bundle_identifier,
         "--entitlements",
@@ -149,6 +152,32 @@ def sign_bundle(
     completed = run(command)
     if completed.returncode != 0:
         raise ValueError(f"codesign failed for {bundle}: {completed.stderr.decode(errors='replace')}")
+
+
+def verify_bundle_signature(
+    bundle: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> None:
+    """Require a valid strict signature before treating the bundle as confined."""
+    command = ["codesign", "--verify", "--strict", "--deep", str(bundle)]
+    completed = run(command, capture_output=True)
+    if completed.returncode != 0:
+        raise ValueError(f"codesign did not verify {bundle}: {completed.stderr.decode(errors='replace')}")
+
+
+def verify_hardened_runtime(
+    bundle: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> None:
+    """Check the signed CodeDirectory actually carries the Hardened Runtime flag."""
+    completed = run(["codesign", "--display", "--verbose=4", str(bundle)], capture_output=True)
+    details = (completed.stdout + completed.stderr).decode(errors="replace")
+    if completed.returncode != 0:
+        raise ValueError(f"cannot inspect the signature for {bundle}: {details}")
+    if not re.search(r"(?m)^CodeDirectory\b[^\r\n]*\bflags=[^\r\n]*\bruntime\b", details):
+        raise ValueError(f"the signature for {bundle} does not enable Hardened Runtime")
 
 
 def parse_args() -> argparse.Namespace:

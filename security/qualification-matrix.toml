@@ -368,13 +368,11 @@ note = "The bundle this milestone produces is signed ad hoc, which is what makes
 [[claim]]
 id = "restricted-macos-load-completes-inside-container"
 statement = "The signed sandboxed plugin host receives an approved artifact, verifies it again inside its container, loads the staged library and executes a real registration there."
-status = "unverified"
-terms = [
-  "sandboxed plugin load",
-  "verified transfer inside the container",
-  "restricted macOS host",
+status = "enforced"
+enforced_by = [
+  { recipe = "test-macos-restricted-host" },
 ]
-note = "The opt-in signed-bundle process test completes authenticated transfer, staged digest verification, native load and a real registration. The unconfined supervisor derives the staged path from kernel-minted session and artifact IDs, walks without following symlinks, rechecks the approved SHA-256 and removes only com.apple.quarantine by file descriptor. The restricted loader loads this container-owned file in place and rechecks its digest after dlopen. The sandbox probe separately confirms filesystem and network denials under the same entitlement set."
+note = "The macOS CI lane builds Hardened Runtime bundles and runs a strict-variant test that refuses a plugin with a different Team ID, followed by a third-party-variant test that completes authenticated transfer, staged digest verification, native load and a real registration. The supervisor derives the staged path from kernel-minted session and artifact IDs, walks without following symlinks, rechecks the approved SHA-256 and removes only com.apple.quarantine by file descriptor. The restricted loader loads this container-owned file in place and rechecks its digest after dlopen. The sandbox probe separately confirms filesystem and network denials. CI uses ad hoc identities; same-Team-ID production loading requires Developer ID qualification."
 
 [[claim]]
 id = "every-hosting-consumer-carries-its-own-host"

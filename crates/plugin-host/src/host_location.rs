@@ -32,6 +32,10 @@ use std::path::{Path, PathBuf};
 /// install it beside the process that starts it.
 pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
 
+/// Expected Team ID for the restricted host signature. Development qualification
+/// may explicitly set `not set` for an ad hoc signature.
+pub const TEAM_ID_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_TEAM_ID";
+
 /// The bundle a confined host is installed as.
 ///
 /// A bare executable and a bundle are the same program; what differs is the

@@ -1185,9 +1185,11 @@ impl PluginActivation {
                 // binding is a default this composition accepts: the frame limit
                 // the protocol's ceiling stands for, the resource ceilings the
                 // host crate ships, and its startup budget.
-                supervisor: PluginHostSupervisorConfig::beside_this_executable(
-                    plugin_runtime_binding(),
-                ),
+                supervisor: PluginHostSupervisorConfig {
+                    isolation: nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment()
+                        .map_err(CliError::Config)?,
+                    ..PluginHostSupervisorConfig::beside_this_executable(plugin_runtime_binding())
+                },
                 registration_cap_millis: NATIVE_REGISTRATION_CAP_MILLIS,
                 observability: nemo_relay_plugin_host::off_path::ObservabilityPolicy {
                     budget_millis: NATIVE_REGISTRATION_CAP_MILLIS,

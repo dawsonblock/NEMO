@@ -1184,7 +1184,11 @@ fn initialize_with_dynamic_plugins_py<'py>(
         // companion is the thing that decides which one runs, and the runtime
         // keeps the authority to refuse a build it did not expect. A deployment
         // that named a host in the environment is still the one in charge.
-        let policy = IsolationPolicy::for_runtime("nemo-relay-python");
+        let isolation =
+            nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let policy =
+            IsolationPolicy::for_runtime("nemo-relay-python").with_native_isolation(isolation);
         let policy = match crate::plugin_host_location::resolved_host() {
             Some(host) => policy.with_host(host),
             None => {

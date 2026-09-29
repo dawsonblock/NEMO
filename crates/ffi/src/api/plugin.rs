@@ -248,6 +248,14 @@ pub unsafe extern "C" fn nemo_relay_initialize_with_dynamic_plugins(
         Ok(dynamic_plugins) => dynamic_plugins,
         Err(status) => return status,
     };
+    let isolation =
+        match nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment() {
+            Ok(isolation) => isolation,
+            Err(error) => {
+                set_last_error(&error);
+                return NemoRelayStatus::InvalidArg;
+            }
+        };
     // The one activation path, shared with the CLI and the other bindings: it
     // resolves the discovered configuration, activates what this process runs,
     // starts the native plugins in a host process, and rolls the whole thing back
@@ -256,7 +264,7 @@ pub unsafe extern "C" fn nemo_relay_initialize_with_dynamic_plugins(
         match tokio_runtime().block_on(ActivatedPluginRuntime::activate_with_discovered_config(
             config,
             dynamic_plugins,
-            IsolationPolicy::for_runtime("nemo-relay-ffi"),
+            IsolationPolicy::for_runtime("nemo-relay-ffi").with_native_isolation(isolation),
         )) {
             Ok(activation) => activation,
             Err(error) => return status_from_activation_error(&error),

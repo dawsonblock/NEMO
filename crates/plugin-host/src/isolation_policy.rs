@@ -22,10 +22,16 @@
 //! variant nothing can honor would read as a feature.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use nemo_relay_plugin_protocol::{PluginFailureCode, PluginProtocolError};
 
 use crate::host_location;
+
+/// Environment variable selecting the host process isolation policy for the
+/// CLI and all language bindings.
+pub const NATIVE_ISOLATION_ENV: &str = "NEMO_RELAY_NATIVE_ISOLATION";
 
 /// Whether the end-to-end approved artifact load path is qualified for restriction.
 ///
@@ -100,6 +106,30 @@ impl NativeIsolationPolicy {
         match self {
             Self::TrustedProcess => "trusted-process",
             Self::RestrictedMacOS => "restricted-macos",
+        }
+    }
+
+    /// Parse one canonical deployment spelling.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "trusted-process" => Ok(Self::TrustedProcess),
+            "restricted-macos" => Ok(Self::RestrictedMacOS),
+            other => Err(format!(
+                "{NATIVE_ISOLATION_ENV} has unsupported value '{other}'; expected 'trusted-process' or 'restricted-macos'"
+            )),
+        }
+    }
+
+    /// Resolve the policy shared by the CLI and every binding. An absent value
+    /// retains the compatible trusted-process default; malformed values fail
+    /// instead of silently selecting a weaker mode.
+    pub fn from_environment() -> Result<Self, String> {
+        match std::env::var(NATIVE_ISOLATION_ENV) {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{NATIVE_ISOLATION_ENV} is not valid Unicode"))
+            }
         }
     }
 
@@ -199,6 +229,156 @@ impl NativeIsolationPolicy {
         }
         Ok(executable)
     }
+
+    /// Verify that a restricted macOS bundle's signed properties match the
+    /// boundary this policy promises before the supervisor starts it.
+    pub fn verify_host_signature(self, executable: &Path) -> Result<(), PluginProtocolError> {
+        if !self.confines_resources() {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            verify_restricted_host_signature(executable)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = executable;
+            Err(refused(RestrictionRequirement::MacOS.message()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_restricted_host_signature(executable: &Path) -> Result<(), PluginProtocolError> {
+    let bundle = executable
+        .ancestors()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == host_location::BUNDLE_NAME)
+        })
+        .ok_or_else(|| refused(RestrictionRequirement::BundledHost.message().into()))?;
+    let canonical_bundle = std::fs::canonicalize(bundle).map_err(|error| {
+        refused(format!(
+            "cannot resolve the restricted host bundle: {error}"
+        ))
+    })?;
+    let canonical_executable = std::fs::canonicalize(executable).map_err(|error| {
+        refused(format!(
+            "cannot resolve the restricted host executable: {error}"
+        ))
+    })?;
+    if !canonical_executable.starts_with(&canonical_bundle) {
+        return Err(refused(
+            "restricted host executable resolves outside its signed application bundle".into(),
+        ));
+    }
+    let verify = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "--deep"])
+        .arg(bundle)
+        .output()
+        .map_err(|error| {
+            refused(format!(
+                "cannot verify the restricted host signature: {error}"
+            ))
+        })?;
+    if !verify.status.success() {
+        return Err(refused(format!(
+            "macOS rejected the restricted host signature: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        )));
+    }
+
+    let details = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(bundle)
+        .output()
+        .map_err(|error| {
+            refused(format!(
+                "cannot inspect the restricted host signature: {error}"
+            ))
+        })?;
+    if !details.status.success() {
+        return Err(refused(format!(
+            "cannot inspect the restricted host signature: {}",
+            String::from_utf8_lossy(&details.stderr).trim()
+        )));
+    }
+    let detail_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&details.stdout),
+        String::from_utf8_lossy(&details.stderr)
+    );
+    let has_identifier = detail_text
+        .lines()
+        .any(|line| line.trim() == format!("Identifier={}", host_location::BUNDLE_IDENTIFIER));
+    let has_runtime = detail_text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("CodeDirectory ") && line.contains("flags=") && line.contains("runtime")
+    });
+    if !has_identifier || !has_runtime {
+        return Err(refused(format!(
+            "restricted host signature must identify {} and enable Hardened Runtime",
+            host_location::BUNDLE_IDENTIFIER
+        )));
+    }
+
+    let expected_team = std::env::var(host_location::TEAM_ID_ENV).map_err(|error| {
+        refused(format!(
+            "restricted macOS requires an expected signing Team ID in {}: {error}",
+            host_location::TEAM_ID_ENV
+        ))
+    })?;
+    if expected_team.is_empty() {
+        return Err(refused(format!(
+            "{} must be non-empty",
+            host_location::TEAM_ID_ENV
+        )));
+    }
+    let has_expected_team = detail_text
+        .lines()
+        .any(|line| line.trim() == format!("TeamIdentifier={expected_team}"));
+    if !has_expected_team {
+        return Err(refused(format!(
+            "restricted host Team ID does not match {}",
+            host_location::TEAM_ID_ENV
+        )));
+    }
+
+    let entitlements = Command::new("/usr/bin/codesign")
+        .args(["--display", "--entitlements", "-"])
+        .arg(bundle)
+        .output()
+        .map_err(|error| {
+            refused(format!(
+                "cannot inspect restricted host entitlements: {error}"
+            ))
+        })?;
+    if !entitlements.status.success() {
+        return Err(refused(format!(
+            "cannot inspect restricted host entitlements: {}",
+            String::from_utf8_lossy(&entitlements.stderr).trim()
+        )));
+    }
+    let entitlement_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&entitlements.stdout),
+        String::from_utf8_lossy(&entitlements.stderr)
+    );
+    let mut sandbox_key = false;
+    let mut sandbox_enabled = false;
+    for line in entitlement_text.lines().map(str::trim) {
+        if let Some(key) = line.strip_prefix("[Key] ") {
+            sandbox_key = key == "com.apple.security.app-sandbox";
+        } else if sandbox_key && line == "[Bool] true" {
+            sandbox_enabled = true;
+        }
+    }
+    if !sandbox_enabled {
+        return Err(refused(
+            "restricted host signature does not carry the App Sandbox entitlement".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A configuration this runtime cannot honor, in the code the boundary already uses.
@@ -246,6 +426,21 @@ mod tests {
             NativeIsolationPolicy::default() == NativeIsolationPolicy::TrustedProcess,
             "the policy a runtime gets when it does not choose is the one that was implicit"
         );
+    }
+
+    #[test]
+    fn deployment_policy_has_one_strict_parser() {
+        assert_eq!(
+            NativeIsolationPolicy::parse("trusted-process").expect("trusted policy"),
+            NativeIsolationPolicy::TrustedProcess
+        );
+        assert_eq!(
+            NativeIsolationPolicy::parse("restricted-macos").expect("restricted policy"),
+            NativeIsolationPolicy::RestrictedMacOS
+        );
+        let error = NativeIsolationPolicy::parse("restricted").expect_err("unknown spelling");
+        assert!(error.contains(NATIVE_ISOLATION_ENV));
+        assert!(error.contains("trusted-process"));
     }
 
     #[test]

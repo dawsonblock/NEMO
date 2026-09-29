@@ -181,6 +181,8 @@ def main() -> int:
         probe, external = build_probe(directory)
         bundle = packager.write_bundle(probe, directory, version="0.0.1")
         packager.sign_bundle(bundle, packager.entitlements_for("restricted"))
+        packager.verify_bundle_signature(bundle)
+        packager.verify_hardened_runtime(bundle)
 
         entitlements = bundle_entitlements(bundle)
         if "com.apple.security.app-sandbox" not in entitlements:

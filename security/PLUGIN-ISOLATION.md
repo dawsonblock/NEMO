@@ -64,7 +64,7 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The loader
   is not linked into the kernel any more, which is why the unsafe count below is a
   twenty-sixth of what it was.
-- **Claims: 35 enforced, 4 asserted and not yet.** Every claim this document makes
+- **Claims: 36 enforced, 3 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that

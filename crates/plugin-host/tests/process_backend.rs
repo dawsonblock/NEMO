@@ -283,6 +283,56 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
     }));
 }
 
+/// The strict signature must reject a plugin signed by a different identity.
+#[tokio::test]
+#[ignore = "requires NEMO_RELAY_STRICT_HOST_EXECUTABLE from a strict signed bundle"]
+async fn a_strict_restricted_bundle_rejects_a_different_plugin_signer() {
+    use nemo_relay::plugin::dynamic::plugin_artifact_identity;
+    use nemo_relay_plugin_protocol::{PluginArtifactIdentity, PluginLoadRequest};
+
+    let _lease = lease_guard().await;
+    let executable = std::env::var_os("NEMO_RELAY_STRICT_HOST_EXECUTABLE")
+        .map(PathBuf::from)
+        .expect("the macOS lane supplies the strict signed bundle executable");
+    assert!(executable.is_file(), "{executable:?}");
+    let fixture = support::PreparedFixture::write(
+        "fixture_intercept",
+        "nemo-ph-strict-restricted",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
+    );
+    let artifact = fixture.artifact();
+    let (manifest_sha256, library_sha256) =
+        plugin_artifact_identity(&artifact).expect("the fixture identity");
+    let mut config = host_config();
+    config.executable = executable;
+    config.isolation =
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::RestrictedMacOS;
+    let backend = ProcessPluginBackend::launch(config)
+        .await
+        .expect("the strict signed bundle starts a confined host");
+
+    let error = backend
+        .load(
+            PluginLoadRequest {
+                plugin_id: "fixture_intercept".into(),
+                artifact,
+                identity: PluginArtifactIdentity {
+                    manifest_sha256,
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect_err("strict library validation must refuse a different signer");
+    assert_eq!(error.failure.code, PluginFailureCode::Rejected, "{error:?}");
+    assert!(
+        error.failure.message.contains("different Team IDs"),
+        "the refusal must come from strict library validation: {error:?}"
+    );
+}
+
 // Single-threaded, deliberately: an off-path callback's answer arrives over the
 // composition's own transport, created on the off-path runtime, so the caller's
 // topology must not decide whether a plugin can answer. This test hung on exactly

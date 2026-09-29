@@ -27,9 +27,14 @@ surface. The split exists because a table inside the crate that implements its h
 side cannot be frozen independently of that code, and a frozen table is what an
 already-built plugin depends on.
 
-Native plugins run in the Relay process and are not sandboxed. They should
-depend on this crate rather than the host `nemo-relay` runtime crate, keeping
-the dynamic-library boundary on the stable C-compatible ABI.
+Relay's CLI and language bindings load native plugins in a separate
+`nemo-plugin-host` process. By default that process is `trusted-process`: crashes
+are isolated, but plugins retain the account's ambient authority. On macOS,
+deployments can select the App Sandbox with
+`NEMO_RELAY_NATIVE_ISOLATION=restricted-macos`; the host must be installed as a
+signed application bundle. Plugins should depend on this crate rather than the
+host `nemo-relay` runtime crate, keeping the dynamic-library boundary on the
+stable C-compatible ABI.
 
 ## Authoring Surface
 

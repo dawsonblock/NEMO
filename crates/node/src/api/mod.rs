@@ -6313,10 +6313,17 @@ pub async fn initialize_with_dynamic_plugins(
             napi::Error::from_reason(format!("invalid dynamic plugin specs: {error}"))
         })?;
     let specs = specs.into_iter().map(Into::into).collect::<Vec<_>>();
+    let isolation =
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment()
+            .map_err(napi::Error::from_reason)?;
     let policy = match plugin_host {
-        Some(path) => IsolationPolicy::for_runtime("nemo-relay-node").with_host(path),
+        Some(path) => IsolationPolicy::for_runtime("nemo-relay-node")
+            .with_native_isolation(isolation)
+            .with_host(path),
         None => match crate::plugin_host_location::beside_this_module() {
-            Some(path) => IsolationPolicy::for_runtime("nemo-relay-node").with_host(path),
+            Some(path) => IsolationPolicy::for_runtime("nemo-relay-node")
+                .with_native_isolation(isolation)
+                .with_host(path),
             None => {
                 return Err(napi::Error::from_reason(
                     "this addon could not find the nemo-plugin-host its package ships, and native \

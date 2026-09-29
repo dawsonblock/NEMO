@@ -246,10 +246,8 @@ fn main() -> ExitCode {
         // stream, so this process forwards them rather than emitting them into a
         // runtime whose subscribers nobody reads. A host started without one
         // emits them locally, which is all a host outside a kernel can do.
-        let forwarding = match (
-            kernel_socket,
-            std::env::var(KERNEL_CREDENTIAL),
-        ) {
+        let forwarding = match (kernel_socket, std::env::var(KERNEL_CREDENTIAL)) {
+            (None, Err(std::env::VarError::NotPresent)) => None,
             (Some(endpoint), Ok(kernel_credential)) if !kernel_credential.is_empty() => {
                 match nemo_relay_plugin_host::runtime_service::connect_to_kernel(
                     &endpoint,
@@ -328,11 +326,25 @@ fn main() -> ExitCode {
                             "failed to reach the kernel at '{}': {error}",
                             endpoint.display()
                         );
-                        None
+                        return ExitCode::from(2);
                     }
                 }
             }
-            _ => None,
+            (Some(endpoint), _) => {
+                eprintln!(
+                    "{KERNEL_SOCKET} is set to '{}' but {KERNEL_CREDENTIAL} is missing or empty",
+                    endpoint.display()
+                );
+                return ExitCode::from(2);
+            }
+            (None, Ok(_)) => {
+                eprintln!("{KERNEL_CREDENTIAL} is set but {KERNEL_SOCKET} is missing");
+                return ExitCode::from(2);
+            }
+            (None, Err(std::env::VarError::NotUnicode(_))) => {
+                eprintln!("{KERNEL_CREDENTIAL} is not valid Unicode");
+                return ExitCode::from(2);
+            }
         };
         // The transport decoder is configured from the same limit the handshake
         // negotiates. A transport default that disagreed with the protocol would

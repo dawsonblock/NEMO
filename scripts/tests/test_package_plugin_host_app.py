@@ -89,9 +89,46 @@ class PackagePluginHostAppTests(unittest.TestCase):
             command = commands[0]
             self.assertEqual(command[0], "codesign")
             self.assertEqual(command[command.index("--sign") + 1], "-")
+            self.assertEqual(command[command.index("--options") + 1], "runtime")
             self.assertEqual(command[command.index("--entitlements") + 1], str(entitlements))
             self.assertEqual(command[command.index("--identifier") + 1], PACKAGE.BUNDLE_IDENTIFIER)
             self.assertEqual(command[-1], str(bundle))
+
+    def test_hardened_runtime_requires_the_signed_code_directory_flag(self) -> None:
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                b"",
+                b"Executable=host\nCodeDirectory v=20500 flags=0x10000(runtime) hashes=1\n",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            PACKAGE.verify_hardened_runtime(Path(temporary) / "host.app", run=run)
+
+    def test_hardened_runtime_rejects_a_signature_without_the_runtime_flag(self) -> None:
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(command, 0, b"", b"CodeDirectory v=20500 flags=0x0 hashes=1\n")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "does not enable Hardened Runtime"):
+                PACKAGE.verify_hardened_runtime(Path(temporary) / "host.app", run=run)
+
+    def test_bundle_signature_verification_is_required(self) -> None:
+        commands: list[list[str]] = []
+
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            commands.append(list(command))
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary) / "host.app"
+            PACKAGE.verify_bundle_signature(bundle, run=run)
+
+        self.assertEqual(
+            commands,
+            [["codesign", "--verify", "--strict", "--deep", str(bundle)]],
+        )
 
     def test_a_failed_signature_is_reported_rather_than_ignored(self) -> None:
         def run(command: list[str]) -> subprocess.CompletedProcess[bytes]:

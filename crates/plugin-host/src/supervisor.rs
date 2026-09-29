@@ -205,6 +205,7 @@ impl PluginHostSupervisor {
             &config.executable,
             &crate::host_location::this_process_directory(),
         )?;
+        config.isolation.verify_host_signature(&executable)?;
         let restricted_ipc =
             config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS;
         let mut socket_dir = create_runtime_dir()?;
@@ -388,13 +389,13 @@ impl PluginHostSupervisor {
                 unavailable(format!("failed to bind the kernel callback socket inside the host container: {error}"))
             })?;
             kernel_listener = Some(listener);
-            if let Some(pipe) = child_pipe.as_mut() {
-                if let Err(error) = pipe.write_all(b"R").await {
-                    let _ = child.kill().await;
-                    return Err(unavailable(format!(
-                        "could not release restricted host startup: {error}"
-                    )));
-                }
+            if let Some(pipe) = child_pipe.as_mut()
+                && let Err(error) = pipe.write_all(b"R").await
+            {
+                let _ = child.kill().await;
+                return Err(unavailable(format!(
+                    "could not release restricted host startup: {error}"
+                )));
             }
             tokio::spawn(async move {
                 let mut stream = reader.into_inner();
@@ -748,7 +749,7 @@ impl ProcessPluginBackend {
                 "plugin library is {length} bytes, over the transfer limit of {MAX_PLUGIN_ARTIFACT_BYTES}"
             )));
         }
-        let mut library = std::fs::File::open(&library_path)
+        let library = std::fs::File::open(&library_path)
             .map_err(|error| rejected(format!("cannot open approved plugin library: {error}")))?;
         let artifact_id = Uuid::now_v7().to_string();
         let session_id = self.supervisor.session.session_id.clone();
@@ -773,39 +774,13 @@ impl ProcessPluginBackend {
                 "the negotiated frame limit is too small to transfer an approved artifact",
             ));
         }
-        let stream_artifact_id = artifact_id.clone();
-        let mut offset = 0_u64;
-        let mut source_done = false;
-        let chunks = std::iter::from_fn(move || {
-            if source_done {
-                return None;
-            }
-            let mut bytes = vec![0_u8; chunk_size];
-            match library.read(&mut bytes) {
-                Ok(0) => {
-                    source_done = true;
-                    None
-                }
-                Ok(count) => {
-                    bytes.truncate(count);
-                    let frame = v1::ArtifactTransferFrame {
-                        frame: Some(v1::artifact_transfer_frame::Frame::Chunk(
-                            v1::ArtifactTransferChunk {
-                                artifact_id: stream_artifact_id.clone(),
-                                offset,
-                                bytes,
-                            },
-                        )),
-                    };
-                    offset += count as u64;
-                    Some(frame)
-                }
-                Err(_) => {
-                    source_done = true;
-                    None
-                }
-            }
-        });
+        let source_error = Arc::new(std::sync::Mutex::new(None));
+        let chunks = artifact_chunk_frames(
+            library,
+            artifact_id.clone(),
+            chunk_size,
+            Arc::clone(&source_error),
+        );
         let finalize = v1::ArtifactTransferFrame {
             frame: Some(v1::artifact_transfer_frame::Frame::Finalize(
                 v1::ArtifactTransferFinalize {
@@ -824,8 +799,15 @@ impl ProcessPluginBackend {
             .request(budget, async move {
                 client.transfer_artifact(request_stream).await
             })
-            .await?
-            .into_inner();
+            .await;
+        if let Some(error) = source_error
+            .lock()
+            .expect("artifact stream error mutex is not poisoned")
+            .take()
+        {
+            return Err(rejected(error));
+        }
+        let outcome = outcome?.into_inner();
         match outcome.result {
             Some(v1::artifact_transfer_outcome::Result::Approved(approved))
                 if approved.artifact_id == artifact_id
@@ -1311,6 +1293,53 @@ fn rejected(message: impl Into<String>) -> PluginProtocolError {
     PluginProtocolError::new(PluginFailureCode::Rejected, message)
 }
 
+/// Stream the approved library in bounded frames, preserving local read errors
+/// as transport errors instead of disguising them as end-of-file.
+fn artifact_chunk_frames<R: Read>(
+    mut library: R,
+    artifact_id: String,
+    chunk_size: usize,
+    source_error: Arc<std::sync::Mutex<Option<String>>>,
+) -> impl Iterator<Item = v1::ArtifactTransferFrame> {
+    let mut offset = 0_u64;
+    let mut source_done = false;
+    std::iter::from_fn(move || {
+        if source_done {
+            return None;
+        }
+        let mut bytes = vec![0_u8; chunk_size];
+        match library.read(&mut bytes) {
+            Ok(0) => {
+                source_done = true;
+                None
+            }
+            Ok(count) => {
+                bytes.truncate(count);
+                let frame = v1::ArtifactTransferFrame {
+                    frame: Some(v1::artifact_transfer_frame::Frame::Chunk(
+                        v1::ArtifactTransferChunk {
+                            artifact_id: artifact_id.clone(),
+                            offset,
+                            bytes,
+                        },
+                    )),
+                };
+                offset += count as u64;
+                Some(frame)
+            }
+            Err(error) => {
+                source_done = true;
+                *source_error
+                    .lock()
+                    .expect("artifact stream error mutex is not poisoned") = Some(format!(
+                    "failed reading approved plugin artifact at byte {offset}: {error}"
+                ));
+                None
+            }
+        }
+    })
+}
+
 /// Read the manifest and resolve its library after confirming the kernel's
 /// approval still describes the source artifact. The receiver independently
 /// hashes both streams before making either file loadable.
@@ -1571,6 +1600,49 @@ async fn handshake(
 mod tests {
     use super::*;
     use crate::host_location::executable_name;
+
+    #[test]
+    fn artifact_stream_preserves_source_read_errors() {
+        struct FailsAfterPrefix {
+            prefix: &'static [u8],
+            sent: bool,
+        }
+
+        impl Read for FailsAfterPrefix {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    buffer[..self.prefix.len()].copy_from_slice(self.prefix);
+                    return Ok(self.prefix.len());
+                }
+                Err(std::io::Error::other("injected EIO"))
+            }
+        }
+
+        let source_error = Arc::new(std::sync::Mutex::new(None));
+        let mut frames = artifact_chunk_frames(
+            FailsAfterPrefix {
+                prefix: b"part",
+                sent: false,
+            },
+            "artifact-1".into(),
+            8,
+            Arc::clone(&source_error),
+        );
+        assert!(frames.next().is_some());
+        assert!(frames.next().is_none(), "the failed stream terminates");
+        let error = source_error
+            .lock()
+            .expect("test mutex is not poisoned")
+            .take()
+            .expect("the source read failure is recorded");
+        assert!(error.contains("failed reading approved plugin artifact"));
+        assert!(error.contains("injected EIO"));
+        assert!(
+            frames.next().is_none(),
+            "the failed stream remains terminated"
+        );
+    }
 
     #[tokio::test]
     async fn a_missing_host_is_reported_with_the_places_it_was_looked_for() {
