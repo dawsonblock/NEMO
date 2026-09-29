@@ -7120,7 +7120,7 @@ fn a_staged_copy_lives_in_a_directory_only_its_load_can_reach() {
             & 0o777;
         assert_eq!(
             mode, 0o700,
-            "only this process may reach the staged copy: {parent:?} is {mode:o}"
+            "the staged copy's directory denies other users: {parent:?} is {mode:o}"
         );
         drop(guard);
         let _ = std::fs::remove_dir_all(&directory);

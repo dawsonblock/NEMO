@@ -1826,6 +1826,14 @@ tcb-baseline:
 test-tcb-scripts:
     uv run --locked python -m pytest scripts/tcb -q
 
+# Run the packaging scripts' tests: the wheel, npm and macOS bundle layouts.
+test-packaging-scripts:
+    uv run --locked python -m pytest scripts/tests -q
+
+# Prove a bundled plugin host is confined to its own container (macOS only).
+verify-macos-sandbox host_binary:
+    uv run --no-project python scripts/qualification/macos_sandbox_probe.py --host-binary "{{ host_binary }}"
+
 # Check that every claim the qualification matrix makes names what enforces it.
 qualification-matrix:
     python3 scripts/qualification/matrix.py

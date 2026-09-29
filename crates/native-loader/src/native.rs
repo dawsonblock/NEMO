@@ -544,11 +544,18 @@ fn drop_native_plugin_descriptor(plugin: &mut NemoRelayNativePluginV1) {
     }
 }
 
-/// A verified copy of a plugin artifact, in a directory only this process can write.
+/// A verified copy of a plugin artifact, in a directory private to this account.
 ///
 /// The copy is what gets loaded. A pathname can be repointed between the hash and
 /// the `dlopen` that follows it, so the loader never executes the source path: it
-/// executes a file this process wrote, in a directory nothing else can write to.
+/// executes a file this process wrote, in a directory whose mode denies other users
+/// and whose name could not be chosen in advance.
+///
+/// Private to the *account*, not to the process: `0700` denies other users, and a
+/// process running under the same account has the same filesystem identity. The
+/// threat model this satisfies is a plugin that is trusted but possibly buggy — a
+/// hostile process under this account would need the mechanism
+/// `stage_verified_library` documents, such as loading through a retained descriptor.
 pub(crate) struct StagedArtifact {
     dir: PathBuf,
 }
@@ -820,10 +827,10 @@ fn load_one_native_plugin(
     // handle, immediately before the loader is given the path: the digest and
     // the file it describes are then the same instance rather than two lookups.
     // An approved load never executes the source path: the verified bytes are
-    // copied into a directory only this process can write, re-hashed there, and
-    // the copy is what the loader opens. A load with nothing approved keeps the
-    // old in-place behaviour and its post-load re-check, because there is no
-    // identity to bind it to.
+    // copied into a directory private to this account, re-hashed there, and the
+    // copy is what the loader opens. A load with nothing approved keeps the old
+    // in-place behaviour and its post-load re-check, because there is no identity to
+    // bind it to.
     let (library_path, staging) = match spec.approval() {
         Some(approved) => {
             let (staged, guard) =
@@ -847,8 +854,8 @@ fn load_one_native_plugin(
         ))
     })?;
     // A staged load needs no second look: the file it opened is one this process
-    // wrote and nothing else can rewrite. A load with no approved identity still
-    // re-checks the path, which is the weaker guarantee it can offer.
+    // wrote, in a directory no other user can write. A load with no approved
+    // identity still re-checks the path, which is the weaker guarantee it can offer.
     if staging.is_none()
         && let Some(verified) = &verified_library_sha256
     {

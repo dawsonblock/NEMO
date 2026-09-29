@@ -547,6 +547,28 @@ const MANIFEST: &[Entry] = &[
         &["a_grant_of_output_capacity_is_refused_when_it_grants_nothing"],
         "",
     ),
+    entry_with_reasons(
+        "ArtifactTransferFrame",
+        "both",
+        false,
+        &[],
+        "the streaming RPC validates protobuf frames directly in the staging state machine",
+        &["ArtifactTransferFrame"],
+        "",
+        &[],
+        "field, offset, size, digest and interruption failures are covered by staging tests",
+    ),
+    entry_with_reasons(
+        "ArtifactTransferOutcome",
+        "both",
+        false,
+        &[],
+        "the streaming RPC constructs and consumes this protobuf result directly",
+        &["ArtifactTransferOutcome"],
+        "",
+        &[],
+        "the result is covered by the authenticated transfer integration test",
+    ),
 ];
 
 fn manifest_path(relative: &str) -> PathBuf {

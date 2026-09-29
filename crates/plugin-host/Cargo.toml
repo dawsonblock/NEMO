@@ -25,6 +25,7 @@ subtle = "2"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = [
     "io-util",
+    "io-std",
     "macros",
     "net",
     "process",

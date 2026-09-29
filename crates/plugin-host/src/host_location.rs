@@ -32,6 +32,14 @@ use std::path::{Path, PathBuf};
 /// install it beside the process that starts it.
 pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
 
+/// The bundle a confined host is installed as.
+///
+/// A bare executable and a bundle are the same program; what differs is the
+/// signature around it. macOS applies App Sandbox through the entitlements a
+/// signed bundle carries, so a host that has to be confined has to be installed
+/// as one — see [`crate::isolation_policy::NativeIsolationPolicy`].
+pub const BUNDLE_NAME: &str = "nemo-plugin-host.app";
+
 /// The identity a runtime's plugin sessions are bound to.
 ///
 /// Bound to the implementation that asked and to the process it asked from, so a
@@ -61,6 +69,59 @@ pub(crate) fn resolve_executable() -> PathBuf {
         std::env::var_os(EXECUTABLE_ENV),
         &directory_holding_this_process(),
     )
+}
+
+/// Where the host lives inside the bundle that carries it.
+///
+/// The layout is Apple's rather than this project's: an application bundle puts
+/// its executable at `Contents/MacOS/<name>`, and the signing that carries the
+/// sandbox covers the bundle rather than the file.
+pub(crate) fn bundle_executable(bundle: &Path) -> PathBuf {
+    bundle
+        .join("Contents")
+        .join("MacOS")
+        .join(executable_name())
+}
+
+/// The bundled host installed beside this process, when there is one.
+///
+/// The same two places a bare host is looked for, because a deployment that
+/// installs the host beside the runtime installs the bundle there too: a test
+/// harness runs from `deps/` while what it exercises is one directory above.
+pub(crate) fn bundled_beside(beside: &Path) -> Option<PathBuf> {
+    for directory in beside_directories(beside) {
+        let bundle = directory.join(BUNDLE_NAME);
+        let executable = bundle_executable(&bundle);
+        if executable.is_file() {
+            return Some(executable);
+        }
+    }
+    None
+}
+
+/// Whether `path` is the executable inside an application bundle.
+///
+/// Structural rather than a comparison against one known location: a deployment
+/// may install a bundle anywhere, and what has to be refused is a *bare*
+/// executable being treated as a confined one. `.../X.app/Contents/MacOS/X` is
+/// the layout whose signature macOS applies entitlements from.
+pub(crate) fn is_bundled_executable(path: &Path) -> bool {
+    let Some(macos) = path.parent() else {
+        return false;
+    };
+    if macos.file_name().is_none_or(|name| name != "MacOS") {
+        return false;
+    }
+    let Some(contents) = macos.parent() else {
+        return false;
+    };
+    if contents.file_name().is_none_or(|name| name != "Contents") {
+        return false;
+    }
+    contents
+        .parent()
+        .and_then(Path::extension)
+        .is_some_and(|extension| extension == "app")
 }
 
 /// The same decision, with the two things it reads passed in.
@@ -95,13 +156,46 @@ fn directory_holding_this_process() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// The same directory, for the one caller that has to hand it to a policy.
+///
+/// The supervisor decides *which* executable to start, and under a confinement
+/// policy that decision needs the place a host is installed: the module that owns
+/// the rule answers it rather than the supervisor guessing.
+pub(crate) fn this_process_directory() -> PathBuf {
+    directory_holding_this_process()
+}
+
 /// The places a host is looked for once nothing has named one.
 fn beside_this_process(beside: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![beside.join(executable_name())];
-    if let Some(above) = beside.parent() {
-        candidates.push(above.join(executable_name()));
-    }
+    candidates.extend(
+        beside_directories(beside)
+            .into_iter()
+            .skip(1)
+            .map(|directory| directory.join(executable_name())),
+    );
     candidates
+}
+
+/// The directories a host is looked for in: this process's own, then its parent.
+fn beside_directories(beside: &Path) -> Vec<PathBuf> {
+    let mut directories = vec![beside.to_path_buf()];
+    if let Some(above) = beside.parent() {
+        directories.push(above.to_path_buf());
+    }
+    directories
+}
+
+/// Where a bundled host would have been found, in the order it was looked for.
+///
+/// The confinement travels with the bundle, so a deployment that selected a
+/// restricted policy and installed none is told which bundles were expected —
+/// the same reason [`host_search_locations`] exists for the bare host.
+pub(crate) fn bundle_search_locations(beside: &Path) -> Vec<PathBuf> {
+    beside_directories(beside)
+        .into_iter()
+        .map(|directory| bundle_executable(&directory.join(BUNDLE_NAME)))
+        .collect()
 }
 
 /// Where a host would have been found, in the order it was looked for.
@@ -115,6 +209,10 @@ pub(crate) fn host_search_locations() -> Vec<PathBuf> {
         locations.push(PathBuf::from(configured));
     }
     locations.extend(beside_this_process(&directory_holding_this_process()));
+    // And the confined spelling of the same installation: a deployment that
+    // selected the restricted policy and received no bundle is told which bundle
+    // was expected, not only that a file was missing.
+    locations.extend(bundle_search_locations(&directory_holding_this_process()));
     locations
 }
 

@@ -77,16 +77,26 @@ UNSAFE = re.compile(r"\bunsafe\b")
 #: can resolve, and the budgets are upper bounds rather than per-artifact counts.
 BUDGET_TARGET = "all"
 
-#: The target the closure checks are resolved for: the platform CI enforces on.
+#: The targets a closure check is resolved for when the policy names none.
 #:
 #: Not the union, because the closure asks a different question — what the kernel's
 #: own process can reach — and the answer for a composed platform is not the union of
-#: the answers for each one. The union is how `napi-sys`'s Windows-only `libloading`
-#: becomes visible under the Node root, which is a fact about that platform's binding
-#: rather than about the composition this milestone closes. Naming the enforced
-#: platform keeps the property checkable rather than host-dependent, and the reach the
-#: union would show is recorded in the milestone document instead of being lost here.
-CLOSURE_TARGET = "x86_64-unknown-linux-gnu"
+#: the answers for each one: under `--target all` the Node binding's `napi-sys` pulls
+#: `libloading` on Windows, which is a fact about that platform's binding rather than
+#: about the composition this milestone closes.
+#:
+#: The list is the platforms the plugin-hosting packages are built for, so one
+#: target's graph cannot stand in for the others: a dependency edge that resolves
+#: only on macOS or only for musl would otherwise escape a check that named one
+#: platform. The host platform is not among the questions for the same reason it is
+#: not among the answers — a gate whose result depends on who ran it is not a gate.
+DEFAULT_CLOSURE_TARGETS = (
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+)
 
 # Budget keys mapped to the measurement they cap.
 LIMIT_FIELDS = {
@@ -191,6 +201,7 @@ def kernel_closure_names(
     repo_root: pathlib.Path,
     roots: list[str],
     edges: str = "normal,build",
+    target: str = DEFAULT_CLOSURE_TARGETS[0],
 ) -> set[str]:
     """Return every package name the kernel's own process can reach.
 
@@ -206,8 +217,9 @@ def kernel_closure_names(
     Callers that want to know about the test tree as well pass `edges="all"` and
     report the difference rather than hiding it.
 
-    The closure is resolved for ``CLOSURE_TARGET`` rather than for the host, so the
-    answer does not depend on the machine that asked for it.
+    The closure is resolved for a named ``target`` rather than for the host, so the
+    answer does not depend on the machine that asked for it, and the caller decides
+    which platform it is asking about.
     """
     completed = subprocess.run(
         [
@@ -217,7 +229,7 @@ def kernel_closure_names(
             "--all-features",
             "--locked",
             "--target",
-            CLOSURE_TARGET,
+            target,
             "--edges",
             edges,
             "--prefix",
@@ -249,26 +261,57 @@ def kernel_closure_reachability(policy: dict, reachable: set[str]) -> set[str]:
     return forbidden.intersection(reachable)
 
 
-def find_closure_problems(policy: dict, reachable: set[str]) -> list[str]:
-    """Return a forbidden package the kernel's closure gained.
+def closure_targets(policy: dict) -> list[str]:
+    """Return every target a closure check has to be resolved for.
+
+    The enforced targets, then whatever a platform-external record names: an
+    exemption that is never measured is a comment, and this gate's whole argument is
+    that a recorded fact is checked rather than remembered.
+    """
+    targets: list[str] = []
+    for section in ("kernel_closure", "kernel_library_closure"):
+        for target in (policy.get(section) or {}).get("targets", DEFAULT_CLOSURE_TARGETS):
+            if target not in targets:
+                targets.append(target)
+    for record in platform_external_records(policy):
+        target = record.get("target")
+        if isinstance(target, str) and target and target not in targets:
+            targets.append(target)
+    return targets
+
+
+def platform_external_records(policy: dict) -> list[dict]:
+    """Return the recorded platform loaders, as the policy writes them."""
+    records = (policy.get("kernel_closure") or {}).get("platform_external", [])
+    return [record for record in records if isinstance(record, dict)]
+
+
+def find_closure_problems(policy: dict, reachable_by_target: dict[str, set[str]]) -> list[str]:
+    """Return a forbidden package a composition's closure gained, per target.
 
     A package on the recorded list is the known remaining work; one that is not is
-    a dependency edge somebody added, which is the failure this check exists for.
+    a dependency edge somebody added, which is the failure this check exists for. Each
+    target is reported by name, because the answer is per platform: a reach that only
+    one platform's graph has is still a reach, and a message that named no platform
+    would leave the reader to guess which build to look at.
     """
     closure = policy.get("kernel_closure")
     if not closure:
         return []
     recorded = set(closure.get("reachable_now", []))
-    reached = kernel_closure_reachability(policy, reachable)
-    return [
-        f"the kernel's closure reaches '{name}', which is not one of the loader "
-        f"packages the policy records as still reachable"
-        for name in sorted(reached - recorded)
-    ]
+    found = []
+    for target, reachable in sorted(reachable_by_target.items()):
+        reached = kernel_closure_reachability(policy, reachable)
+        found.extend(
+            f"the kernel's closure reaches '{name}' on {target}, which is not one of "
+            f"the loader packages the policy records as still reachable"
+            for name in sorted(reached - recorded)
+        )
+    return found
 
 
-def find_library_closure_problems(policy: dict, reachable: set[str]) -> list[str]:
-    """Return a loader package the kernel *library* can still reach.
+def find_library_closure_problems(policy: dict, reachable_by_target: dict[str, set[str]]) -> list[str]:
+    """Return a loader package the kernel *library* can still reach, per target.
 
     This is the milestone's property rather than its progress: the kernel library
     reaching a package that loads native code means the boundary is architectural
@@ -280,11 +323,72 @@ def find_library_closure_problems(policy: dict, reachable: set[str]) -> list[str
     library = policy.get("kernel_library_closure")
     if not library:
         return []
-    reached = kernel_closure_reachability({"kernel_closure": library}, reachable)
-    return [
-        f"the kernel library reaches '{name}', which loads native code; the kernel must not link the loader at all"
-        for name in sorted(reached)
-    ]
+    found = []
+    for target, reachable in sorted(reachable_by_target.items()):
+        reached = kernel_closure_reachability({"kernel_closure": library}, reachable)
+        found.extend(
+            f"the kernel library reaches '{name}' on {target}, which loads native code; "
+            f"the kernel must not link the loader at all"
+            for name in sorted(reached)
+        )
+    return found
+
+
+def find_platform_external_problems(policy: dict, reachable_by_target: dict[str, set[str]]) -> list[str]:
+    """Return every recorded platform loader whose record no longer holds.
+
+    `libloading` is two things, and which one it is depends on who reached it. It is
+    this milestone's native loader when the kernel or a shipping composition reaches
+    it, and it is a platform binding's own dynamic loader when the runtime the
+    binding wraps pulls one in — the Windows N-API machinery does, which is why the
+    union of every platform cannot be the set the composition property is stated
+    over. The first is forbidden on every enforced target. The second is recorded
+    here with the target it happens on, so the exemption is a named fact rather than
+    an omission somebody has to notice.
+
+    Both directions are checked. A record the tree no longer needs is refused, for
+    the same reason a temporary ceiling is: an exemption nobody re-earns is one that
+    hides the next reach. And the exemption covers only the packages it names, so a
+    platform's own loader cannot become cover for this repository's.
+    """
+    closure = policy.get("kernel_closure") or {}
+    enforced = set(closure.get("targets", DEFAULT_CLOSURE_TARGETS))
+    found: list[str] = []
+    for record in platform_external_records(policy):
+        target = record.get("target")
+        packages = record.get("packages")
+        if not isinstance(target, str) or not isinstance(packages, list) or not packages:
+            found.append("a platform-external record names no target, or no packages to exempt")
+            continue
+        if not str(record.get("reason", "")).strip():
+            found.append(
+                f"the platform exemption for '{target}' gives no reason: an exemption "
+                f"without one is an omission the next reader has to reverse-engineer"
+            )
+        if target in enforced:
+            found.append(
+                f"'{target}' is both enforced and recorded as a platform exemption: the "
+                f"closure either holds there or it does not, and no target may be both"
+            )
+            continue
+        reachable = reachable_by_target.get(target)
+        if reachable is None:
+            found.append(f"the platform exemption for '{target}' was never measured")
+            continue
+        for package in packages:
+            if package not in reachable:
+                found.append(
+                    f"the platform exemption for '{package}' on '{target}' is stale: that "
+                    f"resolve no longer reaches it, so the record permits a reach that is "
+                    f"not there rather than describing one that is"
+                )
+        uncovered = set(closure.get("forbidden", [])) - set(packages)
+        for name in sorted(uncovered.intersection(reachable)):
+            found.append(
+                f"the kernel's closure reaches '{name}' on '{target}', which the platform "
+                f"exemption for {', '.join(sorted(packages))} does not cover"
+            )
+    return found
 
 
 def dependency_digest(names: set[str]) -> str:
@@ -502,9 +606,9 @@ def render_surface(
     metadata: dict,
     identities: dict[str, list[str]],
     policy: dict,
-    reachable: set[str] | None = None,
+    reachable: dict[str, set[str]] | None = None,
     test_only: set[str] | None = None,
-    library_reached: set[str] | None = None,
+    library_reached: dict[str, set[str]] | None = None,
 ) -> str:
     """Render the two-tier surface: invariant enforcers, then everything in-process."""
     rows = [
@@ -537,20 +641,32 @@ def render_surface(
     # which is why it is the one the split is judged on.
     closure = policy.get("kernel_closure")
     if closure and reachable is not None:
-        reached = sorted(kernel_closure_reachability(policy, reachable))
-        rendered = ", ".join(reached) if reached else "nothing"
-        rows.append(f"  kernel closure reaches (target: nothing): {rendered}")
+        # One line per target: the property is per platform, and a single line would
+        # have to say which platform it was about and why the others were not asked.
+        for target, names in sorted(reachable.items()):
+            reached = sorted(kernel_closure_reachability(policy, names))
+            rendered = ", ".join(reached) if reached else "nothing"
+            rows.append(f"  kernel closure reaches ({target}): {rendered}")
         # What only the test tree reaches is a different fact, and it is reported
         # rather than folded in or left out: the artifact does not link it, and a
         # reader deciding whether the target is reachable should see both numbers.
         if test_only:
             extra = ", ".join(sorted(test_only))
             rows.append(f"  and the test tree alone reaches: {extra}")
+        # The platform that is recorded rather than enforced says so here as well as
+        # in the policy: a reader comparing the rows should see why there is one
+        # fewer than the platforms the packages are built for.
+        recorded = [
+            record["target"] for record in platform_external_records(policy) if isinstance(record.get("target"), str)
+        ]
+        if recorded:
+            rows.append(f"  platform-external loader reach recorded, not enforced, on: {', '.join(recorded)}")
     library = policy.get("kernel_library_closure")
     if library and library_reached is not None:
-        reached = sorted(kernel_closure_reachability({"kernel_closure": library}, library_reached))
-        rendered = ", ".join(reached) if reached else "nothing"
-        rows.append(f"  kernel library reaches (property, not a target): {rendered}")
+        for target, names in sorted(library_reached.items()):
+            reached = sorted(kernel_closure_reachability({"kernel_closure": library}, names))
+            rendered = ", ".join(reached) if reached else "nothing"
+            rows.append(f"  kernel library reaches ({target}): {rendered}")
     return "\n".join(rows)
 
 
@@ -639,20 +755,37 @@ def main(argv: list[str] | None = None) -> int:
     reports, problems = find_violations(metadata, identities, policy)
     problems.extend(find_temporary_problems(policy, reports))
     kernel_closure = policy.get("kernel_closure")
-    reachable: set[str] | None = None
+    reachable: dict[str, set[str]] | None = None
     test_only: set[str] = set()
     if kernel_closure:
-        reachable = kernel_closure_names(arguments.repo_root, kernel_closure["roots"])
-        problems.extend(find_closure_problems(policy, reachable))
+        # Every target the check is about, including the ones an exemption names: an
+        # exemption that is not measured is a sentence, and this gate's argument is
+        # that a record is checked.
+        reachable = {
+            target: kernel_closure_names(arguments.repo_root, kernel_closure["roots"], target=target)
+            for target in closure_targets(policy)
+        }
+        enforced = {target: reachable[target] for target in kernel_closure.get("targets", DEFAULT_CLOSURE_TARGETS)}
+        problems.extend(find_closure_problems(policy, enforced))
+        problems.extend(find_platform_external_problems(policy, reachable))
         # Dev-dependencies reach the same packages the artifact does today, but they
         # are a separate fact: the loader can leave the kernel's build graph while a
         # test still names it, and that is worth being able to see.
-        everything = kernel_closure_names(arguments.repo_root, kernel_closure["roots"], edges="all")
-        test_only = kernel_closure_reachability(policy, everything) - kernel_closure_reachability(policy, reachable)
+        #
+        # One target is enough for this comparison: it is about which edge kind
+        # resolves a package, not about which platform resolves it.
+        first = next(iter(enforced))
+        everything = kernel_closure_names(arguments.repo_root, kernel_closure["roots"], edges="all", target=first)
+        test_only = kernel_closure_reachability(policy, everything) - kernel_closure_reachability(
+            policy, reachable[first]
+        )
     library_closure = policy.get("kernel_library_closure")
-    library_reachable: set[str] | None = None
+    library_reachable: dict[str, set[str]] | None = None
     if library_closure:
-        library_reachable = kernel_closure_names(arguments.repo_root, library_closure["roots"])
+        library_reachable = {
+            target: kernel_closure_names(arguments.repo_root, library_closure["roots"], target=target)
+            for target in library_closure.get("targets", DEFAULT_CLOSURE_TARGETS)
+        }
         problems.extend(find_library_closure_problems(policy, library_reachable))
 
     print(render(reports))

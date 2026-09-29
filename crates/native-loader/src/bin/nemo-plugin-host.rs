@@ -33,6 +33,8 @@ const CREDENTIAL: &str = "NEMO_RELAY_PLUGIN_HOST_CREDENTIAL";
 const BINDING: &str = "NEMO_RELAY_PLUGIN_HOST_BINDING";
 /// Protocol version the supervisor speaks.
 const PROTOCOL: &str = "NEMO_RELAY_PLUGIN_HOST_PROTOCOL";
+/// Isolation policy selected by the supervisor.
+const ISOLATION: &str = "NEMO_RELAY_PLUGIN_HOST_ISOLATION";
 /// Socket the kernel serves for this host's own calls.
 const KERNEL_SOCKET: &str = "NEMO_RELAY_KERNEL_SOCKET";
 /// Credential the kernel gave this host for those calls.
@@ -55,13 +57,91 @@ const MARK_QUEUE_CAPACITY: &str = "NEMO_RELAY_PLUGIN_HOST_MARK_QUEUE";
 /// Pending marks a host holds when nothing said otherwise.
 const DEFAULT_MARK_QUEUE_CAPACITY: usize = 1024;
 
+const RESTRICTED_IPC_PREFIX: &str = "NEMO_RELAY_RESTRICTED_IPC";
+
+#[cfg(unix)]
+fn restricted_ipc_paths() -> Result<(PathBuf, PathBuf), String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "the sandbox did not provide its container HOME".to_string())?;
+    let directory = home.join(".nr").join(
+        &nemo_relay_plugin_protocol::Uuid::now_v7()
+            .simple()
+            .to_string()[..8],
+    );
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .recursive(true)
+        .create(&directory)
+        .map_err(|error| format!("could not create the container IPC directory: {error}"))?;
+    let host = directory.join("h");
+    let kernel = directory.join("k");
+    // macOS sockaddr_un has a short path field. Check before bind/connect so a
+    // long account or container path fails with a useful startup error.
+    if host.as_os_str().as_bytes().len() >= 104 || kernel.as_os_str().as_bytes().len() >= 104 {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err("the sandbox container path is too long for Unix-domain sockets".into());
+    }
+    Ok((host, kernel))
+}
+
 fn main() -> ExitCode {
-    let socket = match std::env::var_os(SOCKET) {
-        Some(socket) => PathBuf::from(socket),
-        None => {
-            eprintln!("{SOCKET} is not set: this process serves one supervisor's socket");
+    let restricted = match std::env::var(ISOLATION).as_deref() {
+        Ok("trusted-process") | Err(_) => false,
+        Ok("restricted-macos") => true,
+        Ok(other) => {
+            eprintln!("{ISOLATION} has unsupported value '{other}'");
             return ExitCode::from(2);
         }
+    };
+    let (socket, kernel_socket) = if restricted {
+        #[cfg(unix)]
+        {
+            match restricted_ipc_paths() {
+                Ok((host, kernel)) => {
+                    println!(
+                        "{RESTRICTED_IPC_PREFIX}\t{}\t{}",
+                        host.display(),
+                        kernel.display()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    // The parent binds the kernel callback socket at the path
+                    // above, then releases startup with this byte. It keeps the
+                    // pipe open for the life of the session and closes it when
+                    // the session ends.
+                    use std::io::Read;
+                    let mut ready = [0u8; 1];
+                    if let Err(error) = std::io::stdin().read_exact(&mut ready) {
+                        eprintln!("the parent did not provision the sandbox IPC endpoint: {error}");
+                        return ExitCode::from(1);
+                    }
+                    if ready[0] != b'R' {
+                        eprintln!("the parent sent an invalid sandbox IPC readiness byte");
+                        return ExitCode::from(1);
+                    }
+                    (host, Some(kernel))
+                }
+                Err(error) => {
+                    eprintln!("could not prepare restricted IPC: {error}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("restricted-macos requires Unix-domain sockets");
+            return ExitCode::from(2);
+        }
+    } else {
+        let Some(socket) = std::env::var_os(SOCKET).map(PathBuf::from) else {
+            eprintln!("{SOCKET} is not set: this process serves one supervisor's socket");
+            return ExitCode::from(2);
+        };
+        (socket, std::env::var_os(KERNEL_SOCKET).map(PathBuf::from))
     };
     let credential = std::env::var(CREDENTIAL).unwrap_or_default();
     if credential.is_empty() {
@@ -102,6 +182,7 @@ fn main() -> ExitCode {
         session_credential: credential,
         maximum_frame_bytes,
     };
+    let require_staged_artifacts = restricted;
     // A capacity of zero is refused rather than treated as a default: it would
     // mean "accept no mark at all", which is not a bound anybody meant.
     let mark_queue_capacity = match std::env::var(MARK_QUEUE_CAPACITY) {
@@ -140,8 +221,8 @@ fn main() -> ExitCode {
     std::thread::spawn(|| {
         use std::io::Read;
         let mut stdin = std::io::stdin();
-        let mut byte = [0u8; 1];
-        let _ = stdin.read(&mut byte);
+        let mut drained = Vec::new();
+        let _ = stdin.read_to_end(&mut drained);
         std::process::exit(0);
     });
     runtime.block_on(async move {
@@ -162,7 +243,7 @@ fn main() -> ExitCode {
         // runtime whose subscribers nobody reads. A host started without one
         // emits them locally, which is all a host outside a kernel can do.
         let forwarding = match (
-            std::env::var_os(KERNEL_SOCKET).map(PathBuf::from),
+            kernel_socket,
             std::env::var(KERNEL_CREDENTIAL),
         ) {
             (Some(endpoint), Ok(kernel_credential)) if !kernel_credential.is_empty() => {
@@ -254,6 +335,11 @@ fn main() -> ExitCode {
         // make the negotiated frame size declarative rather than enforced.
         let frame_limit = config.maximum_frame_bytes as usize;
         let service = PluginHostService::new(backend, config);
+        let service = if require_staged_artifacts {
+            service.require_staged_artifacts()
+        } else {
+            service
+        };
         let service = match forwarding {
             Some((sender, callbacks)) => service
                 .with_mark_forwarding(sender)

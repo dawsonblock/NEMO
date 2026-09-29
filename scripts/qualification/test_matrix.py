@@ -337,3 +337,124 @@ def test_an_unknown_evidence_kind_is_reported(tmp_path: pathlib.Path) -> None:
     problems = check(root)
     assert len(problems) == 1
     assert "not an evidence kind this gate reads" in problems[0]
+
+
+def isolation_filters() -> str:
+    """Return a filter file that carries the whole plugin isolation boundary."""
+    entries = [f"  - '{prefix}**'" for prefix in matrix.ISOLATION_PREFIXES]
+    entries += [f"  - '{name}'" for name in matrix.ISOLATION_FILES]
+    return f"{matrix.ISOLATION_FILTER}:\n" + "\n".join(entries) + "\n"
+
+
+def isolation_changes(uncomposed: str = "") -> str:
+    """Return a changes file whose lanes react to the boundary, minus one if asked."""
+    lines = []
+    for lane in matrix.ISOLATION_LANES:
+        if lane == uncomposed:
+            lines.append(f"      {lane}: ${{{{ inputs.full_ci }}}}")
+        else:
+            lines.append(
+                f"      {lane}: ${{{{ inputs.full_ci || steps.filter.outputs.{matrix.ISOLATION_FILTER} == 'true' }}}}"
+            )
+    return "jobs:\n  changes:\n    outputs:\n" + "\n".join(lines) + "\n"
+
+
+def filter_tree(tmp_path: pathlib.Path, filters: str, changes: str) -> pathlib.Path:
+    """Build a tree holding one path-filter file and one composition of its outputs."""
+    return tree(
+        tmp_path,
+        {
+            str(matrix.FILTER_FILE): filters,
+            str(matrix.CHANGES_FILE): changes,
+            str(matrix.CALLER_FILE): "".join(
+                f"      run_package: ${{{{ needs.ci_changes.outputs.{lane} == 'true' }}}}\n"
+                for lane in matrix.ISOLATION_LANES
+            ),
+        },
+        "",
+    )
+
+
+def test_a_boundary_change_reruns_every_lane_that_carries_an_artifact() -> None:
+    """The repository's own filters react to a change to the boundary."""
+    # The claim is about inevitability rather than existence: the loader and the host
+    # have source tests either way, and the installed Python and Node lanes are what a
+    # source-only run leaves unexercised. A path that can change the boundary and a
+    # lane that packages it may not be more than one edit apart.
+    assert matrix.filter_problems(matrix.ROOT) == []
+
+
+def test_a_filter_group_that_misses_a_crate_is_reported(tmp_path: pathlib.Path) -> None:
+    """A boundary crate no lane watches is the hole this rule exists to close."""
+    filters = isolation_filters().replace("  - 'crates/plugin-host/**'\n", "")
+    root = filter_tree(tmp_path, filters, isolation_changes())
+    problems = matrix.filter_problems(root)
+    assert len(problems) == 1
+    assert "crates/plugin-host/" in problems[0]
+
+
+def test_a_lane_that_stops_reacting_to_the_boundary_is_reported(tmp_path: pathlib.Path) -> None:
+    """A lane composed without the group runs on everything except the boundary."""
+    root = filter_tree(tmp_path, isolation_filters(), isolation_changes("run_node_package"))
+    problems = matrix.filter_problems(root)
+    assert len(problems) == 1
+    assert "run_node_package" in problems[0]
+    assert matrix.ISOLATION_FILTER in problems[0]
+
+
+def test_a_lane_no_job_consumes_is_reported(tmp_path: pathlib.Path) -> None:
+    """Composing a lane the caller never reads runs nothing, which is the same hole."""
+    root = filter_tree(tmp_path, isolation_filters(), isolation_changes())
+    (root / matrix.CALLER_FILE).write_text("")
+    problems = matrix.filter_problems(root)
+    assert len(problems) == len(matrix.ISOLATION_LANES)
+    assert all("never consumes" in problem for problem in problems)
+
+
+def test_a_tree_with_no_filter_group_is_reported(tmp_path: pathlib.Path) -> None:
+    """A lane that lists the boundary itself drifts from the others, one edit each."""
+    root = filter_tree(tmp_path, "ci:\n  - '.github/workflows/**'\n", isolation_changes())
+    problems = matrix.filter_problems(root)
+    assert len(problems) == 1
+    assert "no 'plugin_isolation' group" in problems[0]
+
+
+def test_a_workflow_that_invokes_a_recipe_is_evidence(tmp_path: pathlib.Path) -> None:
+    """A recipe is enforced by CI when a workflow runs it, and that is the evidence."""
+    root = tree(
+        tmp_path,
+        {
+            "justfile": "verify-installed-python-plugin host:\n    echo hi\n",
+            ".github/workflows/ci_python.yml": (
+                'jobs:\n  installed:\n    steps:\n      - run: just verify-installed-python-plugin "$python" runs\n'
+            ),
+        },
+        claim(
+            "installed",
+            "enforced",
+            'enforced_by = [\n  { recipe = "verify-installed-python-plugin" },\n'
+            '  { workflow = "verify-installed-python-plugin" },\n]\n',
+        ),
+    )
+    assert check(root) == []
+
+
+def test_a_workflow_that_only_names_a_recipe_is_not_evidence(tmp_path: pathlib.Path) -> None:
+    """Naming a recipe in prose is not invoking it, and the gate says so."""
+    root = tree(
+        tmp_path,
+        {
+            "justfile": "verify-installed-node-plugin:\n    echo hi\n",
+            ".github/workflows/ci_node.yml": (
+                "jobs:\n  installed:\n    steps:\n      # verify-installed-node-plugin is not run here yet\n"
+            ),
+        },
+        claim(
+            "installed",
+            "enforced",
+            'enforced_by = [\n  { workflow = "verify-installed-node-plugin" },\n]\n',
+        ),
+    )
+    problems = check(root)
+    assert len(problems) == 1
+    assert "nothing in the tree defines it" in problems[0]

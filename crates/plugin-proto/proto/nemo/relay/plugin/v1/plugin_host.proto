@@ -333,6 +333,53 @@ message LoadRequest {
   string library_digest = 6;
 }
 
+// The first item of a sandboxed artifact upload. Paths never cross this
+// boundary: the host decides its own container path and stages these bytes.
+message ArtifactTransferBegin {
+  string session_id = 1;
+  string artifact_id = 2;
+  string plugin_id = 3;
+  bytes manifest = 4;
+  string manifest_sha256 = 5;
+  string library_sha256 = 6;
+  uint64 library_length = 7;
+}
+
+// One explicitly positioned library chunk.
+message ArtifactTransferChunk {
+  string artifact_id = 1;
+  uint64 offset = 2;
+  bytes bytes = 3;
+}
+
+// Complete the active transfer. Approval is returned only after verification
+// and the atomic move out of incoming/.
+message ArtifactTransferFinalize {
+  string artifact_id = 1;
+}
+
+message ArtifactTransferFrame {
+  oneof frame {
+    ArtifactTransferBegin begin = 1;
+    ArtifactTransferChunk chunk = 2;
+    ArtifactTransferFinalize finalize = 3;
+  }
+}
+
+message ArtifactTransferApproved {
+  string artifact_id = 1;
+  string plugin_id = 2;
+  string manifest_sha256 = 3;
+  string library_sha256 = 4;
+}
+
+message ArtifactTransferOutcome {
+  oneof result {
+    ArtifactTransferApproved approved = 1;
+    PluginFailure failure = 2;
+  }
+}
+
 message LoadResponse {
   PluginHandle handle = 1;
   PluginDescriptor descriptor = 2;
@@ -903,6 +950,9 @@ service PluginHost {
   // Join an established session with another transport. It creates no session.
   rpc Attach(AttachRequest) returns (AttachOutcome);
   rpc Load(LoadRequest) returns (LoadOutcome);
+  // Stream approved bytes into the host's own container. The request metadata
+  // carries the session capability just like every other operation.
+  rpc TransferArtifact(stream ArtifactTransferFrame) returns (ArtifactTransferOutcome);
   rpc Unload(UnloadRequest) returns (UnloadOutcome);
   rpc Inspect(InspectRequest) returns (InspectOutcome);
   rpc Activate(ActivateRequest) returns (ActivateOutcome);

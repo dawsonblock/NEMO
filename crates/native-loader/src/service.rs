@@ -13,12 +13,13 @@
 //! The host enforces the session it established: a request naming another
 //! session, or arriving before the handshake, is refused rather than served.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use nemo_relay::plugin::execution::PluginExecutionBackend;
 use nemo_relay_plugin_proto::convert::{
     activate_outcome_to_wire, activate_request_from_wire, attach_outcome_to_wire,
-    attach_request_from_wire, cancel_outcome_to_wire, execution_outcome_to_wire,
+    attach_request_from_wire, cancel_outcome_to_wire, execution_outcome_to_wire, failure_to_wire,
     handshake_outcome_to_wire, handshake_request_from_wire, health_outcome_to_wire,
     inspect_outcome_to_wire, inspect_request_from_wire, invoke_request_from_wire,
     load_outcome_to_wire, load_request_from_wire, operation_envelope_from_wire,
@@ -26,8 +27,8 @@ use nemo_relay_plugin_proto::convert::{
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_protocol::{
-    LifecycleOutcome, PROTOCOL_VERSION, PluginProtocolError, PluginRegistrationOperation,
-    PluginSessionIdentity, Uuid, check_protocol_version,
+    LifecycleOutcome, PROTOCOL_VERSION, PluginArtifactIdentity, PluginProtocolError,
+    PluginRegistrationOperation, PluginSessionIdentity, Uuid, check_protocol_version,
 };
 use tonic::{Request, Response, Status};
 
@@ -97,6 +98,16 @@ pub struct PluginHostService {
     host_instance_id: String,
     /// The session this host established, if any.
     session: Mutex<HostSession>,
+    /// Files the host received and verified for this session. The map is keyed
+    /// by both session and opaque transfer id; matching digests alone never
+    /// authorise reuse across activations.
+    staged_artifacts: Mutex<HashMap<(String, String), StagedRecord>>,
+    active_artifact_transfers: Arc<Mutex<HashSet<(String, String)>>>,
+    /// Restricted hosts must load only artifacts which arrived through the
+    /// authenticated transfer RPC.
+    require_staged_artifacts: bool,
+    /// Captured once at host creation, before any plugin code can mutate HOME.
+    staging_root: std::path::PathBuf,
     /// Where the marks this host's plugins raise are sent, when this host was
     /// given a kernel to send them to.
     mark_forwarding: Option<MarkForwardingSender>,
@@ -123,6 +134,43 @@ pub struct PluginHostService {
     codec_bridge: tokio::sync::Mutex<
         Option<Result<std::sync::Arc<nemo_relay_plugin_host::codec_context::CodecBridge>, String>>,
     >,
+}
+
+impl Drop for PluginHostService {
+    fn drop(&mut self) {
+        let session_id = self
+            .session
+            .get_mut()
+            .ok()
+            .and_then(|session| match session {
+                HostSession::Active { identity, .. } => Some(identity.session_id.clone()),
+                HostSession::New | HostSession::Closed => None,
+            });
+        if let Some(session_id) = session_id {
+            crate::staging::discard_session(&self.staging_root, &session_id);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StagedRecord {
+    plugin_id: String,
+    identity: PluginArtifactIdentity,
+    artifact: crate::staging::ApprovedArtifact,
+}
+
+struct ActiveTransferReservation {
+    key: (String, String),
+    active: Arc<Mutex<HashSet<(String, String)>>>,
+}
+
+impl Drop for ActiveTransferReservation {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
 }
 
 /// This host's end of the channel its forwarded marks travel on.
@@ -253,11 +301,27 @@ impl PluginHostService {
             config,
             host_instance_id: Uuid::now_v7().to_string(),
             session: Mutex::new(HostSession::New),
+            staged_artifacts: Mutex::new(HashMap::new()),
+            active_artifact_transfers: Arc::new(Mutex::new(HashSet::new())),
+            require_staged_artifacts: false,
+            staging_root: crate::staging::staging_root(),
             mark_forwarding: None,
             kernel: None,
             session_channel: tokio::sync::Mutex::new(None),
             codec_bridge: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Refuse path-based loads because this host runs in a restricted sandbox.
+    pub fn require_staged_artifacts(mut self) -> Self {
+        self.require_staged_artifacts = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_staging_root(mut self, root: std::path::PathBuf) -> Self {
+        self.staging_root = root;
+        self
     }
 
     /// The bridge this host answers synchronous codec calls on, started once.
@@ -1331,7 +1395,30 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                 presented.as_deref(),
                 wire.context.as_ref(),
             )?;
-            let request = load_request_from_wire(&wire)?;
+            let mut request = load_request_from_wire(&wire)?;
+            let key = (wire.session_id.clone(), request.artifact.clone());
+            let staged = self
+                .staged_artifacts
+                .lock()
+                .map_err(|error| refused(format!("the artifact table lock was poisoned: {error}")))?
+                .get(&key)
+                .cloned();
+            match staged {
+                Some(staged) => {
+                    if staged.plugin_id != request.plugin_id || staged.identity != request.identity {
+                        return Err(refused(
+                            "the staged artifact does not match this plugin load approval",
+                        ));
+                    }
+                    request.artifact = staged.artifact.directory.to_string_lossy().into_owned();
+                }
+                None if self.require_staged_artifacts => {
+                    return Err(refused(
+                        "this restricted host accepts plugin loads only after an approved artifact transfer",
+                    ));
+                }
+                None => {}
+            }
             let response = self.backend.load(request, context.clone()).await?;
             // A load that cannot be served in full is a load that does not
             // happen: the backend has already loaded the plugin, so the refusal
@@ -1361,6 +1448,144 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         Ok(Response::new(load_outcome_to_wire(
             LifecycleOutcome::from_result(outcome.map_err(|error| error.failure)),
         )))
+    }
+
+    async fn transfer_artifact(
+        &self,
+        request: Request<tonic::Streaming<v1::ArtifactTransferFrame>>,
+    ) -> Result<Response<v1::ArtifactTransferOutcome>, Status> {
+        let presented = presented_capability(&request);
+        let mut stream = request.into_inner();
+        let result = async {
+            let first = stream
+                .message()
+                .await
+                .map_err(|error| refused(format!("artifact stream failed: {error}")))?
+                .ok_or_else(|| refused("artifact stream ended before BeginArtifact"))?;
+            let begin = match first.frame {
+                Some(v1::artifact_transfer_frame::Frame::Begin(begin)) => begin,
+                _ => return Err(refused("the first artifact frame must be BeginArtifact")),
+            };
+            if begin.artifact_id.is_empty() || begin.plugin_id.is_empty() {
+                return Err(refused("artifact id and plugin id must be non-empty"));
+            }
+            self.established(&begin.session_id)?;
+            self.capability_admitted(presented.as_deref())?;
+
+            let key = (begin.session_id.clone(), begin.artifact_id.clone());
+            if self
+                .staged_artifacts
+                .lock()
+                .map_err(|error| refused(format!("the artifact table lock was poisoned: {error}")))?
+                .contains_key(&key)
+            {
+                return Err(refused(
+                    "this artifact id has already been approved in this session",
+                ));
+            }
+            {
+                let mut active = self.active_artifact_transfers.lock().map_err(|error| {
+                    refused(format!(
+                        "the active artifact-transfer lock was poisoned: {error}"
+                    ))
+                })?;
+                if !active.insert(key.clone()) {
+                    return Err(refused(
+                        "an artifact transfer with this id is already in progress",
+                    ));
+                }
+            }
+            let _reservation = ActiveTransferReservation {
+                key: key.clone(),
+                active: Arc::clone(&self.active_artifact_transfers),
+            };
+
+            let identity = PluginArtifactIdentity {
+                manifest_sha256: begin.manifest_sha256.clone(),
+                library_sha256: begin.library_sha256.clone(),
+            };
+            let transfer = crate::staging::ArtifactTransfer {
+                artifact_id: begin.artifact_id.clone(),
+                plugin_id: begin.plugin_id.clone(),
+                manifest: begin.manifest,
+                manifest_sha256: identity.manifest_sha256.clone(),
+                library_sha256: identity.library_sha256.clone(),
+                library_length: begin.library_length,
+            };
+            let mut staged = crate::staging::StagedArtifact::begin(
+                &self.staging_root,
+                &begin.session_id,
+                &transfer,
+            )
+            .map_err(|error| refused(error.to_string()))?;
+
+            loop {
+                let frame = stream
+                    .message()
+                    .await
+                    .map_err(|error| refused(format!("artifact stream failed: {error}")))?
+                    .ok_or_else(|| refused("artifact stream ended before FinalizeArtifact"))?;
+                match frame.frame {
+                    Some(v1::artifact_transfer_frame::Frame::Chunk(chunk)) => staged
+                        .append(&chunk.artifact_id, chunk.offset, &chunk.bytes)
+                        .map_err(|error| refused(error.to_string()))?,
+                    Some(v1::artifact_transfer_frame::Frame::Finalize(finalize)) => {
+                        let artifact = staged
+                            .finalize(&finalize.artifact_id)
+                            .map_err(|error| refused(error.to_string()))?;
+                        // A second terminal or a trailing chunk is malformed; do
+                        // not make an artifact available until the sender closed
+                        // the stream cleanly.
+                        if stream
+                            .message()
+                            .await
+                            .map_err(|error| refused(format!("artifact stream failed: {error}")))?
+                            .is_some()
+                        {
+                            let _ = std::fs::remove_dir_all(&artifact.directory);
+                            return Err(refused(
+                                "artifact stream sent data after FinalizeArtifact",
+                            ));
+                        }
+                        self.staged_artifacts
+                            .lock()
+                            .map_err(|error| {
+                                refused(format!("the artifact table lock was poisoned: {error}"))
+                            })?
+                            .insert(
+                                key,
+                                StagedRecord {
+                                    plugin_id: begin.plugin_id.clone(),
+                                    identity: identity.clone(),
+                                    artifact,
+                                },
+                            );
+                        return Ok((begin.artifact_id, begin.plugin_id, identity));
+                    }
+                    Some(v1::artifact_transfer_frame::Frame::Begin(_)) | None => {
+                        return Err(refused("only chunks may follow BeginArtifact"));
+                    }
+                }
+            }
+        }
+        .await;
+
+        let result = match result {
+            Ok((artifact_id, plugin_id, identity)) => {
+                v1::artifact_transfer_outcome::Result::Approved(v1::ArtifactTransferApproved {
+                    artifact_id,
+                    plugin_id,
+                    manifest_sha256: identity.manifest_sha256,
+                    library_sha256: identity.library_sha256,
+                })
+            }
+            Err(error) => {
+                v1::artifact_transfer_outcome::Result::Failure(failure_to_wire(&error.failure))
+            }
+        };
+        Ok(Response::new(v1::ArtifactTransferOutcome {
+            result: Some(result),
+        }))
     }
 
     async fn unload(
@@ -1870,6 +2095,10 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
                     ),
                 )));
             }
+        }
+        crate::staging::discard_session(&self.staging_root, &wire.session_id);
+        if let Ok(mut artifacts) = self.staged_artifacts.lock() {
+            artifacts.retain(|(session_id, _), _| session_id != &wire.session_id);
         }
         Ok(Response::new(session_close_outcome_to_wire(
             LifecycleOutcome::Completed(()),
@@ -2616,6 +2845,178 @@ mod tests {
             maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
         };
         (PluginHostService::new(backend, config.clone()), config)
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_transfer_is_staged_and_the_load_resolves_only_its_approved_copy() {
+        use hyper_util::rt::TokioIo;
+        use nemo_relay_plugin_proto::v1::plugin_host_client::PluginHostClient;
+        use nemo_relay_plugin_proto::v1::plugin_host_server::PluginHostServer;
+        use tokio_stream::wrappers::UnixListenerStream;
+        use tonic::transport::{Endpoint, Server};
+        use tower::service_fn;
+
+        let scratch = tempfile::tempdir().expect("a private transfer root");
+        let (service, config) = service();
+        let service = service
+            .require_staged_artifacts()
+            .with_staging_root(scratch.path().to_path_buf());
+        let socket_dir = tempfile::tempdir().expect("a socket directory");
+        let socket = socket_dir.path().join("host.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("the host socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(PluginHostServer::new(service))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await;
+        });
+        let connect_path = socket.clone();
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .expect("a local endpoint")
+            .connect_with_connector(service_fn(move |_| {
+                let path = connect_path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(TokioIo::new)
+                }
+            }))
+            .await
+            .expect("the host channel");
+        let mut client = PluginHostClient::new(channel);
+        let handshake = client
+            .handshake(capable(handshake_request(&config)))
+            .await
+            .expect("the host handshake")
+            .into_inner();
+        let session_id = handshake_outcome_from_wire(&handshake)
+            .expect("a decoded handshake")
+            .into_result()
+            .expect("an established session")
+            .session_id;
+
+        let path_load = v1::LoadRequest {
+            session_id: session_id.clone(),
+            context: Some(context()),
+            plugin_id: "transfer-fixture".into(),
+            artifact: "/outside/container/relay-plugin.toml".into(),
+            manifest_digest: "a".repeat(64),
+            library_digest: "b".repeat(64),
+        };
+        let refused_path = client
+            .load(capable(path_load))
+            .await
+            .expect("the fail-closed load outcome")
+            .into_inner();
+        match refused_path.result.expect("a load result") {
+            v1::load_outcome::Result::Failure(failure) => assert!(
+                failure
+                    .message
+                    .contains("only after an approved artifact transfer")
+            ),
+            v1::load_outcome::Result::Loaded(_) => {
+                panic!("a restricted host accepted a host filesystem path")
+            }
+        }
+
+        let library = b"deliberately not a loadable library".to_vec();
+        let manifest = format!(
+            "manifest_version = 1\n\n[plugin]\nid = \"transfer-fixture\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \">=0.9,<1.0\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"libfixture.dylib\"\nsymbol = \"nemo_relay_plugin_entry\"\n"
+        );
+        let manifest_sha256 = crate::staging::hash_bytes(manifest.as_bytes());
+        let library_sha256 = crate::staging::hash_bytes(&library);
+        let artifact_id = Uuid::now_v7().to_string();
+        let frames = vec![
+            v1::ArtifactTransferFrame {
+                frame: Some(v1::artifact_transfer_frame::Frame::Begin(
+                    v1::ArtifactTransferBegin {
+                        session_id: session_id.clone(),
+                        artifact_id: artifact_id.clone(),
+                        plugin_id: "transfer-fixture".into(),
+                        manifest: manifest.into_bytes(),
+                        manifest_sha256: manifest_sha256.clone(),
+                        library_sha256: library_sha256.clone(),
+                        library_length: library.len() as u64,
+                    },
+                )),
+            },
+            v1::ArtifactTransferFrame {
+                frame: Some(v1::artifact_transfer_frame::Frame::Chunk(
+                    v1::ArtifactTransferChunk {
+                        artifact_id: artifact_id.clone(),
+                        offset: 0,
+                        bytes: library,
+                    },
+                )),
+            },
+            v1::ArtifactTransferFrame {
+                frame: Some(v1::artifact_transfer_frame::Frame::Finalize(
+                    v1::ArtifactTransferFinalize {
+                        artifact_id: artifact_id.clone(),
+                    },
+                )),
+            },
+        ];
+        let outcome = client
+            .transfer_artifact(capable(tokio_stream::iter(frames)))
+            .await
+            .expect("the authenticated transfer RPC")
+            .into_inner();
+        let approved = match outcome.result.expect("a transfer result") {
+            v1::artifact_transfer_outcome::Result::Approved(approved) => approved,
+            v1::artifact_transfer_outcome::Result::Failure(failure) => {
+                panic!("the transfer was refused: {}", failure.message)
+            }
+        };
+        assert_eq!(approved.artifact_id, artifact_id);
+        assert_eq!(approved.plugin_id, "transfer-fixture");
+        assert_eq!(approved.manifest_sha256, manifest_sha256);
+        assert_eq!(approved.library_sha256, library_sha256);
+
+        // The host has proved the transfer and resolved its opaque id to its own
+        // approved path. dlopen now fails because the fixture bytes are not a
+        // library, which proves the path resolution advanced to the loader.
+        let load = v1::LoadRequest {
+            session_id: session_id.clone(),
+            context: Some(context()),
+            plugin_id: "transfer-fixture".into(),
+            artifact: artifact_id,
+            manifest_digest: manifest_sha256,
+            library_digest: library_sha256,
+        };
+        let loaded = client
+            .load(capable(load))
+            .await
+            .expect("the load outcome")
+            .into_inner();
+        let failure = match loaded.result.expect("a load result") {
+            v1::load_outcome::Result::Failure(failure) => failure,
+            v1::load_outcome::Result::Loaded(_) => panic!("invalid bytes unexpectedly loaded"),
+        };
+        assert!(
+            !failure
+                .message
+                .contains("only after an approved artifact transfer")
+        );
+        assert!(
+            failure
+                .message
+                .contains("failed to load native plugin library"),
+            "the opaque transfer id must resolve to the host's approved copy: {}",
+            failure.message
+        );
+        client
+            .session_close(capable(v1::SessionCloseRequest { session_id }))
+            .await
+            .expect("session close");
+        assert_eq!(
+            std::fs::read_dir(scratch.path())
+                .expect("the staging root")
+                .count(),
+            0,
+            "closing the session removes its approved artifacts"
+        );
+        serving.abort();
     }
 
     /// The capability the tests' requests present.

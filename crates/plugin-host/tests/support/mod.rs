@@ -49,6 +49,13 @@ impl PreparedFixture {
         ));
         std::fs::create_dir_all(&directory).expect("a manifest directory");
         let manifest = directory.join("relay-plugin.toml");
+        let staged_library_name = library
+            .file_name()
+            .expect("a native fixture has a file name")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::copy(&library, directory.join(&staged_library_name))
+            .expect("copy the fixture beside its manifest");
         std::fs::write(
             &manifest,
             format!(
@@ -57,7 +64,7 @@ impl PreparedFixture {
                  \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = \
                  [\"plugin_native\"]\n\n[load]\nlibrary = \"{}\"\nsymbol = \"{symbol}\"\n",
                 env!("CARGO_PKG_VERSION"),
-                library.display()
+                staged_library_name
             ),
         )
         .expect("write the manifest");

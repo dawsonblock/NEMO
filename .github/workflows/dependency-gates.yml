@@ -179,6 +179,13 @@ jobs:
       - name: Check Python lockfile
         run: uv lock --check
 
+      # The packaging scripts decide what an installed artifact carries — the host
+      # in a wheel, the platform package in npm, the bundle macOS reads entitlements
+      # from. Their tests existed and nothing ran them, which is the failure mode
+      # the qualification matrix names for its own evidence.
+      - name: Run packaging script tests
+        run: just test-packaging-scripts
+
       - name: Run Python tests
         run: just --set ci true --set output_dir "${{ github.workspace }}" test-python
 

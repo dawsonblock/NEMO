@@ -21,13 +21,39 @@ section was written):
   648 when the loader, the SDK and the ABI left the kernel's process. The loader's
   288 tokens are budgeted on the host side now, at 288, and the two numbers are
   recorded rather than one being inferred from the other.
-- **No root reaches the loader at all.** `just tcb-report` checks the property
-  rather than the progress, for the kernel library and for the composition surfaces
-  together: the closure of `{nemo-relay, nemo-relay-cli, nemo-relay-ffi}` intersects
+- **No root reaches the loader at all, on any platform the packages ship on.**
+  `just tcb-report` checks the property rather than the progress, for the kernel
+  library and for the composition surfaces together: on each of the five targets the
+  plugin-hosting packages are built for, the closure of
+  `{nemo-relay, nemo-relay-cli, nemo-relay-ffi, nemo-relay-python, nemo-relay-node}`
+  intersects
   `{libloading, nemo-relay-native-loader, nemo-relay-native-abi, nemo-relay-plugin}`
   in **nothing**, and any reach is a failure. The child's own end is the loader
   crate's now, so the supervisor's crate does not link it and a binary that runs the
-  kernel cannot open a library.
+  kernel cannot open a library. The one platform deliberately not among the five is
+  Windows: the Node binding's N-API machinery resolves a `libloading` of its own
+  there, native-plugin isolation is not implemented on that platform, and the policy
+  records the target instead of dropping it — the record is measured like the rest,
+  so a target whose resolve stops reaching the loader fails the gate rather than
+  leaving an exemption that quietly stopped being true.
+- **A boundary change re-runs every lane that carries an artifact.** The paths that
+  can change what the process boundary does — the loader, the host, the ABI, the wire
+  and contract crates between them, and the scripts that bundle a host into a package
+  or check one after installation — are one group in `.github/ci-path-filters.yml`,
+  and `ci_changes.yml` composes the Rust, CLI, Go, Python and Node lanes from it.
+  `scripts/qualification/matrix.py` refuses a tree where the group loses a crate or a
+  lane stops reacting, so this is a gate rather than a convention. It closes a
+  qualification hole: the loader and the host are covered by source tests either way,
+  and the installed Python and Node lanes were exactly the ones a change to either
+  could leave skipped.
+- **Installed-artifact qualification is end-to-end on Linux amd64.** The Python wheel
+  lane and the Node `InstalledArtifact` job each build a real fixture from source,
+  install the package the build produced, and require a plugin to run in the host that
+  package installed, with nothing naming a host in the environment. The other
+  packaged targets — Linux arm64, the musllinux wheels, macOS arm64 and the Windows
+  packages — get package install, import and host-startup smoke coverage plus the
+  source-level isolation tests. That is not the same claim, and it is recorded as a
+  row of its own in the matrix rather than folded into the two above.
 - **Native ABI version: 5** (`NEMO_RELAY_NATIVE_ABI_VERSION` in `crates/native-abi`,
   re-exported by `crates/plugin` so every author-facing path is unchanged).
 - **Plugin compatibility:** the CLI, FFI, Python and Node serve plugins from
@@ -38,12 +64,14 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The loader
   is not linked into the kernel any more, which is why the unsafe count below is a
   twenty-sixth of what it was.
-- **Claims: 30 enforced, 1 asserted and not yet.** Every claim this document makes
+- **Claims: 35 enforced, 4 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
   resolves each name against the tree. A test that is renamed or deleted turns that
   gate red, so a sentence here cannot go on describing something nothing checks.
-  The one that is asserted rather than enforced is named there, with why.
+  A claim enforced by a recipe also names the workflow that invokes it, so deleting
+  the CI step turns the row red instead of leaving a recipe that nothing runs. The
+  three claims that are asserted rather than enforced are named there, with why.
 
 What is left of the kernel's `unsafe` is nothing to do with loading. The loader's
 288 occurrences — the ABI adapter's signatures and witnesses — and the SDK's 220 and
@@ -634,6 +662,12 @@ kernel. See *The nested codec call inherits the invocation's deadline* below.
    filesystem profile, or network policy. The threat model this code supports is
    *trusted native plugin, unreliable implementation*; a plugin that is assumed
    hostile needs the platform mechanisms this document has not adopted.
+   `security/MACOS-RESTRICTED-HOST.md` is where the first of those mechanisms is
+   being adopted: the policy, bundle, authenticated artifact-transfer protocol and
+   container-owned IPC are in place. The sandboxed test transfers and verifies the
+   artifact, but App Sandbox denies removing `com.apple.quarantine` from the
+   private load copy, so `dlopen` has not completed. Restricted mode remains
+   fail-closed until the bundled-host transfer-and-load test passes.
 
 The measurements that decide the milestone live in `just tcb-report`; the
 evidence for the claims above lives in the tests named next to the code, which
@@ -2711,13 +2745,16 @@ fixture, and runs `just verify-installed-node-plugin` the same two ways — the 
 package's own host must run the plugin, and a copy with the host removed must refuse
 rather than search.
 
-What that leaves is the shape of the evidence, not its absence: the lanes are named
-here, but the matrix still resolves the claims against the *recipes*, because a
-workflow is not a kind of evidence this gate knows how to resolve by name. The recipes
-are what the lanes invoke, so a rename that broke a lane would also break the matrix.
-What the matrix cannot see is whether a lane was deleted; that is the same class of gap
-as any other untested workflow edit, and it is bounded by these lanes being the only
-callers of the two recipes.
+What that left was the shape of the evidence rather than its absence: the lanes were
+named here, and the matrix resolved the claims against the *recipes*, because a
+workflow was not a kind of evidence the gate knew how to read. The recipes are what the
+lanes invoke, so a rename that broke a lane would break the matrix as well — but
+deleting the CI step would not, and a recipe nothing invokes is a recipe nothing runs.
+That is a kind of evidence now: `{ workflow = "verify-installed-python-plugin" }`
+resolves against the workflow files, and it resolves on an *invocation* rather than a
+mention, so the two claims above turn red when the lane that runs them goes away. The
+same commit made the path filters part of the gate rather than of review: see the
+current-status block, and `filter_problems` in `scripts/qualification/matrix.py`.
 
 Both lanes run the same commands this checkout has already run by hand, against
 artifacts it built: the Python wheel, bundled with its host and installed into a fresh
@@ -2843,6 +2880,12 @@ remembering not to use it.
   exists rather than after it moves, so the milestone's remaining work is named in
   full instead of being hidden behind the crate the loader still lives in. As the
   split lands the list shrinks; when it is empty, the check is the property.
+
+  Both halves of that reading have since moved on, and the current-status block is
+  where the state is stated. The record is empty rather than shrinking, and the check
+  is resolved for every platform the packages are built for rather than for one — the
+  line above is the shape the report printed when it asked a single target, which is
+  why it names the platforms' reach as one set.
 
 ### The seam the loader speaks
 
@@ -3090,15 +3133,27 @@ budgets and digests are resolved for every platform at once (`--target all`), so
 number is the same wherever it is computed and a package cannot hide behind a target
 either — that is the conservative direction, and the ceilings that moved with it
 moved because the number was wrong rather than because a dependency was added. The
-closure checks are resolved for the platform CI enforces on, because they answer a
-different question: what the kernel's own process can reach rather than how large a
-resolved set is. Measuring the union there would make the milestone's central claim
-platform-false, and the reason is worth recording rather than losing: under
-`--target all` the Node binding's `napi-sys` pulls `libloading` on Windows, which is a
-fact about that platform's binding — it loads the Node runtime — and not about the
-composition this milestone closes. A Windows-only reach through a binding's own
-loader is not the plugin loader coming back, and the platform the claim is checked on
-says which of the two is being measured.
+closure checks ask a different question — what the kernel's own process can reach
+rather than how large a resolved set is — and they ask it of each platform the
+packages are built for rather than of the union. Measuring the union would make the
+milestone's central claim platform-false, and the reason is worth recording rather
+than losing: under `--target all` the Node binding's `napi-sys` pulls `libloading` on
+Windows, which is a fact about that platform's binding — it loads the Node runtime —
+and not about the composition this milestone closes.
+
+**And the closure is asked of each platform, with the exception measured.** The five
+targets the plugin-hosting packages are built for — Linux gnu on both architectures,
+macOS arm64, and the two musl targets — each resolve the kernel library and the
+composition surfaces, and each has to reach nothing. The platform that is not among
+them is not left out either: `security/tcb.toml` records Windows as the one target
+whose composition reaches a `libloading`, because the Node binding loads its own
+runtime library there. That record is a measured row rather than a comment — the
+target's own resolve has to still reach exactly the packages it names, the crates of
+ours in the forbidden set have to still be absent from it, and a record the tree no
+longer needs fails the gate, the way a temporary ceiling does. Naming one Linux target
+and leaving the others unasked is what this replaced: a target-specific edge could
+escape a check that read as universal, and a Windows-only reach through a binding's
+own loader is not the plugin loader coming back.
 
 ### The definition of done
 

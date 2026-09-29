@@ -85,6 +85,22 @@ impl IsolationPolicy {
         self
     }
 
+    /// Ask for a level of containment, rather than taking the default.
+    ///
+    /// Explicit because the levels are not interchangeable from a caller's point
+    /// of view: the restricted level changes what a plugin may reach, and a
+    /// runtime that selected it silently would break installations whose plugins
+    /// legitimately need a file or a connection. A level this build cannot honor
+    /// fails at startup instead — see
+    /// [`crate::isolation_policy::NativeIsolationPolicy`].
+    pub fn with_native_isolation(
+        mut self,
+        isolation: crate::isolation_policy::NativeIsolationPolicy,
+    ) -> Self {
+        self.supervisor.isolation = isolation;
+        self
+    }
+
     /// Longest one registration may take when nothing says otherwise.
     ///
     /// A registration that has not answered in this long is one this runtime

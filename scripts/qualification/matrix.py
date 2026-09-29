@@ -21,6 +21,12 @@ enforces, and why:
 * **The generated document matches.** ``security/QUALIFICATION-MATRIX.md`` is
   rendered from the policy file, so a claim that was edited without regenerating it
   is a difference this gate can see.
+* **The lanes a claim depends on still run it.** A claim enforced by a recipe is
+  enforced by CI only if a workflow invokes that recipe, and a lane only runs when
+  the paths that can invalidate it are filtered to it. Both halves are checked here:
+  the ``workflow`` evidence kind resolves a recipe against the workflows that call
+  it, and ``filter_problems`` refuses a tree where a change to the plugin isolation
+  boundary would leave a lane that installs an artifact skipped.
 
 Which is the whole point: renaming or deleting a test turns the gate red, rather
 than leaving a table that still reads as if it were true.
@@ -43,10 +49,15 @@ ROOT = Path(__file__).resolve().parents[2]
 POLICY = ROOT / "security" / "qualification-matrix.toml"
 GENERATED = ROOT / "security" / "QUALIFICATION-MATRIX.md"
 MILESTONE = ROOT / "security" / "PLUGIN-ISOLATION.md"
+#: The next milestone's own document. It is release text for the same reason the
+#: first one is: a reader takes what it says the project does as the project's own
+#: account of itself, so a claim it records as unverified may not be described
+#: there in the words that mean covered.
+RESTRICTED_HOST = ROOT / "security" / "MACOS-RESTRICTED-HOST.md"
 #: Documents a reader takes as the release's own account of itself. A claim the
 #: matrix records as unverified may be discussed in them; it may not be described
 #: there in the words that mean covered.
-RELEASE_TEXT = (MILESTONE, ROOT / "README.md")
+RELEASE_TEXT = (MILESTONE, RESTRICTED_HOST, ROOT / "README.md")
 
 #: Wording that asserts coverage, matched as stems so that "qualified",
 #: "qualification" and "qualifies" all count as the same assertion.
@@ -120,7 +131,64 @@ KINDS = {
     # A recipe's line is its name and then either its parameters or the colon, so the
     # name is matched at the start of a line and followed by whitespace or a colon.
     "recipe": EvidenceKind("justfile", r"(?m)^{name}(?=\s|:)", "just recipe"),
+    # A recipe nothing invokes is a recipe no gate runs. The occurrence is the
+    # invocation rather than the name, so a workflow that mentions the recipe in
+    # prose does not satisfy this: `just <recipe>` is the only form pre-commit and
+    # CI both use.
+    "workflow": EvidenceKind(
+        ".github/workflows/*.y*ml",
+        r"(?m)\bjust\s+(?:--?[^\s]+\s+)*{name}(?=\s|$)",
+        "workflow job",
+    ),
 }
+
+
+#: Where a filter becomes a running lane, and where the lanes are composed.
+FILTER_FILE = Path(".github") / "ci-path-filters.yml"
+CHANGES_FILE = Path(".github") / "workflows" / "ci_changes.yml"
+#: The workflow that turns a composed lane into a job. A lane nobody consumes is a
+#: filter that runs nothing, which is the same failure one step further along.
+CALLER_FILE = Path(".github") / "workflows" / "ci.yaml"
+
+#: The filter group that names the plugin isolation boundary. One group rather than
+#: a copy per lane, because the failure this gate exists for is a lane that stops
+#: listing part of the boundary.
+ISOLATION_FILTER = "plugin_isolation"
+
+#: The boundary, as prefixes. A crate listed as a prefix has to have at least one path
+#: in the group, because a filter that names `crates/native-loader/Cargo.toml` and not
+#: its sources still reacts to a manifest edit and not to the change that matters.
+ISOLATION_PREFIXES = (
+    "crates/native-abi/",
+    "crates/native-loader/",
+    "crates/plugin-host/",
+    "crates/plugin-proto/",
+    "crates/plugin-protocol/",
+    "crates/plugin/src/",
+)
+
+#: The scripts that decide what an installed artifact carries and whether it works.
+#: A change to one of them changes the artifact's composition rather than its source.
+ISOLATION_FILES = (
+    "scripts/bundle-plugin-host.py",
+    "scripts/verify-installed-plugin-host.py",
+    "scripts/verify-installed-python-plugin.py",
+    "scripts/verify-installed-node-plugin.py",
+)
+
+#: The outputs that have to react to a boundary change: every lane that links,
+#: builds, packages or installs something on the far side of the boundary. A lane
+#: that is skipped is a claim that did not run, and the installed Python and Node
+#: lanes are the two whose absence a source-only change would hide.
+ISOLATION_LANES = (
+    "run_rust",
+    "run_rust_package",
+    "run_go",
+    "run_python",
+    "run_python_package",
+    "run_node",
+    "run_node_package",
+)
 
 
 class MatrixError(Exception):
@@ -221,10 +289,22 @@ def candidate_files(root: Path, pattern: str) -> list[Path]:
     The pruning is the point rather than a detail: a repository with a build
     directory has more generated `.rs` files under it than sources above it, and a
     filter applied after the walk would read all of them to discard them.
+
+    A pattern that names a directory is resolved inside it instead of by basename,
+    because ``fnmatch`` cannot express "the workflows": the `workflow` kind reads
+    them, and the alternative is a pattern broad enough to match every YAML file in
+    the tree. The directory is spelled literally rather than with a wildcard, because
+    a wildcard component would not match `.github` — glob skips hidden names.
     """
     key = (root, pattern)
     if key in _CANDIDATES:
         return _CANDIDATES[key]
+    if "/" in pattern:
+        directory, _, name = pattern.rpartition("/")
+        folder = root / directory
+        found = sorted(path for path in (folder.glob(name) if folder.is_dir() else ()) if path.is_file())
+        _CANDIDATES[key] = found
+        return found
     found: list[Path] = []
     for directory, subdirectories, filenames in os.walk(root):
         under_test_sources = Path(directory).name == "tests"
@@ -233,6 +313,111 @@ def candidate_files(root: Path, pattern: str) -> list[Path]:
         )
         found.extend(Path(directory) / name for name in sorted(filenames) if fnmatch.fnmatch(name, pattern))
     _CANDIDATES[key] = found
+    return found
+
+
+def grouped_paths(document: str, group: str) -> list[str] | None:
+    """Return the paths one filter group lists, or None when the group is absent.
+
+    A YAML parser would be a dependency this gate does not otherwise need, and the
+    shape it has to read is a top-level key and the indented list under it. Comments
+    and blank lines are skipped; a line that starts another group ends the one being
+    read, so a path cannot be credited to the wrong group.
+    """
+    lines = document.splitlines()
+    header = f"{group}:"
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.rstrip() == header:
+            start = index + 1
+            break
+    if start is None:
+        return None
+    found: list[str] = []
+    for line in lines[start:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t")):
+            break
+        entry = line.strip()
+        if entry.startswith("- "):
+            found.append(entry[2:].strip().strip("'\""))
+    return found
+
+
+def filter_problems(root: Path) -> list[str]:
+    """Return every way the path filters stop a boundary change from running a lane.
+
+    This is the invariant the milestone's assurance rests on, stated as a check
+    rather than as a sentence: any change capable of altering what the process
+    boundary does has to re-run every lane that builds, packages or installs an
+    artifact containing it. The failure it catches is not a broken test but a test
+    that did not run — the loader and the host are covered by source tests either
+    way, and the composition packages are exactly what a source-only run leaves
+    unexercised.
+    """
+    filters_file = root / FILTER_FILE
+    changes_file = root / CHANGES_FILE
+    found: list[str] = []
+    if not filters_file.is_file():
+        return [f"{FILTER_FILE} does not exist, so nothing filters a boundary change"]
+
+    listed = grouped_paths(filters_file.read_text(), ISOLATION_FILTER)
+    if listed is None:
+        found.append(
+            f"{FILTER_FILE} has no '{ISOLATION_FILTER}' group: the boundary is what a "
+            f"change is recognised by, and a lane that lists the paths itself drifts "
+            f"from the others one edit at a time"
+        )
+    else:
+        for prefix in ISOLATION_PREFIXES:
+            if not any(path.startswith(prefix) for path in listed):
+                found.append(
+                    f"{FILTER_FILE} names no path under '{prefix}': a change there can "
+                    f"change what the boundary does, and no lane would react to it"
+                )
+        for required in ISOLATION_FILES:
+            if required not in listed:
+                found.append(
+                    f"{FILTER_FILE} does not list '{required}': the composition of an "
+                    f"installed artifact is part of the boundary's behavior"
+                )
+
+    if not changes_file.is_file():
+        found.append(f"{CHANGES_FILE} does not exist, so the filter is never composed")
+        return found
+    changes = changes_file.read_text()
+    # The lane is composed where a filter output becomes a job output, which is the
+    # only line of the file that names both. The caller-facing `outputs:` block above
+    # it also spells `run_rust:`, so the lane's own name is not enough to find it.
+    composed = {
+        line.strip().split(":", 1)[0]: line
+        for line in changes.splitlines()
+        if line.strip().startswith(tuple(f"{lane}:" for lane in ISOLATION_LANES)) and "steps.filter.outputs" in line
+    }
+    for lane in ISOLATION_LANES:
+        line = composed.get(lane)
+        if line is None:
+            found.append(f"{CHANGES_FILE} no longer composes '{lane}' from 'steps.filter.outputs.{ISOLATION_FILTER}'")
+        elif f"steps.filter.outputs.{ISOLATION_FILTER}" not in line:
+            found.append(
+                f"{CHANGES_FILE} composes '{lane}' without "
+                f"'steps.filter.outputs.{ISOLATION_FILTER}': a boundary change would "
+                f"leave that lane skipped, which is the failure this rule exists for"
+            )
+
+    caller_file = root / CALLER_FILE
+    if not caller_file.is_file():
+        found.append(f"{CALLER_FILE} does not exist, so no lane reaches a job")
+        return found
+    caller = caller_file.read_text()
+    for lane in ISOLATION_LANES:
+        if f"needs.ci_changes.outputs.{lane}" not in caller:
+            found.append(
+                f"{CALLER_FILE} never consumes '{lane}': the lane is composed from the "
+                f"filters and no job is gated by it, so a boundary change would still "
+                f"run nothing"
+            )
     return found
 
 
@@ -403,7 +588,13 @@ def render(claims: list[Claim], root: Path) -> str:
         enforcing = []
         for kind, name in claim.enforced_by:
             places = resolve(kind, name, root)
-            described = "path" if kind == "script" else KINDS[kind].described
+            if kind == "script":
+                # The name *is* the path for this kind, so the two-column form the
+                # others use would print the same string twice.
+                suffix = "" if places else " — **unresolved**"
+                enforcing.append(f"gate script `{name}`{suffix}")
+                continue
+            described = KINDS[kind].described
             where = f"`{places[0]}`" if places else "**unresolved**"
             enforcing.append(f"{described} `{name}` — {where}")
         lines.append(f"| {claim.statement} | {'<br>'.join(enforcing)} |")
@@ -456,9 +647,13 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
-    found = problems(claims, root) + coverage_claims(
-        claims,
-        tuple(root / document.relative_to(ROOT) for document in RELEASE_TEXT if document.is_relative_to(ROOT)),
+    found = (
+        problems(claims, root)
+        + coverage_claims(
+            claims,
+            tuple(root / document.relative_to(ROOT) for document in RELEASE_TEXT if document.is_relative_to(ROOT)),
+        )
+        + filter_problems(root)
     )
     if found:
         for problem in found:
@@ -494,7 +689,8 @@ def main() -> int:
 
     print(
         f"qualification matrix: {enforced} claims enforced, {unverified} asserted and "
-        f"not yet enforced, every name resolved"
+        f"not yet enforced, every name resolved, every lane a claim depends on still "
+        f"runs it"
     )
     return 0
 

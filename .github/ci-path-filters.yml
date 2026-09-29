@@ -34,6 +34,46 @@ shared:
   - 'justfile'
   - 'rust-toolchain.toml'
 
+# The native plugin isolation boundary, as one list rather than one per lane.
+#
+# Everything the process boundary is made of can change what an installed artifact
+# does: the child's loader, the host that supervises it, the ABI both ends speak, the
+# wire and contract crates between them, and the scripts that put a host into a
+# package. The lanes that must react are composed in `ci_changes.yml` rather than
+# listed here, because that is where a filter becomes a running job.
+#
+# One list on purpose. The hole this closes is a change to the loader or the host
+# that re-ran the workspace's Rust tests while leaving the installed Python and Node
+# lanes skipped, which is exactly the combination that breaks package composition
+# without failing a source test. The rule is asserted rather than described:
+# `scripts/qualification/matrix.py` refuses a tree where a lane that installs an
+# artifact does not react to this filter.
+plugin_isolation:
+  - '.github/ci-path-filters.yml'
+  - 'Cargo.lock'
+  - 'Cargo.toml'
+  - 'crates/native-abi/Cargo.toml'
+  - 'crates/native-abi/src/**'
+  - 'crates/native-loader/Cargo.toml'
+  - 'crates/native-loader/src/**'
+  - 'crates/plugin/Cargo.toml'
+  - 'crates/plugin/src/**'
+  - 'crates/plugin-host/Cargo.toml'
+  - 'crates/plugin-host/src/**'
+  - 'crates/plugin-proto/Cargo.toml'
+  - 'crates/plugin-proto/build.rs'
+  - 'crates/plugin-proto/proto/**'
+  - 'crates/plugin-proto/src/**'
+  - 'crates/plugin-protocol/Cargo.toml'
+  - 'crates/plugin-protocol/src/**'
+  - 'justfile'
+  - 'scripts/bundle-plugin-host.py'
+  - 'scripts/package-cli-bin.py'
+  - 'scripts/package-node-bin.py'
+  - 'scripts/verify-installed-node-plugin.py'
+  - 'scripts/verify-installed-plugin-host.py'
+  - 'scripts/verify-installed-python-plugin.py'
+
 rust_package:
   - 'Cargo.lock'
   - 'Cargo.toml'

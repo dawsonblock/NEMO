@@ -81,7 +81,12 @@ repos:
         # `security/PLUGIN-ISOLATION.md` or `README.md` can invalidate the wording the
         # gate exists to keep honest, and a filter that skipped those files would let
         # that change through without running the check at all.
-        files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/qualification/.*\.py|justfile|README\.md|security/(qualification-matrix\.toml|QUALIFICATION-MATRIX\.md|PLUGIN-ISOLATION\.md))$'
+        #
+        # The workflows and the path filters are here because the check reads them too:
+        # it resolves a recipe against the lanes that invoke it, and it refuses a tree
+        # where a boundary change would leave the lanes that install an artifact
+        # skipped. Both are properties of files this pattern now watches.
+        files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/(qualification|tests)/.*\.py|justfile|README\.md|security/(qualification-matrix\.toml|QUALIFICATION-MATRIX\.md|PLUGIN-ISOLATION\.md|MACOS-RESTRICTED-HOST\.md)|\.github/(ci-path-filters\.yml|workflows/.*\.ya?ml))$'
 
   # Trusted surface — the budgets and the dependency layers
   #

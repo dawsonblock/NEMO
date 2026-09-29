@@ -152,6 +152,37 @@ fn messages() -> Vec<(&'static str, Vec<u8>)> {
             .encode_to_vec(),
         ),
         (
+            "ArtifactTransferFrame",
+            v1::ArtifactTransferFrame {
+                frame: Some(v1::artifact_transfer_frame::Frame::Begin(
+                    v1::ArtifactTransferBegin {
+                        session_id: "session-1".into(),
+                        artifact_id: "artifact-1".into(),
+                        plugin_id: "example".into(),
+                        manifest: b"manifest".to_vec(),
+                        manifest_sha256: "manifest-digest".into(),
+                        library_sha256: "library-digest".into(),
+                        library_length: 4,
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "ArtifactTransferOutcome",
+            v1::ArtifactTransferOutcome {
+                result: Some(v1::artifact_transfer_outcome::Result::Approved(
+                    v1::ArtifactTransferApproved {
+                        artifact_id: "artifact-1".into(),
+                        plugin_id: "example".into(),
+                        manifest_sha256: "manifest-digest".into(),
+                        library_sha256: "library-digest".into(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        ),
+        (
             "PluginFailure",
             v1::PluginFailure {
                 code: v1::FailureCode::OversizedFrame as i32,
@@ -649,6 +680,12 @@ fn the_recorded_wire_bytes_represent_the_current_schema() {
                 .encode_to_vec(),
             "LoadResponse" => v1::LoadResponse::decode(bytes.as_slice())
                 .expect("decode LoadResponse")
+                .encode_to_vec(),
+            "ArtifactTransferFrame" => v1::ArtifactTransferFrame::decode(bytes.as_slice())
+                .expect("decode ArtifactTransferFrame")
+                .encode_to_vec(),
+            "ArtifactTransferOutcome" => v1::ArtifactTransferOutcome::decode(bytes.as_slice())
+                .expect("decode ArtifactTransferOutcome")
                 .encode_to_vec(),
             "PluginFailure" => v1::PluginFailure::decode(bytes.as_slice())
                 .expect("decode PluginFailure")

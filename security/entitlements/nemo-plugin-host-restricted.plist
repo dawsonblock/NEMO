@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+The entitlements a confined plugin host is signed with.
+
+App Sandbox is deny-by-default: a signed bundle carrying only this entitlement
+reaches its own container and what it was handed, and no user files, no devices,
+no outbound network. There is deliberately no `com.apple.security.*` resource
+entitlement here — a host that needs one is a host whose plugin needs a
+capability, and capabilities are granted by the runtime rather than by widening
+the bundle every plugin runs inside.
+
+Library validation stays ON in this variant, so a plugin is loadable only when it
+is signed by Apple or by this bundle's own team. The variant for plugins signed
+by somebody else is `nemo-plugin-host-restricted-third-party.plist`, and the
+weakening it carries is the reason it is a separate file.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+</dict>
+</plist>

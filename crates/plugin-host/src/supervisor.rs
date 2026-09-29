@@ -4,17 +4,18 @@
 //! The kernel's side of the process boundary: spawn, handshake, and the backend.
 //!
 //! Everything the boundary is supposed to guarantee is enforced here rather than
-//! asked of the child: the socket lives in a directory only this process can
-//! read, the child starts with a filtered environment and one credential, the
-//! handshake has to bind the runtime identity before any operation is sent, and
-//! a deadline that passes kills the process rather than waiting for a plugin to
-//! honour a cancellation token.
+//! asked of the child: the socket lives in a directory private to this account,
+//! under a name nothing could choose in advance, the child starts with a filtered
+//! environment and one credential, the handshake has to bind the runtime identity
+//! before any operation is sent, and a deadline that passes kills the process rather
+//! than waiting for a plugin to honour a cancellation token.
 //!
 //! Nothing here trusts the child's own account of itself. A host that exits is
 //! reported as `HostCrashed` rather than as an unavailable service, because the
 //! two call for different responses: one is a process that ended, and the other
 //! is a message that did not arrive.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,8 +23,9 @@ use std::time::Duration;
 
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginExecutionFuture};
 use nemo_relay_plugin_proto::convert::{
-    context_to_wire, health_outcome_from_wire, inspect_outcome_from_wire, inspect_request_to_wire,
-    load_outcome_from_wire, load_request_to_wire, unload_outcome_from_wire, unload_request_to_wire,
+    context_to_wire, failure_from_wire, health_outcome_from_wire, inspect_outcome_from_wire,
+    inspect_request_to_wire, load_outcome_from_wire, load_request_to_wire,
+    unload_outcome_from_wire, unload_request_to_wire,
 };
 use nemo_relay_plugin_proto::v1;
 use nemo_relay_plugin_proto::v1::plugin_host_client::PluginHostClient;
@@ -34,6 +36,7 @@ use nemo_relay_plugin_protocol::{
     PluginInspectRequest, PluginLoadRequest, PluginLoadResponse, PluginProtocolError,
     PluginSessionIdentity, PluginUnloadRequest, Uuid, deadline_expired,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -73,6 +76,14 @@ pub struct PluginHostSupervisorConfig {
     /// Applied to the child rather than to this process, and applied before it
     /// runs any plugin code, so nothing a plugin does can raise it.
     pub limits: crate::limits::PluginHostLimits,
+    /// How much the host process is contained.
+    ///
+    /// The resource limits above bound what the host takes; this decides whether
+    /// the platform confines what it can *reach* — its files, its network, its
+    /// devices. The default is the level that was implicit before the policy had
+    /// a name, and a level this build cannot deliver is refused at startup rather
+    /// than served with a host that runs without it.
+    pub isolation: crate::isolation_policy::NativeIsolationPolicy,
     /// How long to wait for the host to start and handshake.
     pub startup_timeout: Duration,
 }
@@ -95,6 +106,7 @@ impl PluginHostSupervisorConfig {
             offered_read_capabilities: Vec::new(),
             maximum_frame_bytes: MAX_FRAME_BYTES,
             limits: crate::limits::PluginHostLimits::default(),
+            isolation: crate::isolation_policy::NativeIsolationPolicy::default(),
             startup_timeout: Duration::from_secs(10),
         }
     }
@@ -124,6 +136,9 @@ pub struct PluginHostSupervisor {
     child_pipe: Option<tokio::process::ChildStdin>,
     /// Removed when the supervisor drops, so nothing outlives the session.
     socket_dir: PathBuf,
+    /// Host endpoint, discovered from the child in restricted mode because the
+    /// sandbox container path is owned by macOS and must not be guessed here.
+    host_endpoint: PathBuf,
     /// The socket this kernel serves for the child's own calls.
     kernel_endpoint: PathBuf,
     /// The task serving it, aborted with the session.
@@ -180,8 +195,20 @@ pub struct PluginHostSupervisor {
 impl PluginHostSupervisor {
     /// Spawn a host, handshake with it, and hold the session.
     pub async fn spawn(config: PluginHostSupervisorConfig) -> Result<Self, PluginProtocolError> {
-        let socket_dir = create_runtime_dir()?;
-        let socket = socket_dir.join("s");
+        // How much the host is contained, decided before a socket exists: a policy
+        // this build cannot honor is a failure to start rather than a host that
+        // runs without the confinement the deployment named. The executable is
+        // resolved here because under a confinement policy the host is the
+        // bundle's executable, which is not necessarily the path the configuration
+        // was built with.
+        let executable = config.isolation.host_executable(
+            &config.executable,
+            &crate::host_location::this_process_directory(),
+        )?;
+        let restricted_ipc =
+            config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS;
+        let mut socket_dir = create_runtime_dir()?;
+        let mut socket = socket_dir.join("s");
         let credential = Uuid::now_v7().to_string();
         // The capability every operation on this session has to present, minted
         // before the host is told anything so that the session is established
@@ -194,7 +221,7 @@ impl PluginHostSupervisor {
         // kernel is a different relationship than a call into the host, and each
         // side checks the credential the other was given rather than the path,
         // which anybody who can read the environment already knows.
-        let kernel_endpoint = socket_dir.join("k");
+        let mut kernel_endpoint = socket_dir.join("k");
         let kernel_credential = Uuid::now_v7().to_string();
         let operation_scopes = Arc::new(OperationScopes::new());
         let continuations = Arc::new(crate::continuations::Continuations::new());
@@ -210,14 +237,19 @@ impl PluginHostSupervisor {
         // to the reactor that created it, so adopting it on another runtime would leave a socket
         // that accepts at the operating-system level and never answers. The callback executor
         // adopts this one from inside its own reactor below.
-        let kernel_listener =
-            std::os::unix::net::UnixListener::bind(&kernel_endpoint).map_err(|error| {
-                unavailable(format!(
-                    "failed to bind the kernel's socket at '{}': {error}",
-                    kernel_endpoint.display()
-                ))
-            })?;
-        let mut command = Command::new(&config.executable);
+        let mut kernel_listener = if restricted_ipc {
+            None
+        } else {
+            Some(
+                std::os::unix::net::UnixListener::bind(&kernel_endpoint).map_err(|error| {
+                    unavailable(format!(
+                        "failed to bind the kernel's socket at '{}': {error}",
+                        kernel_endpoint.display()
+                    ))
+                })?,
+            )
+        };
+        let mut command = Command::new(&executable);
         // The bounds the child runs under, applied between `fork` and `exec`.
         // This is the only point at which they can be applied and the only point
         // at which they cannot be undone by what they are bounding: whatever the
@@ -254,6 +286,10 @@ impl PluginHostSupervisor {
                 "NEMO_RELAY_PLUGIN_HOST_PROTOCOL",
                 PROTOCOL_VERSION.to_string(),
             )
+            .env(
+                "NEMO_RELAY_PLUGIN_HOST_ISOLATION",
+                config.isolation.as_str(),
+            )
             // A pipe rather than null: the host watches it and exits when the
             // kernel that owns it goes away, which is the one thing that still
             // holds when a supervisor never gets to run its own teardown. The
@@ -261,7 +297,11 @@ impl PluginHostSupervisor {
             .stdin(Stdio::piped())
             // Logs stay logs: the child's output goes to this process's streams
             // and is never a channel the protocol travels on.
-            .stdout(Stdio::inherit())
+            .stdout(if restricted_ipc {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
         let child = command.spawn().map_err(|error| {
@@ -269,7 +309,7 @@ impl PluginHostSupervisor {
             // without the executable that makes isolation possible, so the
             // failure names what was looked for rather than only that the spawn
             // failed: a caller cannot repair a path it was never told.
-            if !config.executable.exists() {
+            if !executable.exists() {
                 let looked = host_search_locations()
                     .into_iter()
                     .map(|location| format!("'{}'", location.display()))
@@ -279,21 +319,92 @@ impl PluginHostSupervisor {
                     "the plugin host executable '{}' does not exist, and a runtime that starts a \
                      host needs the host installed beside it; it was looked for at {looked}, and \
                      {EXECUTABLE_ENV} names one somewhere else",
-                    config.executable.display(),
+                    executable.display(),
                 ));
             }
             unavailable(format!(
                 "failed to start plugin host '{}': {error}; the limits the child was to run \
                  under are applied here, so a limit this platform refuses is a host that does \
                  not start rather than one that runs unbounded",
-                config.executable.display(),
+                executable.display(),
             ))
         })?;
         let process_id = child.id();
         let mut child = child;
         // Held, not used: the host reads it, and what it observes is the moment
         // this handle goes away with the session.
-        let child_pipe = child.stdin.take();
+        let mut child_pipe = child.stdin.take();
+
+        let mut host_endpoint = socket.clone();
+        if restricted_ipc {
+            let stdout = child.stdout.take().ok_or_else(|| {
+                unavailable("the restricted host did not expose its IPC startup pipe")
+            })?;
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let read_endpoint =
+                tokio::time::timeout(config.startup_timeout, reader.read_line(&mut line)).await;
+            let read_endpoint = match read_endpoint {
+                Ok(Ok(count)) if count > 0 => Ok(()),
+                Ok(Ok(_)) => Err(
+                    "the host closed its startup pipe before reporting IPC endpoints".to_string(),
+                ),
+                Ok(Err(error)) => Err(format!("could not read restricted IPC endpoints: {error}")),
+                Err(_) => Err(
+                    "the host did not report restricted IPC endpoints before its startup deadline"
+                        .to_string(),
+                ),
+            };
+            if let Err(error) = read_endpoint {
+                let _ = child.kill().await;
+                return Err(unavailable(error));
+            }
+            let fields = line.trim_end().split('\t').collect::<Vec<_>>();
+            if fields.len() != 3 || fields[0] != "NEMO_RELAY_RESTRICTED_IPC" {
+                let _ = child.kill().await;
+                return Err(unavailable(format!(
+                    "the restricted host sent an invalid IPC record: {line:?}"
+                )));
+            }
+            host_endpoint = PathBuf::from(fields[1]);
+            kernel_endpoint = PathBuf::from(fields[2]);
+            let Some(host_directory) = host_endpoint.parent() else {
+                let _ = child.kill().await;
+                return Err(unavailable(
+                    "the restricted host endpoint has no parent directory",
+                ));
+            };
+            if kernel_endpoint.parent() != Some(host_directory)
+                || host_endpoint.file_name().is_none_or(|name| name != "h")
+                || kernel_endpoint.file_name().is_none_or(|name| name != "k")
+            {
+                let _ = child.kill().await;
+                return Err(unavailable(
+                    "the restricted host reported mismatched IPC endpoints",
+                ));
+            }
+            let listener = std::os::unix::net::UnixListener::bind(&kernel_endpoint).map_err(|error| {
+                let _ = child.start_kill();
+                unavailable(format!("failed to bind the kernel callback socket inside the host container: {error}"))
+            })?;
+            kernel_listener = Some(listener);
+            if let Some(pipe) = child_pipe.as_mut() {
+                if let Err(error) = pipe.write_all(b"R").await {
+                    let _ = child.kill().await;
+                    return Err(unavailable(format!(
+                        "could not release restricted host startup: {error}"
+                    )));
+                }
+            }
+            tokio::spawn(async move {
+                let mut stream = reader.into_inner();
+                let mut output = tokio::io::stdout();
+                let _ = tokio::io::copy(&mut stream, &mut output).await;
+            });
+            let _ = std::fs::remove_dir_all(&socket_dir);
+            socket_dir = host_directory.to_path_buf();
+            socket = host_endpoint.clone();
+        }
 
         // One budget covers the whole startup: the socket appearing *and* the
         // handshake completing. A host that binds, accepts and then never
@@ -395,6 +506,9 @@ impl PluginHostSupervisor {
         let serving_continuations = Arc::clone(&continuations);
         let serving_codecs = Arc::clone(&codecs);
         let runtime_server = callback_runtime.spawn(async move {
+            let Some(kernel_listener) = kernel_listener else {
+                return Err("the kernel callback listener was not created".to_string());
+            };
             if let Err(error) = kernel_listener.set_nonblocking(true) {
                 return Err(format!(
                     "the kernel's socket could not be made non-blocking: {error}"
@@ -428,6 +542,7 @@ impl PluginHostSupervisor {
             process_id,
             child_pipe,
             socket_dir,
+            host_endpoint,
             kernel_endpoint,
             runtime_server,
             callback_runtime: Some(callback_runtime),
@@ -460,7 +575,7 @@ impl PluginHostSupervisor {
     /// Everything a second transport needs to attach to this session.
     pub fn connection_descriptor(&self) -> crate::attached::ConnectionDescriptor {
         crate::attached::ConnectionDescriptor {
-            endpoint: self.socket_dir.join("s"),
+            endpoint: self.host_endpoint.clone(),
             session_credential: self.session_credential.clone(),
             runtime_binding_digest: self.runtime_binding_digest.clone(),
             session_id: self.session.session_id.clone(),
@@ -615,6 +730,125 @@ impl ProcessPluginBackend {
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeRequestGuardrail,
             nemo_relay_plugin_protocol::PluginRegistrationOperation::LlmSanitizeResponseGuardrail,
         ]
+    }
+
+    /// Transfer the approved artifact into the confined host's own container.
+    async fn transfer_artifact(
+        &self,
+        request: &PluginLoadRequest,
+        context: &PluginExecutionContext,
+    ) -> Result<String, PluginProtocolError> {
+        let (manifest, library_path) = artifact_transfer_sources(request)?;
+        let length = std::fs::metadata(&library_path)
+            .map_err(|error| rejected(format!("cannot size approved plugin library: {error}")))?
+            .len();
+        const MAX_PLUGIN_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+        if length > MAX_PLUGIN_ARTIFACT_BYTES {
+            return Err(rejected(format!(
+                "plugin library is {length} bytes, over the transfer limit of {MAX_PLUGIN_ARTIFACT_BYTES}"
+            )));
+        }
+        let mut library = std::fs::File::open(&library_path)
+            .map_err(|error| rejected(format!("cannot open approved plugin library: {error}")))?;
+        let artifact_id = Uuid::now_v7().to_string();
+        let session_id = self.supervisor.session.session_id.clone();
+        let begin = v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Begin(
+                v1::ArtifactTransferBegin {
+                    session_id: session_id.clone(),
+                    artifact_id: artifact_id.clone(),
+                    plugin_id: request.plugin_id.clone(),
+                    manifest,
+                    manifest_sha256: request.identity.manifest_sha256.clone(),
+                    library_sha256: request.identity.library_sha256.clone(),
+                    library_length: length,
+                },
+            )),
+        };
+        let chunk_size = (self.supervisor.session.maximum_frame_bytes as usize)
+            .saturating_sub(256)
+            .min(256 * 1024);
+        if chunk_size == 0 {
+            return Err(rejected(
+                "the negotiated frame limit is too small to transfer an approved artifact",
+            ));
+        }
+        let stream_artifact_id = artifact_id.clone();
+        let mut offset = 0_u64;
+        let mut source_done = false;
+        let chunks = std::iter::from_fn(move || {
+            if source_done {
+                return None;
+            }
+            let mut bytes = vec![0_u8; chunk_size];
+            match library.read(&mut bytes) {
+                Ok(0) => {
+                    source_done = true;
+                    None
+                }
+                Ok(count) => {
+                    bytes.truncate(count);
+                    let frame = v1::ArtifactTransferFrame {
+                        frame: Some(v1::artifact_transfer_frame::Frame::Chunk(
+                            v1::ArtifactTransferChunk {
+                                artifact_id: stream_artifact_id.clone(),
+                                offset,
+                                bytes,
+                            },
+                        )),
+                    };
+                    offset += count as u64;
+                    Some(frame)
+                }
+                Err(_) => {
+                    source_done = true;
+                    None
+                }
+            }
+        });
+        let finalize = v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Finalize(
+                v1::ArtifactTransferFinalize {
+                    artifact_id: artifact_id.clone(),
+                },
+            )),
+        };
+        let frames = std::iter::once(begin)
+            .chain(chunks)
+            .chain(std::iter::once(finalize));
+        let request_stream = capable(tokio_stream::iter(frames), &self.supervisor.capability);
+        let budget = Self::budget(context, now_unix_ms()?)?;
+        let mut client = self.supervisor.client.clone();
+        let outcome = self
+            .supervisor
+            .request(budget, async move {
+                client.transfer_artifact(request_stream).await
+            })
+            .await?
+            .into_inner();
+        match outcome.result {
+            Some(v1::artifact_transfer_outcome::Result::Approved(approved))
+                if approved.artifact_id == artifact_id
+                    && approved.plugin_id == request.plugin_id
+                    && approved.manifest_sha256 == request.identity.manifest_sha256
+                    && approved.library_sha256 == request.identity.library_sha256 =>
+            {
+                Ok(artifact_id)
+            }
+            Some(v1::artifact_transfer_outcome::Result::Failure(failure)) => {
+                Err(error_to_protocol(failure_from_wire(&failure)?))
+            }
+            Some(v1::artifact_transfer_outcome::Result::Approved(_)) => {
+                Err(PluginProtocolError::new(
+                    PluginFailureCode::MalformedResponse,
+                    "the host approved a different artifact transfer than the one sent",
+                ))
+            }
+            None => Err(PluginProtocolError::new(
+                PluginFailureCode::MalformedResponse,
+                "the host returned no artifact transfer outcome",
+            )),
+        }
     }
 
     /// Ask the host to activate components and report what they registered.
@@ -793,10 +1027,15 @@ impl ProcessPluginBackend {
 impl PluginExecutionBackend for ProcessPluginBackend {
     fn load<'a>(
         &'a self,
-        request: PluginLoadRequest,
+        mut request: PluginLoadRequest,
         context: PluginExecutionContext,
     ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
         Box::pin(async move {
+            if self.config.isolation
+                == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS
+            {
+                request.artifact = self.transfer_artifact(&request, &context).await?;
+            }
             let budget = Self::budget(&context, now_unix_ms()?)?;
             let session_id = self.supervisor.session.session_id.clone();
             let wire = load_request_to_wire(&request, &session_id, &context);
@@ -1033,6 +1272,70 @@ fn error_to_protocol(failure: PluginFailure) -> PluginProtocolError {
     PluginProtocolError::new(failure.code, failure.message)
 }
 
+fn rejected(message: impl Into<String>) -> PluginProtocolError {
+    PluginProtocolError::new(PluginFailureCode::Rejected, message)
+}
+
+/// Read the manifest and resolve its library after confirming the kernel's
+/// approval still describes the source artifact. The receiver independently
+/// hashes both streams before making either file loadable.
+fn artifact_transfer_sources(
+    request: &PluginLoadRequest,
+) -> Result<(Vec<u8>, PathBuf), PluginProtocolError> {
+    let (manifest_digest, library_digest) =
+        nemo_relay::plugin::dynamic::plugin_artifact_identity(&request.artifact)
+            .map_err(|error| rejected(format!("the approved artifact cannot be read: {error}")))?;
+    if manifest_digest != request.identity.manifest_sha256
+        || library_digest != request.identity.library_sha256
+    {
+        return Err(rejected(
+            "the source artifact no longer matches the kernel's approved identity",
+        ));
+    }
+    let reference = PathBuf::from(&request.artifact);
+    let manifest_path = if reference.is_dir() {
+        reference.join(nemo_relay::plugin::dynamic::DYNAMIC_PLUGIN_MANIFEST_FILENAME)
+    } else {
+        reference
+    };
+    let manifest = std::fs::read(&manifest_path)
+        .map_err(|error| rejected(format!("cannot read approved plugin manifest: {error}")))?;
+    if manifest.len() > 64 * 1024 {
+        return Err(rejected("the approved plugin manifest exceeds 64 KiB"));
+    }
+    let text = std::str::from_utf8(&manifest).map_err(|error| {
+        rejected(format!(
+            "the approved plugin manifest is not UTF-8: {error}"
+        ))
+    })?;
+    let parsed = nemo_relay::plugin::dynamic::DynamicPluginManifest::parse_toml(text)
+        .map_err(|error| rejected(format!("the approved plugin manifest is invalid: {error}")))?;
+    if parsed.plugin.id != request.plugin_id {
+        return Err(rejected(
+            "the approved plugin manifest declares a different plugin id",
+        ));
+    }
+    let nemo_relay::plugin::dynamic::DynamicPluginManifestLoad::RustDynamic(load) = parsed.load
+    else {
+        return Err(rejected(
+            "the approved plugin manifest does not describe a native library",
+        ));
+    };
+    let library = load
+        .library
+        .ok_or_else(|| rejected("the approved plugin manifest has no library path"))?;
+    let library = PathBuf::from(library);
+    let library_path = if library.is_absolute() {
+        library
+    } else {
+        manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(library)
+    };
+    Ok((manifest, library_path))
+}
+
 fn unavailable(message: impl Into<String>) -> PluginProtocolError {
     PluginProtocolError::new(PluginFailureCode::Unavailable, message)
 }
@@ -1049,11 +1352,13 @@ fn now_unix_ms() -> Result<u64, PluginProtocolError> {
     Ok(now.as_millis() as u64)
 }
 
-/// A directory only this process can read, for one host's socket.
+/// A directory private to this account, for one host's socket.
 ///
 /// The name is short on purpose: a Unix socket path has a small, fixed limit,
 /// and the platform's temporary directory can already be most of it, so a long
-/// name here would refuse to bind on a machine whose temp directory is deep.
+/// name here would refuse to bind on a machine whose temp directory is deep. The
+/// mode denies other users; it does not distinguish processes of the same account,
+/// which is the boundary this socket is for.
 fn create_runtime_dir() -> Result<PathBuf, PluginProtocolError> {
     // The random tail, not the timestamp: two hosts started in the same
     // millisecond would otherwise share a directory, and the second would find
@@ -1230,6 +1535,7 @@ mod tests {
             offered_read_capabilities: Vec::new(),
             maximum_frame_bytes: MAX_FRAME_BYTES,
             limits: crate::limits::PluginHostLimits::default(),
+            isolation: crate::isolation_policy::NativeIsolationPolicy::default(),
             startup_timeout: Duration::from_secs(1),
         };
         let message = match PluginHostSupervisor::spawn(config).await {
@@ -1242,6 +1548,37 @@ mod tests {
         );
         assert!(message.contains(EXECUTABLE_ENV), "{message}");
         assert!(message.contains(executable_name()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_confinement_this_build_cannot_deliver_is_refused_before_anything_starts() {
+        // The configuration says the host is confined. A build that cannot confine
+        // it refuses rather than starting the host anyway: a boundary described in
+        // configuration and absent from the process is worse than one that was
+        // never asked for, because every reader downstream takes the
+        // configuration for the truth. Nothing is created either — the decision
+        // comes before the first socket.
+        let config = PluginHostSupervisorConfig {
+            isolation: crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS,
+            ..PluginHostSupervisorConfig::beside_this_executable("binding")
+        };
+
+        let message = match PluginHostSupervisor::spawn(config).await {
+            Ok(_) => panic!("a confinement this build cannot deliver does not start a host"),
+            Err(error) => error.to_string(),
+        };
+
+        use crate::isolation_policy::RestrictionRequirement;
+        assert!(message.contains("restricted-macos"), "{message}");
+        assert!(
+            message.contains(crate::host_location::BUNDLE_NAME)
+                || message.contains(RestrictionRequirement::StagedArtifactTransfer.message()),
+            "the refusal names what is missing: {message}"
+        );
+        assert!(
+            !message.contains("failed to start plugin host"),
+            "nothing was spawned to fail: {message}"
+        );
     }
 
     // Where a host is found is `host_location`'s rule, and its tests live with it:

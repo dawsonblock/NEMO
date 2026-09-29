@@ -28,6 +28,23 @@ fn host_executable() -> PathBuf {
     nemo_relay_native_loader::child_binary()
 }
 
+/// Serializes the tests that own or assert the process-wide plugin-host lease.
+///
+/// The lease is process-wide state, and this binary runs its tests in parallel: a
+/// test that asserts the lease is free is asserting something another test may be
+/// holding, which is how this suite came to fail on one machine and pass on
+/// another while neither was wrong. Running the whole file on a single thread
+/// would hide that coupling rather than name it, and it would hide accidental
+/// coupling introduced later; this guard names it, so the tests that take or
+/// assert the lease hold it for as long as the assertion means anything and the
+/// rest of the file stays parallel.
+static LEASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The guard a test takes to own the lease and everything asserted about it.
+async fn lease_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    LEASE_GUARD.lock().await
+}
+
 fn host_config() -> PluginHostSupervisorConfig {
     PluginHostSupervisorConfig {
         executable: host_executable(),
@@ -43,6 +60,10 @@ fn host_config() -> PluginHostSupervisorConfig {
         offered_read_capabilities: Vec::new(),
         maximum_frame_bytes: nemo_relay_plugin_protocol::MAX_FRAME_BYTES,
         limits: nemo_relay_plugin_host::limits::PluginHostLimits::default(),
+        // The level the whole suite runs at: an ordinary child process. What the
+        // confined level needs beyond this — a bundle and the artifact transfer —
+        // is what its own tests are about.
+        isolation: nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::default(),
         startup_timeout: Duration::from_secs(20),
     }
 }
@@ -173,6 +194,71 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
         .await
         .expect("an inspection");
     assert!(after.is_empty(), "{after:#?}");
+}
+
+/// Run explicitly on macOS with a signed `restricted-macos` host bundle. The
+/// ordinary suite uses the trusted host so it can run on every platform; this
+/// opt-in lane crosses the actual sandbox boundary and the authenticated byte
+/// transfer together.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE from a signed app bundle"]
+async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
+    use nemo_relay::plugin::dynamic::plugin_artifact_identity;
+    use nemo_relay_plugin_protocol::{PluginArtifactIdentity, PluginLoadRequest};
+
+    let _lease = lease_guard().await;
+    let executable = std::env::var_os("NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE")
+        .map(PathBuf::from)
+        .expect("the macOS lane supplies the executable inside a signed bundle");
+    assert!(executable.is_file(), "{executable:?}");
+    let fixture = support::PreparedFixture::write(
+        "fixture_native",
+        "nemo-ph-restricted",
+        support::native_fixture(),
+        "nemo_relay_fixture_native_plugin",
+    );
+    let artifact = fixture.artifact();
+    let (manifest_sha256, library_sha256) =
+        plugin_artifact_identity(&artifact).expect("the fixture identity");
+    let mut config = host_config();
+    config.executable = executable;
+    config.isolation =
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::RestrictedMacOS;
+    let backend = ProcessPluginBackend::launch(config)
+        .await
+        .expect("the signed bundle starts a confined host and handshakes");
+    assert_ne!(backend.process_id(), Some(std::process::id()));
+
+    let loaded = backend
+        .load(
+            PluginLoadRequest {
+                plugin_id: "fixture_native".into(),
+                artifact,
+                identity: PluginArtifactIdentity {
+                    manifest_sha256: manifest_sha256.clone(),
+                    library_sha256,
+                },
+            },
+            context(),
+        )
+        .await
+        .expect("the approved dylib is transferred, verified and loaded in the container");
+    assert_eq!(
+        loaded.descriptor.manifest_digest.as_deref(),
+        Some(manifest_sha256.as_str())
+    );
+    let inspected = backend
+        .inspect(
+            nemo_relay_plugin_protocol::PluginInspectRequest {
+                handle: Some(loaded.handle),
+            },
+            context(),
+        )
+        .await
+        .expect("the confined host reports the loaded plugin");
+    assert_eq!(inspected.len(), 1);
+    assert_eq!(inspected[0].plugin_id, "fixture_native");
 }
 
 // Single-threaded, deliberately: an off-path callback's answer arrives over the
@@ -1766,6 +1852,7 @@ async fn the_shared_composition_runs_a_native_plugin_in_another_process() {
     use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
+    let _lease = lease_guard().await;
     // The composition every binding and the CLI share. What a binding needs to
     // know is only this: `activate` returning `Ok` means the plugin is live, and
     // the plugin is live *somewhere else* — which is the property the isolation
@@ -1829,6 +1916,7 @@ async fn a_composition_with_no_host_binary_fails_closed_and_owns_nothing_afterwa
     use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
+    let _lease = lease_guard().await;
     let fixture = support::PreparedFixture::write(
         "fixture_intercept",
         "nemo-ph-missing-host",
@@ -1879,6 +1967,7 @@ async fn a_caller_that_stops_waiting_does_not_leave_a_half_applied_activation() 
     use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
     use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
+    let _lease = lease_guard().await;
     // The defect this pins: an activation claims process-wide ownership, registers
     // components and starts a process, so a caller that gives up halfway through
     // must not be able to leave it half-applied. Cancellation is the caller's

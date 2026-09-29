@@ -38,8 +38,10 @@
 # ceilings below moved in this revision without a dependency being added: the raise is
 # the correction, and each entry says so where it moved. The closure checks above are
 # the exception: they ask what the kernel's own process can reach rather than how large
-# a resolved set is, and `scripts/tcb/report.py` says in one place why they name the
-# platform CI enforces on instead.
+# a resolved set is, so they are resolved one platform at a time — for every platform
+# the plugin-hosting packages are built for rather than for the one CI runs on — and
+# the platform that is recorded instead of enforced is named below with the reach that
+# keeps it out of the list.
 
 version = 1
 
@@ -58,6 +60,19 @@ version = 1
 # the forbidden list: protocol types are what the kernel needs in order to talk to a
 # host, and reaching them is the design rather than a leak.
 [kernel_library_closure]
+# Every platform the property is resolved for, rather than the one CI happens to run
+# on. A single target left the rest of them unasked, which is a gap in a check whose
+# whole argument is that the kernel cannot reach a loader: an edge that resolves only
+# for musl or only for macOS would have skipped it. The list is the platforms the
+# plugin-hosting packages are built for, and the platform that is deliberately not on
+# it is named below with the reach that keeps it off.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
 roots = ["nemo-relay"]
 forbidden = ["libloading", "nemo-relay-native-loader", "nemo-relay-native-abi", "nemo-relay-plugin"]
 
@@ -73,6 +88,16 @@ forbidden = ["libloading", "nemo-relay-native-loader", "nemo-relay-native-abi", 
 # The recorded set is empty and the intersection is required to be, so a composition
 # that reaches any of these fails rather than being grandfathered.
 [kernel_closure]
+# The same list as the library's, and one target at a time: the composition surfaces
+# are what ship, so the platforms they are packaged for are the platforms the property
+# has to hold on.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
 roots = [
     "nemo-relay",
     "nemo-relay-cli",
@@ -87,6 +112,27 @@ forbidden = [
     "nemo-relay-plugin",
 ]
 reachable_now = []
+
+# The platform that is recorded rather than enforced.
+#
+# `libloading` is two different things, and which one it is depends on who reached it.
+# It is this repository's native loader when the kernel or a shipping composition
+# reaches it, and it is a platform binding's own dynamic loader when the runtime the
+# binding wraps pulls one in. The Windows N-API machinery does the latter, which is
+# exactly why the union of every platform cannot be the set this property is stated
+# over: under `--target all`, `nemo-relay-node` reaches `libloading` on Windows and on
+# no other target.
+#
+# Recording that platform here rather than leaving it out changes what the check
+# says. The target is measured like the others: its own resolve has to reach the
+# packages named and no others of ours, so a platform's own loader cannot become
+# cover for this repository's. A record the tree no longer needs is refused, the same
+# way a temporary ceiling is, because an exemption nobody re-earns is one that hides
+# the next reach.
+[[kernel_closure.platform_external]]
+target = "x86_64-pc-windows-msvc"
+packages = ["libloading"]
+reason = "the Node binding's N-API machinery loads its own runtime library there; native-plugin isolation is not implemented on Windows, so no composition of this milestone's ships there, and the loader this repository builds is absent from that resolve like every other"
 
 [trusted]
 crates = [
@@ -423,12 +469,23 @@ transitive_dependency_digest = "32c66b87cc783b216a5e49aafac47240f7de9c9fbdd31d42
 # moved one direct dependency and shrank the transitive set by one; what it really
 # removed is what the release binary linked.
 [limits.nemo-relay-native-loader]
-max_direct_dependencies = 16
+# Raised by the artifact staging implementation: streaming SHA-256 is a production
+# dependency now, rather than a test-only dependency, because the host verifies the
+# transferred bytes as they arrive and hashes the promoted file again.
+max_direct_dependencies = 17
 # Raised to the platform union; see the measurement note at the top of this file.
 max_transitive_packages = 295
-max_source_lines = 15288
+# Raised for the bounded artifact staging state machine, streaming service, and
+# sandbox-compatible IPC startup path. The additional source is the implementation
+# of an authenticated transfer, per-session private staging, incremental and final
+# digest checks, atomic promotion, restricted load resolution, and container-owned
+# socket setup. This is a material increase in the host-side trusted surface, so the
+# count and digest are reviewed explicitly; the kernel-process unsafe budget is
+# unchanged and the restricted startup policy remains fail-closed pending real
+# sandboxed dlopen qualification.
+max_source_lines = 16475
 max_unsafe_occurrences = 288
-direct_dependency_digest = "aadc974282ee74c89349bd65d088fccd8cab0c1160e9aa51f95ab06d467dec28"
+direct_dependency_digest = "c8645337cb08161f09d656950e3dd6c785ef92ff9c1f29ba39a8ef39d686f855"
 transitive_dependency_digest = "d6e5755cf0c3cbeff82281e73be9006ea21ade44d1f93f0c21feb94fb55976d5"
 
 # The native plugin ABI's own crate — the first staged step of the split, and the

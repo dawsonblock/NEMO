@@ -2000,6 +2000,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "hyper-util",
  "libloading",
  "log",
  "nemo-relay",
@@ -2016,6 +2017,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
  "uuid",
 ]

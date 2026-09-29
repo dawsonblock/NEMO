@@ -97,18 +97,22 @@ def test_the_measurement_names_a_target_instead_of_taking_the_host(tmp_path: pat
 
     monkeypatch.setattr(report.subprocess, "run", run)
     report.dependency_identities(tmp_path, "nemo-relay")
-    report.kernel_closure_names(tmp_path, ["nemo-relay"])
+    report.kernel_closure_names(tmp_path, ["nemo-relay"], target="aarch64-apple-darwin")
 
     def target_of(argv: list[str]) -> str:
         return argv[argv.index("--target") + 1]
 
     assert target_of(calls[0]) == report.BUDGET_TARGET
-    assert target_of(calls[1]) == report.CLOSURE_TARGET
+    assert target_of(calls[1]) == "aarch64-apple-darwin"
     # The budgets are the union, because a budget has to be the same number wherever
-    # it is computed; the closure names the platform it is enforced on, because it
+    # it is computed; the closure names the platform it is asking about, because it
     # asks what one process can reach rather than how large a resolved set is.
     assert report.BUDGET_TARGET == "all"
-    assert report.CLOSURE_TARGET != report.BUDGET_TARGET
+    assert report.BUDGET_TARGET not in report.DEFAULT_CLOSURE_TARGETS
+    # More than one platform, because the property is about each of them: a check that
+    # named one target left an edge that resolves only for musl or only for macOS
+    # unasked while still reading as universal.
+    assert len(report.DEFAULT_CLOSURE_TARGETS) > 1
 
 
 def test_a_transitive_version_change_fails_the_gate(tmp_path: pathlib.Path) -> None:
@@ -314,6 +318,7 @@ def test_repository_policy_measures_every_crate_it_trusts() -> None:
 
 CLOSURE_POLICY = {
     "kernel_closure": {
+        "targets": ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"],
         "roots": ["nemo-relay"],
         "forbidden": ["libloading", "nemo-relay-plugin", "native-loader"],
         "reachable_now": ["libloading", "nemo-relay-plugin"],
@@ -325,9 +330,9 @@ def test_a_recorded_loader_package_is_the_remaining_work_and_not_a_failure() -> 
     # The list is a record, not a permission: these are the crates the split still
     # has to move, and the gate stays green while the closure reaches them and no
     # further.
-    reachable = {"nemo-relay", "libloading", "nemo-relay-plugin", "serde"}
+    reachable = {"x86_64-unknown-linux-gnu": {"nemo-relay", "libloading", "nemo-relay-plugin", "serde"}}
 
-    assert report.kernel_closure_reachability(CLOSURE_POLICY, reachable) == {
+    assert report.kernel_closure_reachability(CLOSURE_POLICY, reachable["x86_64-unknown-linux-gnu"]) == {
         "libloading",
         "nemo-relay-plugin",
     }
@@ -338,19 +343,109 @@ def test_a_loader_package_the_policy_does_not_record_fails() -> None:
     # A crate that loads native code reaching the kernel is the failure this check
     # exists for, and it is a dependency edge somebody added rather than the work
     # the policy already knows about.
-    reachable = {"nemo-relay", "libloading", "nemo-relay-plugin", "native-loader"}
+    reachable = {"x86_64-unknown-linux-gnu": {"nemo-relay", "libloading", "nemo-relay-plugin", "native-loader"}}
 
     problems = report.find_closure_problems(CLOSURE_POLICY, reachable)
 
     assert len(problems) == 1
     assert "native-loader" in problems[0]
     assert "not one of the loader packages the policy records" in problems[0]
+    # The platform is part of the failure: a reach one platform's graph has is still
+    # a reach, and a message that named none would leave the reader guessing which
+    # build to look at.
+    assert "x86_64-unknown-linux-gnu" in problems[0]
+
+
+def test_a_reach_only_one_target_has_is_still_reported_for_that_target() -> None:
+    clean = {"nemo-relay", "serde"}
+    reaching = {"nemo-relay", "native-loader"}
+
+    assert report.find_closure_problems(CLOSURE_POLICY, {"x86_64-unknown-linux-gnu": clean}) == []
+    problems = report.find_closure_problems(
+        CLOSURE_POLICY, {"x86_64-unknown-linux-gnu": clean, "aarch64-apple-darwin": reaching}
+    )
+
+    assert len(problems) == 1
+    assert "aarch64-apple-darwin" in problems[0]
+    assert "native-loader" in problems[0]
 
 
 def test_a_policy_without_a_closure_section_checks_nothing() -> None:
     # A crate that has not been split yet has nothing to record, and the check says
     # so rather than reporting an empty closure as a pass.
-    assert report.find_closure_problems({}, {"libloading"}) == []
+    assert report.find_closure_problems({}, {"a-target": {"libloading"}}) == []
+
+
+# ---- the platform that is recorded rather than enforced ----
+
+WINDOWS_EXEMPT_POLICY = {
+    "kernel_closure": {
+        "targets": ["x86_64-unknown-linux-gnu"],
+        "roots": ["nemo-relay"],
+        "forbidden": ["libloading", "nemo-relay-plugin"],
+        "reachable_now": [],
+        "platform_external": [
+            {
+                "target": "x86_64-pc-windows-msvc",
+                "packages": ["libloading"],
+                "reason": "the binding's own runtime loader on that platform",
+            }
+        ],
+    }
+}
+
+
+def test_a_recorded_platform_loader_has_to_still_be_there() -> None:
+    # An exemption is measured like everything else in this file. If the resolve no
+    # longer needs it, the record is permitting a reach that is not there instead of
+    # describing one that is, and the next reader would have no reason to look.
+    holds = {"x86_64-pc-windows-msvc": {"nemo-relay", "libloading"}}
+    assert report.find_platform_external_problems(WINDOWS_EXEMPT_POLICY, holds) == []
+
+    stale = {"x86_64-pc-windows-msvc": {"nemo-relay"}}
+    problems = report.find_platform_external_problems(WINDOWS_EXEMPT_POLICY, stale)
+
+    assert len(problems) == 1
+    assert "stale" in problems[0]
+    assert "libloading" in problems[0]
+
+
+def test_a_platform_exemption_covers_only_the_packages_it_names() -> None:
+    # Otherwise a platform's own loader becomes cover for this repository's: the
+    # exemption is for `libloading` on Windows, not for whatever else that resolve
+    # might gain.
+    reaching = {"x86_64-pc-windows-msvc": {"nemo-relay", "libloading", "nemo-relay-plugin"}}
+    problems = report.find_platform_external_problems(WINDOWS_EXEMPT_POLICY, reaching)
+
+    assert len(problems) == 1
+    assert "nemo-relay-plugin" in problems[0]
+    assert "does not cover" in problems[0]
+
+
+def test_an_enforced_target_may_not_also_be_exempt() -> None:
+    policy = {
+        "kernel_closure": {
+            **WINDOWS_EXEMPT_POLICY["kernel_closure"],
+            "targets": ["x86_64-pc-windows-msvc"],
+        }
+    }
+    problems = report.find_platform_external_problems(policy, {"x86_64-pc-windows-msvc": {"nemo-relay", "libloading"}})
+
+    assert len(problems) == 1
+    assert "both enforced and recorded" in problems[0]
+
+
+def test_a_platform_exemption_with_no_reason_is_reported() -> None:
+    policy = {
+        "kernel_closure": {
+            **WINDOWS_EXEMPT_POLICY["kernel_closure"],
+            "platform_external": [{"target": "x86_64-pc-windows-msvc", "packages": ["libloading"]}],
+        }
+    }
+    problems = report.find_platform_external_problems(policy, {"x86_64-pc-windows-msvc": {"nemo-relay", "libloading"}})
+
+    assert len(problems) == 1
+    assert "gives no reason" in problems[0]
 
 
 LIBRARY_CLOSURE_POLICY = {
@@ -365,17 +460,18 @@ def test_the_kernel_library_may_not_reach_a_loader_at_all() -> None:
     # This is the property rather than the ratchet: the kernel library reaching a
     # package that loads native code is a failure, and there is no entry a policy
     # can record to make it a passing debt. A clean closure is the only pass.
-    clean = {"nemo-relay", "nemo-relay-types", "serde"}
+    clean = {"x86_64-unknown-linux-gnu": {"nemo-relay", "nemo-relay-types", "serde"}}
     assert report.find_library_closure_problems(LIBRARY_CLOSURE_POLICY, clean) == []
 
-    reaching = {"nemo-relay", "libloading", "serde"}
+    reaching = {"aarch64-apple-darwin": {"nemo-relay", "libloading", "serde"}}
     problems = report.find_library_closure_problems(LIBRARY_CLOSURE_POLICY, reaching)
     assert len(problems) == 1
     assert "libloading" in problems[0]
+    assert "aarch64-apple-darwin" in problems[0]
 
 
 def test_a_policy_without_a_library_closure_section_checks_nothing() -> None:
-    assert report.find_library_closure_problems({}, {"libloading"}) == []
+    assert report.find_library_closure_problems({}, {"a-target": {"libloading"}}) == []
 
 
 def test_a_second_canonical_figure_in_the_document_fails(tmp_path: pathlib.Path) -> None:
@@ -416,9 +512,11 @@ def test_the_surface_renders_what_the_closure_reaches() -> None:
         **CLOSURE_POLICY,
     }
 
-    rendered = report.render_surface({"packages": []}, {}, policy, {"libloading", "serde"})
+    rendered = report.render_surface(
+        {"packages": []}, {}, policy, {"x86_64-unknown-linux-gnu": {"libloading", "serde"}}
+    )
 
-    assert "kernel closure reaches (target: nothing): libloading" in rendered
+    assert "kernel closure reaches (x86_64-unknown-linux-gnu): libloading" in rendered
 
 
 def test_the_surface_keeps_the_test_tree_fact_visible() -> None:
@@ -433,9 +531,15 @@ def test_the_surface_keeps_the_test_tree_fact_visible() -> None:
         **CLOSURE_POLICY,
     }
 
-    rendered = report.render_surface({"packages": []}, {}, policy, {"libloading"}, {"nemo-relay-plugin"})
+    rendered = report.render_surface(
+        {"packages": []},
+        {},
+        policy,
+        {"x86_64-unknown-linux-gnu": {"libloading"}},
+        {"nemo-relay-plugin"},
+    )
 
-    assert "kernel closure reaches (target: nothing): libloading" in rendered
+    assert "kernel closure reaches (x86_64-unknown-linux-gnu): libloading" in rendered
     assert "and the test tree alone reaches: nemo-relay-plugin" in rendered
 
 
@@ -446,7 +550,7 @@ def test_the_closure_counts_a_dev_only_package_as_part_of_the_test_tree() -> Non
     reachable = {"nemo-relay", "libloading"}
     everything = reachable | {"nemo-relay-plugin"}
 
-    assert report.find_closure_problems(CLOSURE_POLICY, reachable) == []
+    assert report.find_closure_problems(CLOSURE_POLICY, {"x86_64-unknown-linux-gnu": reachable}) == []
     # The test-tree half is computed the same way from the wider set, so a
     # *new* package there is still visible rather than silently accepted.
     assert report.kernel_closure_reachability(CLOSURE_POLICY, everything) == {
@@ -455,7 +559,7 @@ def test_the_closure_counts_a_dev_only_package_as_part_of_the_test_tree() -> Non
     }
 
 
-def test_the_repository_policy_records_a_closure_that_reaches_nothing() -> None:
+def test_the_repository_policy_records_a_closure_that_reaches_nothing_anywhere() -> None:
     # The policy's own record has to be the measurement: a recorded list that no
     # longer matches would make the ratchet pass by describing a graph that is not
     # there. The record is empty now, and this test is what would notice it becoming
@@ -463,12 +567,38 @@ def test_the_repository_policy_records_a_closure_that_reaches_nothing() -> None:
     # progress, so it is asserted here as well as in the report.
     policy = report.load_policy(report.DEFAULT_POLICY)
     closure = policy["kernel_closure"]
-    reachable = report.kernel_closure_names(report.REPO_ROOT, closure["roots"])
+    reachable = {
+        target: report.kernel_closure_names(report.REPO_ROOT, closure["roots"], target=target)
+        for target in report.closure_targets(policy)
+    }
+    enforced = {target: reachable[target] for target in closure["targets"]}
 
-    assert report.find_closure_problems(policy, reachable) == []
+    assert report.find_closure_problems(policy, enforced) == []
+    assert report.find_platform_external_problems(policy, reachable) == []
     assert closure["reachable_now"] == [], (
         "the kernel and the composition surfaces reach nothing that loads native "
         "code; a non-empty record here is the split going backwards"
     )
     assert set(closure["forbidden"]), "a closure with no forbidden set checks nothing"
-    assert report.kernel_closure_reachability(policy, reachable) == set()
+    for target, names in enforced.items():
+        assert report.kernel_closure_reachability(policy, names) == set(), target
+
+
+def test_the_repository_policy_names_every_packaged_target_and_measures_the_rest() -> None:
+    # Two properties, and each one was missing at some point. The enforced set has to
+    # be every platform the packages ship on, rather than the platform CI runs on; and
+    # the platform that is not enforced has to be measured under a record, so a
+    # target-specific reach is a named fact instead of an omission.
+    policy = report.load_policy(report.DEFAULT_POLICY)
+    closure = policy["kernel_closure"]
+    library = policy["kernel_library_closure"]
+    enforced = set(closure["targets"])
+
+    assert enforced == set(report.DEFAULT_CLOSURE_TARGETS)
+    assert set(library["targets"]) == enforced, "both closures ask about the same platforms"
+    records = report.platform_external_records(policy)
+    assert records, "the platform whose resolve reaches a loader is recorded rather than omitted"
+    for record in records:
+        assert record["target"] not in enforced
+        assert record.get("reason", "").strip()
+        assert set(record["packages"]).issubset(set(closure["forbidden"]))

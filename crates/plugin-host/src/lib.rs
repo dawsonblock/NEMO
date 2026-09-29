@@ -20,6 +20,7 @@ pub mod codec_capability;
 pub mod codec_context;
 pub mod continuations;
 pub mod host_location;
+pub mod isolation_policy;
 pub mod limits;
 pub mod observer;
 pub mod off_path;

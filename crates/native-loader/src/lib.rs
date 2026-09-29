@@ -46,6 +46,7 @@ mod host;
 mod native;
 /// The service the host process serves the kernel's lifecycle operations on.
 pub mod service;
+mod staging;
 
 pub use backend::{InProcessPluginBackend, LoadedPlugins, host_build};
 pub use host::PluginHostActivation;
