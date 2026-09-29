@@ -1692,9 +1692,15 @@ mod tests {
 
         use crate::isolation_policy::RestrictionRequirement;
         assert!(message.contains("restricted-macos"), "{message}");
+        #[cfg(target_os = "macos")]
         assert!(
             message.contains(crate::host_location::BUNDLE_NAME)
                 || message.contains(RestrictionRequirement::StagedArtifactTransfer.message()),
+            "the refusal names what is missing: {message}"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            message.contains(RestrictionRequirement::MacOS.message()),
             "the refusal names what is missing: {message}"
         );
         assert!(

@@ -492,6 +492,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_restricted_host_outside_a_bundle_is_refused() {
         // Honoring this would run an unconfined host under a policy that says the
