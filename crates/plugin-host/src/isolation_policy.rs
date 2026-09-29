@@ -243,7 +243,7 @@ impl NativeIsolationPolicy {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = executable;
-            Err(refused(RestrictionRequirement::MacOS.message()))
+            Err(refused(RestrictionRequirement::MacOS.message().into()))
         }
     }
 }

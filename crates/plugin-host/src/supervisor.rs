@@ -739,7 +739,7 @@ impl ProcessPluginBackend {
         request: &PluginLoadRequest,
         context: &PluginExecutionContext,
     ) -> Result<String, PluginProtocolError> {
-        let (manifest, library_path, library_relative_path) = artifact_transfer_sources(request)?;
+        let (manifest, library_path, _library_relative_path) = artifact_transfer_sources(request)?;
         let length = std::fs::metadata(&library_path)
             .map_err(|error| rejected(format!("cannot size approved plugin library: {error}")))?
             .len();
@@ -827,7 +827,7 @@ impl ProcessPluginBackend {
                             crate::macos_quarantine::clear_approved_quarantine(
                                 &session_id,
                                 &artifact_id,
-                                &library_relative_path,
+                                &_library_relative_path,
                                 &expected_sha256,
                             )
                         })
