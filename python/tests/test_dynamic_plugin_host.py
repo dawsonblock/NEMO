@@ -687,13 +687,23 @@ async def test_native_activation_finalizer_releases_callbacks(native_dynamic_plu
     gc.collect()
 
     # The activation's drop tears the host down, so the intercept is gone with it:
-    # the call reaches the tool unchanged rather than the plugin.
-    result = await tools.execute(
-        "python-native-after-finalize",
-        {"input": True},
-        lambda args: ToolExecutionResult(args),
-    )
-    assert result.result == {"input": True}
+    # the call reaches the tool unchanged rather than the plugin. Teardown runs
+    # on a background thread so dropping the wrapper is intentionally nonblocking;
+    # wait for that thread to finish instead of assuming one event-loop turn is
+    # enough.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while True:
+        result = await tools.execute(
+            "python-native-after-finalize",
+            {"input": True},
+            lambda args: ToolExecutionResult(args),
+        )
+        if result.result == {"input": True}:
+            break
+        if loop.time() >= deadline:
+            pytest.fail(f"native plugin callbacks were not released after finalization: {result.result!r}")
+        await asyncio.sleep(0.05)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX worker stop/continue signals")
