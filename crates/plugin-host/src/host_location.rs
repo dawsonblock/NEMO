@@ -45,6 +45,7 @@ pub const TEAM_ID_ENV: &str = "NEMO_RELAY_PLUGIN_HOST_TEAM_ID";
 pub const BUNDLE_NAME: &str = "nemo-plugin-host.app";
 
 /// The identifier whose App Sandbox container receives transferred artifacts.
+#[cfg(target_os = "macos")]
 pub(crate) const BUNDLE_IDENTIFIER: &str = "com.nvidia.nemo-relay.nemo-plugin-host";
 
 /// The identity a runtime's plugin sessions are bound to.
