@@ -2202,36 +2202,46 @@ async fn a_crashed_host_is_replaced_by_one_that_holds_nothing() {
     let mut backend = ProcessPluginBackend::launch(host_config())
         .await
         .expect("a plugin host should start and handshake");
-    let crashed_session = backend.session().session_id.clone();
-    let crashed_capability = backend.connection_descriptor().capability;
-    backend.kill().await.expect("the host should be killable");
-    assert!(
-        backend.exit_status().await.is_some(),
-        "the host should be observed as exited"
-    );
+    let mut prior_session = backend.session().session_id.clone();
+    let mut prior_capability = backend.connection_descriptor().capability;
 
-    backend.restart().await.expect("a fresh host should start");
+    // Repeat the real process failure boundary, rather than only asserting one
+    // clean restart. Each replacement has a new session and capability and
+    // starts with no plugin state inherited from the process it replaced.
+    for cycle in 0..3 {
+        backend.kill().await.expect("the host should be killable");
+        assert!(
+            backend.exit_status().await.is_some(),
+            "cycle {cycle}: the host should be observed as exited"
+        );
 
-    // A new session, and nothing loaded: the previous host's session and the
-    // generations behind its handles belonged to it, so a handle from before the
-    // crash addresses nothing here.
-    assert_ne!(backend.session().session_id, crashed_session);
-    // Holding the capability of a session that has ended is not a way into the
-    // one that replaced it: the capability is minted per session, so the value
-    // that authorised calls to the old host authorises nothing on the new one.
-    assert_ne!(
-        backend.connection_descriptor().capability,
-        crashed_capability,
-        "a replaced host does not keep the capability of the one it replaced"
-    );
-    let descriptors = backend
-        .inspect(
-            nemo_relay_plugin_protocol::PluginInspectRequest { handle: None },
-            context(),
-        )
-        .await
-        .expect("a fresh host answers");
-    assert!(descriptors.is_empty());
+        backend.restart().await.expect("a fresh host should start");
+
+        assert_ne!(
+            backend.session().session_id,
+            prior_session,
+            "cycle {cycle}: a replacement has a new session"
+        );
+        assert_ne!(
+            backend.connection_descriptor().capability,
+            prior_capability,
+            "cycle {cycle}: a replacement has a new capability"
+        );
+        let descriptors = backend
+            .inspect(
+                nemo_relay_plugin_protocol::PluginInspectRequest { handle: None },
+                context(),
+            )
+            .await
+            .expect("a fresh host answers");
+        assert!(
+            descriptors.is_empty(),
+            "cycle {cycle}: no plugin state crosses the process boundary"
+        );
+
+        prior_session = backend.session().session_id.clone();
+        prior_capability = backend.connection_descriptor().capability;
+    }
 }
 
 #[tokio::test]

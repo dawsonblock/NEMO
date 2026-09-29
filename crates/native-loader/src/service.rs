@@ -3017,6 +3017,229 @@ mod tests {
         serving.abort();
     }
 
+    /// An RPC peer cannot turn a partial or non-terminal artifact stream into an
+    /// approved load, and a failed attempt must release its transfer reservation
+    /// so the same opaque id can be retried cleanly.
+    #[tokio::test]
+    async fn malformed_artifact_streams_never_publish_and_can_be_retried() {
+        use hyper_util::rt::TokioIo;
+        use nemo_relay_plugin_proto::v1::plugin_host_client::PluginHostClient;
+        use nemo_relay_plugin_proto::v1::plugin_host_server::PluginHostServer;
+        use tokio_stream::wrappers::UnixListenerStream;
+        use tonic::transport::{Endpoint, Server};
+        use tower::service_fn;
+
+        let scratch = tempfile::tempdir().expect("a private transfer root");
+        let (service, config) = service();
+        let service = service
+            .require_staged_artifacts()
+            .with_staging_root(scratch.path().to_path_buf());
+        let socket_dir = tempfile::tempdir().expect("a socket directory");
+        let socket = socket_dir.path().join("host.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("the host socket");
+        let serving = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(PluginHostServer::new(service))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await;
+        });
+        let connect_path = socket.clone();
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .expect("a local endpoint")
+            .connect_with_connector(service_fn(move |_| {
+                let path = connect_path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(TokioIo::new)
+                }
+            }))
+            .await
+            .expect("the host channel");
+        let mut client = PluginHostClient::new(channel);
+        let session_id = handshake_outcome_from_wire(
+            &client
+                .handshake(capable(handshake_request(&config)))
+                .await
+                .expect("the host handshake")
+                .into_inner(),
+        )
+        .expect("a decoded handshake")
+        .into_result()
+        .expect("an established session")
+        .session_id;
+
+        let library = b"a verified native library payload";
+        let manifest = format!(
+            "manifest_version = 1\n\n[plugin]\nid = \"transfer-fixture\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \">=0.9,<1.0\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"libfixture.dylib\"\nsymbol = \"nemo_relay_plugin_entry\"\n"
+        );
+        let manifest_sha256 = crate::staging::hash_bytes(manifest.as_bytes());
+        let library_sha256 = crate::staging::hash_bytes(library);
+
+        let make_begin = |artifact_id: &str| v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Begin(
+                v1::ArtifactTransferBegin {
+                    session_id: session_id.clone(),
+                    artifact_id: artifact_id.to_owned(),
+                    plugin_id: "transfer-fixture".into(),
+                    manifest: manifest.as_bytes().to_vec(),
+                    manifest_sha256: manifest_sha256.clone(),
+                    library_sha256: library_sha256.clone(),
+                    library_length: library.len() as u64,
+                },
+            )),
+        };
+        let make_chunk = |artifact_id: &str, bytes: &[u8]| v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Chunk(
+                v1::ArtifactTransferChunk {
+                    artifact_id: artifact_id.to_owned(),
+                    offset: 0,
+                    bytes: bytes.to_vec(),
+                },
+            )),
+        };
+        let make_finalize = |artifact_id: &str| v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Finalize(
+                v1::ArtifactTransferFinalize {
+                    artifact_id: artifact_id.to_owned(),
+                },
+            )),
+        };
+        let failure_message =
+            |outcome: v1::ArtifactTransferOutcome| match outcome.result.expect("a transfer result")
+            {
+                v1::artifact_transfer_outcome::Result::Failure(failure) => failure.message,
+                v1::artifact_transfer_outcome::Result::Approved(approved) => {
+                    panic!("malformed transfer was approved: {approved:?}")
+                }
+            };
+        async fn assert_not_loadable(
+            client: &mut PluginHostClient<tonic::transport::Channel>,
+            session_id: &str,
+            artifact_id: &str,
+            manifest_sha256: &str,
+            library_sha256: &str,
+        ) {
+            let load = v1::LoadRequest {
+                session_id: session_id.to_owned(),
+                context: Some(context()),
+                plugin_id: "transfer-fixture".into(),
+                artifact: artifact_id.to_owned(),
+                manifest_digest: manifest_sha256.to_owned(),
+                library_digest: library_sha256.to_owned(),
+            };
+            let outcome = client
+                .load(capable(load))
+                .await
+                .expect("the structured load refusal")
+                .into_inner();
+            match outcome.result.expect("a load result") {
+                v1::load_outcome::Result::Failure(failure) => assert!(
+                    failure
+                        .message
+                        .contains("only after an approved artifact transfer"),
+                    "unapproved artifact must be refused before loading: {}",
+                    failure.message
+                ),
+                v1::load_outcome::Result::Loaded(loaded) => {
+                    panic!("an unapproved transfer loaded: {loaded:?}")
+                }
+            }
+        }
+
+        // End the stream after a partial chunk. The receiver must discard the
+        // incoming file, refuse a load by the opaque id, and release the active
+        // transfer reservation so the same id can be sent again.
+        let truncated_id = "truncated-artifact";
+        let truncated = client
+            .transfer_artifact(capable(tokio_stream::iter(vec![
+                make_begin(truncated_id),
+                make_chunk(truncated_id, &library[..8]),
+            ])))
+            .await
+            .expect("truncated transfer has a structured refusal")
+            .into_inner();
+        assert!(
+            failure_message(truncated).contains("ended before FinalizeArtifact"),
+            "truncation is identified as a non-finalized transfer"
+        );
+        assert_not_loadable(
+            &mut client,
+            &session_id,
+            truncated_id,
+            &manifest_sha256,
+            &library_sha256,
+        )
+        .await;
+
+        let retried = client
+            .transfer_artifact(capable(tokio_stream::iter(vec![
+                make_begin(truncated_id),
+                make_chunk(truncated_id, library),
+                make_finalize(truncated_id),
+            ])))
+            .await
+            .expect("a retry of the same id is served")
+            .into_inner();
+        assert!(
+            matches!(
+                retried.result,
+                Some(v1::artifact_transfer_outcome::Result::Approved(_))
+            ),
+            "the incomplete attempt did not reserve or poison the artifact id: {retried:?}"
+        );
+
+        // Finalize is not the publication point until the sender closes the
+        // stream. A trailing frame after it must remove the just-finalized copy
+        // and leave no approved mapping behind.
+        let trailing_id = "trailing-artifact";
+        let trailing = client
+            .transfer_artifact(capable(tokio_stream::iter(vec![
+                make_begin(trailing_id),
+                make_chunk(trailing_id, library),
+                make_finalize(trailing_id),
+                make_chunk(trailing_id, library),
+            ])))
+            .await
+            .expect("trailing data has a structured refusal")
+            .into_inner();
+        assert!(
+            failure_message(trailing).contains("sent data after FinalizeArtifact"),
+            "the stream must close immediately after finalization"
+        );
+        assert_not_loadable(
+            &mut client,
+            &session_id,
+            trailing_id,
+            &manifest_sha256,
+            &library_sha256,
+        )
+        .await;
+
+        let retried = client
+            .transfer_artifact(capable(tokio_stream::iter(vec![
+                make_begin(trailing_id),
+                make_chunk(trailing_id, library),
+                make_finalize(trailing_id),
+            ])))
+            .await
+            .expect("a retry after trailing data is served")
+            .into_inner();
+        assert!(
+            matches!(
+                retried.result,
+                Some(v1::artifact_transfer_outcome::Result::Approved(_))
+            ),
+            "the trailing-data attempt did not leave stale approval state: {retried:?}"
+        );
+
+        client
+            .session_close(capable(v1::SessionCloseRequest { session_id }))
+            .await
+            .expect("session close");
+        serving.abort();
+    }
+
     /// The capability the tests' requests present.
     ///
     /// A fixed value rather than a minted one, so a test can say which request
