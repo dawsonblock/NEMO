@@ -118,10 +118,10 @@ function initialize(config) {
  *
  * @param {object} config - Base configuration layered over discovered `plugins.toml` files.
  * @param {DynamicPluginActivationSpec[]} specs - Non-empty native-library or worker plugin specifications.
- * @param {string} [pluginHost] - The `nemo-plugin-host` this package shipped. Defaults to the one
- *   beside this package's `bin/`, which is where the platform package puts it. Native plugins run
- *   in that process, so nothing is searched for it: a path that is not there is a failure rather
- *   than a lookup somewhere else.
+ * @param {string} [pluginHost] - The `nemo-plugin-host` this package shipped. Resolved only when
+ *   at least one native plugin needs it; worker-only activation does not require this companion.
+ *   Native plugins run in that process, so nothing is searched for it: a missing path is a
+ *   failure rather than a lookup somewhere else.
  * @returns {Promise<object>} An owned activation with `report`, `active`, `close()`, and async disposal.
  * @remarks File-configured static components initialize before dynamic
  * components. Keep the returned activation alive while its callbacks may run
@@ -129,7 +129,8 @@ function initialize(config) {
  * `initialize()` for a static-only configuration.
  */
 function initializeWithDynamicPlugins(config, specs) {
-  return lib.initializeWithDynamicPlugins(config, specs, resolvePluginHost());
+  const pluginHost = specs.some((spec) => spec.kind === 'rust_dynamic') ? resolvePluginHost() : undefined;
+  return lib.initializeWithDynamicPlugins(config, specs, pluginHost);
 }
 
 /**

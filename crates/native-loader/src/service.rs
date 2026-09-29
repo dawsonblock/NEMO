@@ -173,6 +173,37 @@ impl Drop for ActiveTransferReservation {
     }
 }
 
+/// Removes a verified directory unless the service publishes it in the session map.
+///
+/// Finalization promotes the incoming file to `approved/` before the sender's
+/// stream has proved a clean EOF. This guard owns that physical artifact across
+/// the remaining fallible work, including stream decoding and the map lock.
+struct UnpublishedArtifact {
+    directory: std::path::PathBuf,
+    published: bool,
+}
+
+impl UnpublishedArtifact {
+    fn new(directory: std::path::PathBuf) -> Self {
+        Self {
+            directory,
+            published: false,
+        }
+    }
+
+    fn publish(mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for UnpublishedArtifact {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
 /// This host's end of the channel its forwarded marks travel on.
 ///
 /// Bounded rather than unbounded, because the marks come from a plugin and the
@@ -904,6 +935,130 @@ impl PluginHostService {
 ///
 /// `NotDispatched` is the truth for the classes a host serves today: they run
 /// before any call, so nothing was reached that could have happened elsewhere.
+impl PluginHostService {
+    async fn transfer_artifact_frames<S>(
+        &self,
+        mut stream: S,
+        presented: Option<&str>,
+    ) -> Result<(String, String, PluginArtifactIdentity), PluginProtocolError>
+    where
+        S: futures_util::Stream<Item = Result<v1::ArtifactTransferFrame, Status>> + Unpin,
+    {
+        use futures_util::StreamExt;
+
+        async fn next_frame<S>(
+            stream: &mut S,
+        ) -> Result<Option<v1::ArtifactTransferFrame>, PluginProtocolError>
+        where
+            S: futures_util::Stream<Item = Result<v1::ArtifactTransferFrame, Status>> + Unpin,
+        {
+            stream
+                .next()
+                .await
+                .transpose()
+                .map_err(|error| refused(format!("artifact stream failed: {error}")))
+        }
+        let first = next_frame(&mut stream)
+            .await?
+            .ok_or_else(|| refused("artifact stream ended before BeginArtifact"))?;
+        let begin = match first.frame {
+            Some(v1::artifact_transfer_frame::Frame::Begin(begin)) => begin,
+            _ => return Err(refused("the first artifact frame must be BeginArtifact")),
+        };
+        if begin.artifact_id.is_empty() || begin.plugin_id.is_empty() {
+            return Err(refused("artifact id and plugin id must be non-empty"));
+        }
+        self.established(&begin.session_id)?;
+        self.capability_admitted(presented)?;
+
+        let key = (begin.session_id.clone(), begin.artifact_id.clone());
+        if self
+            .staged_artifacts
+            .lock()
+            .map_err(|error| refused(format!("the artifact table lock was poisoned: {error}")))?
+            .contains_key(&key)
+        {
+            return Err(refused(
+                "this artifact id has already been approved in this session",
+            ));
+        }
+        {
+            let mut active = self.active_artifact_transfers.lock().map_err(|error| {
+                refused(format!(
+                    "the active artifact-transfer lock was poisoned: {error}"
+                ))
+            })?;
+            if !active.insert(key.clone()) {
+                return Err(refused(
+                    "an artifact transfer with this id is already in progress",
+                ));
+            }
+        }
+        let _reservation = ActiveTransferReservation {
+            key: key.clone(),
+            active: Arc::clone(&self.active_artifact_transfers),
+        };
+
+        let identity = PluginArtifactIdentity {
+            manifest_sha256: begin.manifest_sha256.clone(),
+            library_sha256: begin.library_sha256.clone(),
+        };
+        let transfer = crate::staging::ArtifactTransfer {
+            artifact_id: begin.artifact_id.clone(),
+            plugin_id: begin.plugin_id.clone(),
+            manifest: begin.manifest,
+            manifest_sha256: identity.manifest_sha256.clone(),
+            library_sha256: identity.library_sha256.clone(),
+            library_length: begin.library_length,
+        };
+        let mut staged =
+            crate::staging::StagedArtifact::begin(&self.staging_root, &begin.session_id, &transfer)
+                .map_err(|error| refused(error.to_string()))?;
+
+        loop {
+            let frame = next_frame(&mut stream)
+                .await?
+                .ok_or_else(|| refused("artifact stream ended before FinalizeArtifact"))?;
+            match frame.frame {
+                Some(v1::artifact_transfer_frame::Frame::Chunk(chunk)) => staged
+                    .append(&chunk.artifact_id, chunk.offset, &chunk.bytes)
+                    .map_err(|error| refused(error.to_string()))?,
+                Some(v1::artifact_transfer_frame::Frame::Finalize(finalize)) => {
+                    let artifact = staged
+                        .finalize(&finalize.artifact_id)
+                        .map_err(|error| refused(error.to_string()))?;
+                    let unpublished = UnpublishedArtifact::new(artifact.directory.clone());
+                    // A second terminal or a trailing chunk is malformed; do
+                    // not make an artifact available until the sender closed
+                    // the stream cleanly. Any decoding error here drops the
+                    // promoted directory through `unpublished`.
+                    if next_frame(&mut stream).await?.is_some() {
+                        return Err(refused("artifact stream sent data after FinalizeArtifact"));
+                    }
+                    self.staged_artifacts
+                        .lock()
+                        .map_err(|error| {
+                            refused(format!("the artifact table lock was poisoned: {error}"))
+                        })?
+                        .insert(
+                            key,
+                            StagedRecord {
+                                plugin_id: begin.plugin_id.clone(),
+                                identity: identity.clone(),
+                                artifact,
+                            },
+                        );
+                    unpublished.publish();
+                    return Ok((begin.artifact_id, begin.plugin_id, identity));
+                }
+                Some(v1::artifact_transfer_frame::Frame::Begin(_)) | None => {
+                    return Err(refused("only chunks may follow BeginArtifact"));
+                }
+            }
+        }
+    }
+}
+
 fn success(output: String) -> nemo_relay_plugin_protocol::PluginExecutionOutcome {
     use nemo_relay_plugin_protocol::{DispatchState, OutcomeCertainty, PluginExecutionOutcome};
     PluginExecutionOutcome {
@@ -1455,120 +1610,9 @@ impl v1::plugin_host_server::PluginHost for PluginHostService {
         request: Request<tonic::Streaming<v1::ArtifactTransferFrame>>,
     ) -> Result<Response<v1::ArtifactTransferOutcome>, Status> {
         let presented = presented_capability(&request);
-        let mut stream = request.into_inner();
-        let result = async {
-            let first = stream
-                .message()
-                .await
-                .map_err(|error| refused(format!("artifact stream failed: {error}")))?
-                .ok_or_else(|| refused("artifact stream ended before BeginArtifact"))?;
-            let begin = match first.frame {
-                Some(v1::artifact_transfer_frame::Frame::Begin(begin)) => begin,
-                _ => return Err(refused("the first artifact frame must be BeginArtifact")),
-            };
-            if begin.artifact_id.is_empty() || begin.plugin_id.is_empty() {
-                return Err(refused("artifact id and plugin id must be non-empty"));
-            }
-            self.established(&begin.session_id)?;
-            self.capability_admitted(presented.as_deref())?;
-
-            let key = (begin.session_id.clone(), begin.artifact_id.clone());
-            if self
-                .staged_artifacts
-                .lock()
-                .map_err(|error| refused(format!("the artifact table lock was poisoned: {error}")))?
-                .contains_key(&key)
-            {
-                return Err(refused(
-                    "this artifact id has already been approved in this session",
-                ));
-            }
-            {
-                let mut active = self.active_artifact_transfers.lock().map_err(|error| {
-                    refused(format!(
-                        "the active artifact-transfer lock was poisoned: {error}"
-                    ))
-                })?;
-                if !active.insert(key.clone()) {
-                    return Err(refused(
-                        "an artifact transfer with this id is already in progress",
-                    ));
-                }
-            }
-            let _reservation = ActiveTransferReservation {
-                key: key.clone(),
-                active: Arc::clone(&self.active_artifact_transfers),
-            };
-
-            let identity = PluginArtifactIdentity {
-                manifest_sha256: begin.manifest_sha256.clone(),
-                library_sha256: begin.library_sha256.clone(),
-            };
-            let transfer = crate::staging::ArtifactTransfer {
-                artifact_id: begin.artifact_id.clone(),
-                plugin_id: begin.plugin_id.clone(),
-                manifest: begin.manifest,
-                manifest_sha256: identity.manifest_sha256.clone(),
-                library_sha256: identity.library_sha256.clone(),
-                library_length: begin.library_length,
-            };
-            let mut staged = crate::staging::StagedArtifact::begin(
-                &self.staging_root,
-                &begin.session_id,
-                &transfer,
-            )
-            .map_err(|error| refused(error.to_string()))?;
-
-            loop {
-                let frame = stream
-                    .message()
-                    .await
-                    .map_err(|error| refused(format!("artifact stream failed: {error}")))?
-                    .ok_or_else(|| refused("artifact stream ended before FinalizeArtifact"))?;
-                match frame.frame {
-                    Some(v1::artifact_transfer_frame::Frame::Chunk(chunk)) => staged
-                        .append(&chunk.artifact_id, chunk.offset, &chunk.bytes)
-                        .map_err(|error| refused(error.to_string()))?,
-                    Some(v1::artifact_transfer_frame::Frame::Finalize(finalize)) => {
-                        let artifact = staged
-                            .finalize(&finalize.artifact_id)
-                            .map_err(|error| refused(error.to_string()))?;
-                        // A second terminal or a trailing chunk is malformed; do
-                        // not make an artifact available until the sender closed
-                        // the stream cleanly.
-                        if stream
-                            .message()
-                            .await
-                            .map_err(|error| refused(format!("artifact stream failed: {error}")))?
-                            .is_some()
-                        {
-                            let _ = std::fs::remove_dir_all(&artifact.directory);
-                            return Err(refused(
-                                "artifact stream sent data after FinalizeArtifact",
-                            ));
-                        }
-                        self.staged_artifacts
-                            .lock()
-                            .map_err(|error| {
-                                refused(format!("the artifact table lock was poisoned: {error}"))
-                            })?
-                            .insert(
-                                key,
-                                StagedRecord {
-                                    plugin_id: begin.plugin_id.clone(),
-                                    identity: identity.clone(),
-                                    artifact,
-                                },
-                            );
-                        return Ok((begin.artifact_id, begin.plugin_id, identity));
-                    }
-                    Some(v1::artifact_transfer_frame::Frame::Begin(_)) | None => {
-                        return Err(refused("only chunks may follow BeginArtifact"));
-                    }
-                }
-            }
-        }
-        .await;
+        let result = self
+            .transfer_artifact_frames(request.into_inner(), presented.as_deref())
+            .await;
 
         let result = match result {
             Ok((artifact_id, plugin_id, identity)) => {
@@ -3238,6 +3282,128 @@ mod tests {
             .await
             .expect("session close");
         serving.abort();
+    }
+
+    #[tokio::test]
+    async fn an_eof_transport_error_after_finalize_removes_the_unpublished_artifact() {
+        let scratch = tempfile::tempdir().expect("a private transfer root");
+        let (service, config) = service();
+        let service = service
+            .require_staged_artifacts()
+            .with_staging_root(scratch.path().to_path_buf());
+        let session_id = establish(&service, &config).await;
+        let artifact_id = "eof-error-artifact";
+        let library = b"verified library bytes";
+        let manifest = "manifest_version = 1\n\n[plugin]\nid = \"transfer-fixture\"\nkind = \"rust_dynamic\"\n\n[compat]\nrelay = \">=0.9,<1.0\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n[capabilities]\nitems = [\"plugin_native\"]\n\n[load]\nlibrary = \"libfixture.dylib\"\nsymbol = \"nemo_relay_plugin_entry\"\n";
+        let manifest_sha256 = crate::staging::hash_bytes(manifest.as_bytes());
+        let library_sha256 = crate::staging::hash_bytes(library);
+        let begin = v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Begin(
+                v1::ArtifactTransferBegin {
+                    session_id: session_id.clone(),
+                    artifact_id: artifact_id.into(),
+                    plugin_id: "transfer-fixture".into(),
+                    manifest: manifest.as_bytes().to_vec(),
+                    manifest_sha256: manifest_sha256.clone(),
+                    library_sha256: library_sha256.clone(),
+                    library_length: library.len() as u64,
+                },
+            )),
+        };
+        let chunk = v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Chunk(
+                v1::ArtifactTransferChunk {
+                    artifact_id: artifact_id.into(),
+                    offset: 0,
+                    bytes: library.to_vec(),
+                },
+            )),
+        };
+        let finalize = v1::ArtifactTransferFrame {
+            frame: Some(v1::artifact_transfer_frame::Frame::Finalize(
+                v1::ArtifactTransferFinalize {
+                    artifact_id: artifact_id.into(),
+                },
+            )),
+        };
+
+        let failed = service
+            .transfer_artifact_frames(
+                tokio_stream::iter(vec![
+                    Ok(begin.clone()),
+                    Ok(chunk.clone()),
+                    Ok(finalize.clone()),
+                    Err(Status::internal("injected EOF decode failure")),
+                ]),
+                Some(TEST_CAPABILITY),
+            )
+            .await
+            .expect_err("a stream error after finalization must abort publication");
+        assert!(
+            failed
+                .failure
+                .message
+                .contains("injected EOF decode failure"),
+            "the injected terminal read failure is preserved: {failed:?}"
+        );
+
+        fn files_under(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut files = Vec::new();
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return files;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(files_under(&path));
+                } else {
+                    files.push(path);
+                }
+            }
+            files
+        }
+        assert!(
+            files_under(scratch.path()).is_empty(),
+            "failed EOF validation leaves no promoted or incoming artifact"
+        );
+
+        let refused_load = service
+            .load(capable(v1::LoadRequest {
+                session_id: session_id.clone(),
+                context: Some(context()),
+                plugin_id: "transfer-fixture".into(),
+                artifact: artifact_id.into(),
+                manifest_digest: manifest_sha256.clone(),
+                library_digest: library_sha256.clone(),
+            }))
+            .await
+            .expect("the load refusal is structured")
+            .into_inner();
+        match refused_load.result.expect("a load result") {
+            v1::load_outcome::Result::Failure(failure) => assert!(
+                failure
+                    .message
+                    .contains("only after an approved artifact transfer"),
+                "failed EOF cannot populate the approved map: {}",
+                failure.message
+            ),
+            v1::load_outcome::Result::Loaded(loaded) => {
+                panic!("artifact with a failed EOF check loaded: {loaded:?}")
+            }
+        }
+
+        let approved = service
+            .transfer_artifact_frames(
+                tokio_stream::iter(vec![Ok(begin), Ok(chunk), Ok(finalize)]),
+                Some(TEST_CAPABILITY),
+            )
+            .await
+            .expect("a clean retry with the same id must succeed");
+        assert_eq!(approved.0, artifact_id);
+        service
+            .session_close(capable(v1::SessionCloseRequest { session_id }))
+            .await
+            .expect("session close");
     }
 
     /// The capability the tests' requests present.

@@ -1931,6 +1931,16 @@ fn node_conditional_middleware_guardrail(
 mod conditional_gate_tests {
     use super::*;
 
+    fn dynamic_spec(kind: DynamicPluginKind) -> CoreDynamicPluginActivationSpec {
+        CoreDynamicPluginActivationSpec {
+            plugin_id: "fixture".into(),
+            kind,
+            manifest_ref: "relay-plugin.toml".into(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }
+    }
+
     #[test]
     fn conditional_gate_result_wait_is_bounded() {
         let (_tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -1938,6 +1948,16 @@ mod conditional_gate_tests {
             .expect_err("an unresponsive callback must time out");
 
         assert!(error.reason.contains("conditional gate callback timed out"));
+    }
+
+    #[test]
+    fn worker_only_activation_does_not_need_a_native_host() {
+        assert!(!needs_native_host(&[dynamic_spec(
+            DynamicPluginKind::Worker
+        )]));
+        assert!(needs_native_host(&[dynamic_spec(
+            DynamicPluginKind::RustDynamic
+        )]));
     }
 }
 
@@ -6065,6 +6085,12 @@ struct NodeDynamicPluginActivationSpec {
     config: serde_json::Map<String, Json>,
 }
 
+fn needs_native_host(specs: &[CoreDynamicPluginActivationSpec]) -> bool {
+    specs
+        .iter()
+        .any(|spec| spec.kind == DynamicPluginKind::RustDynamic)
+}
+
 impl From<NodeDynamicPluginActivationSpec> for CoreDynamicPluginActivationSpec {
     fn from(spec: NodeDynamicPluginActivationSpec) -> Self {
         Self {
@@ -6316,22 +6342,24 @@ pub async fn initialize_with_dynamic_plugins(
     let isolation =
         nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment()
             .map_err(napi::Error::from_reason)?;
-    let policy = match plugin_host {
-        Some(path) => IsolationPolicy::for_runtime("nemo-relay-node")
-            .with_native_isolation(isolation)
-            .with_host(path),
-        None => match crate::plugin_host_location::beside_this_module() {
-            Some(path) => IsolationPolicy::for_runtime("nemo-relay-node")
-                .with_native_isolation(isolation)
-                .with_host(path),
-            None => {
-                return Err(napi::Error::from_reason(
-                    "this addon could not find the nemo-plugin-host its package ships, and native \
-                     plugins run in that process: pass the host's path to \
-                     initializeWithDynamicPlugins, or install a package that carries one",
-                ));
-            }
-        },
+    let policy = IsolationPolicy::for_runtime("nemo-relay-node").with_native_isolation(isolation);
+    let needs_native_host = needs_native_host(&specs);
+    let policy = if needs_native_host {
+        match plugin_host {
+            Some(path) => policy.with_host(path),
+            None => match crate::plugin_host_location::beside_this_module() {
+                Some(path) => policy.with_host(path),
+                None => {
+                    return Err(napi::Error::from_reason(
+                        "this addon could not find the nemo-plugin-host its package ships, and native \
+                         plugins run in that process: pass the host's path to \
+                         initializeWithDynamicPlugins, or install a package that carries one",
+                    ));
+                }
+            },
+        }
+    } else {
+        policy
     };
     let activation = ActivatedPluginRuntime::activate_with_discovered_config(config, specs, policy)
         .await

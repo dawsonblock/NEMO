@@ -766,7 +766,7 @@ async def test_worker_activation_finalizer_never_waits_on_python_thread(
     assert "fixture_worker" not in plugin.list_kinds()
 
 
-async def test_worker_activation_executes_and_releases_callbacks(worker_dynamic_plugin: _BuiltPlugin):
+async def test_worker_only_activation_needs_no_native_plugin_host(worker_dynamic_plugin: _BuiltPlugin):
     activation = await plugin.initialize_with_dynamic_plugins({}, [worker_dynamic_plugin.spec()])
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()

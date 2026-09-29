@@ -21,9 +21,11 @@
 //! hostile. It is a different mechanism with a different host image, and a
 //! variant nothing can honor would read as a feature.
 
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use nemo_relay_plugin_protocol::{PluginFailureCode, PluginProtocolError};
 
@@ -66,6 +68,12 @@ pub enum NativeIsolationPolicy {
     /// signature, which is why a restricted host is a bundle rather than a bare
     /// executable.
     RestrictedMacOS,
+    /// The same sandbox profile with library validation explicitly disabled.
+    ///
+    /// This is intended for deployments that load plugins signed by another
+    /// team. It is a distinct policy because it carries weaker code-signing
+    /// authority than [`Self::RestrictedMacOS`].
+    RestrictedMacOSThirdParty,
 }
 
 /// Something a restricted host cannot be started without.
@@ -106,6 +114,7 @@ impl NativeIsolationPolicy {
         match self {
             Self::TrustedProcess => "trusted-process",
             Self::RestrictedMacOS => "restricted-macos",
+            Self::RestrictedMacOSThirdParty => "restricted-macos-third-party",
         }
     }
 
@@ -114,8 +123,9 @@ impl NativeIsolationPolicy {
         match value {
             "trusted-process" => Ok(Self::TrustedProcess),
             "restricted-macos" => Ok(Self::RestrictedMacOS),
+            "restricted-macos-third-party" => Ok(Self::RestrictedMacOSThirdParty),
             other => Err(format!(
-                "{NATIVE_ISOLATION_ENV} has unsupported value '{other}'; expected 'trusted-process' or 'restricted-macos'"
+                "{NATIVE_ISOLATION_ENV} has unsupported value '{other}'; expected 'trusted-process', 'restricted-macos', or 'restricted-macos-third-party'"
             )),
         }
     }
@@ -135,7 +145,10 @@ impl NativeIsolationPolicy {
 
     /// Whether a host started under this policy is confined by the platform.
     pub const fn confines_resources(self) -> bool {
-        matches!(self, Self::RestrictedMacOS)
+        matches!(
+            self,
+            Self::RestrictedMacOS | Self::RestrictedMacOSThirdParty
+        )
     }
 
     /// What this policy needs that the deployment does not have.
@@ -238,7 +251,7 @@ impl NativeIsolationPolicy {
         }
         #[cfg(target_os = "macos")]
         {
-            verify_restricted_host_signature(executable)
+            verify_restricted_host_signature(executable, self)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -249,7 +262,10 @@ impl NativeIsolationPolicy {
 }
 
 #[cfg(target_os = "macos")]
-fn verify_restricted_host_signature(executable: &Path) -> Result<(), PluginProtocolError> {
+fn verify_restricted_host_signature(
+    executable: &Path,
+    policy: NativeIsolationPolicy,
+) -> Result<(), PluginProtocolError> {
     let bundle = executable
         .ancestors()
         .find(|path| {
@@ -345,7 +361,7 @@ fn verify_restricted_host_signature(executable: &Path) -> Result<(), PluginProto
     }
 
     let entitlements = Command::new("/usr/bin/codesign")
-        .args(["--display", "--entitlements", "-"])
+        .args(["--display", "--entitlements", ":-"])
         .arg(bundle)
         .output()
         .map_err(|error| {
@@ -359,26 +375,72 @@ fn verify_restricted_host_signature(executable: &Path) -> Result<(), PluginProto
             String::from_utf8_lossy(&entitlements.stderr).trim()
         )));
     }
-    let entitlement_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&entitlements.stdout),
-        String::from_utf8_lossy(&entitlements.stderr)
-    );
-    let mut sandbox_key = false;
-    let mut sandbox_enabled = false;
-    for line in entitlement_text.lines().map(str::trim) {
-        if let Some(key) = line.strip_prefix("[Key] ") {
-            sandbox_key = key == "com.apple.security.app-sandbox";
-        } else if sandbox_key && line == "[Bool] true" {
-            sandbox_enabled = true;
-        }
+    let mut plist = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            refused(format!(
+                "cannot parse restricted host entitlements: {error}"
+            ))
+        })?;
+    plist
+        .stdin
+        .take()
+        .ok_or_else(|| refused("cannot pass restricted host entitlements to plutil".into()))?
+        .write_all(&entitlements.stdout)
+        .map_err(|error| {
+            refused(format!(
+                "cannot pass restricted host entitlements to plutil: {error}"
+            ))
+        })?;
+    let plist = plist.wait_with_output().map_err(|error| {
+        refused(format!(
+            "cannot parse restricted host entitlements: {error}"
+        ))
+    })?;
+    if !plist.status.success() {
+        return Err(refused(format!(
+            "cannot parse restricted host entitlements: {}",
+            String::from_utf8_lossy(&plist.stderr).trim()
+        )));
     }
-    if !sandbox_enabled {
-        return Err(refused(
-            "restricted host signature does not carry the App Sandbox entitlement".into(),
-        ));
+    let parsed: serde_json::Value = serde_json::from_slice(&plist.stdout).map_err(|error| {
+        refused(format!(
+            "cannot decode restricted host entitlements: {error}"
+        ))
+    })?;
+    verify_entitlement_profile(&parsed, policy).map_err(refused)
+}
+
+/// Require the complete signed entitlement dictionary to equal one named profile.
+///
+/// This is kept independent of the macOS process calls so both profiles and
+/// unexpected authority can be tested on every build host.
+fn verify_entitlement_profile(
+    actual: &serde_json::Value,
+    policy: NativeIsolationPolicy,
+) -> Result<(), String> {
+    let expected = match policy {
+        NativeIsolationPolicy::RestrictedMacOS => serde_json::json!({
+            "com.apple.security.app-sandbox": true
+        }),
+        NativeIsolationPolicy::RestrictedMacOSThirdParty => serde_json::json!({
+            "com.apple.security.app-sandbox": true,
+            "com.apple.security.cs.disable-library-validation": true
+        }),
+        NativeIsolationPolicy::TrustedProcess => return Ok(()),
+    };
+    if actual == &expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "restricted host entitlements do not match the '{}' profile; expected {expected}, received {actual}",
+            policy.as_str()
+        ))
     }
-    Ok(())
 }
 
 /// A configuration this runtime cannot honor, in the code the boundary already uses.
@@ -438,9 +500,53 @@ mod tests {
             NativeIsolationPolicy::parse("restricted-macos").expect("restricted policy"),
             NativeIsolationPolicy::RestrictedMacOS
         );
+        assert_eq!(
+            NativeIsolationPolicy::parse("restricted-macos-third-party")
+                .expect("third-party restricted policy"),
+            NativeIsolationPolicy::RestrictedMacOSThirdParty
+        );
         let error = NativeIsolationPolicy::parse("restricted").expect_err("unknown spelling");
         assert!(error.contains(NATIVE_ISOLATION_ENV));
         assert!(error.contains("trusted-process"));
+    }
+
+    #[test]
+    fn restricted_macos_profiles_accept_only_their_exact_entitlements() {
+        let strict = serde_json::json!({
+            "com.apple.security.app-sandbox": true
+        });
+        let third_party = serde_json::json!({
+            "com.apple.security.app-sandbox": true,
+            "com.apple.security.cs.disable-library-validation": true
+        });
+
+        assert!(
+            verify_entitlement_profile(&strict, NativeIsolationPolicy::RestrictedMacOS).is_ok()
+        );
+        assert!(
+            verify_entitlement_profile(
+                &third_party,
+                NativeIsolationPolicy::RestrictedMacOSThirdParty
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_entitlement_profile(&third_party, NativeIsolationPolicy::RestrictedMacOS)
+                .is_err()
+        );
+        assert!(
+            verify_entitlement_profile(&strict, NativeIsolationPolicy::RestrictedMacOSThirdParty)
+                .is_err()
+        );
+
+        let with_network = serde_json::json!({
+            "com.apple.security.app-sandbox": true,
+            "com.apple.security.network.client": true
+        });
+        let error =
+            verify_entitlement_profile(&with_network, NativeIsolationPolicy::RestrictedMacOS)
+                .expect_err("a sandbox plus unrequested network access is not the strict profile");
+        assert!(error.contains("network.client"), "{error}");
     }
 
     #[test]

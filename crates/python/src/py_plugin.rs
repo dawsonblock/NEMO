@@ -35,7 +35,7 @@ use nemo_relay::api::registry::{
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, register_subscriber};
 use nemo_relay::error::Result as FlowResult;
-use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
+use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, DynamicPluginKind};
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
     PluginRegistrationContext, active_plugin_report, clear_plugin_configuration, deregister_plugin,
@@ -1189,25 +1189,30 @@ fn initialize_with_dynamic_plugins_py<'py>(
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let policy =
             IsolationPolicy::for_runtime("nemo-relay-python").with_native_isolation(isolation);
-        let policy = match crate::plugin_host_location::resolved_host() {
-            Some(host) => policy.with_host(host),
-            None => {
-                // Nothing named a host and this extension never learned where it
-                // lives, so there is no installation whose companion it could
-                // name. The runtime would search beside the process, which is
-                // exactly the behaviour the derivation above exists to remove: an
-                // executable that runs plugin code should come from the package
-                // that shipped it or from a deployment that named it. Failing
-                // closed costs a deployment nothing it can reproduce — the
-                // documented answer is `NEMO_RELAY_PLUGIN_HOST`, or an
-                // installation the extension can see — and it removes the case
-                // where this binding runs a host nobody chose.
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "this nemo_relay extension cannot tell which installation it came from, so \
+        let needs_native_host = needs_native_host(&dynamic_plugins);
+        let policy = if needs_native_host {
+            match crate::plugin_host_location::resolved_host() {
+                Some(host) => policy.with_host(host),
+                None => {
+                    // Nothing named a host and this extension never learned where it
+                    // lives, so there is no installation whose companion it could
+                    // name. The runtime would search beside the process, which is
+                    // exactly the behaviour the derivation above exists to remove: an
+                    // executable that runs plugin code should come from the package
+                    // that shipped it or from a deployment that named it. Failing
+                    // closed costs a deployment nothing it can reproduce — the
+                    // documented answer is `NEMO_RELAY_PLUGIN_HOST`, or an
+                    // installation the extension can see — and it removes the case
+                    // where this binding runs a host nobody chose.
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "this nemo_relay extension cannot tell which installation it came from, so \
                      it will not search for a plugin host beside the process. Install the \
                      package, or name the host explicitly in NEMO_RELAY_PLUGIN_HOST.",
-                ));
+                    ));
+                }
             }
+        } else {
+            policy
         };
         let activation = ActivatedPluginRuntime::activate_with_discovered_config(
             config,
@@ -1319,6 +1324,12 @@ fn activation_error_to_py_err(error: PluginActivationError) -> PyErr {
     PluginTeardownError::from_activation_error(error).to_py_err()
 }
 
+fn needs_native_host(dynamic_plugins: &[DynamicPluginActivationSpec]) -> bool {
+    dynamic_plugins
+        .iter()
+        .any(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
+}
+
 /// Report a plugin error as the Python exception it corresponds to.
 ///
 /// Kept beside the activation mapping because the two are the same question
@@ -1326,6 +1337,27 @@ fn activation_error_to_py_err(error: PluginActivationError) -> PyErr {
 #[cfg(test)]
 fn plugin_error_to_py_err(error: PluginError) -> PyErr {
     PluginTeardownError::from_plugin_error(error).to_py_err()
+}
+
+#[cfg(test)]
+mod native_host_resolution_tests {
+    use super::*;
+
+    fn spec(kind: DynamicPluginKind) -> DynamicPluginActivationSpec {
+        DynamicPluginActivationSpec {
+            plugin_id: "fixture".into(),
+            kind,
+            manifest_ref: "relay-plugin.toml".into(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn worker_only_activation_does_not_need_a_native_host() {
+        assert!(!needs_native_host(&[spec(DynamicPluginKind::Worker)]));
+        assert!(needs_native_host(&[spec(DynamicPluginKind::RustDynamic)]));
+    }
 }
 
 #[cfg(test)]

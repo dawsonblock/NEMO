@@ -10,15 +10,22 @@ the sections below say which is which):
 
 - **The policy exists and is explicit.** `NativeIsolationPolicy` names the level a
   deployment selects — `trusted-process`, the level that was implicit before it had
-  a name, and `restricted-macos`. A level this build cannot deliver is refused at
-  startup, before anything is created, rather than served with a host that runs
-  without the confinement the configuration states.
+  a name, `restricted-macos` for same-team loading, and
+  `restricted-macos-third-party` when loading a plugin from another signer requires
+  disabling library validation. These restricted profiles are distinct and a level
+  this build cannot deliver is refused at startup, before anything is created,
+  rather than served with a host that runs without the confinement the configuration
+  states.
 - **A confined host is a verified bundle.** `scripts/package-plugin-host-app.py`
   produces `nemo-plugin-host.app` from the built executable, with
   `Contents/Info.plist` and the entitlements in `security/entitlements/`. It signs
   with Hardened Runtime. Before launch, the supervisor asks `codesign` to verify
-  the bundle and checks its bundle identifier, App Sandbox entitlement, and
-  CodeDirectory runtime flag. Restricted launch requires the expected signing
+  the bundle and checks its bundle identifier, exact entitlement dictionary, and
+  CodeDirectory runtime flag. The strict profile permits only App Sandbox. The
+  third-party profile permits App Sandbox plus
+  `com.apple.security.cs.disable-library-validation`; additional capabilities such
+  as network access, filesystem exceptions, JIT, or device access are rejected.
+  Restricted launch requires the expected signing
   Team ID in `NEMO_RELAY_PLUGIN_HOST_TEAM_ID`; the macOS CI qualification
   explicitly uses `not set` for its ad hoc test signature. Production deployments
   must set the Developer ID Team ID. The development ad hoc signature is for local
@@ -52,8 +59,11 @@ the sections below say which is which):
 The CLI and Python, Node.js, and FFI activation entry points share one policy
 parser. Leave `NEMO_RELAY_NATIVE_ISOLATION` unset for the compatible
 `trusted-process` default, or set it to `restricted-macos` to require the verified
-App Sandbox bundle. Unknown values fail activation; they do not fall back to the
-trusted policy. The setting applies to native plugin hosting in that process.
+App Sandbox bundle with same-team library validation. Set it to
+`restricted-macos-third-party` only for a bundle carrying the separate
+disable-library-validation profile. Unknown values and profile mismatches fail
+activation; they do not fall back to the trusted policy. The setting applies to
+native plugin hosting in that process.
 
 ```sh
 export NEMO_RELAY_NATIVE_ISOLATION=restricted-macos

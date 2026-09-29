@@ -206,8 +206,7 @@ impl PluginHostSupervisor {
             &crate::host_location::this_process_directory(),
         )?;
         config.isolation.verify_host_signature(&executable)?;
-        let restricted_ipc =
-            config.isolation == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS;
+        let restricted_ipc = config.isolation.confines_resources();
         let mut socket_dir = create_runtime_dir()?;
         let mut socket = socket_dir.join("s");
         let credential = Uuid::now_v7().to_string();
@@ -815,9 +814,7 @@ impl ProcessPluginBackend {
                     && approved.manifest_sha256 == request.identity.manifest_sha256
                     && approved.library_sha256 == request.identity.library_sha256 =>
             {
-                if self.config.isolation
-                    == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS
-                {
+                if self.config.isolation.confines_resources() {
                     #[cfg(target_os = "macos")]
                     {
                         let session_id = session_id.clone();
@@ -1048,9 +1045,7 @@ impl PluginExecutionBackend for ProcessPluginBackend {
         context: PluginExecutionContext,
     ) -> PluginExecutionFuture<'a, PluginLoadResponse> {
         Box::pin(async move {
-            if self.config.isolation
-                == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS
-            {
+            if self.config.isolation.confines_resources() {
                 request.artifact = self.transfer_artifact(&request, &context).await?;
             }
             let budget = Self::budget(&context, now_unix_ms()?)?;

@@ -320,11 +320,14 @@ enabled = true
     assert.deepEqual(toolAfterDispose, { result: { original: true, downstream: true } });
   });
 
-  it('owns worker managed callbacks until close', async () => {
-    const activation = await plugin.initializeWithDynamicPlugins({ version: 1, components: [] }, [
-      activationSpec('fixture_worker', 'worker', workerManifestRef),
-    ]);
+  it('activates worker-only plugins without requiring a native host', async () => {
+    const previousHost = process.env.NEMO_RELAY_PLUGIN_HOST;
+    delete process.env.NEMO_RELAY_PLUGIN_HOST;
+    let activation;
     try {
+      activation = await plugin.initializeWithDynamicPlugins({ version: 1, components: [] }, [
+        activationSpec('fixture_worker', 'worker', workerManifestRef),
+      ]);
       assert.deepEqual(activation.report.diagnostics, []);
       const toolResult = await executeTool('node_worker_dynamic_tool');
       assert.equal(toolResult.result.worker_plugin_tool_execution_request, true);
@@ -334,7 +337,12 @@ enabled = true
       assert.equal(llmResult.requestContent.worker_plugin_llm_execution_request, true);
       assert.equal(llmResult.worker_plugin_llm_execution, true);
     } finally {
-      await activation.close();
+      await activation?.close();
+      if (previousHost === undefined) {
+        delete process.env.NEMO_RELAY_PLUGIN_HOST;
+      } else {
+        process.env.NEMO_RELAY_PLUGIN_HOST = previousHost;
+      }
     }
 
     const toolAfterClose = await executeTool('node_worker_closed_tool');
