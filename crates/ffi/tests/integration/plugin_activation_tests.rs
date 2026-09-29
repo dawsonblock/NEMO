@@ -3,25 +3,35 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::ptr;
+#[cfg(unix)]
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nemo_relay_ffi::types::{FfiPluginActivation, nemo_relay_plugin_activation_free};
 use tempfile::TempDir;
 
+#[cfg(unix)]
 const DISCOVERY_CHILD_ENV: &str = "NEMO_RELAY_FFI_DISCOVERY_CHILD";
+#[cfg(unix)]
 const DISCOVERED_STATIC_PLUGIN_KIND: &str = "ffi_discovered_static";
+#[cfg(unix)]
 static DISCOVERED_STATIC_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
 static DISCOVERED_STATIC_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
 static DISCOVERED_STATIC_CONFIG: Mutex<Option<Json>> = Mutex::new(None);
 
+#[cfg(unix)]
 struct PluginDiscoveryTestEnv {
     previous_cwd: PathBuf,
     previous_xdg_config_home: Option<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 impl PluginDiscoveryTestEnv {
     fn enter(cwd: &Path, xdg_config_home: &Path) -> Self {
         let guard = Self {
@@ -36,6 +46,7 @@ impl PluginDiscoveryTestEnv {
     }
 }
 
+#[cfg(unix)]
 impl Drop for PluginDiscoveryTestEnv {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.previous_cwd);
@@ -75,6 +86,7 @@ fn ffi_activation_layers_discovered_static_and_explicit_dynamic_plugins() {
     );
 }
 
+#[cfg(unix)]
 fn run_discovered_config_activation_test() {
     let _ = nemo_relay_clear_plugin_configuration();
     DISCOVERED_STATIC_REGISTRATIONS.store(0, Ordering::SeqCst);
@@ -161,6 +173,7 @@ source = "user-file"
 }
 
 #[track_caller]
+#[cfg(unix)]
 fn assert_empty_dynamic_specs_rejected(config: &CString, empty_specs: &CString) {
     let mut empty_activation = ptr::null_mut();
     let mut empty_report = ptr::null_mut();
@@ -185,6 +198,7 @@ fn assert_empty_dynamic_specs_rejected(config: &CString, empty_specs: &CString) 
 }
 
 #[track_caller]
+#[cfg(unix)]
 fn write_and_assert_discovered_activation(
     report: &Json,
     plugins_toml: &Path,
@@ -239,6 +253,7 @@ fn write_and_assert_discovered_activation(
     assert_eq!(DISCOVERED_STATIC_CALLBACKS.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 unsafe extern "C" fn discovered_static_register(
     _user_data: *mut libc::c_void,
     plugin_config_json: *const c_char,
@@ -264,6 +279,7 @@ unsafe extern "C" fn discovered_static_register(
     }
 }
 
+#[cfg(unix)]
 unsafe extern "C" fn discovered_static_tool_request(
     _user_data: *mut libc::c_void,
     _name: *const c_char,
@@ -456,6 +472,7 @@ fn ffi_llm_execution_reaches_a_native_plugin_across_the_boundary() {
 }
 
 /// Answer an LLM call with the request it was given.
+#[cfg(unix)]
 unsafe extern "C" fn llm_exec_cb(
     _user_data: *mut libc::c_void,
     request_json: *const c_char,
@@ -740,6 +757,7 @@ fn plugin_kinds() -> Vec<String> {
     serde_json::from_value(unsafe { returned_json(output) }).expect("plugin kinds JSON")
 }
 
+#[cfg(unix)]
 fn build_native_fixture() -> &'static Path {
     prepared_fixture("NEMO_RELAY_TEST_NATIVE_PLUGIN")
 }
@@ -778,6 +796,7 @@ fn prepared_fixture(environment: &str) -> &'static Path {
     Box::leak(path.into_boxed_path())
 }
 
+#[cfg(unix)]
 fn write_native_manifest(directory: &Path, library: &Path) -> PathBuf {
     let manifest = directory.join("relay-plugin.toml");
     std::fs::write(
