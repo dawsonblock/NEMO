@@ -143,6 +143,8 @@ pub enum PluginActivationError {
     Plugin(PluginError),
     /// The process boundary refused something.
     Boundary(PluginProtocolError),
+    /// A native plugin process backend is unavailable on this platform.
+    UnsupportedPlatform(crate::error::PluginHostError),
     /// Activation failed and its rollback could not be shown to be complete.
     ///
     /// The process-wide ownership was retained rather than released: a second
@@ -156,7 +158,7 @@ impl PluginActivationError {
     pub fn as_plugin_error(&self) -> Option<&PluginError> {
         match self {
             Self::Plugin(error) => Some(error),
-            Self::Boundary(_) | Self::Retained(_) => None,
+            Self::Boundary(_) | Self::UnsupportedPlatform(_) | Self::Retained(_) => None,
         }
     }
 }
@@ -166,6 +168,7 @@ impl std::fmt::Display for PluginActivationError {
         match self {
             Self::Plugin(error) => write!(formatter, "{error}"),
             Self::Boundary(error) => write!(formatter, "{}", error.failure.message),
+            Self::UnsupportedPlatform(error) => write!(formatter, "{error}"),
             Self::Retained(message) => write!(formatter, "{message}"),
         }
     }
@@ -231,6 +234,7 @@ impl ActivatedPluginRuntime {
         // discovered file can turn it into a different failure, and before any
         // ownership is claimed.
         validate_dynamic_plugin_specs(&dynamic_plugins)?;
+        ensure_native_platform_support(&dynamic_plugins)?;
         let resolved = nemo_relay::plugin::resolve_plugin_config(config)
             .map_err(PluginActivationError::Plugin)?;
         Self::activate_resolved(resolved, dynamic_plugins, policy).await
@@ -273,6 +277,8 @@ impl ActivatedPluginRuntime {
         I: IntoIterator<Item = DynamicPluginActivationSpec>,
     {
         let dynamic_plugins = dynamic_plugins.into_iter().collect::<Vec<_>>();
+        validate_dynamic_plugin_specs(&dynamic_plugins)?;
+        ensure_native_platform_support(&dynamic_plugins)?;
         // The transaction runs on an executor of its own rather than on the
         // caller's task. An activation claims process-wide ownership, registers
         // components and starts processes; a caller that stops waiting halfway
@@ -602,6 +608,25 @@ impl ActivatedPluginRuntime {
     }
 }
 
+fn ensure_native_platform_support(
+    dynamic_plugins: &[DynamicPluginActivationSpec],
+) -> Result<(), PluginActivationError> {
+    #[cfg(windows)]
+    if dynamic_plugins
+        .iter()
+        .any(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
+    {
+        return Err(PluginActivationError::UnsupportedPlatform(
+            crate::error::PluginHostError::UnsupportedPlatform {
+                feature: "native plugin process isolation",
+                platform: "windows",
+            },
+        ));
+    }
+    let _ = dynamic_plugins;
+    Ok(())
+}
+
 impl Drop for ActivatedPluginRuntime {
     fn drop(&mut self) {
         // A drop that cannot clear has nothing left to say: core logs what its
@@ -710,6 +735,55 @@ where
         Err(_) => Err(PluginActivationError::Plugin(PluginError::Internal(
             "the plugin activation task stopped before returning a result".to_string(),
         ))),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod platform_tests {
+    use super::*;
+
+    /// Native process isolation is a typed unsupported-platform result on Windows.
+    #[tokio::test]
+    async fn native_process_isolation_is_explicitly_unsupported() {
+        let host_error = crate::supervisor::ProcessPluginHost::start(
+            crate::supervisor::PluginHostSupervisorConfig::beside_this_executable(
+                "windows-platform-test",
+            ),
+        )
+        .expect_err("the Windows host backend is not implemented");
+        assert!(matches!(
+            host_error,
+            crate::error::PluginHostError::UnsupportedPlatform {
+                feature: "native plugin process isolation",
+                platform: "windows"
+            }
+        ));
+
+        let spec = DynamicPluginActivationSpec {
+            plugin_id: "native-fixture".to_string(),
+            kind: DynamicPluginKind::RustDynamic,
+            manifest_ref: "not-opened-on-unsupported-platform".to_string(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        };
+        let error = ActivatedPluginRuntime::activate(
+            PluginConfig::default(),
+            [spec],
+            IsolationPolicy::for_runtime("windows-platform-test"),
+        )
+        .await
+        .err()
+        .expect("Windows has no native process-host backend");
+
+        assert!(matches!(
+            error,
+            PluginActivationError::UnsupportedPlatform(
+                crate::error::PluginHostError::UnsupportedPlatform {
+                    feature: "native plugin process isolation",
+                    platform: "windows"
+                }
+            )
+        ));
     }
 }
 

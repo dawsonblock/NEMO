@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-
 //! Evidence that the bounds a deployment states reach the process that runs a
 //! plugin.
 //!
@@ -8,6 +7,7 @@
 //! wrong is quiet: `pre_exec` runs in the forked child, where a failure that is
 //! not propagated leaves a host running with no bound at all. The child is
 //! asked what it holds, through the same call the supervisor uses.
+#![cfg(unix)]
 
 use std::os::unix::process::CommandExt;
 

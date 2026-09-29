@@ -35,39 +35,7 @@ use nemo_relay_plugin_protocol::{
 };
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
-/// How much a runtime asks of plugins *beside* the calls it makes.
-///
-/// Two settings rather than one because they answer different questions: how long
-/// one off-path operation may take, and how many may be in flight at once. Both
-/// are stated, because a runtime that decides either for its deployment is a
-/// runtime whose limit nobody chose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObservabilityPolicy {
-    /// Longest one off-path operation may take.
-    pub budget_millis: u64,
-    /// How many off-path operations may be in flight at once.
-    pub max_in_flight: usize,
-}
-
-impl ObservabilityPolicy {
-    /// Refuse a policy that states nothing.
-    ///
-    /// Zero would mean "no time" and "no capacity", which nobody means, and both
-    /// are the same mistake as a default: a value the deployment did not choose.
-    pub fn validate(&self) -> Result<(), PluginProtocolError> {
-        if self.budget_millis == 0 {
-            return Err(refused(
-                "an observability budget of zero milliseconds would refuse every off-path operation",
-            ));
-        }
-        if self.max_in_flight == 0 {
-            return Err(refused(
-                "an in-flight limit of zero would refuse every off-path operation",
-            ));
-        }
-        Ok(())
-    }
-}
+pub use crate::off_path_policy::ObservabilityPolicy;
 
 fn refused(message: &str) -> PluginProtocolError {
     PluginProtocolError::new(PluginFailureCode::Rejected, message.to_string())

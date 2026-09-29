@@ -106,7 +106,6 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 # "requires the 'worker-grpc' feature" — which is what these tests did until the
 # loader's feature was forwarded here. A dev-dependency, so the kernel itself still
 # reaches neither the loader nor the lane's transport.
-nemo-relay-native-loader = { workspace = true, features = ["worker-grpc"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "test-util", "rt-multi-thread", "time"] }
 futures = "0.3"
 opentelemetry_sdk = { workspace = true, features = ["trace", "logs", "metrics", "testing"] }
@@ -117,6 +116,10 @@ tokio-stream = { version = "0.1", features = ["net"] }
 serde_json = "1"
 object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+# The native host uses Unix-domain IPC and is not a Windows runtime dependency.
+nemo-relay-native-loader = { workspace = true, features = ["worker-grpc"] }
 
 [[test]]
 name = "codec_integration"

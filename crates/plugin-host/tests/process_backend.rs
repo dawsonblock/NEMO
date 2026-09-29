@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-
 //! The process boundary, exercised end to end.
 //!
 //! These are the first tests in which a plugin lifecycle operation crosses a
 //! process boundary: a real child is spawned, it handshakes over a socket it
 //! was told about and a credential it was given out of band, and the kernel's
 //! operations are answered by that process rather than by a library call.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

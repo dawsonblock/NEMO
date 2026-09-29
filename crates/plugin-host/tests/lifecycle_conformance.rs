@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-
 //! The lifecycle, run against the backend that runs in the caller's process.
 //!
 //! `process_backend.rs` runs the same checks against a child. The two files
@@ -12,6 +11,7 @@
 //! Both suites are the same code — `conformance::check` and
 //! `conformance::check_lifecycle` — so a case added for one backend is
 //! immediately a case for the other.
+#![cfg(unix)]
 
 mod support;
 

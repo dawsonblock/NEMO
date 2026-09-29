@@ -14,35 +14,72 @@
 //! supervisor's own.
 
 pub mod activation;
+#[cfg(unix)]
 pub mod attached;
+#[cfg(unix)]
 pub mod capability;
+#[cfg(unix)]
 pub mod codec_capability;
+#[cfg(unix)]
 pub mod codec_context;
+#[cfg(unix)]
 pub mod continuations;
+pub mod error;
+pub use error::PluginHostError;
 pub mod host_location;
 pub mod isolation_policy;
 pub mod limits;
 #[cfg(target_os = "macos")]
 mod macos_quarantine;
+#[cfg(unix)]
 pub mod observer;
+#[cfg(unix)]
 pub mod off_path;
+#[cfg(windows)]
+#[path = "windows/off_path.rs"]
+pub mod off_path;
+pub mod off_path_policy;
 pub mod operation_context;
+#[cfg(unix)]
 pub mod operation_scopes;
+#[cfg(unix)]
 pub mod proxy;
+#[cfg(unix)]
 pub mod runtime_service;
+#[cfg(unix)]
 pub mod session;
+#[cfg(unix)]
 pub mod session_channel;
+#[cfg(unix)]
 pub mod session_driver;
+#[cfg(unix)]
+pub mod supervisor;
+#[cfg(windows)]
+#[path = "windows/supervisor.rs"]
 pub mod supervisor;
 
+#[cfg(windows)]
+mod windows;
+#[cfg(unix)]
+pub use supervisor::ProcessPluginBackend as ProcessPluginHost;
+#[cfg(windows)]
+pub use windows::ProcessLoadedPlugins;
+#[cfg(windows)]
+pub use windows::unsupported_backend::ProcessPluginHost;
+
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use nemo_relay::plugin::execution::{PluginExecutionBackend, PluginManager};
+#[cfg(unix)]
 use nemo_relay_plugin_protocol::{
     PluginArtifactIdentity, PluginFailure, PluginHandle, PluginLoadRequest, PluginProtocolError,
 };
 
+#[cfg(unix)]
 use crate::operation_context::{lifecycle_context, refused};
+#[cfg(unix)]
 use crate::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
 
 /// Plugins loaded in a host process, with their registrations proxied here.
@@ -62,6 +99,7 @@ use crate::supervisor::{PluginHostSupervisorConfig, ProcessPluginBackend};
 ///
 /// Dropping this removes the proxies and kills the host, so a plugin's callbacks
 /// cannot outlive the runtime that installed them.
+#[cfg(unix)]
 pub struct ProcessLoadedPlugins {
     backend: Arc<ProcessPluginBackend>,
     /// Held so it outlives the proxies that submit to it.
@@ -74,6 +112,7 @@ pub struct ProcessLoadedPlugins {
     handles: Vec<PluginHandle>,
 }
 
+#[cfg(unix)]
 impl ProcessLoadedPlugins {
     /// Load, activate and proxy every plugin in `specs`.
     ///

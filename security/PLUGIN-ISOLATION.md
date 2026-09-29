@@ -64,6 +64,11 @@ section was written):
   route fails the check instead of being grandfathered by a missing one. The loader
   is not linked into the kernel any more, which is why the unsafe count below is a
   twenty-sixth of what it was.
+- **Windows native plugin hosting is explicitly unsupported.** Shared activation,
+  policy and error APIs compile on Windows; the socket transport and process
+  supervisor compile only on Unix. Selecting a native plugin on Windows returns
+  `PluginHostError::UnsupportedPlatform`. The Windows CI lane checks every
+  workspace target and compiles every test without running native-plugin tests.
 - **Claims: 36 enforced, 3 asserted and not yet.** Every claim this document makes
   is listed with what enforces it in `security/QUALIFICATION-MATRIX.md`, generated
   from `security/qualification-matrix.toml`, and `just qualification-matrix`
@@ -2544,13 +2549,14 @@ packaging. What has *not* been run on Linux is the whole wheel-and-tarball chain
 end to end — that is what the packaging jobs do, and it is the next thing to
 watch on a real runner.
 
-**And the platform the runtime does not exist on says so.** The transport between
-kernel and host is a Unix-domain socket, and the kernel's side of it is
-`std::os::unix`: the crate that holds the supervisor does not compile on Windows
-at all. Packaging that offered `nemo-plugin-host.exe` and an installer that
-fetched one were therefore describing a runtime the implementation does not have,
-which is the worst kind of documentation — one a deployment can act on. The
-declaration is explicit now:
+**And Windows has an explicit native-host boundary.** The transport between
+kernel and host remains a Unix-domain socket. The shared activation contract and
+typed error compile on Windows; the supervisor and socket transport are behind
+the Unix platform boundary. `ProcessPluginHost::start` returns
+`PluginHostError::UnsupportedPlatform`, and activation refuses a native plugin
+before resolving its manifest or claiming process-wide ownership. The Windows CI
+lane checks the complete workspace and compiles test targets, then runs the
+Windows-only behavior test:
 
 - the packaging recipes state that the isolated runtime is not implemented on
   Windows, skip the host, and carry the runtime or the addon alone;
@@ -2562,11 +2568,10 @@ declaration is explicit now:
 - the checks that look for an installed host on Windows are skipped by name
   rather than passing vacuously.
 
-What this does not do is make Windows work. Native-plugin isolation on Windows
-needs a transport abstraction: named pipes or an equivalent, with the same
-session, credential and capability semantics the socket has. Until that exists,
-the honest statement is the narrow one the code now makes — a Windows runtime can
-run plugins in its own process, and cannot host a native plugin out of process.
+This does not add named pipes or run native plugins on Windows. It makes the
+unsupported operation an explicit typed refusal while keeping the Windows
+workspace buildable; a Windows transport can be added later with the same session,
+credential and capability semantics as the Unix socket.
 
 What has *not* moved: the loader still executes inside the kernel's address
 space, because the backend the host process serves is the same in-process

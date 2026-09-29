@@ -482,10 +482,12 @@ max_transitive_packages = 295
 # the restricted loader uses that authenticated container copy in place and
 # rechecks its digest after dlopen. The signed-bundle qualification exercises the
 # complete transfer/load/registration path. The host's configured callback failure
-# has an executable startup regression test. These changes add code to both sides of
-# the trust boundary, which is why the measured count is recorded explicitly; direct
-# dependencies and unsafe source in the kernel host remain within their ceilings.
-max_source_lines = 16540
+# has an executable startup regression test. The explicit Unix entry point and
+# Windows unsupported-host surface keep the workspace buildable without a second
+# IPC implementation. These changes add code to both sides of the trust boundary,
+# which is why the measured count is recorded explicitly; unsafe source remains
+# within its ceiling.
+max_source_lines = 16572
 max_unsafe_occurrences = 288
 direct_dependency_digest = "c8645337cb08161f09d656950e3dd6c785ef92ff9c1f29ba39a8ef39d686f855"
 transitive_dependency_digest = "d6e5755cf0c3cbeff82281e73be9006ea21ade44d1f93f0c21feb94fb55976d5"

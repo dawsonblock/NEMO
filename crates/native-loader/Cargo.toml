@@ -12,7 +12,7 @@ description = "Loads native NeMo Relay plugins: the loader, the host process's o
 [lints]
 workspace = true
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 nemo-relay.workspace = true
 nemo-relay-plugin-host.workspace = true
 nemo-relay-plugin-proto.workspace = true
@@ -39,7 +39,7 @@ worker-grpc = ["nemo-relay/worker-grpc"]
 name = "native_plugin_integration"
 path = "tests/integration/native_plugin_tests.rs"
 
-[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 spdlog-rs = { version = "0.5", features = ["log", "multi-thread"] }

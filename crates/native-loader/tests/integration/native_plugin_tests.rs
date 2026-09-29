@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-
 //! Integration coverage for SDK-built native dynamic plugins.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

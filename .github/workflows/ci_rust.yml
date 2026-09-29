@@ -135,6 +135,13 @@ jobs:
         with:
           tool: cargo-llvm-cov@${{ steps.ci-config.outputs.cargo_llvm_cov_version }},cargo-nextest@${{ steps.ci-config.outputs.cargo_nextest_version }},just@${{ steps.ci-config.outputs.just_version }}
 
+      - name: Check Windows workspace compilation boundary
+        if: ${{ runner.os == 'Windows' }}
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          cargo check --locked --workspace --all-targets
+          cargo test --locked --workspace --no-run
+
       - name: Run Rust tests with coverage
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
         run: |

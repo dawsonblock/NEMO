@@ -28,6 +28,7 @@
 //! seam's own tests in the kernel crate: the reach into the runtime is the
 //! operations on that handle and nothing else.
 
+#[cfg(unix)]
 mod backend;
 /// Test support for the confidentiality property across the boundary.
 ///
@@ -35,22 +36,32 @@ mod backend;
 /// helpers the boundary tests use — in this crate and in the supervisor's — to
 /// prove a plugin cannot smuggle a value through. It is a public module for that
 /// reason and not because it is part of the crate's interface.
+#[cfg(unix)]
 pub mod confidentiality;
 /// The conformance suite both ends of the protocol are held to.
 ///
 /// It is public for the same reason `confidentiality` is: the supervisor's tests
 /// run it against the process backend, this crate's tests run it against the
 /// in-process one, and both are tests of the same contract.
+#[cfg(unix)]
 pub mod conformance;
+#[cfg(unix)]
 mod host;
+#[cfg(unix)]
 mod native;
 /// The service the host process serves the kernel's lifecycle operations on.
+#[cfg(unix)]
 pub mod service;
+#[cfg(unix)]
 mod staging;
 
+#[cfg(unix)]
 pub use backend::{InProcessPluginBackend, LoadedPlugins, host_build};
+#[cfg(unix)]
 pub use host::PluginHostActivation;
+#[cfg(unix)]
 pub use native::*;
+#[cfg(unix)]
 pub use service::{ForwardedStep, PluginHostConfig, PluginHostService};
 
 /// The path to the child binary this crate builds.
@@ -61,6 +72,7 @@ pub use service::{ForwardedStep, PluginHostConfig, PluginHostService};
 /// from `deps/`. It exists so that a test which needs to start a host process finds
 /// the host this workspace built rather than guessing at a path.
 #[must_use]
+#[cfg(unix)]
 pub fn child_binary() -> std::path::PathBuf {
     let mut directory = std::env::current_exe().expect("the running test binary has a path");
     directory.pop();
