@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(unix)]
 
 //! Isolated regression coverage for builtin plugin ownership.
+
+#![cfg(unix)]
 
 use std::future::Future;
 use std::pin::Pin;

@@ -5787,6 +5787,7 @@ async fn a_named_upstream_redirect_is_not_followed() {
 /// because a fixture was missing would be a run where the claim held nothing. Both
 /// failures below name what to build, which is what `just test-rust` builds before
 /// the suite runs.
+#[cfg(unix)]
 fn native_intercept_fixture() -> (std::path::PathBuf, String) {
     let library = std::env::var_os("NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN")
         .map(std::path::PathBuf::from)
@@ -5845,6 +5846,7 @@ fn native_intercept_fixture() -> (std::path::PathBuf, String) {
 /// the library that answered is **not** loaded into this process. The last fact
 /// is what the in-process path could not say — it registered the plugin's kind
 /// here, because here is where the callbacks were.
+#[cfg(unix)]
 #[tokio::test]
 async fn cli_activation_serves_a_native_plugin_from_another_process() {
     let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
