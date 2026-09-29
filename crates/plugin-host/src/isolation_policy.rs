@@ -31,10 +31,11 @@ use crate::host_location;
 ///
 /// The restricted host now creates its two Unix-domain endpoints inside the
 /// sandbox container and reports them through the startup pipe. The parent binds
-/// the callback endpoint there before releasing host startup. However, the macOS
-/// process test has not completed a plugin load: App Sandbox denies removal of
-/// the quarantine metadata on the staged copy, and `dlopen` cannot be qualified.
-/// Keep the policy fail-closed until that platform behavior has a supported fix.
+/// the callback endpoint there before releasing host startup. App Sandbox tags
+/// newly created library files with quarantine, and macOS denies removing that
+/// metadata from inside the sandbox; the documented executable-writing
+/// entitlement also did not prevent it. Keep startup fail-closed until an approved
+/// architecture for this platform behavior is implemented and qualified.
 const RESTRICTED_ARTIFACT_LOAD_QUALIFIED: bool = false;
 
 /// How much a host process is contained.

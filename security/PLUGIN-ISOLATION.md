@@ -666,8 +666,11 @@ kernel. See *The nested codec call inherits the invocation's deadline* below.
    being adopted: the policy, bundle, authenticated artifact-transfer protocol and
    container-owned IPC are in place. The sandboxed test transfers and verifies the
    artifact, but App Sandbox denies removing `com.apple.quarantine` from the
-   private load copy, so `dlopen` has not completed. Restricted mode remains
-   fail-closed until the bundled-host transfer-and-load test passes.
+   private load copy, so `dlopen` has not completed. The documented
+   executable-writing entitlement did not change this behavior. Apple DTS states
+   there is no in-sandbox removal API; resolving this requires a separate decision
+   about an operation outside the sandbox or a different plugin signing/trust
+   model. Restricted mode remains fail-closed.
 
 The measurements that decide the milestone live in `just tcb-report`; the
 evidence for the claims above lives in the tests named next to the code, which

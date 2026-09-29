@@ -35,10 +35,12 @@ the sections below say which is which):
   artifact, and resolves loads only through the approved copy. The parent and host
   now establish their sockets inside the host container using endpoints announced
   on a startup pipe; the sandboxed test reaches the transfer and verifies the
-  staged copy. The test then fails closed because App Sandbox denies removal of
-  `com.apple.quarantine` from the loader's private copy (`Operation not
-  permitted`), so an approved dylib has not yet completed `dlopen`. The policy
-  remains fail-closed until the complete sandboxed transfer-and-load path passes.
+  staged copy. App Sandbox adds `com.apple.quarantine` to files the host creates,
+  and denies removing it. The documented executable-writing entitlement did not
+  prevent quarantine on the staged dylib, so `dlopen` still times out. Apple DTS
+  states there is no in-sandbox API to remove this attribute; resolving it needs a
+  separate architecture decision about a narrowly scoped unsandboxed helper or a
+  different plugin signing/trust model. Restricted mode remains fail-closed.
 
 ## Target
 
@@ -150,12 +152,17 @@ the operating-system denial behavior; neither result substitutes for the other.
    approved load resolution and per-session cleanup. Digest mismatch, interruption,
    and over-limit behavior are covered at the staging layer. These tests run
    outside App Sandbox, so they do not prove the complete confined transfer path.
-2. **The macOS quarantine interaction still needs a supported resolution.** The
-   host's private staged copy receives `com.apple.quarantine`; attempting to clear
-   it from inside App Sandbox is denied. The host must not load a copy until this
-   platform behavior is handled without widening filesystem authority or
-   bypassing the kernel's approval digest. The restricted policy refuses startup
-   while this end-to-end load remains unqualified.
+2. **The macOS quarantine interaction does not have an in-sandbox resolution.**
+   Apple documents that sandbox-created files are quarantined and its developer
+   support confirms the sandbox cannot remove that attribute. The
+   `com.apple.security.files.user-selected.executable` entitlement, intended for
+   executable files written to user-selected locations, was tested and did not
+   change the quarantine on a file staged in the host container. A future design
+   must either introduce a narrowly scoped operation outside the sandbox or require
+   a signing/trust model that Gatekeeper accepts. Neither is implemented here; the
+   restricted policy refuses startup while the real native load is unqualified.
+   See [Apple's App Sandbox guidance](https://developer.apple.com/library/archive/documentation/Miscellaneous/Reference/EntitlementKeyReference/Chapters/EnablingAppSandbox.html)
+   and [Apple DTS's quarantine guidance](https://developer.apple.com/forums/thread/811450).
 3. **Packaging.** The bundle has to travel in the artifacts that carry a host: the
    CLI release archive and wheel, the Python wheel, and the Node platform package.
    Each needs its install layout decided rather than assumed — a wheel's
