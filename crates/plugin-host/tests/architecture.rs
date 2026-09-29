@@ -583,6 +583,7 @@ fn the_loader_is_a_dependency_of_one_crate_and_the_kernel_does_not_depend_on_the
 /// reference the kernel checks, and the work happens where the object is. It joined this
 /// list after a real child resolved the kernel's codec through that reference.
 #[test]
+#[cfg(unix)]
 fn the_boundary_serves_a_named_subset_of_the_registration_surface() {
     use nemo_relay_plugin_host::supervisor::ProcessPluginBackend;
     use nemo_relay_plugin_protocol::PluginRegistrationOperation as Operation;

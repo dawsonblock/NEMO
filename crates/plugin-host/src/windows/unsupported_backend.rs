@@ -82,3 +82,21 @@ pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
 pub fn plugin_runtime_binding(implementation: &str) -> String {
     crate::host_location::plugin_runtime_binding(implementation)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_process_isolation_is_explicitly_unsupported() {
+        let config = PluginHostSupervisorConfig::beside_this_executable("test-runtime");
+
+        match ProcessPluginHost::start(config) {
+            Err(PluginHostError::UnsupportedPlatform { feature, platform }) => {
+                assert_eq!(feature, "native plugin process isolation");
+                assert_eq!(platform, "windows");
+            }
+            Ok(_) => panic!("Windows must refuse native process isolation"),
+        }
+    }
+}
