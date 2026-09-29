@@ -49,6 +49,7 @@ impl Drop for PluginDiscoveryTestEnv {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_layers_discovered_static_and_explicit_dynamic_plugins() {
     if std::env::var_os(DISCOVERY_CHILD_ENV).is_some() {
@@ -280,6 +281,7 @@ unsafe extern "C" fn discovered_static_tool_request(
     CString::new(args.to_string()).unwrap().into_raw()
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_loads_native_callbacks_and_removes_them_before_free() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -342,6 +344,7 @@ fn ffi_activation_loads_native_callbacks_and_removes_them_before_free() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_rejects_overlapping_outputs_without_claiming_host() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -385,6 +388,7 @@ fn ffi_activation_rejects_overlapping_outputs_without_claiming_host() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_llm_execution_reaches_a_native_plugin_across_the_boundary() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -467,6 +471,7 @@ unsafe extern "C" fn llm_exec_cb(
         .into_raw()
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_refuses_an_unusable_host_without_falling_back() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -565,6 +570,7 @@ fn ffi_activation_loads_worker_callbacks_and_stops_worker_on_clear() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_rolls_back_an_earlier_native_load_when_a_later_load_fails() {
     let _guard = TEST_MUTEX.lock().unwrap();

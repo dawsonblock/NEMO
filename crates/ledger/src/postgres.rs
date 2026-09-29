@@ -3191,7 +3191,7 @@ mod tests {
         assert!(validate_schema_name("nemo;drop schema public").is_err());
         assert!(matches!(
             PostgresEffectStore::connect_insecure_local_for_tests(
-                "host=/tmp dbname=postgres",
+                "host=127.0.0.1 dbname=postgres",
                 "nemo_effects",
                 LeaseConfiguration::default(),
                 0,

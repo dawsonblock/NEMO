@@ -2337,6 +2337,7 @@ async fn serve_listener_rejects_invalid_plugin_config() {
     assert!(nemo_relay::plugin::active_plugin_report().is_none());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn serve_listener_activates_static_plugins_before_dynamic_load_and_cleans_failure() {
     let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;

@@ -126,6 +126,7 @@ fn test_ffi_dynamic_plugin_activation_rejects_invalid_inputs_without_outputs() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn test_ffi_dynamic_plugin_activation_surfaces_load_failures_and_releases_owner() {
     let _guard = TEST_MUTEX.lock().unwrap();
