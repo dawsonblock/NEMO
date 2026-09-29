@@ -11,6 +11,7 @@
 use chrono::Utc;
 use semver::{Comparator, Op, Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value as Json};
 use strum::{Display, IntoStaticStr};
 
 use crate::plugin::{
@@ -23,50 +24,53 @@ pub type DynamicPluginId = String;
 /// Canonical filename for authored Relay plugin manifests.
 pub const DYNAMIC_PLUGIN_MANIFEST_FILENAME: &str = "relay-plugin.toml";
 
-mod host;
+mod artifact;
+mod hosted;
 mod manifest;
-mod native;
 mod registry;
 #[cfg(feature = "worker-grpc")]
 mod worker;
 
-pub use host::*;
+// The inert half of the artifact vocabulary: identity, hashing and
+// manifest-relative resolution, which the kernel asks about a plugin artifact
+// without owning a way to run one.
+pub use artifact::*;
+pub use hosted::*;
 pub use manifest::*;
-pub use native::*;
 pub use registry::*;
 #[cfg(feature = "worker-grpc")]
 pub use worker::*;
 
-#[derive(Debug)]
-pub(crate) struct DynamicPluginTeardownOutcome {
-    pub(crate) errors: Vec<String>,
-    pub(crate) safe_to_unload: bool,
-}
-
-impl DynamicPluginTeardownOutcome {
-    pub(crate) fn success() -> Self {
-        Self {
-            errors: Vec::new(),
-            safe_to_unload: true,
-        }
-    }
-
-    pub(crate) fn record_error(&mut self, error: impl Into<String>, safe_to_unload: bool) {
-        self.errors.push(error.into());
-        self.safe_to_unload &= safe_to_unload;
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.errors.extend(other.errors);
-        self.safe_to_unload &= other.safe_to_unload;
-    }
+/// One dynamic plugin component to load and activate in an embedding host.
+///
+/// This is the composition's input rather than either end's: a supervisor hands it
+/// to the process backend, and the in-process activation hands the same record to
+/// the loader. It lives in the kernel's control-plane vocabulary — beside
+/// [`DynamicPluginKind`], which it names — because that is what both ends already
+/// depend on, and because the crate the supervisor links must not be the crate that
+/// can load a library.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DynamicPluginActivationSpec {
+    /// Expected plugin identifier from the authored manifest.
+    pub plugin_id: String,
+    /// Plugin execution lane.
+    pub kind: DynamicPluginKind,
+    /// Path or reference to the authored `relay-plugin.toml`.
+    pub manifest_ref: String,
+    /// Relay-managed runtime environment used by Python workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_ref: Option<String>,
+    /// Component-local configuration passed to the dynamically loaded plugin.
+    #[serde(default)]
+    pub config: Map<String, Json>,
 }
 
 pub(super) fn deregister_tracked_registrations_checked(
     registrations: &mut Vec<(String, u64)>,
     plugin_type: &str,
-) -> DynamicPluginTeardownOutcome {
-    let mut outcome = DynamicPluginTeardownOutcome::success();
+) -> RegistrationTeardown {
+    let mut outcome = RegistrationTeardown::success();
     for (plugin_kind, registration_id) in std::mem::take(registrations).into_iter().rev() {
         match deregister_plugin_registration_checked(&plugin_kind, registration_id) {
             Ok(PluginDeregistrationOutcome::Removed) => {}

@@ -33,7 +33,7 @@ The release pipeline publishes these package surfaces from a tag push:
 | crates.io | `nemo-relay-types`, `nemo-relay-plugin`, `nemo-relay-worker-proto`, `nemo-relay-worker`, `nemo-relay`, `nemo-relay-adaptive`, `nemo-relay-pii-redaction`, `nemo-relay-ffi`, `nemo-relay-cli` |
 | PyPI | `nemo-relay` wheels and source distribution, `nemo-relay-plugin` and `nemo-relay-cli-bin` wheels |
 | npm | `nemo-relay-node` and its seven platform packages, and `nemo-relay-openclaw` |
-| GitHub Releases | CLI binaries, `nemo-relay` and `nemo-relay-cli-bin` wheels, Node npm tarballs, and checksums |
+| GitHub Releases | CLI binaries and their plugin host binaries, `nemo-relay` and `nemo-relay-cli-bin` wheels, Node npm tarballs, and checksums |
 | Fern | The documentation site |
 
 Go remains source-first. There is no separate Go package-manager publication
@@ -263,11 +263,17 @@ The release pipeline then:
    - `package-python-plugin` builds the `nemo-relay-plugin` wheel.
    - The Rust CLI matrix builds GNU Linux binaries in manylinux containers and
      musl Linux binaries natively, validates each in its matching container, and
-     packages each prebuilt binary as a `nemo-relay-cli-bin` wheel.
+     packages each prebuilt binary as a `nemo-relay-cli-bin` wheel together with
+     the `nemo-plugin-host` executable built for the same target. The host is
+     what runs a native plugin outside the runtime's process, so it is published
+     as its own release asset *and* bundled into the wheel's `.data/scripts`,
+     which installs it into the same directory as the CLI — the directory the
+     runtime looks in when a deployment names no host.
    - The distribution release-asset job uploads the CLI binaries, `nemo-relay`
-     API wheels, CLI wheels, and split Node npm packages.
+     API wheels (each carrying the plugin host), CLI wheels, and split Node npm
+     packages.
      `SHA256SUMS` covers every attached distribution artifact, and raw CLI
-     binaries also receive individual `.sha256` files for installer
+     binaries and plugin host binaries also receive individual `.sha256` files for installer
      compatibility.
      GitHub-facing npm artifacts use
      `nemo-relay-node-npm[-<os>-<cpu>]-<version>.tgz`; their registry package

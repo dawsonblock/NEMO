@@ -10,7 +10,10 @@ GITHUB_API_URL="https://api.github.com/repos/${REPOSITORY}"
 
 usage() {
     cat <<'EOF'
-Install the NeMo Relay CLI from GitHub Releases.
+Install the NeMo Relay CLI and its plugin host from GitHub Releases.
+
+Both executables are installed into the same directory: the CLI starts the host
+to run native plugins outside its own process, and looks for it beside itself.
 
 Usage:
   install.sh [--install-dir DIR]
@@ -144,7 +147,9 @@ if [ "$is_windows_shell" -eq 1 ]; then
             ;;
     esac
     binary_name="nemo-relay.exe"
+    host_binary_name="nemo-plugin-host.exe"
     asset="nemo-relay-cli-${target}-${version}.exe"
+    host_asset="nemo-plugin-host-${target}-${version}.exe"
 else
     case "${os}:${arch}" in
         Linux:x86_64|Linux:amd64)
@@ -161,11 +166,15 @@ else
             ;;
     esac
     binary_name="nemo-relay"
+    host_binary_name="nemo-plugin-host"
     asset="nemo-relay-cli-${target}-${version}"
+    host_asset="nemo-plugin-host-${target}-${version}"
 fi
 
 asset_url="${GITHUB_URL}/releases/download/${version}/${asset}"
 checksum_url="${asset_url}.sha256"
+host_asset_url="${GITHUB_URL}/releases/download/${version}/${host_asset}"
+host_checksum_url="${host_asset_url}.sha256"
 
 mkdir -p "$install_dir" || error "could not create install directory: ${install_dir}"
 [ -d "$install_dir" ] || error "install path is not a directory: ${install_dir}"
@@ -177,38 +186,92 @@ checksum_file=$(mktemp "${install_dir}/.nemo-relay.checksum.XXXXXX") || {
     rm -f "$download_file"
     error "could not create a temporary file in ${install_dir}"
 }
+host_download_file=$(mktemp "${install_dir}/.nemo-relay.host.XXXXXX") || {
+    rm -f "$download_file" "$checksum_file"
+    error "could not create a temporary file in ${install_dir}"
+}
+host_checksum_file=$(mktemp "${install_dir}/.nemo-relay.host-checksum.XXXXXX") || {
+    rm -f "$download_file" "$checksum_file" "$host_download_file"
+    error "could not create a temporary file in ${install_dir}"
+}
 
 cleanup() {
-    rm -f "$download_file" "$checksum_file"
+    rm -f "$download_file" "$checksum_file" "$host_download_file" "$host_checksum_file"
 }
 trap cleanup EXIT HUP INT TERM
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | sed -n '1{s/[[:space:]].*//;p;}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | sed -n '1{s/[[:space:]].*//;p;}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | sed 's/^.*= //'
+    else
+        error "no SHA-256 utility found; install sha256sum, shasum, or openssl"
+    fi
+}
+
+expected_checksum() {
+    checksum_value=$(sed -n '1{s/[[:space:]].*//;p;}' "$1" | tr 'A-F' 'a-f')
+    printf '%s\n' "$checksum_value" | grep -Eq '^[0-9a-f]{64}$' || \
+        error "invalid checksum file for $2"
+    printf '%s\n' "$checksum_value"
+}
+
+verify_download() {
+    actual=$(sha256_of "$1")
+    actual=$(printf '%s\n' "$actual" | tr 'A-F' 'a-f')
+    [ "$actual" = "$2" ] || error "checksum verification failed for $3"
+}
 
 printf 'Downloading NeMo Relay CLI %s for %s...\n' "$version" "$target"
 curl_with_timeouts -o "$download_file" "$asset_url" || error "could not download ${asset_url}"
 curl_with_timeouts -o "$checksum_file" "$checksum_url" || error "could not download ${checksum_url}"
+expected=$(expected_checksum "$checksum_file" "$asset")
+verify_download "$download_file" "$expected" "$asset"
 
-expected_checksum=$(sed -n '1{s/[[:space:]].*//;p;}' "$checksum_file" | tr 'A-F' 'a-f')
-printf '%s\n' "$expected_checksum" | grep -Eq '^[0-9a-f]{64}$' || \
-    error "invalid checksum file for ${asset}"
-
-if command -v sha256sum >/dev/null 2>&1; then
-    actual_checksum=$(sha256sum "$download_file" | sed -n '1{s/[[:space:]].*//;p;}')
-elif command -v shasum >/dev/null 2>&1; then
-    actual_checksum=$(shasum -a 256 "$download_file" | sed -n '1{s/[[:space:]].*//;p;}')
-elif command -v openssl >/dev/null 2>&1; then
-    actual_checksum=$(openssl dgst -sha256 "$download_file" | sed 's/^.*= //')
-else
-    error "no SHA-256 utility found; install sha256sum, shasum, or openssl"
+# The host is the executable that runs a native plugin outside this process, so
+# an installation without one is an installation whose native plugins cannot be
+# isolated. It travels with the CLI from the release that publishes it; a release
+# that predates the host publishes nine assets and not ten, and installing the
+# CLI alone is then the most this installer can do — loudly, because the runtime
+# refuses to fall back to loading in process.
+host_available=0
+if curl_with_timeouts -o "$host_checksum_file" "$host_checksum_url"; then
+    curl_with_timeouts -o "$host_download_file" "$host_asset_url" || \
+        error "could not download ${host_asset_url}"
+    expected=$(expected_checksum "$host_checksum_file" "$host_asset")
+    verify_download "$host_download_file" "$expected" "$host_asset"
+    host_available=1
 fi
-actual_checksum=$(printf '%s\n' "$actual_checksum" | tr 'A-F' 'a-f')
-
-[ "$actual_checksum" = "$expected_checksum" ] || error "checksum verification failed for ${asset}"
 
 chmod 0755 "$download_file" || error "could not make the downloaded binary executable"
+if [ "$host_available" -eq 1 ]; then
+    chmod 0755 "$host_download_file" || error "could not make the downloaded host executable"
+fi
+
+# Everything is on disk and verified before either file is promoted, and the
+# host is promoted first: the CLI is the executable that decides whether a host
+# is started, so an upgrade interrupted between the two moves leaves the old
+# decider beside a new dependency rather than a new decider beside an old one.
+# Neither order can produce a silently mismatched pair, because the handshake
+# compares the release each was built from before any plugin code loads.
+if [ "$host_available" -eq 1 ]; then
+    host_destination="${install_dir}/${host_binary_name}"
+    mv -f "$host_download_file" "$host_destination" || \
+        error "could not install ${host_destination}"
+fi
 destination="${install_dir}/${binary_name}"
 mv -f "$download_file" "$destination" || error "could not install ${destination}"
 
 printf 'Installed NeMo Relay CLI %s to %s\n' "$version" "$destination"
+if [ "$host_available" -eq 1 ]; then
+    printf 'Installed the plugin host to %s\n' "$host_destination"
+else
+    printf 'Warning: release %s does not publish %s (or it could not be fetched), so native plugins cannot be hosted outside this installation. Install a release that publishes the host, or set NEMO_RELAY_PLUGIN_HOST to a host built from this release.\n' \
+        "$version" "$host_asset" >&2
+fi
 if [ "$is_windows_shell" -eq 1 ]; then
     require_command cygpath
     if command -v powershell.exe >/dev/null 2>&1; then

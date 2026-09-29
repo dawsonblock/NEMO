@@ -8,6 +8,22 @@
 #include <stddef.h>
 
 /**
+ * Milliseconds one managed FFI call may take.
+ *
+ * Stated here because these entry points carry no deadline: a caller that needs
+ * a different one needs an entry point that takes one. What it is *for* is the
+ * budget the kernel hands a registration that runs in another process — the
+ * runtime decides how long a plugin's work may take, and a plugin reached with
+ * no budget at all is refused rather than trusted.
+ *
+ * This value cannot lengthen anything: the kernel narrows an inherited budget to
+ * its own ceiling, and a call that publishes nothing already runs under that
+ * ceiling. What publishing changes is that plugin work now has a budget that
+ * came from the composition rather than none at all.
+ */
+#define MANAGED_CALL_BUDGET_MILLIS 30000
+
+/**
  * Status codes returned by all FFI functions.
  *
  * Every `extern "C"` function in this library returns an `NemoRelayStatus`.
@@ -206,6 +222,8 @@ typedef struct FfiOpenTelemetrySubscriber FfiOpenTelemetrySubscriber;
  *
  * The inner option allows explicit activation cleanup to be idempotent while
  * retaining a stable allocation until the foreign caller frees the handle.
+ * What it holds is the shared activation: the ownership, the configuration's
+ * own components, and the process the native plugins run in.
  */
 typedef struct FfiPluginActivation FfiPluginActivation;
 
@@ -2136,6 +2154,23 @@ NemoRelayStatus nemo_relay_initialize_with_dynamic_plugins(const char *config_js
                                                            const char *dynamic_plugins_json,
                                                            struct FfiPluginActivation **out_activation,
                                                            char **out_report_json);
+
+/**
+ * Clear one owned dynamic plugin activation.
+ *
+ * Before that, ask which process the native plugins are in. **Experimental:**
+ * this accessor exists so an embedder can check the isolation claim rather than
+ * take it on faith; it reports `0` when the activation has no process-hosted
+ * plugin, which is the case for a configuration of worker plugins alone.
+ *
+ * # Safety
+ * `activation` must be a valid activation handle returned by
+ * `nemo_relay_initialize_with_dynamic_plugins`, or null. `out_pid` must be a
+ * valid pointer. A null `activation` reports `0` rather than failing: "this
+ * handle has nothing" and "this handle was cleared" are the same answer.
+ */
+NemoRelayStatus nemo_relay_plugin_activation_host_pid(const struct FfiPluginActivation *activation,
+                                                      uint32_t *out_pid);
 
 /**
  * Clear one owned dynamic plugin activation.

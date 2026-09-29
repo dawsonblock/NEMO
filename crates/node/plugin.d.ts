@@ -104,6 +104,12 @@ export interface DynamicPluginActivation extends AsyncDisposable {
    * guarantee another process-wide activation can start after failed teardown.
    */
   readonly active: boolean;
+  /**
+   * Process the native plugins are running in, or `null` when this activation
+   * holds no host — it started none, or it has closed. The plugins do not run in
+   * the process that asked for them, and this is that claim as a value.
+   */
+  readonly hostPid: number | null;
   /** Clear callbacks before unloading libraries and workers. Idempotent. */
   close(): Promise<void>;
   /** Delegate structured `await using` cleanup to `close()`. */

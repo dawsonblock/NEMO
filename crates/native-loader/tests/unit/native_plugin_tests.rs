@@ -10,29 +10,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use nemo_relay_plugin::{
+use nemo_relay_native_abi::{
     NemoRelayNativeLlmNextFn, NemoRelayNativeLlmSanitizeRequestContext,
     NemoRelayNativeLlmSanitizeResponseContext, NemoRelayNativeLlmStreamNextFn,
     NemoRelayNativeToolNextFn,
 };
 #[cfg(unix)]
-use nemo_relay_plugin::{NemoRelayNativePluginRegisterFn, NemoRelayNativePluginValidateFn};
+use nemo_relay_native_abi::{NemoRelayNativePluginRegisterFn, NemoRelayNativePluginValidateFn};
 use serde_json::json;
 
-use crate::api::optimization::{
-    LlmOptimizationRecorder, current_llm_optimization_recorder, scope_llm_optimization_recorder,
+use nemo_relay::api::runtime::{
+    BuiltinLlmCodec, LlmSanitizeRequestContext, LlmSanitizeResponseContext, NemoRelayContextState,
+    global_context,
 };
-use crate::api::runtime::scope_stack::active_event_uuid;
-use crate::api::runtime::subscriber_dispatcher::{
-    capture_nested_publication_buffer, with_task_publication_context,
-};
-use crate::api::runtime::{
-    BuiltinLlmCodec, LlmSanitizeRequestContext, LlmSanitizeResponseContext,
-    MiddlewareContinuationLease, NemoRelayContextState, TASK_SCOPE_STACK, current_scope_stack,
-    global_context, with_active_event_uuid,
-};
-use crate::codec::openai_chat::OpenAIChatCodec;
-use crate::codec::response::AnnotatedLlmResponse;
+use nemo_relay::codec::openai_chat::OpenAIChatCodec;
+use nemo_relay::codec::response::AnnotatedLlmResponse;
 
 type RawToolExecutionNextFn =
     Arc<dyn Fn(Json) -> Pin<Box<dyn Future<Output = FlowResult<Json>> + Send>> + Send + Sync>;
@@ -505,6 +497,8 @@ fn native_test_adapter(
             relay_compat: "^0.8".into(),
             allows_multiple_components: false,
             plugin: Mutex::new(plugin),
+            _staging: None,
+            registrations: Mutex::new(Vec::new()),
             _library: libloading::os::unix::Library::this().into(),
         }),
     }
@@ -617,30 +611,47 @@ fn assert_native_digest_edges() {
     let library = temp.path().join("plugin.bin");
     std::fs::write(&library, b"native plugin bytes").unwrap();
     assert_eq!(
-        resolve_manifest_relative_path(&manifest, "plugin.bin"),
+        host_runtime().resolve_manifest_relative(&manifest, "plugin.bin"),
         library
     );
     assert_eq!(
-        resolve_manifest_relative_path(&manifest, temp.path().to_str().unwrap()),
+        host_runtime().resolve_manifest_relative(&manifest, temp.path().to_str().unwrap()),
         temp.path()
     );
-    assert_eq!(hex_digest([0x00, 0xab, 0xff]), "00abff");
-    let digest = hex_digest(Sha256::digest(b"native plugin bytes"));
-    assert!(verify_sha256(&library, &format!("sha256:{}", digest.to_uppercase())).is_ok());
-    assert!(verify_sha256(&library, "sha256:00").is_err());
-    assert!(verify_sha256(&temp.path().join("missing"), "00").is_err());
+    let digest = host_runtime().hash_bytes(b"native plugin bytes");
+    assert!(
+        host_runtime()
+            .verify_path(&library, &format!("sha256:{}", digest.to_uppercase()))
+            .is_ok()
+    );
+    assert!(host_runtime().verify_path(&library, "sha256:00").is_err());
+    assert!(
+        host_runtime()
+            .verify_path(&temp.path().join("missing"), "00")
+            .is_err()
+    );
 }
 
+#[allow(clippy::cognitive_complexity)] // One assertion per field of four tables.
 fn assert_native_host_api_versions() {
     let current = native_host_api();
+    let frozen_v4 = native_host_api_v4();
     let frozen_v3 = native_host_api_v3();
     let legacy = native_host_api_v2();
     assert!(!current.is_null());
+    assert!(!frozen_v4.is_null());
     assert!(!frozen_v3.is_null());
     assert!(!legacy.is_null());
     assert_eq!(
         unsafe { (*current).abi_version },
         NEMO_RELAY_NATIVE_ABI_VERSION
+    );
+    // Every older table is frozen at the version it was built for, so a plugin
+    // that only knows that version sees the shape it was compiled against rather
+    // than a prefix of the current one.
+    assert_eq!(
+        unsafe { (*frozen_v4).abi_version },
+        NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS
     );
     assert_eq!(unsafe { (*frozen_v3).abi_version }, 3);
     assert_eq!(
@@ -649,6 +660,10 @@ fn assert_native_host_api_versions() {
     );
     assert_eq!(
         unsafe { (*current).struct_size },
+        std::mem::size_of::<NemoRelayNativeHostApiV5>()
+    );
+    assert_eq!(
+        unsafe { (*frozen_v4).struct_size },
         std::mem::size_of::<NemoRelayNativeHostApiV4>()
     );
     assert_eq!(
@@ -661,7 +676,22 @@ fn assert_native_host_api_versions() {
     );
     #[cfg(target_pointer_width = "64")]
     {
-        assert_eq!(std::mem::align_of::<NemoRelayNativeHostApiV4>(), 8);
+        assert_eq!(std::mem::align_of::<NemoRelayNativeHostApiV5>(), 8);
+        assert_eq!(std::mem::size_of::<NemoRelayNativeHostApiV5>(), 624);
+        assert_eq!(std::mem::offset_of!(NemoRelayNativeHostApiV5, v4), 0);
+        assert_eq!(
+            std::mem::offset_of!(NemoRelayNativeHostApiV5, capture_mark_window_thread),
+            600
+        );
+        assert_eq!(
+            std::mem::offset_of!(NemoRelayNativeHostApiV5, release_mark_window),
+            608
+        );
+        assert_eq!(
+            std::mem::offset_of!(NemoRelayNativeHostApiV5, emit_mark_in_window),
+            616
+        );
+        // The frozen v4 table is the current table's prefix, unchanged in shape.
         assert_eq!(std::mem::size_of::<NemoRelayNativeHostApiV4>(), 600);
         assert_eq!(std::mem::offset_of!(NemoRelayNativeHostApiV4, v3), 0);
         assert_eq!(
@@ -1735,8 +1765,220 @@ fn assert_native_json_output_and_host_api() {
     assert_eq!(host_api.abi_version, NEMO_RELAY_NATIVE_ABI_VERSION);
     assert_eq!(
         host_api.struct_size,
-        std::mem::size_of::<NemoRelayNativeHostApiV4>()
+        std::mem::size_of::<NemoRelayNativeHostApiV5>()
     );
+}
+
+/// A mark window captured for one call is refused once that call is over.
+///
+/// The security property, stated as a sequence rather than as cleanup: a plugin task
+/// that outlives its call still holds the window it captured, and the operation
+/// identity that window carries belongs to a call the kernel has already settled. A
+/// late mark through it must be refused — not attributed to whatever holds that
+/// identity now — and a later operation's window must be unaffected by it.
+#[test]
+fn a_captured_mark_window_is_refused_once_its_call_is_over() {
+    use nemo_relay::plugin::execution::{ForwardedMark, MarkForwarder};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The host's own end of one call's window.
+    struct Sink {
+        label: &'static str,
+        closed: AtomicBool,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MarkForwarder for Sink {
+        fn forward(&self, mark: &ForwardedMark) -> nemo_relay::error::Result<()> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(nemo_relay::error::FlowError::Internal(format!(
+                    "the invocation '{}' this mark belongs to has ended",
+                    self.label
+                )));
+            }
+            self.seen.lock().unwrap().push(mark.name.clone());
+            Ok(())
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let first = std::sync::Arc::new(Sink {
+            label: "operation-1",
+            closed: AtomicBool::new(false),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // The call is running: the window it opened is captured, and a mark through
+        // it belongs to this call.
+        let window = nemo_relay::plugin::execution::with_mark_forwarder(
+            std::sync::Arc::clone(&first) as std::sync::Arc<dyn MarkForwarder>,
+            async {
+                let mut window = ptr::null_mut();
+                let status = unsafe { native_capture_mark_window_thread(&mut window) };
+                assert_eq!(status, NemoRelayStatus::Ok);
+                assert!(!window.is_null(), "a running call has a window to capture");
+                window
+            },
+        )
+        .await;
+        assert_eq!(first.seen.lock().unwrap().len(), 0);
+
+        // The call ends. The window the plugin kept is a *stale* capability: the
+        // mark it raises now is refused rather than attributed to the next
+        // operation.
+        first.closed.store(true, Ordering::SeqCst);
+        let late = std::ffi::CString::new("late.mark").unwrap();
+        let emitted = unsafe {
+            native_emit_mark_in_window(
+                window,
+                native_string_from_str(late.to_str().unwrap()).expect("a name"),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        assert_ne!(
+            emitted,
+            NemoRelayStatus::Ok,
+            "a mark raised through a window whose call is over is refused"
+        );
+        assert_eq!(
+            first.seen.lock().unwrap().len(),
+            0,
+            "and it is not attributed to the operation the window named"
+        );
+
+        // Releasing the stale handle is safe, and a later operation's window is
+        // unaffected: the refusal was the window's, not the mechanism's.
+        unsafe { native_release_mark_window(window) };
+        let second = std::sync::Arc::new(Sink {
+            label: "operation-2",
+            closed: AtomicBool::new(false),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        nemo_relay::plugin::execution::with_mark_forwarder(
+            std::sync::Arc::clone(&second) as std::sync::Arc<dyn MarkForwarder>,
+            async {
+                let mut fresh = ptr::null_mut();
+                assert_eq!(
+                    unsafe { native_capture_mark_window_thread(&mut fresh) },
+                    NemoRelayStatus::Ok
+                );
+                let name = native_string_from_str("fresh.mark").expect("a name");
+                assert_eq!(
+                    unsafe {
+                        native_emit_mark_in_window(
+                            fresh,
+                            name,
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                        )
+                    },
+                    NemoRelayStatus::Ok
+                );
+                unsafe { native_release_mark_window(fresh) };
+            },
+        )
+        .await;
+        assert_eq!(
+            *second.seen.lock().unwrap(),
+            vec!["fresh.mark".to_string()],
+            "the later operation's own marks are the only ones it sees"
+        );
+        assert_eq!(
+            *first.seen.lock().unwrap(),
+            Vec::<String>::new(),
+            "and the late mark never became anyone's"
+        );
+    });
+}
+
+/// The negotiation a plugin's entry goes through.
+///
+/// Every already-built plugin depends on this order: the current table first, then
+/// each frozen one, newest first. A plugin that only knows one version must be handed
+/// that version rather than a newer one it refuses — and one this host cannot speak to
+/// at all must be refused rather than handed a table it cannot read.
+#[test]
+fn the_entry_negotiation_offers_the_newest_version_a_plugin_accepts() {
+    for (plugin_max, expected) in [
+        (NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION),
+        (
+            NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
+            NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
+        ),
+        (
+            nemo_relay_native_abi::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
+            nemo_relay_native_abi::NEMO_RELAY_NATIVE_ABI_VERSION_ASYNC_MIDDLEWARE,
+        ),
+        (
+            NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,
+            NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,
+        ),
+    ] {
+        let mut plugin = NemoRelayNativePluginV1::default();
+        let status = negotiate_plugin_entry(entry_accepting_up_to(plugin_max), &mut plugin);
+        assert_eq!(
+            status,
+            NemoRelayStatus::Ok,
+            "a plugin built for v{plugin_max} is served"
+        );
+        assert_eq!(
+            OFFERED.lock().unwrap().last().copied(),
+            Some(expected),
+            "and the table it accepted is the newest one it knows"
+        );
+    }
+
+    let mut plugin = NemoRelayNativePluginV1::default();
+    let refused = negotiate_plugin_entry(entry_accepting_up_to(1), &mut plugin);
+    assert_eq!(
+        refused,
+        NemoRelayStatus::InvalidArg,
+        "a plugin sharing no version with this host is refused rather than handed one it cannot read"
+    );
+    assert_eq!(
+        OFFERED.lock().unwrap().len(),
+        4,
+        "every table this host can offer was offered before refusing"
+    );
+}
+
+/// The versions a fake plugin's entry was offered, in order.
+static OFFERED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// A plugin whose supported range ends at `max`, as an entry the loader can call.
+fn entry_accepting_up_to(max: u32) -> NemoRelayNativePluginEntry {
+    /// The version the fake plugin being called accepts up to.
+    static MAX: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+    unsafe extern "C" fn entry(
+        host: *const NemoRelayNativeHostApiV1,
+        _plugin: *mut NemoRelayNativePluginV1,
+    ) -> NemoRelayStatus {
+        let offered = unsafe { (*host).abi_version };
+        OFFERED.lock().unwrap().push(offered);
+        if offered <= *MAX.lock().unwrap() {
+            NemoRelayStatus::Ok
+        } else {
+            NemoRelayStatus::InvalidArg
+        }
+    }
+
+    OFFERED.lock().unwrap().clear();
+    *MAX.lock().unwrap() = max;
+    entry
 }
 
 #[test]
@@ -1840,72 +2082,6 @@ fn native_async_next_abi_runs_tool_llm_and_stream_continuations() {
 }
 
 #[test]
-fn native_async_next_reports_a_revoked_continuation_without_calling_the_provider() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let provider_calls = Arc::new(AtomicUsize::new(0));
-    let (lease, guard) = MiddlewareContinuationLease::capture();
-    let next = Arc::new(NativeAsyncNext::new(
-        canonical_tool_next({
-            let provider_calls = provider_calls.clone();
-            Arc::new(move |value| {
-                let provider_calls = provider_calls.clone();
-                let invocation = lease.begin();
-                Box::pin(async move {
-                    invocation?
-                        .invoke(|| async move {
-                            provider_calls.fetch_add(1, Ordering::SeqCst);
-                            Ok(value)
-                        })
-                        .await
-                })
-            })
-        }),
-        runtime.handle().clone(),
-        None,
-    ));
-    let next_ref = Arc::into_raw(next) as *const NemoRelayNativeAsyncNext;
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let completion = Arc::new(NativeAsyncCompletion {
-        sender: Mutex::new(Some(sender)),
-        cancelled: AtomicBool::new(false),
-        next_invoked: AtomicBool::new(false),
-        next_abort: Mutex::new(None),
-        continuation_aborts: Mutex::new(HashMap::new()),
-        codec: None,
-        before_settlement_lock: None,
-        _callback_user_data: None,
-    });
-    let completion_ref =
-        Arc::into_raw(Arc::clone(&completion)) as *const NemoRelayNativeAsyncCompletion;
-    let invocation = native_string_from_json(&json!({"tool": true})).unwrap();
-
-    drop(guard);
-    assert_eq!(
-        unsafe { native_async_next_invoke(next_ref, invocation, completion_ref) },
-        NemoRelayStatus::Ok
-    );
-    let error = runtime
-        .block_on(receiver)
-        .expect("native completion should settle")
-        .expect_err("revoked continuation should reject");
-    assert!(
-        error
-            .to_string()
-            .contains("execution continuation is no longer active")
-    );
-    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
-
-    unsafe {
-        native_string_free(invocation);
-        native_async_next_release(next_ref);
-        native_async_completion_release(completion_ref);
-    }
-}
-
-#[test]
 fn native_async_next_result_supports_repeated_concurrent_calls() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1921,7 +2097,7 @@ fn native_async_next_result_supports_repeated_concurrent_calls() {
                     tokio::task::yield_now().await;
                     Ok(json!({
                         "value": value,
-                        "scope": crate::api::runtime::task_scope_top().uuid.to_string(),
+                        "scope": nemo_relay::api::runtime::task_scope_top().uuid.to_string(),
                     }))
                 })
             })
@@ -2217,7 +2393,7 @@ fn native_async_next_result_uses_captured_scope_on_an_unbound_plugin_thread() {
                 Box::pin(async move {
                     Ok(json!({
                         "value": value,
-                        "scope": crate::api::runtime::task_scope_top().uuid.to_string(),
+                        "scope": nemo_relay::api::runtime::task_scope_top().uuid.to_string(),
                     }))
                 })
             })),
@@ -2259,301 +2435,6 @@ fn native_async_next_result_uses_captured_scope_on_an_unbound_plugin_thread() {
         native_string_free(invocation);
         native_async_next_release(next_ref);
     }
-}
-
-fn native_continuation_context_observation(
-    expected_stack: &ScopeStackHandle,
-    expected_event_uuid: uuid::Uuid,
-) -> Json {
-    let expected_scope_uuid = expected_stack
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .top()
-        .uuid;
-    let visible_scope_uuid = current_scope_stack()
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .top()
-        .uuid;
-    json!({
-        "scope_stack": visible_scope_uuid == expected_scope_uuid,
-        "active_event_uuid": active_event_uuid() == Some(expected_event_uuid),
-        "publication_context": crate::api::runtime::subscriber_dispatcher::publication_context::<String>()
-            .is_some_and(|context| context.as_str() == "native-continuation"),
-        "publication_buffer": capture_nested_publication_buffer().is_some(),
-        "optimization_recorder": current_llm_optimization_recorder().is_some(),
-    })
-}
-
-#[test]
-fn native_async_next_preserves_runtime_context_for_unary_and_stream_continuations() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let expected_stack = create_scope_stack();
-    let expected_event_uuid = uuid::Uuid::now_v7();
-    let expected = json!({
-        "scope_stack": true,
-        "active_event_uuid": true,
-        "publication_context": true,
-        "publication_buffer": true,
-        "optimization_recorder": true,
-    });
-
-    runtime.block_on(TASK_SCOPE_STACK.scope(
-        expected_stack.clone(),
-        with_task_publication_context(
-            Some(Arc::new(String::from("native-continuation"))),
-            scope_llm_optimization_recorder(
-                LlmOptimizationRecorder::default(),
-                with_active_event_uuid(
-                    expected_event_uuid,
-                    crate::api::runtime::subscriber_dispatcher::with_async_publication_context(
-                        crate::api::runtime::subscriber_dispatcher::register_async_publication(),
-                        async {
-                            let unary_stack = expected_stack.clone();
-                            let unary = Arc::new(NativeAsyncNext::new(
-                                canonical_tool_next(Arc::new(move |_value| {
-                                    let unary_stack = unary_stack.clone();
-                                    Box::pin(async move {
-                                        Ok(native_continuation_context_observation(
-                                            &unary_stack,
-                                            expected_event_uuid,
-                                        ))
-                                    })
-                                })),
-                                runtime.handle().clone(),
-                                None,
-                            ));
-                            let unary_ref = Arc::into_raw(unary) as *const NemoRelayNativeAsyncNext;
-                            let (sender, receiver) = tokio::sync::oneshot::channel();
-                            let completion = Arc::new(NativeAsyncCompletion {
-                                sender: Mutex::new(Some(sender)),
-                                cancelled: AtomicBool::new(false),
-                                next_invoked: AtomicBool::new(false),
-                                next_abort: Mutex::new(None),
-                                continuation_aborts: Mutex::new(HashMap::new()),
-                                codec: None,
-                                before_settlement_lock: None,
-                                _callback_user_data: None,
-                            });
-                            let completion_ref = Arc::into_raw(Arc::clone(&completion))
-                                as *const NemoRelayNativeAsyncCompletion;
-                            let invocation = native_string_from_json(&Json::Null).unwrap();
-                            assert_eq!(
-                                unsafe {
-                                    native_async_next_invoke(unary_ref, invocation, completion_ref)
-                                },
-                                NemoRelayStatus::Ok
-                            );
-                            assert_eq!(
-                                receiver.await.unwrap().unwrap(),
-                                json!({"result": expected.clone(), "pending_marks": []})
-                            );
-                            unsafe {
-                                native_string_free(invocation);
-                                native_async_next_release(unary_ref);
-                                native_async_completion_release(completion_ref);
-                            }
-
-                            let stream_stack = expected_stack.clone();
-                            let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
-                            let observed_tx = Arc::new(Mutex::new(Some(observed_tx)));
-                            let stream_next = Arc::new(NativeAsyncNext::new(
-                                NativeAsyncNextInner::LlmStream(Arc::new(move |_request| {
-                                    let stream_stack = stream_stack.clone();
-                                    let observed_tx = observed_tx.clone();
-                                    Box::pin(async move {
-                                        if let Some(sender) = observed_tx
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner())
-                                            .take()
-                                        {
-                                            let _ = sender.send(
-                                                native_continuation_context_observation(
-                                                    &stream_stack,
-                                                    expected_event_uuid,
-                                                ),
-                                            );
-                                        }
-                                        Ok(LlmJsonStream::new(tokio_stream::empty()))
-                                    })
-                                })),
-                                runtime.handle().clone(),
-                                None,
-                            ));
-                            let stream_next_ref =
-                                Arc::into_raw(stream_next) as *const NemoRelayNativeAsyncNext;
-                            let (sender, receiver) = tokio::sync::mpsc::channel(1);
-                            let stream = Arc::new(NativeAsyncStream {
-                                sender: Mutex::new(Some(sender)),
-                                cancelled: AtomicBool::new(false),
-                                settled: AtomicBool::new(false),
-                                backpressured: AtomicBool::new(false),
-                                downstream_aborts: Mutex::new(HashMap::new()),
-                                settlement: Mutex::new(()),
-                                before_settlement_lock: None,
-                                _callback_user_data: None,
-                            });
-                            let stream_ref = Arc::into_raw(Arc::clone(&stream))
-                                as *const NemoRelayNativeAsyncStream;
-                            let invocation = native_string_from_json(
-                                &serde_json::to_value(LlmRequest {
-                                    headers: Map::new(),
-                                    content: Json::Null,
-                                })
-                                .unwrap(),
-                            )
-                            .unwrap();
-                            assert_eq!(
-                                unsafe {
-                                    native_async_next_invoke_stream(
-                                        stream_next_ref,
-                                        invocation,
-                                        stream_ref,
-                                        accept_native_stream_item,
-                                        ptr::null_mut(),
-                                    )
-                                },
-                                NemoRelayStatus::Ok
-                            );
-                            assert_eq!(observed_rx.await.unwrap(), expected);
-                            drop(NativeAsyncStreamReceiver {
-                                receiver,
-                                stream: Arc::clone(&stream),
-                            });
-                            unsafe {
-                                native_string_free(invocation);
-                                native_async_next_release(stream_next_ref);
-                                native_async_stream_release(stream_ref);
-                            }
-                        },
-                    ),
-                ),
-            ),
-        ),
-    ));
-}
-
-#[test]
-fn native_sync_next_preserves_runtime_context_for_unary_and_stream_continuations() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let expected_stack = create_scope_stack();
-    let expected_event_uuid = uuid::Uuid::now_v7();
-    let expected = json!({
-        "scope_stack": true,
-        "active_event_uuid": true,
-        "publication_context": true,
-        "publication_buffer": true,
-        "optimization_recorder": true,
-    });
-
-    runtime.block_on(TASK_SCOPE_STACK.scope(
-        expected_stack.clone(),
-        with_task_publication_context(
-            Some(Arc::new(String::from("native-continuation"))),
-            scope_llm_optimization_recorder(
-                LlmOptimizationRecorder::default(),
-                with_active_event_uuid(
-                    expected_event_uuid,
-                    crate::api::runtime::subscriber_dispatcher::with_async_publication_context(
-                        crate::api::runtime::subscriber_dispatcher::register_async_publication(),
-                        async {
-                            let unary_stack = expected_stack.clone();
-                            let unary_next: ToolExecutionNextFn = Arc::new(move |_value| {
-                                let unary_stack = unary_stack.clone();
-                                Box::pin(async move {
-                                    Ok(ToolExecutionResult::new(
-                                        native_continuation_context_observation(
-                                            &unary_stack,
-                                            expected_event_uuid,
-                                        ),
-                                    ))
-                                })
-                            });
-                            let unary_next = unary_next;
-                            let invocation = native_string_from_json(&Json::Null).unwrap();
-                            let mut output = ptr::null_mut();
-                            assert_eq!(
-                                unsafe {
-                                    native_tool_next(
-                                        invocation,
-                                        (&unary_next as *const ToolExecutionNextFn)
-                                            .cast_mut()
-                                            .cast(),
-                                        &mut output,
-                                    )
-                                },
-                                NemoRelayStatus::Ok
-                            );
-                            let observed: Json =
-                                serde_json::from_str(&read_native_string(output).unwrap()).unwrap();
-                            assert_eq!(observed, json!({"result": expected}));
-                            unsafe {
-                                native_string_free(invocation);
-                                native_string_free(output);
-                            }
-
-                            let stream_stack = expected_stack.clone();
-                            let stream_next: LlmStreamExecutionNextFn = Arc::new(move |_request| {
-                                let stream_stack = stream_stack.clone();
-                                Box::pin(async move {
-                                    Ok(LlmJsonStream::new(futures_util::stream::once(async move {
-                                        Ok(native_continuation_context_observation(
-                                            &stream_stack,
-                                            expected_event_uuid,
-                                        ))
-                                    })))
-                                })
-                            });
-                            let request = native_string_from_json(
-                                &serde_json::to_value(LlmRequest {
-                                    headers: Map::new(),
-                                    content: Json::Null,
-                                })
-                                .unwrap(),
-                            )
-                            .unwrap();
-                            let mut native_stream = NemoRelayNativeLlmStreamV1::default();
-                            assert_eq!(
-                                unsafe {
-                                    native_llm_stream_next(
-                                        request,
-                                        (&stream_next as *const LlmStreamExecutionNextFn)
-                                            .cast_mut()
-                                            .cast(),
-                                        &mut native_stream,
-                                    )
-                                },
-                                NemoRelayStatus::Ok
-                            );
-                            unsafe { native_string_free(request) };
-
-                            let mut output = ptr::null_mut();
-                            assert_eq!(
-                                unsafe {
-                                    native_stream.next.unwrap()(
-                                        native_stream.user_data,
-                                        &mut output,
-                                    )
-                                },
-                                NemoRelayStatus::Ok
-                            );
-                            let observed: Json =
-                                serde_json::from_str(&read_native_string(output).unwrap()).unwrap();
-                            assert_eq!(observed, expected);
-                            unsafe { native_string_free(output) };
-                            drop_native_stream(native_stream);
-                        },
-                    ),
-                ),
-            ),
-        ),
-    ));
 }
 
 #[test]
@@ -4103,10 +3984,6 @@ unsafe extern "C" fn fail_scope_callback(_user_data: *mut c_void) -> NemoRelaySt
 
 #[test]
 fn native_scope_stack_abi_covers_lifecycle_and_validation() {
-    let _runtime_guard = crate::shared_runtime::runtime_owner_test_mutex()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    crate::shared_runtime::reset_runtime_owner_for_tests();
     let _global_context_restore = GlobalContextRestore::replace_with_empty();
     let _restore = ThreadScopeStackRestore::capture();
 
@@ -4757,6 +4634,8 @@ fn native_registration_entrypoints_reject_invalid_host_contexts_and_names() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let mut invalid_host = NativeHostPluginContext {
@@ -5193,6 +5072,8 @@ fn assert_async_request_registration_rejects_legacy_relay_contract() {
         relay_compat: "^0.5".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let mut registration = PluginRegistrationContext::new();
@@ -5242,6 +5123,8 @@ async fn native_async_wrappers_validate_callback_result_shapes() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let result = native_string("true");
@@ -5357,8 +5240,8 @@ async fn native_async_wrappers_validate_callback_result_shapes() {
         fields_result.cast(),
         None,
     );
-    let event = Event::Mark(crate::api::event::MarkEvent::new(
-        crate::api::event::BaseEvent::builder()
+    let event = Event::Mark(nemo_relay::api::event::MarkEvent::new(
+        nemo_relay::api::event::BaseEvent::builder()
             .name("native-async-event")
             .build(),
         None,
@@ -6107,6 +5990,8 @@ async fn native_callback_wrappers_release_error_outputs_and_preserve_reasons() {
         relay_compat: "^0.8".into(),
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
+        _staging: None,
+        registrations: Mutex::new(Vec::new()),
         _library: libloading::os::unix::Library::this().into(),
     });
     let request = LlmRequest {
@@ -7026,4 +6911,267 @@ fn native_stream_continuation_covers_success_and_error() {
         unsafe { native_llm_stream_next(ptr::null(), ptr::null_mut(), ptr::null_mut()) },
         NemoRelayStatus::NullPointer
     );
+}
+
+#[test]
+fn a_verified_artifact_is_loaded_from_a_private_copy_and_not_from_its_source_path() {
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    std::fs::write(&source, b"the approved bytes").expect("write the source");
+    let approved = host_runtime().hash_bytes(b"the approved bytes");
+
+    let stage = super::stage_verified_library(&source, &approved).expect("a matching artifact");
+    let (staged_path, guard) = stage;
+    assert_ne!(
+        staged_path, source,
+        "the path that gets loaded is the copy, not the source"
+    );
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read the copy"),
+        b"the approved bytes",
+        "the copy holds the verified bytes"
+    );
+    assert!(
+        staged_path.starts_with(std::env::temp_dir()),
+        "the copy lives in this process's own directory: {}",
+        staged_path.display()
+    );
+
+    // The source is not what was loaded: replacing it now changes nothing about
+    // the staged copy, which is the whole point of staging.
+    std::fs::write(&source, b"something else entirely").expect("replace the source");
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read the copy"),
+        b"the approved bytes"
+    );
+
+    drop(guard);
+    assert!(
+        !staged_path.exists(),
+        "dropping the copy removes it: the mapping it backed is already gone"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_digest_mismatch_never_reaches_a_staging_directory() {
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    std::fs::write(&source, b"the approved bytes").expect("write the source");
+    let approved = host_runtime().hash_bytes(b"the approved bytes");
+    // The file is not the approved one.
+    std::fs::write(&source, b"not the approved bytes").expect("replace the source");
+
+    let error = super::stage_verified_library(&source, &approved)
+        .expect_err("an artifact that is not the approved one");
+    assert!(
+        error.to_string().contains("hashes to"),
+        "the refusal names the digests: {error}"
+    );
+    // Nothing is left behind for a later load to pick up.
+    let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .expect("the temp directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("nemo-native-artifacts-"))
+                && path.join("library").exists()
+                && std::fs::read(path.join("library"))
+                    .is_ok_and(|bytes| bytes == b"not the approved bytes")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a refused artifact leaves no staging directory: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn two_loads_of_one_artifact_are_staged_separately() {
+    // Two loads of the *same* bytes used to land on the same path, because the
+    // path was derived from the digest and the process id: the second load
+    // truncated the file the first was running from. Each load gets its own
+    // directory now, so the copies are distinct objects that cannot disturb each
+    // other.
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    std::fs::write(&source, b"the approved bytes").expect("write the source");
+    let approved = host_runtime().hash_bytes(b"the approved bytes");
+
+    let (first_path, first_guard) =
+        super::stage_verified_library(&source, &approved).expect("the first load");
+    let (second_path, second_guard) =
+        super::stage_verified_library(&source, &approved).expect("the second load");
+    assert_ne!(
+        first_path, second_path,
+        "identical bytes are still two separately staged copies"
+    );
+    assert_ne!(
+        first_path.parent(),
+        second_path.parent(),
+        "each copy has its own directory: {} and {}",
+        first_path.parent().unwrap_or(&first_path).display(),
+        second_path.parent().unwrap_or(&second_path).display()
+    );
+    assert_eq!(
+        std::fs::read(&first_path).expect("read the first copy"),
+        b"the approved bytes"
+    );
+    assert_eq!(
+        std::fs::read(&second_path).expect("read the second copy"),
+        b"the approved bytes"
+    );
+
+    // Dropping one copy removes only its own directory: the other load's bytes
+    // are not the first load's to remove.
+    drop(first_guard);
+    assert!(!first_path.exists(), "the dropped copy is gone");
+    assert_eq!(
+        std::fs::read(&second_path).expect("the other copy is still there"),
+        b"the approved bytes"
+    );
+    drop(second_guard);
+    assert!(!second_path.exists());
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn concurrent_loads_of_one_artifact_each_get_their_own_copy() {
+    // The case the digest-derived name could not handle, run the way it would
+    // happen: several loads of one approved artifact at the same time. Every one
+    // of them has to receive its own object, because a loader given a path
+    // another load is also writing is being handed a file that is changing
+    // underneath it.
+    let directory = std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("a test directory");
+    let source = directory.join("library");
+    let bytes: Vec<u8> = (0..4096u32).map(|value| (value % 251) as u8).collect();
+    std::fs::write(&source, &bytes).expect("write the source");
+    let approved = host_runtime().hash_bytes(&bytes);
+
+    let loads: Vec<_> = (0..16)
+        .map(|_| {
+            let source = source.clone();
+            let approved = approved.clone();
+            std::thread::spawn(move || {
+                super::stage_verified_library(&source, &approved).expect("a staged copy")
+            })
+        })
+        .collect();
+    let staged: Vec<_> = loads
+        .into_iter()
+        .map(|load| load.join().expect("a load that finished"))
+        .collect();
+
+    let mut paths: Vec<_> = staged.iter().map(|(path, _)| path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(
+        paths.len(),
+        staged.len(),
+        "every concurrent load staged its own file"
+    );
+    for (path, _) in &staged {
+        assert_eq!(
+            std::fs::read(path).expect("read a staged copy"),
+            bytes,
+            "{} holds the approved bytes",
+            path.display()
+        );
+    }
+    drop(staged);
+    for path in paths {
+        assert!(
+            !path.exists(),
+            "{} was removed with its load",
+            path.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_staged_copy_lives_in_a_directory_only_its_load_can_reach() {
+    // The bytes are only as private as the directory that holds them: a copy in
+    // a world-readable directory is a copy another user can read, and one in a
+    // world-writable directory is a copy another user can replace.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("nemo-stage-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("a test directory");
+        let source = directory.join("library");
+        std::fs::write(&source, b"the approved bytes").expect("write the source");
+        let approved = host_runtime().hash_bytes(b"the approved bytes");
+
+        let (staged, guard) = super::stage_verified_library(&source, &approved).expect("a copy");
+        let parent = staged.parent().expect("the copy's directory");
+        let mode = std::fs::metadata(parent)
+            .expect("the directory's metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the staged copy's directory denies other users: {parent:?} is {mode:o}"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+#[test]
+fn an_artifact_identity_describes_the_manifest_and_library_it_named() {
+    // The identity is the pair the runtime approves, so it has to come from one
+    // reading of the manifest: the digest of the bytes that were parsed, beside
+    // the digest of the library those bytes named.
+    let directory =
+        std::env::temp_dir().join(format!("nemo-identity-test-{}", uuid::Uuid::now_v7()));
+    let library_dir = directory.join("lib");
+    std::fs::create_dir_all(&library_dir).expect("a library directory");
+    let library = library_dir.join("library");
+    std::fs::write(&library, b"the library bytes").expect("write the library");
+    let manifest = directory.join("relay-plugin.toml");
+    let manifest_source = format!(
+        "manifest_version = 1\n\n[plugin]\nid = \"identity_fixture\"\nkind = \"rust_dynamic\"\n\n\
+         [compat]\nrelay = \"={}\"\nnative_api = \"1\"\n\n[defaults]\nenabled = false\n\n\
+         [capabilities]\nitems = [\"plugin_native\"]\n\n\
+         [load]\nlibrary = \"lib/library\"\nsymbol = \"nemo_relay_identity_fixture\"\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(&manifest, &manifest_source).expect("write the manifest");
+
+    let (manifest_sha256, library_sha256) =
+        nemo_relay::plugin::dynamic::ApprovedPluginArtifact::approve(&manifest.to_string_lossy())
+            .expect("an approval")
+            .digests();
+    assert_eq!(
+        manifest_sha256,
+        host_runtime().hash_bytes(manifest_source.as_bytes()),
+        "the manifest digest is the digest of the bytes that were read"
+    );
+    assert_eq!(
+        library_sha256,
+        host_runtime().hash_bytes(b"the library bytes"),
+        "the library digest is the digest of the library the manifest named"
+    );
+
+    // A directory reference names the manifest inside it, as the loader does, so
+    // the same artifact has one identity however it is named.
+    let (from_directory, _) =
+        nemo_relay::plugin::dynamic::ApprovedPluginArtifact::approve(&directory.to_string_lossy())
+            .expect("an approval")
+            .digests();
+    assert_eq!(
+        from_directory, manifest_sha256,
+        "naming the directory and naming the manifest are the same artifact"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
 }

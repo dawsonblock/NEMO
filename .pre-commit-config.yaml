@@ -55,7 +55,7 @@ repos:
     hooks:
       - id: ty
         name: ty (type check)
-        entry: uv run ty check . --extra-search-path python/plugin/src --extra-search-path scripts/docs --extra-search-path scripts/licensing --exclude docs/** --exclude fern/** --exclude ./examples/** --exclude .cache/** --exclude .claude/** --exclude python/plugin/src/nemo_relay_plugin/_proto/**
+        entry: uv run ty check . --extra-search-path python/plugin/src --extra-search-path scripts/docs --extra-search-path scripts/licensing --extra-search-path scripts/qualification --exclude docs/** --exclude fern/** --exclude ./examples/** --exclude .cache/** --exclude .claude/** --exclude python/plugin/src/nemo_relay_plugin/_proto/**
         language: system
         types: [python]
         pass_filenames: false
@@ -65,6 +65,51 @@ repos:
         language: system
         files: '^(examples/python-grpc-worker-plugin/nemo_relay_python_grpc_worker_example/.*\.py|python/plugin/src/nemo_relay_plugin/.*\.py)$'
         pass_filenames: false
+
+  # Qualification — the claims a milestone makes and what enforces them
+  - repo: local
+    hooks:
+      # Runs on anything that could be evidence, because the failure this catches is a
+      # test that was renamed or deleted: the matrix names it, and the gate says so
+      # rather than leaving the document asserting something nothing checks.
+      - id: qualification-matrix
+        name: qualification matrix
+        entry: python3 scripts/qualification/matrix.py
+        language: system
+        pass_filenames: false
+        # Release prose included, because the check reads it: a commit that only edits
+        # `security/PLUGIN-ISOLATION.md` or `README.md` can invalidate the wording the
+        # gate exists to keep honest, and a filter that skipped those files would let
+        # that change through without running the check at all.
+        #
+        # The workflows and the path filters are here because the check reads them too:
+        # it resolves a recipe against the lanes that invoke it, and it refuses a tree
+        # where a boundary change would leave the lanes that install an artifact
+        # skipped. Both are properties of files this pattern now watches.
+        files: '^(crates/.*\.rs|python/.*\.py|crates/node/tests/.*\.mjs|scripts/(qualification|tests)/.*\.py|justfile|README\.md|security/(qualification-matrix\.toml|QUALIFICATION-MATRIX\.md|PLUGIN-ISOLATION\.md|MACOS-RESTRICTED-HOST\.md)|\.github/(ci-path-filters\.yml|workflows/.*\.ya?ml))$'
+
+  # Trusted surface — the budgets and the dependency layers
+  #
+  # These two gates were run by hand, and the hole that leaves is exactly the one they
+  # exist to close: a budget measured before the last edit landed is a budget the tree
+  # does not have, and nothing noticed until somebody ran the report by hand. The same
+  # class of mistake was committed twice — a raise that did not match the tree — so the
+  # gates run where the edits do now.
+  - repo: local
+    hooks:
+      - id: tcb-report
+        name: TCB budgets
+        entry: python3 scripts/tcb/report.py
+        language: system
+        pass_filenames: false
+        files: '^(Cargo\.lock|Cargo\.toml|crates/.*/Cargo\.toml|crates/.*\.rs|security/tcb\.toml)$'
+
+      - id: layer-report
+        name: dependency layers
+        entry: python3 scripts/tcb/layers.py
+        language: system
+        pass_filenames: false
+        files: '^(Cargo\.lock|Cargo\.toml|crates/.*/Cargo\.toml|security/layers\.toml)$'
 
   # Documentation — external link validation
   - repo: https://github.com/lycheeverse/lychee.git

@@ -24,6 +24,7 @@ __skip-implicit-config = ["nemo-relay/__skip-implicit-config"]
 nemo-relay = { workspace = true, features = ["atof-streaming", "guardrails-remote", "object-store", "worker-grpc"] }
 nemo-relay-adaptive = { workspace = true, features = ["redis-backend"] }
 nemo-relay-pii-redaction.workspace = true
+nemo-relay-plugin-host = { workspace = true, features = ["worker-grpc"] }
 pyo3 = { version = "0.29.0", features = ["abi3", "abi3-py311", "experimental-inspect", "macros"] }
 pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
 pythonize = "0.29.0"
@@ -33,3 +34,8 @@ uuid = { workspace = true, features = ["v7"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 chrono = "0.4"
+
+[dev-dependencies]
+# The layout tests build the directory shapes an installation produces, which is
+# the only way to check what the binding resolves against them.
+tempfile = "3"

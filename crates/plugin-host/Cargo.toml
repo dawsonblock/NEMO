@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The kernel's side of the native plugin boundary: the process backend, its supervisor, and the proxies that serve a host's registrations."
+
+[lints]
+workspace = true
+
+[dependencies]
+nemo-relay.workspace = true
+nemo-relay-plugin-protocol.workspace = true
+futures-util = "0.3"
+serde_json = "1"
+# Activation owns a cancellation-safe transaction on every platform, so its
+# runtime, sync and macro features are shared; process and socket features are Unix-only.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[target.'cfg(unix)'.dependencies]
+chrono = "0.4"
+getrandom = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+nemo-relay-plugin-proto.workspace = true
+rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+tokio = { version = "1", features = ["io-util", "io-std", "net", "process"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.2", default-features = false, features = [
+    "codegen",
+    "router",
+    "transport",
+] }
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+# The worker lane: a plugin whose code runs in a process the kernel starts and
+# whose adapter lives here. Off by default because most consumers do not run
+# worker plugins, and the error a consumer without it gets says so.
+worker-grpc = ["nemo-relay/worker-grpc"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nemo-relay-native-loader.workspace = true
+tempfile = "3"

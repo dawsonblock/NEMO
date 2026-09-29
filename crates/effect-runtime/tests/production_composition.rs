@@ -136,9 +136,6 @@ fn runtime(environment: &str) -> RuntimeIdentity {
 /// Constructors that may only appear outside production code.
 const NON_PRODUCTION_CONSTRUCTORS: &[&str] = &["new_unchecked_for_tests"];
 
-/// Paths allowed to name a non-production constructor.
-const COMPOSITION_ROOT: &str = "crates/effect-runtime/";
-
 /// The file that defines the raw constructor, and therefore may mention it.
 const CONSTRUCTOR_DEFINITION: &str = "crates/core/src/kernel.rs";
 
@@ -206,7 +203,7 @@ fn production_crates_cannot_reach_a_non_production_constructor() {
 }
 
 #[test]
-fn the_composition_root_is_the_only_non_test_user_of_the_raw_constructor() {
+fn no_crate_reaches_the_unchecked_test_constructor() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -230,14 +227,14 @@ fn the_composition_root_is_the_only_non_test_user_of_the_raw_constructor() {
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .any(|line| line.contains("Kernel::new_unchecked_for_tests("));
-            if calls && !path.starts_with(COMPOSITION_ROOT) {
+            if calls {
                 offenders.push(path);
             }
         }
     }
     assert!(
         offenders.is_empty(),
-        "only {COMPOSITION_ROOT} may compose a kernel directly, found: {offenders:?}"
+        "no crate may compose a kernel through the unchecked test constructor, found: {offenders:?}"
     );
 }
 
@@ -369,6 +366,29 @@ impl CompositionFixture {
         )
         .expect("connect composition owner store")
     }
+
+    /// Build the runtime store over a transport that may attest readiness.
+    ///
+    /// The fixture's own connection is the explicitly local test transport,
+    /// which is correct for creating the schema and the roles and can never
+    /// attest production readiness. Verified TLS is the transport a CI database
+    /// can actually serve, so this reads its trust root from
+    /// `NEMO_RELAY_TEST_POSTGRES_TLS_CA` and returns `None` when it is absent.
+    fn verified_runtime_store(&self) -> Option<PostgresEffectStore> {
+        let ca_path = std::env::var("NEMO_RELAY_TEST_POSTGRES_TLS_CA").ok()?;
+        let root_ca_pem = std::fs::read(ca_path).ok()?;
+        Some(
+            PostgresEffectStore::connect_verified_tls_with_budgets(
+                &self.runtime_url,
+                &self.schema,
+                LeaseConfiguration::default(),
+                4,
+                &root_ca_pem,
+                nemo_relay_ledger::postgres::PostgresOperationBudgets::default(),
+            )
+            .expect("connect verified TLS runtime store"),
+        )
+    }
 }
 
 impl Drop for CompositionFixture {
@@ -386,23 +406,64 @@ impl Drop for CompositionFixture {
 
 #[test]
 #[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
-fn a_production_kernel_composes_only_with_the_durable_store() {
+fn a_verified_transport_composes_a_production_kernel() {
     let Some(fixture) = CompositionFixture::create() else {
         eprintln!("skipping: NEMO_RELAY_TEST_POSTGRES_URL or role creation unavailable");
         return;
     };
-    let store = fixture.runtime_store();
-    let sealed = registry(&[ExecutionClass::Mutation])
-        .seal()
-        .expect("seal registry");
+    let Some(store) = fixture.verified_runtime_store() else {
+        eprintln!(
+            "skipping: set NEMO_RELAY_TEST_POSTGRES_TLS_CA to a trust root the server \
+             presents, so the transport can attest production readiness"
+        );
+        return;
+    };
+
+    // The negative cases prove a bad production composition is rejected. This
+    // one proves the path still exists at all: without it the suite would stay
+    // green if production startup became impossible in every configuration.
     let kernel = Kernel::new_production(
         runtime("production"),
-        sealed,
+        registry(&[ExecutionClass::Mutation])
+            .seal()
+            .expect("seal registry"),
         nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
         store,
     )
-    .expect("production composition must succeed with a ready durable store");
+    .expect("a verified transport with a ready durable store must compose");
     assert_eq!(kernel.registry_digest().len(), 64);
+}
+
+#[test]
+#[ignore = "requires NEMO_RELAY_TEST_POSTGRES_URL"]
+fn production_composition_rejects_a_test_transport_store() {
+    let Some(fixture) = CompositionFixture::create() else {
+        eprintln!("skipping: NEMO_RELAY_TEST_POSTGRES_URL or role creation unavailable");
+        return;
+    };
+
+    // The fixture's own transport is the explicitly local test transport: it is
+    // correct for creating the schema and the runtime role, and it can never
+    // attest production readiness. Every store carries the sealed
+    // `ProductionEffectStore` bound regardless of how it was opened, so without
+    // this check a production kernel could be composed around a connection that
+    // was never verified.
+    let result = Kernel::new_production(
+        runtime("production"),
+        registry(&[ExecutionClass::Mutation])
+            .seal()
+            .expect("seal registry"),
+        nemo_relay::kernel::BackendRouter::new(TestAuthority, TestBackend, TestBackend),
+        fixture.runtime_store(),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(KernelError::EffectStoreNotProductionReady(ref detail))
+                if detail.contains("test-only plaintext transport")
+        ),
+        "the test transport must not attest production readiness"
+    );
 }
 
 #[test]
@@ -442,8 +503,11 @@ fn production_composition_is_fail_closed() {
         Err(KernelError::ProductionRequiresConsequentialCapability)
     ));
 
-    // A schema-owning credential cannot compose a production kernel: readiness
-    // requires a data-only runtime role.
+    // A schema-owning credential cannot compose a production kernel, but this
+    // fixture cannot reach that check: its transport is the test-only one, so
+    // the transport gate fires first. The privilege check itself is covered by
+    // `verify_runtime_privileges` in the ledger suite, which uses the test
+    // transport directly.
     let result = Kernel::new_production(
         runtime("production"),
         registry(&[ExecutionClass::Mutation]).seal().expect("seal"),
@@ -451,8 +515,12 @@ fn production_composition_is_fail_closed() {
         fixture.owner_store(),
     );
     assert!(
-        matches!(result, Err(KernelError::EffectStoreNotProductionReady(_))),
-        "an owning credential must not compose a production kernel"
+        matches!(
+            result,
+            Err(KernelError::EffectStoreNotProductionReady(ref detail))
+                if detail.contains("test-only plaintext transport")
+        ),
+        "the transport gate must fire before any credential check"
     );
 }
 

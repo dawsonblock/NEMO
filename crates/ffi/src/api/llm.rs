@@ -8,8 +8,8 @@ use super::{
     NemoRelayCollectorCb, NemoRelayFinalizerCb, NemoRelayFreeFn, NemoRelayLlmExecCb,
     NemoRelayStatus, TASK_SCOPE_STACK, c_char, c_str_to_json, c_str_to_opt_json, c_str_to_string,
     clear_last_error, core_llm_api, current_scope_stack, json_to_c_string, set_last_error,
-    status_from_error, tokio_runtime, unix_micros_to_opt_timestamp, wrap_codec_fn,
-    wrap_collector_fn, wrap_finalizer_fn, wrap_llm_exec_fn, wrap_llm_stream_exec_fn,
+    status_from_error, tokio_runtime, unix_micros_to_opt_timestamp, with_managed_budget,
+    wrap_codec_fn, wrap_collector_fn, wrap_finalizer_fn, wrap_llm_exec_fn, wrap_llm_stream_exec_fn,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use tokio_stream::StreamExt;
@@ -548,23 +548,26 @@ pub unsafe extern "C" fn nemo_relay_llm_call_execute(
     let default_fn: LlmExecutionNextFn = Arc::new(move |request| exec_fn(request));
 
     let scope_stack = current_scope_stack();
-    let result = tokio_runtime().block_on(TASK_SCOPE_STACK.scope(scope_stack, async {
-        core_llm_api::llm_call_execute(
-            core_llm_api::LlmCallExecuteParams::builder()
-                .name(parsed.name)
-                .request(parsed.request)
-                .func(default_fn)
-                .parent_opt(parsed.parent_handle)
-                .attributes(parsed.attrs)
-                .data_opt(parsed.data)
-                .metadata_opt(parsed.metadata)
-                .model_name_opt(parsed.model_name)
-                .codec_opt(parsed.codec)
-                .response_codec_opt(parsed.response_codec)
-                .build(),
-        )
-        .await
-    }));
+    let result = tokio_runtime().block_on(with_managed_budget(TASK_SCOPE_STACK.scope(
+        scope_stack,
+        async {
+            core_llm_api::llm_call_execute(
+                core_llm_api::LlmCallExecuteParams::builder()
+                    .name(parsed.name)
+                    .request(parsed.request)
+                    .func(default_fn)
+                    .parent_opt(parsed.parent_handle)
+                    .attributes(parsed.attrs)
+                    .data_opt(parsed.data)
+                    .metadata_opt(parsed.metadata)
+                    .model_name_opt(parsed.model_name)
+                    .codec_opt(parsed.codec)
+                    .response_codec_opt(parsed.response_codec)
+                    .build(),
+            )
+            .await
+        },
+    )));
 
     match result {
         Ok(json) => {
@@ -712,26 +715,29 @@ pub unsafe extern "C" fn nemo_relay_llm_stream_call_execute(
         };
 
     let scope_stack = current_scope_stack();
-    let result = tokio_runtime().block_on(TASK_SCOPE_STACK.scope(scope_stack, async {
-        core_llm_api::llm_stream_call_execute_with_fallible_finalizer(
-            core_llm_api::LlmStreamCallExecuteParams::builder()
-                .name(parsed.name)
-                .request(parsed.request)
-                .func(default_fn)
-                .collector(wrapped_collector)
-                .finalizer(Box::new(|| serde_json::Value::Null))
-                .parent_opt(parsed.parent_handle)
-                .attributes(parsed.attrs)
-                .data_opt(parsed.data)
-                .metadata_opt(parsed.metadata)
-                .model_name_opt(parsed.model_name)
-                .codec_opt(parsed.codec)
-                .response_codec_opt(parsed.response_codec)
-                .build(),
-            wrapped_finalizer,
-        )
-        .await
-    }));
+    let result = tokio_runtime().block_on(with_managed_budget(TASK_SCOPE_STACK.scope(
+        scope_stack,
+        async {
+            core_llm_api::llm_stream_call_execute_with_fallible_finalizer(
+                core_llm_api::LlmStreamCallExecuteParams::builder()
+                    .name(parsed.name)
+                    .request(parsed.request)
+                    .func(default_fn)
+                    .collector(wrapped_collector)
+                    .finalizer(Box::new(|| serde_json::Value::Null))
+                    .parent_opt(parsed.parent_handle)
+                    .attributes(parsed.attrs)
+                    .data_opt(parsed.data)
+                    .metadata_opt(parsed.metadata)
+                    .model_name_opt(parsed.model_name)
+                    .codec_opt(parsed.codec)
+                    .response_codec_opt(parsed.response_codec)
+                    .build(),
+                wrapped_finalizer,
+            )
+            .await
+        },
+    )));
 
     match result {
         Ok(rust_stream) => {

@@ -882,6 +882,7 @@ prepend_go_bin_to_path() {
 prepare_test_plugin_fixtures() {
     local target_dir="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures"
     local native_library=""
+    local intercept_library=""
     local worker_executable="nemo-relay-worker-plugin-fixture"
     local host_os=""
 
@@ -889,13 +890,16 @@ prepare_test_plugin_fixtures() {
     case "${RUNNER_OS:-}:${OSTYPE:-}:$host_os" in
         Windows:*|*:msys*:*|*:win32*:*|*:*:MINGW*|*:*:MSYS*|*:*:CYGWIN*)
             native_library="nemo_relay_plugin_fixture.dll"
+            intercept_library="nemo_relay_native_intercept_fixture.dll"
             worker_executable="${worker_executable}.exe"
             ;;
         *:darwin*:*|*:*:Darwin)
             native_library="libnemo_relay_plugin_fixture.dylib"
+            intercept_library="libnemo_relay_native_intercept_fixture.dylib"
             ;;
         *)
             native_library="libnemo_relay_plugin_fixture.so"
+            intercept_library="libnemo_relay_native_intercept_fixture.so"
             ;;
     esac
 
@@ -904,10 +908,14 @@ prepare_test_plugin_fixtures() {
         --manifest-path crates/core/tests/fixtures/native_plugin/Cargo.toml \
         --target-dir "$target_dir"
     cargo build --quiet --locked \
+        --manifest-path crates/core/tests/fixtures/native_intercept_plugin/Cargo.toml \
+        --target-dir "$target_dir"
+    cargo build --quiet --locked \
         --manifest-path crates/core/tests/fixtures/worker_plugin/Cargo.toml \
         --target-dir "$target_dir"
 
     export NEMO_RELAY_TEST_NATIVE_PLUGIN="$target_dir/debug/$native_library"
+    export NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN="$target_dir/debug/$intercept_library"
     export NEMO_RELAY_TEST_WORKER_PLUGIN="$target_dir/debug/$worker_executable"
     if [[ ! -f "$NEMO_RELAY_TEST_NATIVE_PLUGIN" ]]; then
         echo "ERROR: missing native plugin test fixture: $NEMO_RELAY_TEST_NATIVE_PLUGIN" >&2
@@ -1108,6 +1116,7 @@ build-test-plugin-fixtures:
     {{ bash_helpers }}
     prepare_test_plugin_fixtures
     printf 'Native plugin fixture: %s\n' "$NEMO_RELAY_TEST_NATIVE_PLUGIN"
+    printf 'Single-registration fixture: %s\n' "$NEMO_RELAY_TEST_NATIVE_INTERCEPT_PLUGIN"
     printf 'Worker plugin fixture: %s\n' "$NEMO_RELAY_TEST_WORKER_PLUGIN"
 
 
@@ -1290,6 +1299,9 @@ test-postgres-db-failure-boundaries:
 # E3.2 runtime composition: production construction ownership, registry sealing,
 # and fail-closed production startup. The two database-backed cases need
 # NEMO_RELAY_TEST_POSTGRES_URL; the architectural and sealing cases do not.
+# The positive case also needs NEMO_RELAY_TEST_POSTGRES_TLS_CA, because the
+# transport has to be one that can attest production readiness; it skips with a
+# printed reason when that is unset.
 test-runtime-composition:
     cargo test --locked -p nemo-effect-runtime --test production_composition -- --include-ignored --test-threads=1
 
@@ -1431,6 +1443,11 @@ test-python:
             prepare_llvm_cov_workspace
         fi
     fi
+    # The Rust tests drive the same managed calls Python does, and a test thread's
+    # default stack is smaller than the coroutine chain a plugin call reaches
+    # through. Sizing it here is the same decision the extension makes for its own
+    # runtime, stated where the tests are run.
+    export RUST_MIN_STACK=8388608
     cargo nextest run --locked -p nemo-relay-python --features __skip-implicit-config --lib --profile ci
     python_executable="$(uv_python_executable)"
     sync_args=(--inexact --all-packages --no-install-project --no-install-package nemo-relay)
@@ -1451,6 +1468,13 @@ test-python:
     use_project_python_source "$python_executable"
     "$python_executable" -m maturin develop --features __skip-implicit-config --skip-install
     prepare_test_plugin_fixtures
+    # The runtime starts the plugin host from beside the executable that started
+    # it, and a checkout has no installed host: this names the one the checkout
+    # builds. It is the same escape hatch a source deployment uses, used here for
+    # the same reason — and a native plugin activation without it still fails
+    # closed with the message that says where the host was looked for.
+    cargo build --locked -p nemo-relay-native-loader
+    export NEMO_RELAY_PLUGIN_HOST="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-plugin-host"
     pytest_cmd+=(--durations=25)
     "$python_executable" -m "${pytest_cmd[@]}" --ignore=python/tests/integrations
     (cd examples/language-binding-plugin/python && uv run --locked --group test --reinstall-package nemo-relay pytest)
@@ -1621,6 +1645,15 @@ test-go:
     export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
     cargo build $flag -p nemo-relay-ffi --features __skip-implicit-config
     prepare_test_plugin_fixtures
+    # The binding starts native plugins in a host process, and a checkout has no
+    # installed host: this names the one the checkout builds. It is the same escape
+    # hatch a source deployment uses, used here for the same reason — and an
+    # activation without it still fails closed with the message that says where the
+    # host was looked for. The FFI is the one consumer with no packaging step of its
+    # own, so naming the host *is* how its deployments reach one, which is why the
+    # suite exercises that path rather than assuming an installed companion.
+    cargo build $flag -p nemo-relay-native-loader
+    export NEMO_RELAY_PLUGIN_HOST="$lib_dir/nemo-plugin-host"
 
     if [[ "$is_windows" == true ]]; then
         export CC=clang
@@ -1683,6 +1716,13 @@ test-node:
     trap 'rm -rf "$test_config_home"' EXIT
     export XDG_CONFIG_HOME="$test_config_home"
     export NEMO_RELAY_TEST_SKIP_IMPLICIT_CONFIG=1
+    # The binding starts native plugins in the host its package ships, and a
+    # checkout has no installed host: this names the one the checkout builds. It
+    # is the same escape hatch a source deployment uses, used here for the same
+    # reason — and a native plugin activation without it still fails closed with
+    # the message that says where the host was looked for.
+    cargo build --locked -p nemo-relay-native-loader
+    export NEMO_RELAY_PLUGIN_HOST="$NEMO_RELAY_REPO_ROOT/target/debug/nemo-plugin-host"
     if is_true "{{ ci }}"; then
         coverage_out="$(prepare_artifact node-coverage.xml)"
         junit_out="$(prepare_artifact node-junit.xml)"
@@ -1764,6 +1804,69 @@ qualification-digest:
 # Run the mandatory provenance, tier, and evidence-bundle test suites.
 test-qualification-scripts:
     uv run --locked python -m pytest scripts/qualification -q
+
+# Report the trusted computing base budget and fail on forbidden dependencies or growth.
+tcb-report:
+    python3 scripts/tcb/report.py
+
+# Prove the release artifact a deployment runs carries no loader, ABI or SDK symbols.
+# This is a milestone gate rather than a hook: it reads a release build.
+symbol-report:
+    python3 scripts/tcb/symbols.py
+
+# Enforce the dependency-layer rules and fail on a new upward edge.
+layer-report:
+    python3 scripts/tcb/layers.py
+
+# Capture the minimal-trusted-kernel baseline into reports/ (generated, git-ignored).
+tcb-baseline:
+    python3 scripts/tcb/baseline.py
+
+# Run the trusted computing base gate's own tests.
+test-tcb-scripts:
+    uv run --locked python -m pytest scripts/tcb -q
+
+# Run the packaging scripts' tests: the wheel, npm and macOS bundle layouts.
+test-packaging-scripts:
+    uv run --locked python -m pytest scripts/tests -q
+
+# Prove a bundled plugin host is confined to its own container (macOS only).
+verify-macos-sandbox host_binary:
+    uv run --no-project python scripts/qualification/macos_sandbox_probe.py --host-binary "{{ host_binary }}"
+
+# Exercise strict library validation and the approved third-party plugin load path.
+test-macos-restricted-host host_binary output_directory version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just build-test-plugin-fixtures
+    codesign --force --sign - \
+        "{{ NEMO_RELAY_REPO_ROOT }}/target/test-plugin-fixtures/debug/libnemo_relay_native_intercept_fixture.dylib"
+    python3 scripts/package-plugin-host-app.py \
+        --host-binary "{{ host_binary }}" \
+        --output-directory "{{ output_directory }}" \
+        --version "{{ version }}" \
+        --variant restricted
+    NEMO_RELAY_PLUGIN_HOST_TEAM_ID="not set" \
+    NEMO_RELAY_STRICT_HOST_EXECUTABLE="{{ output_directory }}/nemo-plugin-host.app/Contents/MacOS/nemo-plugin-host" \
+        cargo test --locked -p nemo-relay-plugin-host --test process_backend \
+            a_strict_restricted_bundle_rejects_a_different_plugin_signer -- --ignored --exact
+    python3 scripts/package-plugin-host-app.py \
+        --host-binary "{{ host_binary }}" \
+        --output-directory "{{ output_directory }}" \
+        --version "{{ version }}" \
+        --variant third-party
+    NEMO_RELAY_PLUGIN_HOST_TEAM_ID="not set" \
+    NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE="{{ output_directory }}/nemo-plugin-host.app/Contents/MacOS/nemo-plugin-host" \
+        cargo test --locked -p nemo-relay-plugin-host --test process_backend \
+            a_restricted_bundle_loads_only_the_transferred_approved_copy -- --ignored --exact
+
+# Check that every claim the qualification matrix makes names what enforces it.
+qualification-matrix:
+    python3 scripts/qualification/matrix.py
+
+# Regenerate security/QUALIFICATION-MATRIX.md from its policy file.
+qualification-matrix-write:
+    python3 scripts/qualification/matrix.py --write
 
 # Verify source, lockfile, Git, and archive digests against qualification evidence.
 provenance-check:
@@ -1956,12 +2059,65 @@ package-node:
                 ;;
         esac
     fi
+    # The host travels inside the platform package rather than beside the
+    # checkout: it is the executable that runs a native plugin outside the
+    # runtime's process, and the addon resolves it from its own directory. Built
+    # here, after the version was written, so the addon and the host inside one
+    # package are the same release; built static on Linux, so it runs on the
+    # glibc floor the package is tagged for rather than on this machine's. On
+    # Windows there is no host to ship yet — the isolated runtime is not
+    # implemented there — and this says so rather than shipping a package whose
+    # addon has nothing to start.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo "The isolated native plugin runtime is not implemented on Windows yet;" >&2
+            echo "this package carries the addon alone and native plugins cannot be hosted." >&2
+            host_binary=""
+            ;;
+        *)
+    host_directory="target/release"
+    host_build=(cargo build --release -p nemo-relay-native-loader)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        host_target="${node_target:-$(rustc -vV | sed -n 's/^host: //p')}"
+        host_target="$(printf '%s\n' "$host_target" | sed 's/-gnu$/-musl/')"
+        if [[ -z "$host_target" ]] || ! rustup target list --installed 2>/dev/null | grep -qx "$host_target"; then
+            echo "Error: the static target ${host_target:-<unknown>} is not installed; add it with:" >&2
+            echo "  rustup target add ${host_target:-<target>}" >&2
+            exit 1
+        fi
+        # Static linking needs a musl C compiler for the crates that build C: the
+        # Rust target brings the standard library, not the toolchain the C
+        # dependencies are compiled with, and a build that skipped this fails with
+        # a missing `*-linux-musl-gcc` rather than a package without a host.
+        host_cc_var="CC_$(printf '%s' "$host_target" | tr '-' '_')"
+        if [[ -z "${!host_cc_var:-}" ]]; then
+            if ! command -v musl-gcc >/dev/null 2>&1; then
+                echo "Error: musl-gcc is required to link ${host_target} statically; install it with:" >&2
+                echo "  apt-get install -y musl-tools   # or the equivalent for this distribution" >&2
+                exit 1
+            fi
+            export "$host_cc_var=musl-gcc"
+        fi
+        host_directory="target/${host_target}/release"
+        host_build=(cargo build --release -p nemo-relay-native-loader --target "$host_target")
+    fi
+    "${host_build[@]}"
+    host_executable="nemo-plugin-host"
+    case "$node_platform" in
+        windows-*) host_executable="nemo-plugin-host.exe" ;;
+    esac
+    host_binary="${host_directory}/${host_executable}"
+            ;;
+    esac
     package_args=(
         --node-dir crates/node
         --platform "$node_platform"
         --version "$package_version"
         --output-dir "$package_dir"
     )
+    if [[ -n "$host_binary" ]]; then
+        package_args+=(--host-binary "$host_binary")
+    fi
     if [[ "$node_platform" == "linux-amd64" ]]; then
         package_args+=(--metapackage)
     fi
@@ -2050,6 +2206,60 @@ package-python:
         echo "Error: No wheels found in $package_dir"
         exit 1
     fi
+    # The host travels inside the wheel rather than beside it. It is not an
+    # optional utility: it is the executable that performs the loading a binding
+    # is not allowed to perform, so a wheel that installs without it installs a
+    # runtime whose native plugins cannot be isolated. On Windows there is no
+    # host to ship yet — the isolated runtime is not implemented there — so the
+    # wheel carries the runtime alone and the metadata says so.
+    #
+    # Built here rather than expected from an earlier step, because the version
+    # written above decides what the host reports about itself: a host built
+    # before that line would be a host from another release inside this one.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo "The isolated native plugin runtime is not implemented on Windows yet;" >&2
+            echo "this wheel carries the runtime alone and native plugins cannot be hosted." >&2
+            ;;
+        *)
+    host_binary="$NEMO_RELAY_REPO_ROOT/target/release/nemo-plugin-host"
+    host_build=(cargo build --release -p nemo-relay-native-loader)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        # Static, so the host runs on the oldest glibc this wheel's tag promises
+        # rather than on the one the build machine happens to have. The extension
+        # is linked for that floor by maturin; a host linked here would otherwise
+        # be the newer of the two, which is the tag the wheel would then be
+        # lying about.
+        host_target="$(rustc -vV | sed -n 's/^host: //p' | sed 's/-gnu$/-musl/')"
+        if [[ -z "$host_target" ]] || ! rustup target list --installed 2>/dev/null | grep -qx "$host_target"; then
+            echo "Error: the static target ${host_target:-<unknown>} is not installed; add it with:" >&2
+            echo "  rustup target add ${host_target:-<target>}" >&2
+            exit 1
+        fi
+        # Static linking needs a musl C compiler for the crates that build C: the
+        # Rust target brings the standard library, not the toolchain the C
+        # dependencies are compiled with, and a build that skipped this fails with
+        # a missing `*-linux-musl-gcc` rather than a wheel without a host.
+        host_cc_var="CC_$(printf '%s' "$host_target" | tr '-' '_')"
+        if [[ -z "${!host_cc_var:-}" ]]; then
+            if ! command -v musl-gcc >/dev/null 2>&1; then
+                echo "Error: musl-gcc is required to link ${host_target} statically; install it with:" >&2
+                echo "  apt-get install -y musl-tools   # or the equivalent for this distribution" >&2
+                exit 1
+            fi
+            export "$host_cc_var=musl-gcc"
+        fi
+        host_build=(cargo build --release -p nemo-relay-native-loader --target "$host_target")
+        host_binary="$NEMO_RELAY_REPO_ROOT/target/${host_target}/release/nemo-plugin-host"
+    fi
+    "${host_build[@]}"
+    for wheel in "${wheels[@]}"; do
+        uv run --no-project python scripts/bundle-plugin-host.py \
+            --wheel "$wheel" \
+            --host-binary "$host_binary"
+    done
+            ;;
+    esac
 
 # --set [output_dir=<path>] [ref_name=<name>]
 package-python-sdist:
@@ -2118,15 +2328,95 @@ package-python-plugin:
     python_executable="$(project_python_executable)"
     "$python_executable" scripts/validate_python_plugin_package.py
 
-# Package a prebuilt CLI binary for PyPI.
-package-cli-bin binary target version package_dir:
+# Package a prebuilt CLI binary and its plugin host for PyPI.
+package-cli-bin binary host_binary target version package_dir:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "$NEMO_RELAY_REPO_ROOT"
     args=(
         --binary "{{ binary }}"
+        --host-binary "{{ host_binary }}"
         --target "{{ target }}"
         --version "{{ version }}"
         --output-dir "{{ package_dir }}"
     )
     uv run --no-project python scripts/package-cli-bin.py "${args[@]}"
+
+# Verify that an installed CLI wheel carries a plugin host it can start.
+# --set binary=<path> host_binary=<path>
+verify-installed-host binary host_binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv run --no-project python scripts/verify-installed-plugin-host.py \
+        --binary "{{ binary }}" \
+        --host-binary "{{ host_binary }}"
+
+# Verify that a built wheel installs a plugin host beside the interpreter.
+# --set wheel=<path> cli=<name>
+verify-installed-wheel wheel cli="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    args=(--wheel "{{ wheel }}")
+    if [[ -n "{{ cli }}" ]]; then
+        args+=(--cli "{{ cli }}")
+    fi
+    uv run --no-project python scripts/verify-installed-plugin-host.py "${args[@]}"
+
+# Verify that a built Node platform package installs a runnable plugin host.
+# --set npm_package=<path>
+verify-installed-npm-package npm_package:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    uv run --no-project python scripts/verify-installed-plugin-host.py \
+        --npm-package "{{ npm_package }}"
+
+# Run a native plugin against an installed Python runtime, or require its refusal.
+# --set python=<interpreter> expect=runs|refused [host=<path>]
+verify-installed-python-plugin python expect host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    fixture_name="libnemo_relay_plugin_fixture.so"
+    case "$(uname -s)" in
+        Darwin) fixture_name="libnemo_relay_plugin_fixture.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) fixture_name="nemo_relay_plugin_fixture.dll" ;;
+    esac
+    fixture="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures/debug/$fixture_name"
+    args=(
+        --python "{{ python }}"
+        --fixture "$fixture"
+        --expect "{{ expect }}"
+    )
+    if [[ -n "{{ host }}" ]]; then
+        args+=(--host "{{ host }}")
+    fi
+    uv run --no-project python scripts/verify-installed-python-plugin.py "${args[@]}"
+
+# Run a native plugin against an installed Node.js package, or require its refusal.
+# --set metapackage=<path> native=<path> expect=runs|refused [node=<path>] [host=<path>]
+verify-installed-node-plugin metapackage native expect="runs" node="" host="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$NEMO_RELAY_REPO_ROOT"
+    fixture_name="libnemo_relay_plugin_fixture.so"
+    case "$(uname -s)" in
+        Darwin) fixture_name="libnemo_relay_plugin_fixture.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) fixture_name="nemo_relay_plugin_fixture.dll" ;;
+    esac
+    fixture="$NEMO_RELAY_REPO_ROOT/target/test-plugin-fixtures/debug/$fixture_name"
+    args=(
+        --metapackage "{{ metapackage }}"
+        --native "{{ native }}"
+        --fixture "$fixture"
+        --expect "{{ expect }}"
+    )
+    if [[ -n "{{ node }}" ]]; then
+        args+=(--node "{{ node }}")
+    fi
+    if [[ -n "{{ host }}" ]]; then
+        args+=(--host "{{ host }}")
+    fi
+    uv run --no-project python scripts/verify-installed-node-plugin.py "${args[@]}"

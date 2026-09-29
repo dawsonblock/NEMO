@@ -63,13 +63,15 @@ impl std::fmt::Debug for PostgresTransport {
     }
 }
 
-/// Immutable settings required to construct one durable NEMO runtime.
+/// Store connection, policy, and transport settings.
+///
+/// These fields do not decide the deployment profile, so they stay public and
+/// callers can name them at the construction site. The transport is the one
+/// exception in spirit: a profile that requires verified transport rejects the
+/// local test transport. That check belongs to the profile constructor, which
+/// is why this value is not validated on its own.
 #[derive(Clone, PartialEq, Eq)]
-pub struct EffectRuntimeConfig {
-    /// Deployment profile.
-    pub mode: RuntimeMode,
-    /// Stable host-authenticated identity bound into durable action records.
-    pub runtime_identity: RuntimeIdentity,
+pub struct EffectStoreSettings {
     /// PostgreSQL connection target. Credentials must come from secret storage.
     pub database_url: String,
     /// Effect-store schema owned by the deployment.
@@ -84,18 +86,47 @@ pub struct EffectRuntimeConfig {
     pub database_transport: PostgresTransport,
 }
 
-impl std::fmt::Debug for EffectRuntimeConfig {
+impl std::fmt::Debug for EffectStoreSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("EffectRuntimeConfig")
-            .field("mode", &self.mode)
-            .field("runtime_identity", &self.runtime_identity)
+            .debug_struct("EffectStoreSettings")
             .field("database_url", &"[redacted]")
             .field("schema", &self.schema)
             .field("maximum_pool_size", &self.maximum_pool_size)
             .field("lease_configuration", &self.lease_configuration)
             .field("operation_budgets", &self.operation_budgets)
             .field("database_transport", &self.database_transport)
+            .finish()
+    }
+}
+
+/// Immutable settings required to construct one durable NEMO runtime.
+///
+/// The profile is private and is fixed by the constructor that produced this
+/// value. The deployment profile decides which admission checks apply, so a
+/// caller must not be able to hold production evidence while declaring a
+/// profile that skips them. The only ways to build a configuration are the
+/// constructors below, and each one pairs a profile with the evidence that
+/// justifies it. The profile is therefore *derived* from the evidence rather
+/// than asserted next to it, and a contradictory combination is
+/// unrepresentable instead of merely rejected later.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffectRuntimeConfig {
+    /// Deployment profile, fixed by the constructor that produced this value.
+    mode: RuntimeMode,
+    /// Stable host-authenticated identity bound into durable action records.
+    runtime_identity: RuntimeIdentity,
+    /// Store connection, policy, and transport settings.
+    settings: EffectStoreSettings,
+}
+
+impl std::fmt::Debug for EffectRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectRuntimeConfig")
+            .field("mode", &self.mode)
+            .field("runtime_identity", &self.runtime_identity)
+            .field("settings", &self.settings)
             .finish()
     }
 }
@@ -107,6 +138,9 @@ pub enum RuntimeReadinessError {
     RuntimeIdentity(RuntimeIdentityError),
     /// Production must use a production runtime identity environment.
     ProductionEnvironmentMismatch,
+    /// A development or qualification profile must not claim the production
+    /// environment.
+    DevelopmentEnvironmentMismatch,
     /// Production cannot use an insecure loopback database transport.
     InsecureProductionTransport,
     /// Runtime configuration omitted a required value.
@@ -127,6 +161,12 @@ impl std::fmt::Display for RuntimeReadinessError {
                 write!(
                     formatter,
                     "production mode requires runtime environment production"
+                )
+            }
+            Self::DevelopmentEnvironmentMismatch => {
+                write!(
+                    formatter,
+                    "development and qualification modes require a non-production runtime environment"
                 )
             }
             Self::InsecureProductionTransport => {
@@ -160,6 +200,7 @@ impl std::error::Error for RuntimeReadinessError {
             Self::Store(error) => Some(error),
             Self::Kernel(error) => Some(error),
             Self::ProductionEnvironmentMismatch
+            | Self::DevelopmentEnvironmentMismatch
             | Self::InsecureProductionTransport
             | Self::MissingConfiguration(_)
             | Self::LocalSocketUnsupported => None,
@@ -168,32 +209,100 @@ impl std::error::Error for RuntimeReadinessError {
 }
 
 impl EffectRuntimeConfig {
-    /// Validate deployment policy before any database connection is attempted.
+    /// Compose a production configuration from production evidence.
+    ///
+    /// Both forms of evidence are required: a `production` runtime identity and
+    /// a transport that is not the explicitly local test transport. Neither is
+    /// a formality, so a deployment cannot reach the production profile while
+    /// holding only one of them.
+    pub fn production(
+        runtime_identity: RuntimeIdentity,
+        settings: EffectStoreSettings,
+    ) -> Result<Self, RuntimeReadinessError> {
+        if runtime_identity.environment != "production" {
+            return Err(RuntimeReadinessError::ProductionEnvironmentMismatch);
+        }
+        if matches!(
+            settings.database_transport,
+            PostgresTransport::InsecureLoopbackForTests
+        ) {
+            return Err(RuntimeReadinessError::InsecureProductionTransport);
+        }
+        Ok(Self::assemble(
+            RuntimeMode::Production,
+            runtime_identity,
+            settings,
+        ))
+    }
+
+    /// Compose a qualification configuration from local-only evidence.
+    ///
+    /// Qualification runs against the explicitly local test transport and must
+    /// declare a non-production identity, so a deployment cannot relaunch
+    /// production traffic under a profile that skips production admission.
+    pub fn qualification(
+        runtime_identity: RuntimeIdentity,
+        settings: EffectStoreSettings,
+    ) -> Result<Self, RuntimeReadinessError> {
+        Self::local(RuntimeMode::Qualification, runtime_identity, settings)
+    }
+
+    /// Compose a development configuration from local-only evidence.
+    pub fn development(
+        runtime_identity: RuntimeIdentity,
+        settings: EffectStoreSettings,
+    ) -> Result<Self, RuntimeReadinessError> {
+        Self::local(RuntimeMode::Development, runtime_identity, settings)
+    }
+
+    fn local(
+        mode: RuntimeMode,
+        runtime_identity: RuntimeIdentity,
+        settings: EffectStoreSettings,
+    ) -> Result<Self, RuntimeReadinessError> {
+        if runtime_identity.environment == "production" {
+            return Err(RuntimeReadinessError::DevelopmentEnvironmentMismatch);
+        }
+        Ok(Self::assemble(mode, runtime_identity, settings))
+    }
+
+    fn assemble(
+        mode: RuntimeMode,
+        runtime_identity: RuntimeIdentity,
+        settings: EffectStoreSettings,
+    ) -> Self {
+        Self {
+            mode,
+            runtime_identity,
+            settings,
+        }
+    }
+
+    /// Return the profile this configuration was built for.
+    pub const fn mode(&self) -> RuntimeMode {
+        self.mode
+    }
+
+    /// Validate the remaining deployment policy before any database connection
+    /// is attempted.
+    ///
+    /// The profile and its evidence are not re-checked here. The private fields
+    /// and the constructors above already make a contradictory configuration
+    /// unrepresentable, so a check would be dead code.
     pub fn validate(&self) -> Result<(), RuntimeReadinessError> {
         self.runtime_identity
             .validate()
             .map_err(RuntimeReadinessError::RuntimeIdentity)?;
-        if self.database_url.trim().is_empty() {
+        if self.settings.database_url.trim().is_empty() {
             return Err(RuntimeReadinessError::MissingConfiguration("database_url"));
         }
-        if self.schema.trim().is_empty() {
+        if self.settings.schema.trim().is_empty() {
             return Err(RuntimeReadinessError::MissingConfiguration("schema"));
         }
-        if self.maximum_pool_size == 0 {
+        if self.settings.maximum_pool_size == 0 {
             return Err(RuntimeReadinessError::MissingConfiguration(
                 "maximum_pool_size",
             ));
-        }
-        if self.mode == RuntimeMode::Production {
-            if self.runtime_identity.environment != "production" {
-                return Err(RuntimeReadinessError::ProductionEnvironmentMismatch);
-            }
-            if matches!(
-                self.database_transport,
-                PostgresTransport::InsecureLoopbackForTests
-            ) {
-                return Err(RuntimeReadinessError::InsecureProductionTransport);
-            }
         }
         Ok(())
     }
@@ -204,24 +313,24 @@ impl EffectRuntimeConfig {
     /// prevents normal worker credentials from acquiring DDL authority.
     pub fn connect_store(&self) -> Result<PostgresEffectStore, RuntimeReadinessError> {
         self.validate()?;
-        let store = match &self.database_transport {
+        let store = match &self.settings.database_transport {
             PostgresTransport::InsecureLoopbackForTests => {
                 PostgresEffectStore::connect_insecure_local_for_tests_with_budgets(
-                    &self.database_url,
-                    &self.schema,
-                    self.lease_configuration,
-                    self.maximum_pool_size,
-                    self.operation_budgets.clone(),
+                    &self.settings.database_url,
+                    &self.settings.schema,
+                    self.settings.lease_configuration,
+                    self.settings.maximum_pool_size,
+                    self.settings.operation_budgets.clone(),
                 )
             }
             #[cfg(unix)]
             PostgresTransport::LocalSocket => {
                 PostgresEffectStore::connect_local_socket_with_budgets(
-                    &self.database_url,
-                    &self.schema,
-                    self.lease_configuration,
-                    self.maximum_pool_size,
-                    self.operation_budgets.clone(),
+                    &self.settings.database_url,
+                    &self.settings.schema,
+                    self.settings.lease_configuration,
+                    self.settings.maximum_pool_size,
+                    self.settings.operation_budgets.clone(),
                 )
             }
             #[cfg(not(unix))]
@@ -230,12 +339,12 @@ impl EffectRuntimeConfig {
             }
             PostgresTransport::VerifiedTls { root_ca_pem } => {
                 PostgresEffectStore::connect_verified_tls_with_budgets(
-                    &self.database_url,
-                    &self.schema,
-                    self.lease_configuration,
-                    self.maximum_pool_size,
+                    &self.settings.database_url,
+                    &self.settings.schema,
+                    self.settings.lease_configuration,
+                    self.settings.maximum_pool_size,
                     root_ca_pem,
-                    self.operation_budgets.clone(),
+                    self.settings.operation_budgets.clone(),
                 )
             }
             PostgresTransport::MutualTls {
@@ -243,16 +352,16 @@ impl EffectRuntimeConfig {
                 client_identity_pkcs12,
                 client_identity_password,
             } => PostgresEffectStore::connect_mutual_tls_with_budgets(
-                &self.database_url,
-                &self.schema,
-                self.lease_configuration,
-                self.maximum_pool_size,
+                &self.settings.database_url,
+                &self.settings.schema,
+                self.settings.lease_configuration,
+                self.settings.maximum_pool_size,
                 PostgresMutualTlsCredentials {
                     root_ca_pem: root_ca_pem.clone(),
                     client_identity_pkcs12: client_identity_pkcs12.clone(),
                     client_identity_password: client_identity_password.clone(),
                 },
-                self.operation_budgets.clone(),
+                self.settings.operation_budgets.clone(),
             ),
         }
         .map_err(RuntimeReadinessError::Store)?;
@@ -296,30 +405,29 @@ where
         function_hooks: F,
         effect_fabric: E,
     ) -> Result<Self, RuntimeReadinessError> {
-        // Boot order: verify the durable substrate, then seal the capability
-        // registry, then compose the kernel. The kernel cannot be constructed
-        // before both, because the production constructor requires a sealed
-        // registry and a store that attested readiness.
+        // Boot order: verify the durable substrate, then compose the kernel.
+        // Every profile goes through a checked constructor, so no profile can
+        // assemble a kernel by skipping admission: production additionally
+        // requires a ready store behind the sealed `ProductionEffectStore`
+        // trait, and the development constructor still validates the runtime
+        // identity and seals the registry.
         let store = config.connect_store()?;
-        let sealed = registry.seal().map_err(RuntimeReadinessError::Kernel)?;
         let kernel = match config.mode {
-            RuntimeMode::Production => Kernel::new_production(
-                config.runtime_identity,
-                sealed,
-                BackendRouter::new(authority, function_hooks, effect_fabric),
-                store.clone(),
-            ),
-            RuntimeMode::Development | RuntimeMode::Qualification => {
-                // Non-production profiles may compose without a production
-                // runtime environment, but still receive a sealed registry and
-                // a store that passed the same schema verification.
-                Ok(Kernel::new_unchecked_for_tests(
+            RuntimeMode::Production => {
+                let sealed = registry.seal().map_err(RuntimeReadinessError::Kernel)?;
+                Kernel::new_production(
                     config.runtime_identity,
                     sealed,
                     BackendRouter::new(authority, function_hooks, effect_fabric),
                     store.clone(),
-                ))
+                )
             }
+            RuntimeMode::Development | RuntimeMode::Qualification => Kernel::new_development(
+                config.runtime_identity,
+                registry,
+                BackendRouter::new(authority, function_hooks, effect_fabric),
+                store.clone(),
+            ),
         }
         .map_err(RuntimeReadinessError::Kernel)?;
         Ok(Self {
@@ -349,21 +457,18 @@ where
 mod tests {
     use super::*;
 
-    fn config(mode: RuntimeMode, transport: PostgresTransport) -> EffectRuntimeConfig {
-        EffectRuntimeConfig {
-            mode,
-            runtime_identity: RuntimeIdentity {
-                principal_id: "runtime-principal".into(),
-                tenant_id: Some("runtime-tenant".into()),
-                runtime_id: "deployment-runtime".into(),
-                environment: if mode == RuntimeMode::Production {
-                    "production"
-                } else {
-                    "qualification"
-                }
-                .into(),
-                session_id: Some("process-session".into()),
-            },
+    fn identity(environment: &str) -> RuntimeIdentity {
+        RuntimeIdentity {
+            principal_id: "runtime-principal".into(),
+            tenant_id: Some("runtime-tenant".into()),
+            runtime_id: "deployment-runtime".into(),
+            environment: environment.into(),
+            session_id: Some("process-session".into()),
+        }
+    }
+
+    fn settings(transport: PostgresTransport) -> EffectStoreSettings {
+        EffectStoreSettings {
             database_url: "host=127.0.0.1 user=nemo".into(),
             schema: "nemo_effects".into(),
             maximum_pool_size: 4,
@@ -373,55 +478,104 @@ mod tests {
         }
     }
 
+    fn production(
+        environment: &str,
+        transport: PostgresTransport,
+    ) -> Result<EffectRuntimeConfig, RuntimeReadinessError> {
+        EffectRuntimeConfig::production(identity(environment), settings(transport))
+    }
+
+    fn qualification(
+        transport: PostgresTransport,
+    ) -> Result<EffectRuntimeConfig, RuntimeReadinessError> {
+        EffectRuntimeConfig::qualification(identity("qualification"), settings(transport))
+    }
+
     #[test]
-    fn production_rejects_plaintext_transport_and_nonproduction_identity() {
-        let insecure = config(
-            RuntimeMode::Production,
-            PostgresTransport::InsecureLoopbackForTests,
-        );
+    fn production_requires_production_evidence() {
         assert!(matches!(
-            insecure.validate(),
+            production("production", PostgresTransport::InsecureLoopbackForTests),
             Err(RuntimeReadinessError::InsecureProductionTransport)
         ));
 
-        let mut mismatched = config(
-            RuntimeMode::Production,
+        assert!(matches!(
+            production(
+                "qualification",
+                PostgresTransport::VerifiedTls {
+                    root_ca_pem: b"certificate".to_vec(),
+                }
+            ),
+            Err(RuntimeReadinessError::ProductionEnvironmentMismatch)
+        ));
+
+        let ready = production(
+            "production",
             PostgresTransport::VerifiedTls {
                 root_ca_pem: b"certificate".to_vec(),
             },
-        );
-        mismatched.runtime_identity.environment = "qualification".into();
-        assert!(matches!(
-            mismatched.validate(),
-            Err(RuntimeReadinessError::ProductionEnvironmentMismatch)
-        ));
+        )
+        .expect("production evidence composes");
+        assert_eq!(ready.mode(), RuntimeMode::Production);
+    }
+
+    #[test]
+    fn local_profiles_cannot_claim_the_production_environment() {
+        // The profile is fixed by constructor, so the contradiction is
+        // rejected where the configuration is built rather than where it is
+        // used, and no field can drift afterwards.
+        for profile in [
+            EffectRuntimeConfig::development(
+                identity("production"),
+                settings(PostgresTransport::InsecureLoopbackForTests),
+            ),
+            EffectRuntimeConfig::qualification(
+                identity("production"),
+                settings(PostgresTransport::InsecureLoopbackForTests),
+            ),
+        ] {
+            assert!(matches!(
+                profile,
+                Err(RuntimeReadinessError::DevelopmentEnvironmentMismatch)
+            ));
+        }
+
+        // An honest non-production identity still composes and validates.
+        let local =
+            qualification(PostgresTransport::InsecureLoopbackForTests).expect("local evidence");
+        assert_eq!(local.mode(), RuntimeMode::Qualification);
+        assert!(local.validate().is_ok());
     }
 
     #[test]
     fn configuration_rejects_ambiguous_runtime_identity_before_connecting() {
-        let mut invalid = config(
-            RuntimeMode::Qualification,
-            PostgresTransport::InsecureLoopbackForTests,
-        );
-        invalid.runtime_identity.tenant_id = Some(" ".into());
+        let mut ambiguous = identity("qualification");
+        ambiguous.tenant_id = Some(" ".into());
+        let configured = EffectRuntimeConfig::qualification(
+            ambiguous,
+            settings(PostgresTransport::InsecureLoopbackForTests),
+        )
+        .expect("the profile constrains only the environment");
         assert!(matches!(
-            invalid.validate(),
+            configured.validate(),
             Err(RuntimeReadinessError::RuntimeIdentity(_))
         ));
     }
 
     #[test]
     fn runtime_configuration_redacts_connection_and_tls_material() {
-        let mut configured = config(
-            RuntimeMode::Qualification,
-            PostgresTransport::MutualTls {
-                root_ca_pem: b"root-ca-secret".to_vec(),
-                client_identity_pkcs12: b"client-identity-secret".to_vec(),
-                client_identity_password: "client-password-secret".into(),
+        let configured = EffectRuntimeConfig::qualification(
+            identity("qualification"),
+            EffectStoreSettings {
+                database_url: "postgresql://nemo:database-password-secret@db.example/nemo".into(),
+                database_transport: PostgresTransport::MutualTls {
+                    root_ca_pem: b"root-ca-secret".to_vec(),
+                    client_identity_pkcs12: b"client-identity-secret".to_vec(),
+                    client_identity_password: "client-password-secret".into(),
+                },
+                ..settings(PostgresTransport::InsecureLoopbackForTests)
             },
-        );
-        configured.database_url =
-            "postgresql://nemo:database-password-secret@db.example/nemo".into();
+        )
+        .expect("qualification configuration");
         let debug = format!("{configured:?}");
         for secret in [
             "database-password-secret",

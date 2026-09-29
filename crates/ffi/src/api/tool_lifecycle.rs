@@ -6,7 +6,7 @@ use super::{
     TASK_SCOPE_STACK, ToolAttributes, ToolExecutionNextFn, c_char, c_str_to_json,
     c_str_to_opt_json, c_str_to_string, clear_last_error, core_tool_api, current_scope_stack,
     json_to_c_string, set_last_error, status_from_error, tokio_runtime,
-    unix_micros_to_opt_timestamp, wrap_tool_exec_fn,
+    unix_micros_to_opt_timestamp, with_managed_budget, wrap_tool_exec_fn,
 };
 
 // ---------------------------------------------------------------------------
@@ -332,21 +332,26 @@ pub unsafe extern "C" fn nemo_relay_tool_call_execute_v2(
     let default_fn: ToolExecutionNextFn = Arc::new(move |args| exec_fn(args));
 
     let scope_stack = current_scope_stack();
-    let result = tokio_runtime().block_on(TASK_SCOPE_STACK.scope(scope_stack, async {
-        core_tool_api::tool_call_execute(
-            core_tool_api::ToolCallExecuteParams::builder()
-                .name(name)
-                .args(args)
-                .func(default_fn)
-                .parent_opt(parent_handle)
-                .attributes(attrs)
-                .data_opt(data)
-                .metadata_opt(metadata)
-                .tool_call_id_opt(tool_call_id)
-                .build(),
-        )
-        .await
-    }));
+    // Under this interface's stated budget: a registration that runs in another
+    // process needs one, and this entry point carries no deadline of its own.
+    let result = tokio_runtime().block_on(with_managed_budget(TASK_SCOPE_STACK.scope(
+        scope_stack,
+        async {
+            core_tool_api::tool_call_execute(
+                core_tool_api::ToolCallExecuteParams::builder()
+                    .name(name)
+                    .args(args)
+                    .func(default_fn)
+                    .parent_opt(parent_handle)
+                    .attributes(attrs)
+                    .data_opt(data)
+                    .metadata_opt(metadata)
+                    .tool_call_id_opt(tool_call_id)
+                    .build(),
+            )
+            .await
+        },
+    )));
 
     match result {
         Ok(execution_result) => match serde_json::to_value(execution_result) {

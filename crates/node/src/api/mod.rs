@@ -58,10 +58,8 @@ use nemo_relay::api::tool::ToolAttributes;
 use nemo_relay::codec::request::AnnotatedLlmRequest;
 use nemo_relay::codec::response::Usage;
 use nemo_relay::error::{FlowError, Result as FlowResult};
-use nemo_relay::plugin::dynamic::{
-    DynamicPluginActivationSpec as CoreDynamicPluginActivationSpec, DynamicPluginKind,
-    PluginHostActivation as CorePluginHostActivation,
-};
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec as CoreDynamicPluginActivationSpec;
+use nemo_relay::plugin::dynamic::DynamicPluginKind;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
     PluginRegistrationContext, active_plugin_report as active_plugin_report_impl,
@@ -78,6 +76,7 @@ use nemo_relay_adaptive::context_helpers::set_latency_sensitivity as adaptive_se
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_adaptive::{AdaptiveConfig, AdaptiveRuntime as CoreAdaptiveRuntime};
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_plugin_host::activation::{ActivatedPluginRuntime, IsolationPolicy};
 
 pub(crate) const LLM_STREAM_BRIDGE_CAPACITY: usize = 32;
 
@@ -146,8 +145,42 @@ fn effective_scope_top(
     with_scope_stack_handle(scope_stack.clone(), task_scope_top)
 }
 
+/// The stack a managed Node.js call's future needs, on the thread that drives it.
+///
+/// Stated rather than inherited, because the inherited default is not enough. A
+/// managed call that reaches a plugin runs through a chain of wrappers this
+/// binding does not control — the caller's callback, the executor's future, the
+/// registry chain, a plugin proxy, and the host's client — and in a build that
+/// does not collapse the layers that chain is over a megabyte deep. Tokio's
+/// default worker stack is two megabytes, and the deep cases did not fit in it: a
+/// worker that walked off the end took Node down with it, which is SIGSEGV and
+/// not a rejected call. They fit now that the future is boxed, but that is a
+/// margin nobody chose, so the runtime states this instead. It is the size the
+/// Python binding states for the same chain, and the order the process's main
+/// thread gets.
+const NODE_FUTURE_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Give NAPI's runtime the stack the futures it drives need.
+///
+/// NAPI creates its runtime on first use, with Tokio's defaults, so this runs
+/// from the module initializer: at load, before any exported function can be
+/// called, and therefore before anything can have entered a runtime. A runtime
+/// already running would be the wrong one to configure, and this is the only
+/// moment where that cannot have happened yet.
+fn install_managed_call_runtime() {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        .thread_stack_size(NODE_FUTURE_STACK_BYTES);
+    let runtime = builder
+        .build()
+        .expect("the runtime every managed Node.js call is driven on should build");
+    create_custom_tokio_runtime(runtime);
+}
+
 #[napi::module_init]
 fn init() {
+    install_managed_call_runtime();
     initialize_shared_runtime_binding("node")
         .expect("node runtime ownership initialization should succeed");
     register_adaptive_component()
@@ -1898,6 +1931,16 @@ fn node_conditional_middleware_guardrail(
 mod conditional_gate_tests {
     use super::*;
 
+    fn dynamic_spec(kind: DynamicPluginKind) -> CoreDynamicPluginActivationSpec {
+        CoreDynamicPluginActivationSpec {
+            plugin_id: "fixture".into(),
+            kind,
+            manifest_ref: "relay-plugin.toml".into(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }
+    }
+
     #[test]
     fn conditional_gate_result_wait_is_bounded() {
         let (_tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -1905,6 +1948,16 @@ mod conditional_gate_tests {
             .expect_err("an unresponsive callback must time out");
 
         assert!(error.reason.contains("conditional gate callback timed out"));
+    }
+
+    #[test]
+    fn worker_only_activation_does_not_need_a_native_host() {
+        assert!(!needs_native_host(&[dynamic_spec(
+            DynamicPluginKind::Worker
+        )]));
+        assert!(needs_native_host(&[dynamic_spec(
+            DynamicPluginKind::RustDynamic
+        )]));
     }
 }
 
@@ -2954,7 +3007,7 @@ pub fn tool_call_execute(
     let default_fn: ToolExecutionNextFn = std::sync::Arc::new(move |args| exec_fn(args));
 
     env.execute_tokio_future(
-        async move {
+        with_managed_budget(async move {
             with_publication_callback_context(
                 publication_context_id,
                 publication_buffer,
@@ -2981,7 +3034,7 @@ pub fn tool_call_execute(
                 },
             )
             .await
-        },
+        }),
         |_env, result| Ok(result),
     )
 }
@@ -3034,7 +3087,7 @@ pub fn tool_call_execute_async(
     });
 
     env.execute_tokio_future(
-        async move {
+        with_managed_budget(async move {
             with_publication_callback_context(
                 publication_context_id,
                 publication_buffer,
@@ -3061,7 +3114,7 @@ pub fn tool_call_execute_async(
                 },
             )
             .await
-        },
+        }),
         |_env, result| Ok(result),
     )
 }
@@ -3206,7 +3259,7 @@ pub fn llm_call_execute(
             codec
         });
     env.execute_tokio_future(
-        async move {
+        with_managed_budget(async move {
             with_publication_callback_context(
                 publication_context_id,
                 publication_buffer,
@@ -3233,7 +3286,7 @@ pub fn llm_call_execute(
                 },
             )
             .await
-        },
+        }),
         move |_env, result| {
             drop(codec_references);
             Ok(result)
@@ -3305,7 +3358,7 @@ pub fn llm_call_execute_async(
         });
 
     env.execute_tokio_future(
-        async move {
+        with_managed_budget(async move {
             with_publication_callback_context(
                 publication_context_id,
                 publication_buffer,
@@ -3332,7 +3385,7 @@ pub fn llm_call_execute_async(
                 },
             )
             .await
-        },
+        }),
         move |_env, result| {
             drop(codec_references);
             Ok(result)
@@ -3469,7 +3522,7 @@ pub fn llm_stream_call_execute(
         });
     let completion_codec_references = codec_references.clone();
     env.execute_tokio_future(
-        async move {
+        with_managed_budget(async move {
             with_publication_callback_context(
                 publication_context_id.clone(),
                 publication_buffer.clone(),
@@ -3518,7 +3571,7 @@ pub fn llm_stream_call_execute(
                 },
             )
             .await
-        },
+        }),
         move |_env, result| {
             drop(completion_codec_references);
             Ok(result)
@@ -6032,6 +6085,12 @@ struct NodeDynamicPluginActivationSpec {
     config: serde_json::Map<String, Json>,
 }
 
+fn needs_native_host(specs: &[CoreDynamicPluginActivationSpec]) -> bool {
+    specs
+        .iter()
+        .any(|spec| spec.kind == DynamicPluginKind::RustDynamic)
+}
+
 impl From<NodeDynamicPluginActivationSpec> for CoreDynamicPluginActivationSpec {
     fn from(spec: NodeDynamicPluginActivationSpec) -> Self {
         Self {
@@ -6058,7 +6117,7 @@ pub struct DynamicPluginActivation {
 type DynamicPluginTeardownResult = std::result::Result<(), String>;
 
 enum DynamicPluginCloseStatus {
-    Active(Option<CorePluginHostActivation>),
+    Active(Option<ActivatedPluginRuntime>),
     Closing,
     Closed,
 }
@@ -6069,7 +6128,7 @@ struct DynamicPluginCloseState {
 }
 
 impl DynamicPluginCloseState {
-    fn new(activation: CorePluginHostActivation) -> Self {
+    fn new(activation: ActivatedPluginRuntime) -> Self {
         let (completion, _) = tokio::sync::watch::channel(None);
         Self {
             status: StdMutex::new(DynamicPluginCloseStatus::Active(Some(activation))),
@@ -6085,6 +6144,19 @@ impl DynamicPluginCloseState {
         match &*status {
             DynamicPluginCloseStatus::Active(activation) => activation.is_some(),
             DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => false,
+        }
+    }
+
+    fn host_pid(&self) -> Option<u32> {
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*status {
+            DynamicPluginCloseStatus::Active(Some(activation)) => activation.native_process_id(),
+            DynamicPluginCloseStatus::Active(None)
+            | DynamicPluginCloseStatus::Closing
+            | DynamicPluginCloseStatus::Closed => None,
         }
     }
 
@@ -6193,6 +6265,18 @@ impl DynamicPluginActivation {
         Ok(self.close_state.active())
     }
 
+    /// Return the process the native plugins are running in.
+    ///
+    /// `null` when this activation holds no host: it started none, or it has
+    /// closed and the process it started is gone. It is the isolation claim as a
+    /// value rather than a description — the plugins did not run in the process
+    /// that asked for them, and a caller comparing this to its own pid is what
+    /// says so.
+    #[napi(getter)]
+    pub fn host_pid(&self) -> Option<u32> {
+        self.close_state.host_pid()
+    }
+
     /// Clear plugin callbacks before unloading libraries and workers.
     ///
     /// This method is idempotent, including when concurrent callers race to
@@ -6236,10 +6320,17 @@ impl Drop for DynamicPluginActivation {
 /// Static-only callers should use `initializePlugins`. The returned object owns
 /// all loaded libraries and worker processes. Its validation report is available
 /// through the `report` property.
+///
+/// `pluginHost` is the host this package shipped, resolved by the JavaScript
+/// wrapper that knows where its own installation is. It is optional so a directly
+/// required addon still works, in which case the addon looks beside its own module
+/// — and if neither finds one, the call fails rather than searching `PATH` for an
+/// executable to trust.
 #[napi]
 pub async fn initialize_with_dynamic_plugins(
     config: Json,
     specs: Json,
+    plugin_host: Option<String>,
 ) -> napi::Result<DynamicPluginActivation> {
     let config: PluginConfig = serde_json::from_value(config)
         .map_err(|error| napi::Error::from_reason(format!("invalid plugin config: {error}")))?;
@@ -6248,11 +6339,32 @@ pub async fn initialize_with_dynamic_plugins(
             napi::Error::from_reason(format!("invalid dynamic plugin specs: {error}"))
         })?;
     let specs = specs.into_iter().map(Into::into).collect::<Vec<_>>();
-    let (activation, report) =
-        CorePluginHostActivation::activate_with_discovered_config(config, specs)
-            .await
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?;
-    let report = serde_json::to_value(report)
+    let isolation =
+        nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment()
+            .map_err(napi::Error::from_reason)?;
+    let policy = IsolationPolicy::for_runtime("nemo-relay-node").with_native_isolation(isolation);
+    let needs_native_host = needs_native_host(&specs);
+    let policy = if needs_native_host {
+        match plugin_host {
+            Some(path) => policy.with_host(path),
+            None => match crate::plugin_host_location::beside_this_module() {
+                Some(path) => policy.with_host(path),
+                None => {
+                    return Err(napi::Error::from_reason(
+                        "this addon could not find the nemo-plugin-host its package ships, and native \
+                         plugins run in that process: pass the host's path to \
+                         initializeWithDynamicPlugins, or install a package that carries one",
+                    ));
+                }
+            },
+        }
+    } else {
+        policy
+    };
+    let activation = ActivatedPluginRuntime::activate_with_discovered_config(config, specs, policy)
+        .await
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+    let report = serde_json::to_value(activation.report())
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
     Ok(DynamicPluginActivation {
         close_state: Arc::new(DynamicPluginCloseState::new(activation)),
@@ -6279,4 +6391,45 @@ pub fn active_plugin_report() -> napi::Result<Option<Json>> {
 #[napi]
 pub fn list_plugin_kinds() -> Vec<String> {
     list_plugin_kinds_impl()
+}
+/// Milliseconds one managed Node.js call may take.
+///
+/// Stated here because these entry points carry no deadline of their own. What it
+/// is *for* is the budget the kernel hands a registration that runs in another
+/// process — the runtime decides how long a plugin's work may take, and a plugin
+/// reached with no budget at all is refused rather than trusted. It cannot
+/// lengthen anything: the kernel narrows an inherited budget to its own ceiling.
+pub(crate) const MANAGED_CALL_BUDGET_MILLIS: u64 = 30_000;
+
+/// Run one managed Node.js operation under the budget this binding states.
+///
+/// The future leaves this function boxed, and that is load-bearing rather than
+/// incidental. NAPI drives a managed call from the thread JavaScript called the
+/// entry point on, which is the thread V8 gave a *JavaScript* stack limit — a
+/// megabyte by default, against the eight the machine gave the thread. A managed
+/// call's future is large, because it carries the whole pipeline and a debug
+/// build does not collapse the layers, so an entry point that holds that future
+/// in its frame is deeper than V8's limit for the JavaScript beside it before it
+/// ever reaches the runtime. The next JavaScript the promise machinery runs — a
+/// promise hook, say — is then refused with `Maximum call stack size exceeded`,
+/// which is not a JavaScript problem and cannot be caught as one: it came from
+/// this frame, not from the script.
+///
+/// Boxing makes the frame the size of the pointer instead. The pipeline is built
+/// and polled with a stack the JavaScript on that thread never sees, and the
+/// entry point returns a promise at the depth it started at.
+pub(crate) fn with_managed_budget<F>(future: F) -> Pin<Box<dyn Future<Output = F::Output> + Send>>
+where
+    F: Future + Send + 'static,
+{
+    Box::pin(async move {
+        nemo_relay::api::runtime::with_execution_budget(
+            nemo_relay::api::runtime::ExecutionBudget::new(
+                nemo_relay::api::runtime::budget_now_unix_ms() + MANAGED_CALL_BUDGET_MILLIS,
+                MANAGED_CALL_BUDGET_MILLIS,
+            ),
+            future,
+        )
+        .await
+    })
 }

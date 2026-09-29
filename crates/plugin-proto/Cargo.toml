@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-plugin-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC protocol for the out-of-process native plugin host."
+
+[lints]
+workspace = true
+
+[dependencies]
+nemo-relay-plugin-protocol.workspace = true
+prost = "0.14"
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "transport"] }
+tonic-prost = "0.14.2"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.2"
+
+[dev-dependencies]
+serde_json = "1"

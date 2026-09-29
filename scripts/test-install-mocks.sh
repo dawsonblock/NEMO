@@ -96,8 +96,19 @@ case "$url" in
         printf '%s\n' "$MOCK_API_RESPONSE"
         ;;
     *.sha256)
-        [ "${MOCK_CHECKSUM_MISSING:-0}" != 1 ] || exit 22
-        printf '%s  %s\n' "$MOCK_EXPECTED_CHECKSUM" "${url##*/}" >"$output"
+        # A release that predates the plugin host publishes the CLI's checksum
+        # and nothing for the host, which is the state the installer reports
+        # rather than fails on.
+        case "$url" in
+            *nemo-plugin-host-*)
+                [ "${MOCK_HOST_CHECKSUM_MISSING:-0}" != 1 ] || exit 22
+                printf '%s  %s\n' "${MOCK_HOST_EXPECTED_CHECKSUM:-$MOCK_EXPECTED_CHECKSUM}" "${url##*/}" >"$output"
+                ;;
+            *)
+                [ "${MOCK_CHECKSUM_MISSING:-0}" != 1 ] || exit 22
+                printf '%s  %s\n' "$MOCK_EXPECTED_CHECKSUM" "${url##*/}" >"$output"
+                ;;
+        esac
         ;;
     *)
         printf '#!/bin/sh\nprintf "mock nemo-relay\\n"\n' >"$output"
@@ -107,7 +118,14 @@ EOF
 
     cat >"${mock_commands_dir}/sha256sum" <<'EOF'
 #!/bin/sh
-printf '%s  %s\n' "$MOCK_ACTUAL_CHECKSUM" "$1"
+case "$1" in
+    *.nemo-relay.host.*)
+        printf '%s  %s\n' "${MOCK_HOST_ACTUAL_CHECKSUM:-$MOCK_ACTUAL_CHECKSUM}" "$1"
+        ;;
+    *)
+        printf '%s  %s\n' "$MOCK_ACTUAL_CHECKSUM" "$1"
+        ;;
+esac
 EOF
 
     cat >"${mock_commands_dir}/cygpath" <<'EOF'
@@ -148,6 +166,9 @@ new_case() {
     MOCK_EXPECTED_CHECKSUM=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     MOCK_ACTUAL_CHECKSUM=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     MOCK_CHECKSUM_MISSING=0
+    MOCK_HOST_EXPECTED_CHECKSUM=$MOCK_EXPECTED_CHECKSUM
+    MOCK_HOST_ACTUAL_CHECKSUM=$MOCK_ACTUAL_CHECKSUM
+    MOCK_HOST_CHECKSUM_MISSING=0
     MOCK_GH_TOKEN=mock-github-token
     NEMO_RELAY_VERSION=0.5.0
     HOME=$home_dir
@@ -157,6 +178,7 @@ new_case() {
     GH_TOKEN=$MOCK_GH_TOKEN
     export MOCK_UNAME_S MOCK_UNAME_M MOCK_API_RESPONSE
     export MOCK_EXPECTED_CHECKSUM MOCK_ACTUAL_CHECKSUM MOCK_CHECKSUM_MISSING MOCK_GH_TOKEN
+    export MOCK_HOST_EXPECTED_CHECKSUM MOCK_HOST_ACTUAL_CHECKSUM MOCK_HOST_CHECKSUM_MISSING
     export GH_TOKEN NEMO_RELAY_VERSION HOME PATH MOCK_CURL_LOG MOCK_POWERSHELL_LOG
     return 0
 }
@@ -269,6 +291,55 @@ test_checksum_mismatch_preserves_existing_binary() {
     return 0
 }
 
+test_release_with_a_host_installs_both_beside_each_other() {
+    new_case
+    run_installer
+    assert_success
+    install_dir="${HOME}/.local/bin"
+    [ -f "${install_dir}/nemo-relay" ] || fail "the CLI was not installed"
+    [ -f "${install_dir}/nemo-plugin-host" ] || fail "the plugin host was not installed"
+    assert_contains "$run_output" "Installed the plugin host"
+    assert_file_contains "$curl_log" "nemo-plugin-host-x86_64-unknown-linux-musl-0.5.0"
+    assert_no_temporary_files "$install_dir"
+    return 0
+}
+
+test_release_without_a_host_warns_and_installs_the_cli() {
+    new_case
+    MOCK_HOST_CHECKSUM_MISSING=1
+    export MOCK_HOST_CHECKSUM_MISSING
+    run_installer
+    assert_success
+    install_dir="${HOME}/.local/bin"
+    [ -f "${install_dir}/nemo-relay" ] || fail "the CLI was not installed"
+    [ ! -e "${install_dir}/nemo-plugin-host" ] || \
+        fail "a host appeared from a release that does not publish one"
+    # The warning is the point: an installation that cannot host a plugin has to
+    # say so rather than look complete.
+    assert_contains "$run_output" "does not publish"
+    assert_no_temporary_files "$install_dir"
+    return 0
+}
+
+test_host_checksum_mismatch_replaces_neither_binary() {
+    new_case
+    install_dir="${HOME}/.local/bin"
+    mkdir -p "$install_dir"
+    printf 'existing binary\n' >"${install_dir}/nemo-relay"
+    MOCK_HOST_ACTUAL_CHECKSUM=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export MOCK_HOST_ACTUAL_CHECKSUM
+    run_installer
+    assert_failure
+    assert_contains "$run_output" "checksum verification failed"
+    # The CLI verified, and is still not replaced: both files are verified
+    # before either is promoted, so a release whose host does not match what it
+    # published cannot leave half of itself installed.
+    assert_file_contains "${install_dir}/nemo-relay" "existing binary"
+    [ ! -e "${install_dir}/nemo-plugin-host" ] || fail "an unverified host was installed"
+    assert_no_temporary_files "$install_dir"
+    return 0
+}
+
 test_linux_arm64_mapping
 test_macos_arm64_mapping
 test_git_bash_windows_x86_64_mapping_and_path_update
@@ -277,5 +348,8 @@ test_unsupported_platform
 test_malformed_release_response
 test_missing_checksum_fails_closed
 test_checksum_mismatch_preserves_existing_binary
+test_release_with_a_host_installs_both_beside_each_other
+test_release_without_a_host_warns_and_installs_the_cli
+test_host_checksum_mismatch_replaces_neither_binary
 
 printf 'PASS: %s mock-only installer scenarios\n' "$tests_run"

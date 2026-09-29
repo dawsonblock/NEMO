@@ -2680,6 +2680,15 @@ class _PluginHostActivation:
         """
         ...
 
+    @property
+    def host_pid(self) -> int | None:
+        """Return the process the native plugins are running in.
+
+        ``None`` when this activation holds no host: it started none, or it has
+        closed and the process it started is gone.
+        """
+        ...
+
     def close(self) -> Awaitable[None]:
         """Clear and unload this activation; repeated calls are safe."""
         ...

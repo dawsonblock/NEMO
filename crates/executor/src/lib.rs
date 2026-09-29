@@ -176,29 +176,12 @@ pub mod unstable {
         pub trace_id: Option<String>,
     }
 
-    /// Dispatch certainty at the external-effect boundary.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum DispatchState {
-        /// The provider was not contacted.
-        NotDispatched,
-        /// Dispatch was attempted but acceptance is not proven.
-        DispatchAttempted,
-        /// The provider accepted the dispatch, but completion may remain unknown.
-        DispatchConfirmed,
-    }
-
-    /// Certainty about the external effect outcome.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum OutcomeCertainty {
-        /// The effect definitely did not commit.
-        ConfirmedFailure,
-        /// The effect definitely committed.
-        ConfirmedSuccess,
-        /// The runtime cannot prove success or failure.
-        Unknown,
-    }
+    // Dispatch certainty is contract vocabulary rather than an adapter detail:
+    // the kernel classifies backend errors with it, and the plugin contract has
+    // to report it so a plugin failure cannot pass for a definite outcome. It
+    // is canonical in `nemo-relay-types` and re-exported here so the paths that
+    // already name it keep working.
+    pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
 
     /// Structured error emitted by a backend that can cross an effect boundary.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

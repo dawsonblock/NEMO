@@ -96,7 +96,7 @@ async fn transparent_hook_delivery_authenticates_the_wrapper_gateway() {
         proxy_credential,
         Some(shutdown_rx),
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, async {
         loop {
             let url = gateway_url.clone();
             let fingerprint = fingerprint.clone();
@@ -143,7 +143,7 @@ async fn transparent_hook_delivery_authenticates_the_wrapper_gateway() {
 
     assert_eq!(response.status, 200);
     let _ = shutdown_tx.send(());
-    tokio::time::timeout(Duration::from_secs(5), server)
+    tokio::time::timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC, server)
         .await
         .expect("wrapper gateway did not stop")
         .unwrap()

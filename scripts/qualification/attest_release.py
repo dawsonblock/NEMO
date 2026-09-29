@@ -269,6 +269,18 @@ def verify(
     if attestation.get("artifact", {}).get("sha256") != actual_artifact:
         findings.append("release attestation is bound to a different artifact digest")
 
+    # The attestation records the evidence manifest it was issued against.
+    # Verifying that *some* valid bundle is present is not enough: if the
+    # evidence was regenerated afterwards, the signed statement no longer
+    # describes what the release is being justified by, and an older
+    # attestation would outlive the evidence it claimed to bind.
+    digest_path = qualification_dir / bundle.MANIFEST_DIGEST_NAME
+    if (
+        digest_path.is_file()
+        and attestation.get("evidence", {}).get("manifest_sha256") != digest_path.read_text().strip()
+    ):
+        findings.append("release attestation is bound to a different evidence manifest digest")
+
     findings.extend(bundle.verify(qualification_dir.parent, qualification_dir))
     findings.extend(self_reference_findings(artifact, attestation_path))
 

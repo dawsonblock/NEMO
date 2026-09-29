@@ -4,7 +4,9 @@
 //! Qualification-only executable: a real kernel and PostgreSQL effect store
 //! around a persistent, deterministic external-effect simulator.
 
-use nemo_effect_runtime::{DurableRuntime, EffectRuntimeConfig, PostgresTransport, RuntimeMode};
+use nemo_effect_runtime::{
+    DurableRuntime, EffectRuntimeConfig, EffectStoreSettings, PostgresTransport,
+};
 use nemo_relay::kernel::{
     CapabilityDefinition, CapabilityRegistry, InvocationOutcome, InvocationRequest,
     RecoveryDecision,
@@ -298,22 +300,23 @@ fn run() -> Result<(), Box<dyn Error>> {
     migrator.migrate()?;
     let provider = PersistentProviderSimulator::new(&connection, &schema)?;
     let runtime = DurableRuntime::bootstrap(
-        EffectRuntimeConfig {
-            mode: RuntimeMode::Qualification,
-            runtime_identity: RuntimeIdentity {
+        EffectRuntimeConfig::qualification(
+            RuntimeIdentity {
                 principal_id: "qualification-principal".into(),
                 tenant_id: Some("qualification-tenant".into()),
                 runtime_id,
                 environment: "qualification".into(),
                 session_id: None,
             },
-            database_url: connection,
-            schema,
-            maximum_pool_size: 4,
-            lease_configuration: LeaseConfiguration::default(),
-            operation_budgets: Default::default(),
-            database_transport: PostgresTransport::InsecureLoopbackForTests,
-        },
+            EffectStoreSettings {
+                database_url: connection,
+                schema,
+                maximum_pool_size: 4,
+                lease_configuration: LeaseConfiguration::default(),
+                operation_budgets: Default::default(),
+                database_transport: PostgresTransport::InsecureLoopbackForTests,
+            },
+        )?,
         registry(),
         QualificationAuthority,
         FunctionHooksExecutionBackend::new(fast_hook),

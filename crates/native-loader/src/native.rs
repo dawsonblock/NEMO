@@ -16,18 +16,20 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 
 use futures_util::FutureExt;
 
-use crate::api::event::{DataSchema, Event, EventSanitizeFields, LogSeverity};
-use crate::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
-use crate::api::registry::{
+use chrono::{DateTime, Utc};
+use libloading::{Library, Symbol};
+use nemo_relay::api::event::{DataSchema, Event, EventSanitizeFields, LogSeverity};
+use nemo_relay::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
+use nemo_relay::api::registry::{
     RuntimeRegistrationKind, deregister_conditional_middleware_guardrail,
     list_runtime_registrations, register_conditional_middleware_guardrail,
 };
-use crate::api::runtime::{
+use nemo_relay::api::runtime::{
     ConditionalMiddlewareGuardrailFn, EventMetadataInjectorFn, EventSanitizeFn, EventSubscriberFn,
     LlmCodecIdentity, LlmConditionalFn, LlmExecutionFn, LlmExecutionNextFn, LlmJsonStream,
     LlmRequestInterceptFn, LlmSanitizeRequestContext, LlmSanitizeRequestFn,
@@ -35,66 +37,169 @@ use crate::api::runtime::{
     LlmStreamExecutionNextFn, MiddlewareContinuationContext, ToolConditionalFn, ToolExecutionFn,
     ToolExecutionNextFn, ToolInterceptFn, ToolSanitizeFn,
 };
-use crate::api::runtime::{
+use nemo_relay::api::runtime::{
     ScopeStackHandle, ThreadScopeStackBinding, capture_thread_scope_stack, create_scope_stack,
     current_scope_stack, restore_thread_scope_stack, scope_stack_active, set_thread_scope_stack,
     sync_thread_scope_stack, with_scope_stack,
 };
-use crate::api::scope::{
+use nemo_relay::api::scope::{
     EmitMarkEventParams, PopScopeParams, PushScopeParams, ScopeAttributes, ScopeHandle, ScopeType,
 };
-use crate::api::scope::{event as emit_scope_mark, get_handle, pop_scope, push_scope};
-use crate::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
-use crate::codec::request::AnnotatedLlmRequest;
-use crate::codec::traits::{LlmCodec, LlmResponseCodec};
-use crate::error::{FlowError, Result as FlowResult};
-use crate::plugin::{
+use nemo_relay::api::scope::{event as emit_scope_mark, get_handle, pop_scope, push_scope};
+use nemo_relay::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
+use nemo_relay::codec::request::AnnotatedLlmRequest;
+use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
+use nemo_relay::error::{FlowError, Result as FlowResult};
+use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginError, PluginRegistration,
-    PluginRegistrationContext, active_runtime_diagnostics_snapshot,
-    deregister_plugin_registration_checked, register_plugin_tracked,
+    PluginRegistrationContext,
 };
-use chrono::{DateTime, Utc};
-use libloading::{Library, Symbol};
-use nemo_relay_plugin::{
-    NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY,
-    NemoRelayNativeAsyncCallbackState, NemoRelayNativeAsyncCompletion,
-    NemoRelayNativeAsyncLlmStreamOpenCb, NemoRelayNativeAsyncLlmStreamPullCb,
-    NemoRelayNativeAsyncMiddlewareCb, NemoRelayNativeAsyncMiddlewareKind, NemoRelayNativeAsyncNext,
-    NemoRelayNativeAsyncNextResultCb, NemoRelayNativeAsyncNextStreamCb, NemoRelayNativeAsyncStream,
+
+use nemo_relay_native_abi::{
+    NEMO_RELAY_NATIVE_ABI_VERSION, NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS,
+    NEMO_RELAY_NATIVE_ABI_VERSION_LEGACY, NemoRelayNativeAsyncCallbackState,
+    NemoRelayNativeAsyncCompletion, NemoRelayNativeAsyncLlmStreamOpenCb,
+    NemoRelayNativeAsyncLlmStreamPullCb, NemoRelayNativeAsyncMiddlewareCb,
+    NemoRelayNativeAsyncMiddlewareKind, NemoRelayNativeAsyncNext, NemoRelayNativeAsyncNextResultCb,
+    NemoRelayNativeAsyncNextStreamCb, NemoRelayNativeAsyncStream,
     NemoRelayNativeAsyncStreamMiddlewareCb, NemoRelayNativeConditionalMiddlewareCb,
     NemoRelayNativeEventSanitizeCb, NemoRelayNativeEventSubscriberCb, NemoRelayNativeFreeFn,
     NemoRelayNativeHostApiV1, NemoRelayNativeHostApiV3, NemoRelayNativeHostApiV4,
-    NemoRelayNativeLlmAsyncStream, NemoRelayNativeLlmCodecKind, NemoRelayNativeLlmConditionalCb,
-    NemoRelayNativeLlmExecutionCb, NemoRelayNativeLlmRequestCodec,
+    NemoRelayNativeHostApiV5, NemoRelayNativeLlmAsyncStream, NemoRelayNativeLlmCodecKind,
+    NemoRelayNativeLlmConditionalCb, NemoRelayNativeLlmExecutionCb, NemoRelayNativeLlmRequestCodec,
     NemoRelayNativeLlmRequestInterceptCb, NemoRelayNativeLlmResponseCodec,
     NemoRelayNativeLlmSanitizeRequestCb, NemoRelayNativeLlmSanitizeRequestContext,
     NemoRelayNativeLlmSanitizeResponseCb, NemoRelayNativeLlmSanitizeResponseContext,
-    NemoRelayNativeLlmStreamExecutionCb, NemoRelayNativeLlmStreamV1, NemoRelayNativePluginContext,
-    NemoRelayNativePluginEntry, NemoRelayNativePluginRuntime, NemoRelayNativePluginV1,
-    NemoRelayNativeScopeHandle, NemoRelayNativeScopeStack, NemoRelayNativeScopeStackBinding,
-    NemoRelayNativeScopeType, NemoRelayNativeString, NemoRelayNativeToolConditionalCb,
-    NemoRelayNativeToolExecutionCb, NemoRelayNativeToolJsonCb, NemoRelayNativeWithScopeStackCb,
-    NemoRelayStatus,
+    NemoRelayNativeLlmStreamExecutionCb, NemoRelayNativeLlmStreamV1, NemoRelayNativeMarkWindow,
+    NemoRelayNativePluginContext, NemoRelayNativePluginEntry, NemoRelayNativePluginRuntime,
+    NemoRelayNativePluginV1, NemoRelayNativeScopeHandle, NemoRelayNativeScopeStack,
+    NemoRelayNativeScopeStackBinding, NemoRelayNativeScopeType, NemoRelayNativeString,
+    NemoRelayNativeToolConditionalCb, NemoRelayNativeToolExecutionCb, NemoRelayNativeToolJsonCb,
+    NemoRelayNativeWithScopeStackCb, NemoRelayStatus,
 };
 use serde_json::{Map, Value as Json};
-use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tokio_stream::{Stream, StreamExt};
 use uuid::Uuid;
 
-use super::{
-    DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad,
-    DynamicPluginTeardownOutcome, deregister_tracked_registrations_checked,
-    validate_annotated_request_consumer_compatibility, validate_dynamic_plugin_relay_compatibility,
+use nemo_relay::plugin::dynamic::{
+    ApprovedPluginArtifact, DYNAMIC_PLUGIN_MANIFEST_FILENAME, DynamicPluginKind,
+    DynamicPluginManifest, DynamicPluginManifestLoad, NativeHostRuntime, RegistrationTeardown,
 };
+use nemo_relay_plugin_protocol::PluginArtifactIdentity;
 
+/// The runtime this host participates in.
+///
+/// The handle carries nothing — it is the name of the kernel services a hosted
+/// plugin may use — so the loader asks the runtime of the process it is running
+/// in, which is the runtime whose registry, invocation and artifact decisions its
+/// callbacks act on. Every kernel-touching operation below goes through it.
+fn host_runtime() -> NativeHostRuntime {
+    NativeHostRuntime::new()
+}
+
+/// An artifact whose bytes this side has approved.
+///
 /// Native plugin load request derived from host dynamic-plugin state.
+///
+/// Built through one of the constructors below and nowhere else, so that a load
+/// says out loud which kind of load it is. The approval is private for that
+/// reason: a caller cannot assemble a spec out of parts and leave the approval
+/// out, because leaving it out is a thing one has to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativePluginLoadSpec {
     /// Expected plugin kind.
     pub plugin_id: String,
     /// Path to the authored `relay-plugin.toml`.
     pub manifest_ref: String,
+    /// The artifact this load is allowed to open, when anything was approved.
+    approval: Option<ApprovedPluginArtifact>,
+    /// The restricted process host may load its verified container-owned copy
+    /// in place; the service retains that staged artifact for the session.
+    load_approved_in_place: bool,
+}
+
+impl NativePluginLoadSpec {
+    /// Build a spec whose artifact this side approves.
+    ///
+    /// The approval is computed here, before any load, so the caller cannot
+    /// forget it: an artifact whose identity cannot be computed is one that
+    /// cannot be approved, and that is a failure rather than a load without a
+    /// guarantee.
+    pub fn approved(
+        plugin_id: impl Into<String>,
+        manifest_ref: impl Into<String>,
+    ) -> nemo_relay::plugin::Result<Self> {
+        let manifest_ref = manifest_ref.into();
+        let artifact = ApprovedPluginArtifact::approve(&manifest_ref)?;
+        Ok(Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref,
+            approval: Some(artifact),
+            load_approved_in_place: false,
+        })
+    }
+
+    /// Build a spec around an approval another side made and sent here.
+    ///
+    /// This is the process boundary's constructor: the side that loads is not
+    /// the side that approved, so the digests arrive with the request and the
+    /// loader confirms them. It is a production constructor for that reason —
+    /// there is nothing weaker about an approval made in the kernel and checked
+    /// in the host than one made in the host — and it is separate from
+    /// `approved` so that "who decided this artifact was the right one" is not
+    /// hidden behind a boolean.
+    pub fn with_approved_identity(
+        plugin_id: impl Into<String>,
+        manifest_ref: impl Into<String>,
+        identity: PluginArtifactIdentity,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref: manifest_ref.into(),
+            approval: Some(ApprovedPluginArtifact::from_identity(identity)),
+            load_approved_in_place: false,
+        }
+    }
+
+    /// Build an approval whose bytes already live in this restricted host's
+    /// private app container. The authenticated staging service owns the file's
+    /// lifetime, so making another copy in the sandbox's temporary directory is
+    /// unnecessary and can cross the sandbox's writable boundary.
+    pub(crate) fn with_approved_identity_in_place(
+        plugin_id: impl Into<String>,
+        manifest_ref: impl Into<String>,
+        identity: PluginArtifactIdentity,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref: manifest_ref.into(),
+            approval: Some(ApprovedPluginArtifact::from_identity(identity)),
+            load_approved_in_place: true,
+        }
+    }
+
+    /// Build a spec for an artifact nobody approved.
+    ///
+    /// The loader then falls back to whatever integrity the manifest itself
+    /// declares, and to loading the library where it sits rather than from a
+    /// staged copy. That is a weaker guarantee and it is meant to read as one:
+    /// the loader's own tests use this to exercise what a load does with an
+    /// artifact, and no shipped path does. Naming it is deliberate — the field
+    /// it fills is private so that omitting approval is always written down.
+    pub fn development(plugin_id: impl Into<String>, manifest_ref: impl Into<String>) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref: manifest_ref.into(),
+            approval: None,
+            load_approved_in_place: false,
+        }
+    }
+
+    /// What this load is allowed to open, when anything was approved.
+    pub fn approval(&self) -> Option<&ApprovedPluginArtifact> {
+        self.approval.as_ref()
+    }
 }
 
 /// Owns native dynamic libraries registered into the plugin registry.
@@ -107,32 +212,107 @@ pub struct NativePluginActivation {
     plugin_registrations: Vec<(String, u64)>,
 }
 
+/// One registration a native plugin made, recorded where it was made.
+///
+/// The attachment point is known inside the host function that installs the
+/// registration and nowhere else: afterwards a registered component is a name
+/// in a table, and a table of names cannot say which surface a callback answers
+/// on. A host that has to describe its registrations to another process
+/// therefore records them as they happen rather than reconstructing them by
+/// inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePluginRegistration {
+    /// The attachment point the plugin registered at.
+    pub operation: RuntimeRegistrationKind,
+    /// The name the plugin authored.
+    pub local_name: String,
+    /// The runtime-qualified name, which is what gates match and ordering
+    /// applies to.
+    pub qualified_name: String,
+    /// Priority the registration declared, when its hook carries one.
+    pub priority: Option<i32>,
+    /// Whether it may break its chain, when its hook carries that.
+    pub may_break_chain: Option<bool>,
+    /// The registration this one gates, when it is a conditional guardrail.
+    pub gated_registration: Option<String>,
+}
+
+/// One loaded plugin as the loader knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeLoadedPlugin {
+    /// The plugin kind this activation registered.
+    pub plugin_kind: String,
+    /// The compatibility range the manifest declared, when it declared one.
+    pub declared_compat: Option<String>,
+    /// What its register callback installed, in the order it installed it.
+    ///
+    /// Empty until the plugin has been asked to register, because native
+    /// registration is config-driven: the loader registers a plugin kind at
+    /// load time and the callbacks arrive when the runtime initializes the
+    /// plugin's components.
+    pub registrations: Vec<NativePluginRegistration>,
+}
+
 impl NativePluginActivation {
     /// Returns `true` when no native plugins were loaded.
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
     }
 
+    /// Return the plugin kinds this activation registered.
+    ///
+    /// A backend outside this crate holds the activation as the lifetime guard
+    /// for what it loaded, and has to describe those kinds without reaching into
+    /// the instances themselves.
+    pub fn plugin_kinds(&self) -> Vec<String> {
+        self.plugin_registrations
+            .iter()
+            .map(|(plugin_kind, _)| plugin_kind.clone())
+            .collect()
+    }
+
+    /// Describe each loaded plugin as the loader actually knows it.
+    ///
+    /// Returns the registered kind, the compatibility version the plugin's
+    /// manifest declares, and the registrations its callbacks made. Nothing
+    /// here is inferred: a caller that needs the ABI version negotiated with
+    /// the library has to say so, because this activation does not retain it
+    /// and reporting the host's maximum instead would invent a guarantee the
+    /// plugin never made.
+    pub fn loaded_plugins(&self) -> Vec<NativeLoadedPlugin> {
+        self.plugins
+            .iter()
+            .map(|instance| {
+                let declared = if instance.relay_compat.trim().is_empty() {
+                    None
+                } else {
+                    Some(instance.relay_compat.clone())
+                };
+                NativeLoadedPlugin {
+                    plugin_kind: instance.plugin_kind.clone(),
+                    declared_compat: declared,
+                    registrations: instance
+                        .registrations
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone(),
+                }
+            })
+            .collect()
+    }
+
     /// Consumes the activation and deregisters loaded plugin kinds.
     pub fn clear(self) {}
 
-    pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> DynamicPluginTeardownOutcome {
-        deregister_tracked_registrations_checked(&mut self.plugin_registrations, "native")
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_plugin_kind_for_test(plugin_kind: impl Into<String>) -> Self {
-        Self {
-            plugins: Vec::new(),
-            plugin_registrations: vec![(plugin_kind.into(), 0)],
-        }
+    pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> RegistrationTeardown {
+        host_runtime().tear_down(&mut self.plugin_registrations, "native")
     }
 }
 
 impl Drop for NativePluginActivation {
     fn drop(&mut self) {
         for (plugin_kind, registration_id) in self.plugin_registrations.iter().rev() {
-            let _ = deregister_plugin_registration_checked(plugin_kind, *registration_id);
+            let _ = host_runtime().remove_plugin(plugin_kind, *registration_id);
         }
     }
 }
@@ -141,7 +321,7 @@ impl Drop for NativePluginActivation {
 ///
 /// The returned activation must be kept alive until after active plugin
 /// configuration has been cleared.
-pub fn load_native_plugins<I>(specs: I) -> crate::plugin::Result<NativePluginActivation>
+pub fn load_native_plugins<I>(specs: I) -> nemo_relay::plugin::Result<NativePluginActivation>
 where
     I: IntoIterator<Item = NativePluginLoadSpec>,
 {
@@ -152,7 +332,7 @@ where
     for spec in specs {
         let instance = load_one_native_plugin(&spec)?;
         let plugin_kind = instance.plugin_kind.clone();
-        let registration_id = register_plugin_tracked(Arc::new(NativePluginAdapter {
+        let registration_id = host_runtime().install_plugin(Arc::new(NativePluginAdapter {
             plugin_kind: plugin_kind.clone(),
             allows_multiple_components: instance.allows_multiple_components,
             instance: instance.clone(),
@@ -234,7 +414,7 @@ impl Plugin for NativePluginAdapter {
         &'a self,
         plugin_config: &Map<String, Json>,
         ctx: &'a mut PluginRegistrationContext,
-    ) -> Pin<Box<dyn Future<Output = crate::plugin::Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = nemo_relay::plugin::Result<()>> + Send + 'a>> {
         let plugin_config = plugin_config.clone();
         Box::pin(async move {
             let plugin = self.instance.plugin.lock().map_err(|err| {
@@ -289,7 +469,64 @@ struct NativePluginInstance {
     relay_compat: String,
     allows_multiple_components: bool,
     plugin: Mutex<NemoRelayNativePluginV1>,
+    /// Where the verified copy this instance was loaded from lives.
+    ///
+    /// Held so the directory outlives the mapping: the file inside it is the one
+    /// `dlopen` opened, and nothing else may write there.
+    _staging: Option<StagedArtifact>,
+    /// What this plugin's register callbacks installed.
+    ///
+    /// Written where the attachment point is known — inside each host
+    /// registration function — and read when the activation describes itself.
+    /// The lock is only ever held to record or clone a `Vec`, so recovering
+    /// from a poisoned lock loses nothing: there is no half-updated invariant
+    /// to preserve, and refusing to record would silently produce an incomplete
+    /// description of what is loaded.
+    ///
+    /// A plugin's register callbacks can run more than once against one loaded
+    /// instance: a session that activates, tears down and activates again runs
+    /// them each time, and so does the discovery path that has to know what a
+    /// serving activation would refuse. What this holds is therefore the
+    /// registrations the instance *currently* has, keyed by attachment point,
+    /// rather than a log of everything it ever made — a log would report a
+    /// plugin that registered seventeen callbacks as one that registered
+    /// thirty-four, and a description that doubles itself is a description no
+    /// reader can trust.
+    registrations: Mutex<Vec<NativePluginRegistration>>,
     _library: Library,
+}
+
+impl NativePluginInstance {
+    /// Record one registration the plugin made.
+    ///
+    /// A second registration at the same attachment point replaces the first:
+    /// within one activation the runtime's own registry refuses a name it
+    /// already holds, so reaching here twice means the instance was asked to
+    /// register again — after a teardown, or for an inspection — and what the
+    /// instance has now is what the second call installed.
+    fn record_registration(&self, registration: NativePluginRegistration) {
+        let mut registrations = self
+            .registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        registrations.retain(|existing| {
+            existing.qualified_name != registration.qualified_name
+                || existing.operation != registration.operation
+        });
+        registrations.push(registration);
+    }
+
+    /// Drop the records for a registration the plugin removed.
+    ///
+    /// A gate the plugin registers through its runtime handle can be removed
+    /// while the plugin is still loaded, and a description that kept it would
+    /// claim a registration that no longer runs.
+    fn forget_registration(&self, qualified_name: &str) {
+        self.registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|registration| registration.qualified_name != qualified_name);
+    }
 }
 
 fn serialize_native_tool_result(result: ToolExecutionResult) -> serde_json::Result<Json> {
@@ -330,10 +567,233 @@ fn drop_native_plugin_descriptor(plugin: &mut NemoRelayNativePluginV1) {
     }
 }
 
+/// A verified copy of a plugin artifact, in a directory private to this account.
+///
+/// The copy is what gets loaded. A pathname can be repointed between the hash and
+/// the `dlopen` that follows it, so the loader never executes the source path: it
+/// executes a file this process wrote, in a directory whose mode denies other users
+/// and whose name could not be chosen in advance.
+///
+/// Private to the *account*, not to the process: `0700` denies other users, and a
+/// process running under the same account has the same filesystem identity. The
+/// threat model this satisfies is a plugin that is trusted but possibly buggy — a
+/// hostile process under this account would need the mechanism
+/// `stage_verified_library` documents, such as loading through a retained descriptor.
+pub(crate) struct StagedArtifact {
+    dir: PathBuf,
+}
+
+impl std::fmt::Debug for StagedArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedArtifact")
+            .field("dir", &self.dir)
+            .finish()
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        // Best effort: the library stays mapped after this, which is what makes
+        // removing the file safe on the platforms this runs on.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy a verified artifact into a private directory and return the copy's path.
+///
+/// The source is read through an open handle so the digest describes an instance
+/// rather than a name, and the copy is re-hashed before it is handed back: the
+/// bytes that will be loaded are bytes this function has read twice.
+///
+/// The copy exists because an approved load never executes the approved path: a
+/// path can be repointed between the moment it was approved and the moment it is
+/// opened, and a copy that no *other user* can write and that nothing can name in
+/// advance cannot be. That is the guarantee, stated as what it is: the directory is
+/// the load's own, its mode denies other users, and its name is random rather than
+/// derived from the digest. It is not a statement about another process running as
+/// the same user — Unix permissions do not make that one a boundary, and a threat
+/// model that includes a hostile process under this account needs a mechanism this
+/// one does not claim, such as loading through a retained descriptor.
+pub(crate) fn stage_verified_library(
+    library_path: &Path,
+    approved_library_sha256: &str,
+) -> nemo_relay::plugin::Result<(PathBuf, StagedArtifact)> {
+    use std::io::Read;
+
+    let mut source = std::fs::File::open(library_path).map_err(|error| {
+        PluginError::NotFound(format!(
+            "native plugin library '{}' could not be opened: {error}",
+            library_path.display()
+        ))
+    })?;
+    // One handle, read twice: hashing consumes it, so it is rewound rather than
+    // cloned — a clone would share the offset and the copy would then start at
+    // the end of the file, which is exactly the bug this comment replaces.
+    let source_digest = host_runtime().hash_open_file(&mut source)?;
+    {
+        use std::io::Seek;
+        source.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+            PluginError::Internal(format!(
+                "failed to rewind '{}': {error}",
+                library_path.display()
+            ))
+        })?;
+    }
+    if source_digest != approved_library_sha256 {
+        return Err(PluginError::RegistrationFailed(format!(
+            "native plugin library '{}' hashes to {source_digest}, while \
+             {approved_library_sha256} was approved",
+            library_path.display()
+        )));
+    }
+
+    // Nothing another user controls decides where the copy lands: the directory is
+    // this load's own, its mode denies other users, and its name is random rather than
+    // derived from the digest, so two loads of one artifact cannot land on each other.
+    // The digest-derived name this replaces mapped every load of one artifact to one
+    // path, which is exactly the case that collides — and a second load truncating the
+    // file the first is running from is the collision that matters.
+    //
+    // The guard is built *before* anything can fail, so every path from here — a failed
+    // open, a short read, a write error, a digest that does not match — takes the
+    // directory with it. Creating it and returning the guard only at the end left the
+    // private directory behind on the paths in between, which is litter rather than a
+    // vulnerability, and litter is what a guard removes by construction.
+    let guard = StagedArtifact {
+        dir: create_staging_directory()?,
+    };
+    let dir = guard.dir.clone();
+
+    let staged = dir.join("library");
+    // Exclusive creation, so a destination that already exists is an error
+    // rather than something this load overwrites. The directory is fresh, so
+    // this refuses a pre-existing target instead of trusting that there is none.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut destination = options.open(&staged).map_err(|error| {
+        PluginError::Internal(format!(
+            "failed to create the staged artifact '{}': {error}",
+            staged.display()
+        ))
+    })?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).map_err(|error| {
+            PluginError::Internal(format!(
+                "failed to read '{}': {error}",
+                library_path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut destination, &buffer[..read]).map_err(|error| {
+            PluginError::Internal(format!("failed to write '{}': {error}", staged.display()))
+        })?;
+    }
+    destination.sync_all().map_err(|error| {
+        PluginError::Internal(format!("failed to flush '{}': {error}", staged.display()))
+    })?;
+    drop(destination);
+    // The copy is re-hashed from the file that will be loaded rather than from
+    // the bytes as they were written: the guarantee is about the artifact the
+    // loader opens, and reading it back is how the digests describe the same
+    // instance the loader will get rather than the same buffer this loop held.
+    let staged_digest = host_runtime().hash_path(&staged)?;
+    if staged_digest != approved_library_sha256 {
+        return Err(PluginError::RegistrationFailed(format!(
+            "the staged copy of '{}' hashes to {staged_digest}, while \
+             {approved_library_sha256} was approved",
+            library_path.display()
+        )));
+    }
+    Ok((staged, guard))
+}
+
+/// Create the private directory one staged artifact lives in.
+///
+/// The name is random rather than derived from the digest or the process id, and
+/// the directory is created exclusively: nothing else can choose the path a load
+/// writes into, and nothing can arrange for the path to exist before it does. A
+/// digest-derived name under a process-derived root is predictable, which is the
+/// property that makes it possible for another process running as the same user
+/// to put something there first. A retry is not a workaround for that: the first
+/// name is unavailable, so another is chosen rather than reusing it.
+fn create_staging_directory() -> nemo_relay::plugin::Result<PathBuf> {
+    for _ in 0..16 {
+        let dir =
+            std::env::temp_dir().join(format!("nemo-native-artifacts-{}", Uuid::new_v4().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            // A name already taken is another load's, not this one's: the next
+            // attempt gets a name nobody holds rather than sharing that one.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(PluginError::Internal(format!(
+                    "failed to create the staging directory '{}': {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Err(PluginError::Internal(
+        "failed to create a private staging directory for a native plugin".to_string(),
+    ))
+}
+
 fn load_one_native_plugin(
     spec: &NativePluginLoadSpec,
-) -> crate::plugin::Result<Arc<NativePluginInstance>> {
-    let (manifest, manifest_ref) = DynamicPluginManifest::load_from_path(&spec.manifest_ref)?;
+) -> nemo_relay::plugin::Result<Arc<NativePluginInstance>> {
+    // The manifest is read once and parsed from the bytes that were hashed, so
+    // the identity and the content are the same object rather than two lookups
+    // of one path.
+    let manifest_path = {
+        let path = PathBuf::from(&spec.manifest_ref);
+        if path.is_dir() {
+            path.join(DYNAMIC_PLUGIN_MANIFEST_FILENAME)
+        } else {
+            path
+        }
+    };
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        PluginError::NotFound(format!(
+            "dynamic plugin manifest '{}' could not be read: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest_sha256 = host_runtime().hash_bytes(&manifest_bytes);
+    if let Some(approved) = spec.approval()
+        && approved.identity().manifest_sha256 != manifest_sha256
+    {
+        return Err(PluginError::RegistrationFailed(format!(
+            "dynamic plugin '{}' is not the approved artifact: '{}' hashes to \
+             {manifest_sha256}, while {} was approved",
+            spec.plugin_id,
+            manifest_path.display(),
+            approved.identity().manifest_sha256
+        )));
+    }
+    let manifest_ref = manifest_path.to_string_lossy().into_owned();
+    let manifest = DynamicPluginManifest::parse_toml(
+        std::str::from_utf8(&manifest_bytes).map_err(|error| {
+            PluginError::InvalidConfig(format!(
+                "'{}' is not UTF-8: {error}",
+                manifest_path.display()
+            ))
+        })?,
+    )?;
     if manifest.plugin.id.trim() != spec.plugin_id {
         return Err(PluginError::InvalidConfig(format!(
             "dynamic plugin manifest id '{}' does not match expected id '{}'",
@@ -367,7 +827,7 @@ fn load_one_native_plugin(
         )));
     };
     let manifest_path = PathBuf::from(&manifest_ref);
-    let library_path = resolve_manifest_relative_path(
+    let library_path = host_runtime().resolve_manifest_relative(
         &manifest_path,
         load.library
             .as_deref()
@@ -384,8 +844,33 @@ fn load_one_native_plugin(
         .as_ref()
         .and_then(|integrity| integrity.sha256.as_deref())
     {
-        verify_sha256(&library_path, expected_digest)?;
+        host_runtime().verify_path(&library_path, expected_digest)?;
     }
+    // Ordinary approved loads are copied into private staging. The restricted
+    // host instead loads the authenticated container copy in place, then checks
+    // the digest again after dlopen. Unapproved development loads retain their
+    // existing in-place behavior and post-load check.
+    let (library_path, staging) = match spec.approval() {
+        Some(approved) if spec.load_approved_in_place => {
+            let measured = host_runtime().hash_path(&library_path)?;
+            if measured != approved.identity().library_sha256 {
+                return Err(PluginError::RegistrationFailed(format!(
+                    "the transferred library hashes to {measured}, while {} was approved",
+                    approved.identity().library_sha256
+                )));
+            }
+            (library_path.clone(), None)
+        }
+        Some(approved) => {
+            let (staged, guard) =
+                stage_verified_library(&library_path, &approved.identity().library_sha256)?;
+            (staged, Some(guard))
+        }
+        None => (library_path.clone(), None),
+    };
+    let verified_library_sha256 = spec
+        .approval()
+        .map(|approved| approved.identity().library_sha256.clone());
     let symbol = load
         .symbol
         .as_deref()
@@ -397,6 +882,22 @@ fn load_one_native_plugin(
             library_path.display()
         ))
     })?;
+    // A staged load needs no second look: the file it opened is one this process
+    // wrote, in a directory no other user can write. A load with no approved
+    // identity still re-checks the path, which is the weaker guarantee it can offer.
+    if staging.is_none()
+        && let Some(verified) = &verified_library_sha256
+    {
+        let mapped = host_runtime().hash_path(&library_path)?;
+        if &mapped != verified {
+            drop(library);
+            return Err(PluginError::RegistrationFailed(format!(
+                "native plugin library '{}' changed between verification and loading; it is \
+                 not the artifact this load approved",
+                library_path.display()
+            )));
+        }
+    }
     let mut plugin = NemoRelayNativePluginV1::default();
     unsafe {
         let entry: Symbol<NemoRelayNativePluginEntry> =
@@ -406,18 +907,7 @@ fn load_one_native_plugin(
                     library_path.display()
                 ))
             })?;
-        let mut status = entry(native_host_api(), &mut plugin);
-        // Older SDKs reject newer tables. Negotiate from the current v4 table
-        // through separately frozen v3 and v2 tables so their struct sizes and
-        // function pointers do not change as the current ABI grows.
-        if status == NemoRelayStatus::InvalidArg {
-            drop_native_plugin_descriptor(&mut plugin);
-            status = entry(native_host_api_v3(), &mut plugin);
-        }
-        if status == NemoRelayStatus::InvalidArg {
-            drop_native_plugin_descriptor(&mut plugin);
-            status = entry(native_host_api_v2(), &mut plugin);
-        }
+        let status = negotiate_plugin_entry(*entry, &mut plugin);
         if status != NemoRelayStatus::Ok {
             drop_native_plugin_descriptor(&mut plugin);
             return Err(PluginError::RegistrationFailed(format!(
@@ -449,18 +939,20 @@ fn load_one_native_plugin(
         relay_compat,
         allows_multiple_components: plugin.allows_multiple_components,
         plugin: Mutex::new(plugin),
+        registrations: Mutex::new(Vec::new()),
+        _staging: staging,
         _library: library,
     }))
 }
 
-fn validate_relay_compatibility(relay: Option<&str>) -> crate::plugin::Result<()> {
-    validate_dynamic_plugin_relay_compatibility(relay, "native")
+fn validate_relay_compatibility(relay: Option<&str>) -> nemo_relay::plugin::Result<()> {
+    host_runtime().validate_relay_compatibility(relay, "native")
 }
 
 fn validate_plugin_descriptor(
     plugin_id: &str,
     plugin: &NemoRelayNativePluginV1,
-) -> crate::plugin::Result<()> {
+) -> nemo_relay::plugin::Result<()> {
     if plugin.struct_size < std::mem::size_of::<NemoRelayNativePluginV1>() {
         return Err(PluginError::InvalidConfig(format!(
             "native plugin '{plugin_id}' returned incompatible plugin descriptor size {}",
@@ -478,48 +970,6 @@ fn validate_plugin_descriptor(
         )));
     }
     Ok(())
-}
-
-fn resolve_manifest_relative_path(manifest_path: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        manifest_path
-            .parent()
-            .map(|parent| parent.join(&path))
-            .unwrap_or(path)
-    }
-}
-
-fn verify_sha256(path: &Path, expected: &str) -> crate::plugin::Result<()> {
-    let expected = expected
-        .trim()
-        .strip_prefix("sha256:")
-        .unwrap_or(expected.trim());
-    let bytes = std::fs::read(path).map_err(|err| {
-        PluginError::Internal(format!("failed to read '{}': {err}", path.display()))
-    })?;
-    let actual = hex_digest(Sha256::digest(bytes));
-    if actual.eq_ignore_ascii_case(expected) {
-        Ok(())
-    } else {
-        Err(PluginError::InvalidConfig(format!(
-            "native plugin library '{}' sha256 mismatch",
-            path.display()
-        )))
-    }
-}
-
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[repr(C)]
@@ -542,7 +992,7 @@ struct NativeOwnedGate {
 }
 
 impl NativeHostPluginRuntime {
-    fn cleanup(&self) -> crate::plugin::Result<()> {
+    fn cleanup(&self) -> nemo_relay::plugin::Result<()> {
         self.active.store(false, Ordering::Release);
         let mut gates = match self.gates.lock() {
             Ok(gates) => gates,
@@ -860,8 +1310,57 @@ unsafe extern "C" fn native_llm_response_codec_decode(
 }
 
 fn native_host_api() -> *const NemoRelayNativeHostApiV1 {
+    static HOST_API: OnceLock<NemoRelayNativeHostApiV5> = OnceLock::new();
+    &HOST_API.get_or_init(build_native_host_api_v5).v4.v3.v1 as *const NemoRelayNativeHostApiV1
+}
+
+/// The frozen v4 table, for plugins built against an SDK that stops at v4.
+///
+/// A plugin that only knows v4 refuses the current table — its own supported range
+/// ends before this host's version — and the refusal says nothing about what the
+/// two could have agreed on. Offering the version it was built against is what
+/// keeps an older plugin working while the current ABI grows, and it is why each
+/// older table is frozen rather than derived from the current one.
+fn native_host_api_v4() -> *const NemoRelayNativeHostApiV1 {
     static HOST_API: OnceLock<NemoRelayNativeHostApiV4> = OnceLock::new();
-    &HOST_API.get_or_init(build_native_host_api_v4).v3.v1 as *const NemoRelayNativeHostApiV1
+    &HOST_API.get_or_init(build_frozen_host_api_v4).v3.v1 as *const NemoRelayNativeHostApiV1
+}
+
+/// Call a plugin's entry, offering every table this host can speak.
+///
+/// A plugin built against an older SDK refuses a table whose version it does not
+/// know — its own supported range ends before this host's version — and that refusal
+/// says nothing about what the two could have agreed on. The negotiation therefore
+/// offers the current table first and then each frozen older one, newest first, so
+/// what a plugin is handed is the newest version it was built for.
+///
+/// The order is the whole of the rule, which is why it is a function with a test of
+/// its own rather than a loop inside the loader: getting it wrong is silent, and it
+/// is how every already-built plugin would stop loading at once.
+fn negotiate_plugin_entry(
+    entry: NemoRelayNativePluginEntry,
+    plugin: &mut NemoRelayNativePluginV1,
+) -> NemoRelayStatus {
+    let mut status = unsafe { entry(native_host_api(), plugin) };
+    for table in [
+        native_host_api_v4(),
+        native_host_api_v3(),
+        native_host_api_v2(),
+    ] {
+        if status != NemoRelayStatus::InvalidArg {
+            break;
+        }
+        drop_native_plugin_descriptor(plugin);
+        status = unsafe { entry(table, plugin) };
+    }
+    status
+}
+
+fn build_frozen_host_api_v4() -> NemoRelayNativeHostApiV4 {
+    let mut v4 = build_native_host_api_v4();
+    v4.v3.v1.abi_version = NEMO_RELAY_NATIVE_ABI_VERSION_COMPLETION_CODECS;
+    v4.v3.v1.struct_size = std::mem::size_of::<NemoRelayNativeHostApiV4>();
+    v4
 }
 
 fn native_host_api_v3() -> *const NemoRelayNativeHostApiV1 {
@@ -959,6 +1458,18 @@ fn build_native_host_api_v3() -> NemoRelayNativeHostApiV3 {
     }
 }
 
+fn build_native_host_api_v5() -> NemoRelayNativeHostApiV5 {
+    let mut v4 = build_native_host_api_v4();
+    v4.v3.v1.abi_version = NEMO_RELAY_NATIVE_ABI_VERSION;
+    v4.v3.v1.struct_size = std::mem::size_of::<NemoRelayNativeHostApiV5>();
+    NemoRelayNativeHostApiV5 {
+        v4,
+        capture_mark_window_thread: native_capture_mark_window_thread,
+        release_mark_window: native_release_mark_window,
+        emit_mark_in_window: native_emit_mark_in_window,
+    }
+}
+
 fn build_native_host_api_v4() -> NemoRelayNativeHostApiV4 {
     let mut v3 = build_native_host_api_v3();
     v3.v1.abi_version = NEMO_RELAY_NATIVE_ABI_VERSION;
@@ -994,7 +1505,114 @@ fn build_native_host_api_v4() -> NemoRelayNativeHostApiV4 {
     }
 }
 
-fn read_native_string(value: *const NemoRelayNativeString) -> crate::plugin::Result<String> {
+/// The mark window an invocation is running under, as an owned handle.
+///
+/// Captured where the host opens it — around the callback it is invoking — and
+/// carried from there by whoever will be running the callback's work, because the
+/// work outlives the call: a stream the callback returns is polled long after the
+/// invocation that created it returned, and the marks it raises then belong to the
+/// same operation as the ones raised during the call.
+type MarkWindowHandle = Arc<dyn nemo_relay::plugin::execution::MarkForwarder>;
+
+/// Captures the mark window the calling invocation runs under.
+///
+/// Answers a null handle when there is no window: a callback invoked outside the
+/// host's own mark-forwarding window — as the in-process backend invokes one — has
+/// no operation to attribute its marks to through this path, and the plugin's own
+/// runtime handles them locally, which is what it already does.
+unsafe extern "C" fn native_capture_mark_window_thread(
+    out: *mut *mut NemoRelayNativeMarkWindow,
+) -> NemoRelayStatus {
+    if out.is_null() {
+        set_native_last_error("mark window capture received null out pointer");
+        return NemoRelayStatus::NullPointer;
+    }
+    clear_native_last_error();
+    let window = host_runtime()
+        .capture_mark_window()
+        .map(|forwarder| Box::into_raw(Box::new(forwarder)) as *mut NemoRelayNativeMarkWindow)
+        .unwrap_or(ptr::null_mut());
+    unsafe { *out = window };
+    NemoRelayStatus::Ok
+}
+
+/// Releases one owned mark-window handle.
+unsafe extern "C" fn native_release_mark_window(window: *mut NemoRelayNativeMarkWindow) {
+    if !window.is_null() {
+        drop(unsafe { Box::from_raw(window as *mut MarkWindowHandle) });
+    }
+}
+
+/// Emits a mark through the window it was raised under.
+///
+/// The window, not the call, says whose mark this is: a plugin chooses what a mark
+/// says and not which operation it belongs to. A null window is refused rather than
+/// attributed to whatever the calling thread happens to be doing — a mark with no
+/// operation is a mark nobody can place, and placing it somewhere is worse than
+/// saying so.
+unsafe extern "C" fn native_emit_mark_in_window(
+    window: *const NemoRelayNativeMarkWindow,
+    name: *const NemoRelayNativeString,
+    parent: *const NemoRelayNativeScopeHandle,
+    data_json: *const NemoRelayNativeString,
+    metadata_json: *const NemoRelayNativeString,
+    data_schema_json: *const NemoRelayNativeString,
+    severity: *const NemoRelayNativeString,
+    timestamp_unix_micros: *const i64,
+) -> NemoRelayStatus {
+    if window.is_null() {
+        set_native_last_error("mark emission requires the window it belongs to");
+        return NemoRelayStatus::InvalidArg;
+    }
+    clear_native_last_error();
+    let forwarder = unsafe { (window as *const MarkWindowHandle).as_ref() }.expect("checked above");
+    let name = match read_name(name) {
+        Ok(name) => name,
+        Err(status) => return status,
+    };
+    let data = match optional_json_from_native_string(data_json, "mark data") {
+        Ok(data) => data,
+        Err(status) => return status,
+    };
+    let metadata = match optional_json_from_native_string(metadata_json, "mark metadata") {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    let data_schema = match optional_typed_json_from_native_string::<DataSchema>(
+        data_schema_json,
+        "mark data schema",
+    ) {
+        Ok(data_schema) => data_schema,
+        Err(status) => return status,
+    };
+    let severity = match optional_severity_from_native_string(severity) {
+        Ok(severity) => severity,
+        Err(status) => return status,
+    };
+    let timestamp = match optional_timestamp_from_native(timestamp_unix_micros) {
+        Ok(timestamp) => timestamp,
+        Err(status) => return status,
+    };
+    let parent_ref = native_scope_ref(parent);
+    let params = EmitMarkEventParams::builder()
+        .name(&name)
+        .parent_opt(parent_ref)
+        .data_opt(data)
+        .metadata_opt(metadata)
+        .data_schema_opt(data_schema)
+        .severity_opt(severity)
+        .timestamp_opt(timestamp)
+        .build();
+    match host_runtime()
+        .forward_mark(&params)
+        .and_then(|mark| forwarder.forward(&mark))
+    {
+        Ok(()) => NemoRelayStatus::Ok,
+        Err(err) => status_from_flow_error(err),
+    }
+}
+
+fn read_native_string(value: *const NemoRelayNativeString) -> nemo_relay::plugin::Result<String> {
     if value.is_null() {
         return Ok(String::new());
     }
@@ -1362,7 +1980,7 @@ unsafe extern "C" fn native_get_runtime_diagnostics(
     out_json: *mut *mut NemoRelayNativeString,
 ) -> NemoRelayStatus {
     clear_native_last_error();
-    let diagnostics = active_runtime_diagnostics_snapshot();
+    let diagnostics = host_runtime().runtime_diagnostics();
     match serde_json::to_value(diagnostics) {
         Ok(entries) => {
             let value = Json::Object(Map::from_iter([("entries".into(), entries)]));
@@ -1507,6 +2125,13 @@ fn status_from_flow_error(err: FlowError) -> NemoRelayStatus {
         FlowError::ResourceExhausted { .. } => NemoRelayStatus::Backpressured,
         // Admission timeout is retryable backpressure at the native boundary.
         FlowError::Timeout { .. } => NemoRelayStatus::Backpressured,
+        // A registration that failed keeps its reason: the dispatch state and
+        // the certainty belong to whoever decides about effects, and a status
+        // code at the ABI boundary is not a place to keep them.
+        FlowError::PluginInvocation { failure, .. } => {
+            set_native_last_error(failure.message);
+            NemoRelayStatus::Internal
+        }
         FlowError::Upstream(_) | FlowError::Internal(_) | FlowError::CallbackException { .. } => {
             NemoRelayStatus::Internal
         }
@@ -2527,7 +3152,7 @@ unsafe extern "C" fn native_async_next_invoke(
             }
             _ => unreachable!("native next invocation kind matched its continuation"),
         };
-    let continuation_context = match next.context.isolated_for_current_invocation() {
+    let continuation_context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -2807,7 +3432,7 @@ unsafe extern "C" fn native_async_next_invoke_result(
             return NemoRelayStatus::InvalidArg;
         }
     };
-    let continuation_context = match next.context.isolated_for_current_invocation() {
+    let continuation_context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -2896,7 +3521,7 @@ unsafe extern "C" fn native_async_next_invoke_stream(
         Ok(request) => request,
         Err(status) => return status,
     };
-    let continuation_context = match next.context.isolated_for_current_invocation() {
+    let continuation_context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -3048,7 +3673,7 @@ unsafe extern "C" fn native_async_next_open_llm_stream(
         Ok(request) => request,
         Err(status) => return status,
     };
-    let context = match next.context.isolated_for_current_invocation() {
+    let context = match host_runtime().isolate_invocation(&next.context) {
         Ok(context) => context,
         Err(error) => return status_from_flow_error(error),
     };
@@ -3788,9 +4413,20 @@ unsafe extern "C" fn native_plugin_context_register_async_stream_middleware(
     match context.register_llm_stream_execution_intercept(
         &name,
         priority,
-        wrap_native_incremental_llm_stream_execution(instance, cb, user_data, free_fn),
+        wrap_native_incremental_llm_stream_execution(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                context,
+                RuntimeRegistrationKind::LlmStreamExecutionIntercept,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(error) => status_from_plugin_error(error),
     }
 }
@@ -3832,15 +4468,66 @@ unsafe extern "C" fn native_plugin_context_register_async_middleware(
         return NemoRelayStatus::InvalidArg;
     }
     if kind == NemoRelayNativeAsyncMiddlewareKind::LlmRequestIntercept
-        && let Err(error) = validate_annotated_request_consumer_compatibility(
-            &instance.relay_compat,
-            &instance.plugin_kind,
-        )
+        && let Err(error) = host_runtime()
+            .validate_request_consumer_compatibility(&instance.relay_compat, &instance.plugin_kind)
     {
         return status_from_plugin_error(error);
     }
     let (user_data, free_fn) = user_data_guard.transfer();
     let context = unsafe { &mut *host_ctx.ctx };
+    // The attachment point each kind installs itself at. This mirrors the
+    // registration arms below, and both are exhaustive so a kind the ABI gains
+    // cannot be handled by one without the other.
+    let operation = match kind {
+        NemoRelayNativeAsyncMiddlewareKind::ToolSanitizeRequest => {
+            RuntimeRegistrationKind::ToolSanitizeRequestGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::ToolSanitizeResponse => {
+            RuntimeRegistrationKind::ToolSanitizeResponseGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::ToolConditionalExecution => {
+            RuntimeRegistrationKind::ToolConditionalExecutionGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::ToolRequestIntercept => {
+            RuntimeRegistrationKind::ToolRequestIntercept
+        }
+        NemoRelayNativeAsyncMiddlewareKind::ToolExecutionIntercept => {
+            RuntimeRegistrationKind::ToolExecutionIntercept
+        }
+        NemoRelayNativeAsyncMiddlewareKind::LlmSanitizeRequest => {
+            RuntimeRegistrationKind::LlmSanitizeRequestGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::LlmSanitizeResponse => {
+            RuntimeRegistrationKind::LlmSanitizeResponseGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::LlmConditionalExecution => {
+            RuntimeRegistrationKind::LlmConditionalExecutionGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::LlmRequestIntercept => {
+            RuntimeRegistrationKind::LlmRequestIntercept
+        }
+        NemoRelayNativeAsyncMiddlewareKind::LlmExecutionIntercept => {
+            RuntimeRegistrationKind::LlmExecutionIntercept
+        }
+        NemoRelayNativeAsyncMiddlewareKind::MarkSanitize => {
+            RuntimeRegistrationKind::MarkSanitizeGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::ScopeSanitizeStart => {
+            RuntimeRegistrationKind::ScopeSanitizeStartGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::ScopeSanitizeEnd => {
+            RuntimeRegistrationKind::ScopeSanitizeEndGuardrail
+        }
+        NemoRelayNativeAsyncMiddlewareKind::EventMetadataInjector => {
+            RuntimeRegistrationKind::EventMetadataInjector
+        }
+        NemoRelayNativeAsyncMiddlewareKind::LlmStreamExecutionIntercept => {
+            unreachable!("completion-based stream middleware was rejected before registration")
+        }
+    };
+    // Kept for the record: each arm below hands the instance to a callback
+    // wrapper, and the registration still has to be recorded against it.
+    let recorded_instance = instance.clone();
     let registration = match kind {
         NemoRelayNativeAsyncMiddlewareKind::ToolSanitizeRequest => context
             .register_tool_sanitize_request_guardrail(
@@ -3933,7 +4620,18 @@ unsafe extern "C" fn native_plugin_context_register_async_middleware(
             ),
     };
     match registration {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &recorded_instance,
+                context,
+                operation,
+                &name,
+                Some(priority),
+                Some(break_chain),
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(error) => status_from_plugin_error(error),
     }
 }
@@ -3996,7 +4694,7 @@ unsafe extern "C" fn native_plugin_context_runtime(
     let namespace = context.qualify_name("");
     let runtime = Arc::new(NativeHostPluginRuntime {
         namespace,
-        encode_local_names: context.uses_plugin_component_namespace(),
+        encode_local_names: host_runtime().qualifies_component_names(context),
         instance: Arc::downgrade(&host_ctx.instance),
         active: AtomicBool::new(true),
         gates: Mutex::new(HashMap::new()),
@@ -4191,19 +4889,24 @@ fn register_native_owned_gate(
         format!(
             "{}{}",
             runtime.namespace,
-            crate::plugin::encode_plugin_component_field(&local_name)
+            host_runtime().qualify_component_field(&local_name)
         )
     } else {
         format!("{}{}", runtime.namespace, local_name)
     };
     if let Err(error) = register_conditional_middleware_guardrail(
         &qualified_name,
-        kinds,
+        kinds.clone(),
         &registration_name,
         guardrail,
     ) {
         return status_from_flow_error(error);
     }
+    // Kept for the record: the ownership entry takes the names, and a gate that
+    // fails to hand back a handle is rolled back above without ever being
+    // recorded.
+    let recorded_local_name = local_name.clone();
+    let recorded_qualified_name = qualified_name.clone();
     gates.insert(
         handle.clone(),
         NativeOwnedGate {
@@ -4213,6 +4916,15 @@ fn register_native_owned_gate(
     );
     match native_string_from_str(&handle) {
         Some(value) => {
+            if let Some(instance) = runtime.instance.upgrade() {
+                record_native_gate_at(
+                    &instance,
+                    &recorded_local_name,
+                    &recorded_qualified_name,
+                    &kinds,
+                    &registration_name,
+                );
+            }
             unsafe { *out_handle = value };
             NemoRelayStatus::Ok
         }
@@ -4256,10 +4968,17 @@ unsafe extern "C" fn native_plugin_runtime_deregister_conditional_middleware_gua
     let Some(gate) = gates.get(&handle) else {
         return NemoRelayStatus::Ok;
     };
-    match deregister_conditional_middleware_guardrail(&gate.qualified_name) {
+    let qualified_name = gate.qualified_name.clone();
+    match deregister_conditional_middleware_guardrail(&qualified_name) {
         Ok(removed) => {
             if removed {
                 gates.remove(&handle);
+                // The plugin removed a registration it had made, so the
+                // description keeps up rather than claiming a gate that is
+                // gone.
+                if let Some(instance) = runtime.instance.upgrade() {
+                    instance.forget_registration(&qualified_name);
+                }
             }
             unsafe { *out_removed = removed };
             NemoRelayStatus::Ok
@@ -4296,13 +5015,18 @@ unsafe extern "C" fn native_plugin_context_register_conditional_middleware_guard
         Ok(reason) => reason,
         Err(status) => return status,
     };
-    match unsafe { &mut *host_ctx.ctx }.register_conditional_middleware_guardrail(
+    let instance = host_ctx.instance.clone();
+    let context = unsafe { &mut *host_ctx.ctx };
+    match context.register_conditional_middleware_guardrail(
         &name,
-        kinds,
+        kinds.clone(),
         &registration_name,
         Arc::new(move |_, _| Some(reason.clone())),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_gate(&instance, context, &name, &kinds, &registration_name);
+            NemoRelayStatus::Ok
+        }
         Err(error) => status_from_plugin_error(error),
     }
 }
@@ -4335,16 +5059,112 @@ unsafe extern "C" fn native_plugin_context_register_conditional_middleware_guard
         Err(status) => return status,
     };
     let (user_data, free_fn) = user_data_guard.transfer();
-    let guardrail =
-        wrap_conditional_middleware_guardrail(host_ctx.instance.clone(), cb, user_data, free_fn);
-    match unsafe { &mut *host_ctx.ctx }.register_conditional_middleware_guardrail(
+    let instance = host_ctx.instance.clone();
+    let guardrail = wrap_conditional_middleware_guardrail(instance.clone(), cb, user_data, free_fn);
+    let context = unsafe { &mut *host_ctx.ctx };
+    match context.register_conditional_middleware_guardrail(
         &name,
-        kinds,
+        kinds.clone(),
         &registration_name,
         guardrail,
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_gate(&instance, context, &name, &kinds, &registration_name);
+            NemoRelayStatus::Ok
+        }
         Err(error) => status_from_plugin_error(error),
+    }
+}
+
+/// Record a registration the plugin has just made.
+///
+/// Called only after the runtime accepted the registration: a hook that failed
+/// installed nothing, and recording it would describe a component that does not
+/// exist.
+fn record_native_registration(
+    instance: &NativePluginInstance,
+    ctx: &PluginRegistrationContext,
+    operation: RuntimeRegistrationKind,
+    local_name: &str,
+    priority: Option<i32>,
+    may_break_chain: Option<bool>,
+    gated_registration: Option<String>,
+) {
+    record_native_registration_at(
+        instance,
+        operation,
+        local_name,
+        ctx.qualify_name(local_name),
+        priority,
+        may_break_chain,
+        gated_registration,
+    );
+}
+
+/// Record one registration against a name the caller has already qualified.
+///
+/// The runtime-handle gate path qualifies names itself rather than through a
+/// registration context, so the name travels with the record instead of being
+/// derived from a context that path does not have.
+fn record_native_registration_at(
+    instance: &NativePluginInstance,
+    operation: RuntimeRegistrationKind,
+    local_name: &str,
+    qualified_name: String,
+    priority: Option<i32>,
+    may_break_chain: Option<bool>,
+    gated_registration: Option<String>,
+) {
+    instance.record_registration(NativePluginRegistration {
+        operation,
+        local_name: local_name.to_owned(),
+        qualified_name,
+        priority,
+        may_break_chain,
+        gated_registration,
+    });
+}
+
+/// Record a conditional guardrail against every kind it gates.
+///
+/// A gate is not a component at one attachment point: it decides whether
+/// registrations of the kinds it names run. Reporting it once per gated kind is
+/// what lets a remote installer install a matching gate at each point, and the
+/// target name is the runtime-qualified registration the gate matches on.
+fn record_native_gate(
+    instance: &NativePluginInstance,
+    ctx: &PluginRegistrationContext,
+    local_name: &str,
+    kinds: &BTreeSet<RuntimeRegistrationKind>,
+    gated_registration: &str,
+) {
+    record_native_gate_at(
+        instance,
+        local_name,
+        &ctx.qualify_name(local_name),
+        kinds,
+        gated_registration,
+    );
+}
+
+/// Record a conditional guardrail against an already-qualified name.
+fn record_native_gate_at(
+    instance: &NativePluginInstance,
+    local_name: &str,
+    qualified_name: &str,
+    kinds: &BTreeSet<RuntimeRegistrationKind>,
+    gated_registration: &str,
+) {
+    for kind in kinds {
+        record_native_registration_at(
+            instance,
+            *kind,
+            local_name,
+            qualified_name.to_owned(),
+            None,
+            None,
+            Some(gated_registration.to_owned()),
+        );
     }
 }
 
@@ -4379,15 +5199,26 @@ unsafe extern "C" fn native_plugin_context_register_subscriber(
     };
     match ctx.register_subscriber(
         &name,
-        wrap_event_subscriber(instance, cb, user_data, free_fn),
+        wrap_event_subscriber(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::Subscriber,
+                &name,
+                None,
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
 
 macro_rules! native_tool_json_context_register {
-    ($fn_name:ident, $ctx_method:ident) => {
+    ($fn_name:ident, $ctx_method:ident, $operation:expr) => {
         unsafe extern "C" fn $fn_name(
             ctx: *mut NemoRelayNativePluginContext,
             name: *const NemoRelayNativeString,
@@ -4410,9 +5241,20 @@ macro_rules! native_tool_json_context_register {
             match ctx.$ctx_method(
                 &name,
                 priority,
-                wrap_tool_json_fn(instance, cb, user_data, free_fn),
+                wrap_tool_json_fn(instance.clone(), cb, user_data, free_fn),
             ) {
-                Ok(()) => NemoRelayStatus::Ok,
+                Ok(()) => {
+                    record_native_registration(
+                        &instance,
+                        ctx,
+                        $operation,
+                        &name,
+                        Some(priority),
+                        None,
+                        None,
+                    );
+                    NemoRelayStatus::Ok
+                }
                 Err(err) => status_from_plugin_error(err),
             }
         }
@@ -4421,11 +5263,13 @@ macro_rules! native_tool_json_context_register {
 
 native_tool_json_context_register!(
     native_plugin_context_register_tool_sanitize_request_guardrail,
-    register_tool_sanitize_request_guardrail
+    register_tool_sanitize_request_guardrail,
+    RuntimeRegistrationKind::ToolSanitizeRequestGuardrail
 );
 native_tool_json_context_register!(
     native_plugin_context_register_tool_sanitize_response_guardrail,
-    register_tool_sanitize_response_guardrail
+    register_tool_sanitize_response_guardrail,
+    RuntimeRegistrationKind::ToolSanitizeResponseGuardrail
 );
 
 unsafe extern "C" fn native_plugin_context_register_tool_conditional_execution_guardrail(
@@ -4450,9 +5294,20 @@ unsafe extern "C" fn native_plugin_context_register_tool_conditional_execution_g
     match ctx.register_tool_conditional_execution_guardrail(
         &name,
         priority,
-        wrap_tool_conditional_fn(instance, cb, user_data, free_fn),
+        wrap_tool_conditional_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::ToolConditionalExecutionGuardrail,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4481,9 +5336,20 @@ unsafe extern "C" fn native_plugin_context_register_tool_request_intercept(
         &name,
         priority,
         break_chain,
-        wrap_tool_intercept_fn(instance, cb, user_data, free_fn),
+        wrap_tool_intercept_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::ToolRequestIntercept,
+                &name,
+                Some(priority),
+                Some(break_chain),
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4510,9 +5376,20 @@ unsafe extern "C" fn native_plugin_context_register_tool_execution_intercept(
     match ctx.register_tool_execution_intercept(
         &name,
         priority,
-        wrap_tool_execution_fn(instance, cb, user_data, free_fn),
+        wrap_tool_execution_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::ToolExecutionIntercept,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4539,9 +5416,20 @@ unsafe extern "C" fn native_plugin_context_register_llm_sanitize_request_guardra
     match ctx.register_llm_sanitize_request_guardrail(
         &name,
         priority,
-        wrap_llm_sanitize_request_fn(instance, cb, user_data, free_fn),
+        wrap_llm_sanitize_request_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::LlmSanitizeRequestGuardrail,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4568,9 +5456,20 @@ unsafe extern "C" fn native_plugin_context_register_llm_sanitize_response_guardr
     match ctx.register_llm_sanitize_response_guardrail(
         &name,
         priority,
-        wrap_llm_sanitize_response_fn(instance, cb, user_data, free_fn),
+        wrap_llm_sanitize_response_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::LlmSanitizeResponseGuardrail,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4597,9 +5496,20 @@ unsafe extern "C" fn native_plugin_context_register_llm_conditional_execution_gu
     match ctx.register_llm_conditional_execution_guardrail(
         &name,
         priority,
-        wrap_llm_conditional_fn(instance, cb, user_data, free_fn),
+        wrap_llm_conditional_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::LlmConditionalExecutionGuardrail,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4619,10 +5529,9 @@ unsafe extern "C" fn native_plugin_context_register_llm_request_intercept(
         Err(status) => return status,
     };
     let instance = host_ctx.instance.clone();
-    if let Err(error) = validate_annotated_request_consumer_compatibility(
-        &instance.relay_compat,
-        &instance.plugin_kind,
-    ) {
+    if let Err(error) = host_runtime()
+        .validate_request_consumer_compatibility(&instance.relay_compat, &instance.plugin_kind)
+    {
         return status_from_plugin_error(error);
     }
     let ctx = unsafe { &mut *host_ctx.ctx };
@@ -4634,9 +5543,20 @@ unsafe extern "C" fn native_plugin_context_register_llm_request_intercept(
         &name,
         priority,
         break_chain,
-        wrap_llm_request_intercept_fn(instance, cb, user_data, free_fn),
+        wrap_llm_request_intercept_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::LlmRequestIntercept,
+                &name,
+                Some(priority),
+                Some(break_chain),
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4663,9 +5583,20 @@ unsafe extern "C" fn native_plugin_context_register_llm_execution_intercept(
     match ctx.register_llm_execution_intercept(
         &name,
         priority,
-        wrap_llm_execution_fn(instance, cb, user_data, free_fn),
+        wrap_llm_execution_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::LlmExecutionIntercept,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
@@ -4692,15 +5623,26 @@ unsafe extern "C" fn native_plugin_context_register_llm_stream_execution_interce
     match ctx.register_llm_stream_execution_intercept(
         &name,
         priority,
-        wrap_llm_stream_execution_fn(instance, cb, user_data, free_fn),
+        wrap_llm_stream_execution_fn(instance.clone(), cb, user_data, free_fn),
     ) {
-        Ok(()) => NemoRelayStatus::Ok,
+        Ok(()) => {
+            record_native_registration(
+                &instance,
+                ctx,
+                RuntimeRegistrationKind::LlmStreamExecutionIntercept,
+                &name,
+                Some(priority),
+                None,
+                None,
+            );
+            NemoRelayStatus::Ok
+        }
         Err(err) => status_from_plugin_error(err),
     }
 }
 
 macro_rules! native_event_sanitize_context_register {
-    ($fn_name:ident, $ctx_method:ident) => {
+    ($fn_name:ident, $ctx_method:ident, $operation:expr) => {
         unsafe extern "C" fn $fn_name(
             ctx: *mut NemoRelayNativePluginContext,
             name: *const NemoRelayNativeString,
@@ -4723,9 +5665,20 @@ macro_rules! native_event_sanitize_context_register {
             match ctx.$ctx_method(
                 &name,
                 priority,
-                wrap_event_sanitize_fn(instance, cb, user_data, free_fn),
+                wrap_event_sanitize_fn(instance.clone(), cb, user_data, free_fn),
             ) {
-                Ok(()) => NemoRelayStatus::Ok,
+                Ok(()) => {
+                    record_native_registration(
+                        &instance,
+                        ctx,
+                        $operation,
+                        &name,
+                        Some(priority),
+                        None,
+                        None,
+                    );
+                    NemoRelayStatus::Ok
+                }
                 Err(err) => status_from_plugin_error(err),
             }
         }
@@ -4734,15 +5687,18 @@ macro_rules! native_event_sanitize_context_register {
 
 native_event_sanitize_context_register!(
     native_plugin_context_register_mark_sanitize_guardrail,
-    register_mark_sanitize_guardrail
+    register_mark_sanitize_guardrail,
+    RuntimeRegistrationKind::MarkSanitizeGuardrail
 );
 native_event_sanitize_context_register!(
     native_plugin_context_register_scope_sanitize_start_guardrail,
-    register_scope_sanitize_start_guardrail
+    register_scope_sanitize_start_guardrail,
+    RuntimeRegistrationKind::ScopeSanitizeStartGuardrail
 );
 native_event_sanitize_context_register!(
     native_plugin_context_register_scope_sanitize_end_guardrail,
-    register_scope_sanitize_end_guardrail
+    register_scope_sanitize_end_guardrail,
+    RuntimeRegistrationKind::ScopeSanitizeEndGuardrail
 );
 
 fn wrap_conditional_middleware_guardrail(
@@ -5806,5 +6762,5 @@ fn write_native_json(value: &Json, out: *mut *mut NemoRelayNativeString) -> Nemo
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/native_plugin_tests.rs"]
+#[path = "../tests/unit/native_plugin_tests.rs"]
 mod tests;

@@ -3,25 +3,35 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::ptr;
+#[cfg(unix)]
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nemo_relay_ffi::types::{FfiPluginActivation, nemo_relay_plugin_activation_free};
 use tempfile::TempDir;
 
+#[cfg(unix)]
 const DISCOVERY_CHILD_ENV: &str = "NEMO_RELAY_FFI_DISCOVERY_CHILD";
+#[cfg(unix)]
 const DISCOVERED_STATIC_PLUGIN_KIND: &str = "ffi_discovered_static";
+#[cfg(unix)]
 static DISCOVERED_STATIC_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
 static DISCOVERED_STATIC_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
 static DISCOVERED_STATIC_CONFIG: Mutex<Option<Json>> = Mutex::new(None);
 
+#[cfg(unix)]
 struct PluginDiscoveryTestEnv {
     previous_cwd: PathBuf,
     previous_xdg_config_home: Option<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 impl PluginDiscoveryTestEnv {
     fn enter(cwd: &Path, xdg_config_home: &Path) -> Self {
         let guard = Self {
@@ -36,6 +46,7 @@ impl PluginDiscoveryTestEnv {
     }
 }
 
+#[cfg(unix)]
 impl Drop for PluginDiscoveryTestEnv {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.previous_cwd);
@@ -49,6 +60,7 @@ impl Drop for PluginDiscoveryTestEnv {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_layers_discovered_static_and_explicit_dynamic_plugins() {
     if std::env::var_os(DISCOVERY_CHILD_ENV).is_some() {
@@ -74,6 +86,7 @@ fn ffi_activation_layers_discovered_static_and_explicit_dynamic_plugins() {
     );
 }
 
+#[cfg(unix)]
 fn run_discovered_config_activation_test() {
     let _ = nemo_relay_clear_plugin_configuration();
     DISCOVERED_STATIC_REGISTRATIONS.store(0, Ordering::SeqCst);
@@ -138,7 +151,7 @@ source = "user-file"
         "config": {}
     }]));
 
-    write_and_assert_discovered_activation(&report, &plugins_toml);
+    write_and_assert_discovered_activation(&report, &plugins_toml, activation);
 
     unsafe {
         assert_eq!(
@@ -160,6 +173,7 @@ source = "user-file"
 }
 
 #[track_caller]
+#[cfg(unix)]
 fn assert_empty_dynamic_specs_rejected(config: &CString, empty_specs: &CString) {
     let mut empty_activation = ptr::null_mut();
     let mut empty_report = ptr::null_mut();
@@ -184,7 +198,12 @@ fn assert_empty_dynamic_specs_rejected(config: &CString, empty_specs: &CString) 
 }
 
 #[track_caller]
-fn write_and_assert_discovered_activation(report: &Json, plugins_toml: &Path) {
+#[cfg(unix)]
+fn write_and_assert_discovered_activation(
+    report: &Json,
+    plugins_toml: &Path,
+    activation: *const FfiPluginActivation,
+) {
     // The file-only component and its config must survive the merge.
     let diagnostics = report["diagnostics"].as_array().expect("diagnostics array");
     assert_eq!(diagnostics.len(), 1);
@@ -203,7 +222,27 @@ fn write_and_assert_discovered_activation(report: &Json, plugins_toml: &Path) {
         DISCOVERED_STATIC_CONFIG.lock().unwrap().as_ref(),
         Some(&json!({"source": "user-file"}))
     );
-    assert!(plugin_kinds().iter().any(|kind| kind == "fixture_native"));
+    // The native plugin's kind is registered where its library is — the host
+    // process — so this process not having it is the isolation property. The
+    // intercepts below are what prove it is reachable anyway.
+    assert!(
+        !plugin_kinds().iter().any(|kind| kind == "fixture_native"),
+        "the FFI process must not load the plugin: {:?}",
+        plugin_kinds()
+    );
+    // And where it did load is a process of its own, which is the claim the
+    // registry check above can only imply.
+    let mut host_pid = 0u32;
+    assert_eq!(
+        unsafe { api::nemo_relay_plugin_activation_host_pid(activation, &mut host_pid) },
+        NemoRelayStatus::Ok
+    );
+    assert_ne!(host_pid, 0, "the host process was not reported");
+    assert_ne!(
+        host_pid,
+        std::process::id(),
+        "the plugin must not run in the process that asked for it"
+    );
 
     // Mutating the file after startup has no effect: discovery is one-shot.
     std::fs::write(plugins_toml, "invalid = [").expect("mutate plugin config after startup");
@@ -214,6 +253,7 @@ fn write_and_assert_discovered_activation(report: &Json, plugins_toml: &Path) {
     assert_eq!(DISCOVERED_STATIC_CALLBACKS.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 unsafe extern "C" fn discovered_static_register(
     _user_data: *mut libc::c_void,
     plugin_config_json: *const c_char,
@@ -239,6 +279,7 @@ unsafe extern "C" fn discovered_static_register(
     }
 }
 
+#[cfg(unix)]
 unsafe extern "C" fn discovered_static_tool_request(
     _user_data: *mut libc::c_void,
     _name: *const c_char,
@@ -256,6 +297,7 @@ unsafe extern "C" fn discovered_static_tool_request(
     CString::new(args.to_string()).unwrap().into_raw()
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_loads_native_callbacks_and_removes_them_before_free() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -270,7 +312,14 @@ fn ffi_activation_loads_native_callbacks_and_removes_them_before_free() {
         "config": {}
     }]));
     assert_eq!(report["diagnostics"], json!([]));
-    assert!(plugin_kinds().iter().any(|kind| kind == "fixture_native"));
+    // The plugin's kind is registered where its library is, which is the host
+    // process — so *this* process having no such kind is the isolation property,
+    // and the callback below is what proves the plugin is reachable anyway.
+    assert!(
+        !plugin_kinds().iter().any(|kind| kind == "fixture_native"),
+        "the FFI process must not load the plugin: {:?}",
+        plugin_kinds()
+    );
 
     assert_eq!(
         tool_request_intercepts("ffi-native-tool", json!({"input": true}))["native_plugin"],
@@ -311,6 +360,7 @@ fn ffi_activation_loads_native_callbacks_and_removes_them_before_free() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_rejects_overlapping_outputs_without_claiming_host() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -354,6 +404,155 @@ fn ffi_activation_rejects_overlapping_outputs_without_claiming_host() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn ffi_llm_execution_reaches_a_native_plugin_across_the_boundary() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = nemo_relay_clear_plugin_configuration();
+
+    let manifest_dir = TempDir::new().expect("native manifest tempdir");
+    let manifest = write_native_manifest(manifest_dir.path(), build_native_fixture());
+    let (mut activation, _) = initialize_with_dynamic_plugins(json!([{
+        "plugin_id": "fixture_native",
+        "kind": "rust_dynamic",
+        "manifest_ref": manifest,
+        "config": {}
+    }]));
+
+    // The LLM entry points are managed actions too, and a registration that runs
+    // in another process is refused when it is reached with no budget. Until they
+    // published one, this call failed with "reached outside a managed action" —
+    // which the tool path's qualification could not see, because it never ran a
+    // plugin through the LLM family.
+    let name = cstring("ffi-native-llm");
+    let request = cstring(
+        r#"{"headers":{},"content":{"model":"fixture","messages":[{"role":"user","content":"hi"}]}}"#,
+    );
+    let mut out = ptr::null_mut();
+    let status = unsafe {
+        api::nemo_relay_llm_call_execute(
+            name.as_ptr(),
+            request.as_ptr(),
+            llm_exec_cb,
+            ptr::null_mut(),
+            None,
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            None,
+            None,
+            ptr::null_mut(),
+            None,
+            ptr::null(),
+            &mut out,
+        )
+    };
+    assert_eq!(
+        status,
+        NemoRelayStatus::Ok,
+        "the LLM call failed: {:?}",
+        unsafe { read_last_error() }
+    );
+    let executed = unsafe { returned_json(out) };
+    assert_eq!(
+        executed["native_plugin_llm_execution"],
+        json!(true),
+        "the plugin's LLM execution intercept did not run: {executed}"
+    );
+
+    unsafe {
+        assert_eq!(
+            api::nemo_relay_plugin_activation_clear(activation),
+            NemoRelayStatus::Ok
+        );
+        nemo_relay_plugin_activation_free(&mut activation);
+    }
+}
+
+/// Answer an LLM call with the request it was given.
+#[cfg(unix)]
+unsafe extern "C" fn llm_exec_cb(
+    _user_data: *mut libc::c_void,
+    request_json: *const c_char,
+) -> *mut c_char {
+    let request: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(request_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap_or(Json::Null);
+    CString::new(request.to_string())
+        .expect("no interior null")
+        .into_raw()
+}
+
+#[cfg(unix)]
+#[test]
+fn ffi_activation_refuses_an_unusable_host_without_falling_back() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = nemo_relay_clear_plugin_configuration();
+
+    let manifest_dir = TempDir::new().expect("native manifest tempdir");
+    let manifest = write_native_manifest(manifest_dir.path(), build_native_fixture());
+    let config = cstring(r#"{"version":1,"components":[]}"#);
+    let specs = cstring(
+        &json!([{
+            "plugin_id": "fixture_native",
+            "kind": "rust_dynamic",
+            "manifest_ref": manifest,
+            "config": {}
+        }])
+        .to_string(),
+    );
+    // A host that exists and is not a host: the deployment names one, the
+    // supervisor tries to start it, and the session is never established. What
+    // must not happen is the plugin being loaded here instead. The temp
+    // directory is the cheapest such thing — it exists, and nothing can execute
+    // it — so the case is a fast failure rather than a startup timeout.
+    let unusable = manifest_dir.path().to_path_buf();
+    let previous = std::env::var_os("NEMO_RELAY_PLUGIN_HOST");
+    // Safety: the test mutex serializes this with every other test in the file.
+    unsafe { std::env::set_var("NEMO_RELAY_PLUGIN_HOST", &unusable) };
+
+    let mut activation = ptr::null_mut();
+    let mut report = ptr::null_mut();
+    let status = unsafe {
+        api::nemo_relay_initialize_with_dynamic_plugins(
+            config.as_ptr(),
+            specs.as_ptr(),
+            &mut activation,
+            &mut report,
+        )
+    };
+    match previous {
+        Some(value) => unsafe { std::env::set_var("NEMO_RELAY_PLUGIN_HOST", value) },
+        None => unsafe { std::env::remove_var("NEMO_RELAY_PLUGIN_HOST") },
+    }
+
+    assert_ne!(
+        status,
+        NemoRelayStatus::Ok,
+        "a host that cannot serve a session must not activate anything"
+    );
+    assert!(
+        activation.is_null(),
+        "no handle is handed out for a failure"
+    );
+    assert!(
+        unsafe { read_last_error() }
+            .unwrap_or_default()
+            .contains("native plugin load failed"),
+        "the failure has to say the plugin load failed: {:?}",
+        unsafe { read_last_error() }
+    );
+    assert!(
+        !plugin_kinds().iter().any(|kind| kind == "fixture_native"),
+        "the plugin must not be loaded in this process as a fallback"
+    );
+}
+
 #[test]
 fn ffi_activation_loads_worker_callbacks_and_stops_worker_on_clear() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -388,6 +587,7 @@ fn ffi_activation_loads_worker_callbacks_and_stops_worker_on_clear() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ffi_activation_rolls_back_an_earlier_native_load_when_a_later_load_fails() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -493,20 +693,59 @@ unsafe fn returned_json(pointer: *mut c_char) -> Json {
     serde_json::from_str(&json).expect("returned JSON")
 }
 
+/// Ask the chain what a tool call's arguments become.
+///
+/// A managed call rather than a registry query, because that is the only place a
+/// registration living in another process may run: the runtime decides how long
+/// the work may take, and a plugin reached from nowhere in particular has no
+/// budget to be trusted with. The callback runs the tool and returns what it was
+/// given, so the assertion is about the intercept and not about the tool.
 fn tool_request_intercepts(name: &str, args: Json) -> Json {
     let name = cstring(name);
     let args = cstring(&args.to_string());
-    let mut output = ptr::null_mut();
+    let mut executed = ptr::null_mut();
     let status = unsafe {
-        api::nemo_relay_tool_request_intercepts(name.as_ptr(), args.as_ptr(), &mut output)
+        api::nemo_relay_tool_call_execute(
+            name.as_ptr(),
+            args.as_ptr(),
+            echo_tool_cb,
+            ptr::null_mut(),
+            None,
+            ptr::null(),
+            1,
+            ptr::null(),
+            ptr::null(),
+            &mut executed,
+        )
     };
     assert_eq!(
         status,
         NemoRelayStatus::Ok,
-        "tool request intercept failed: {:?}",
+        "the managed tool call failed: {:?}",
         unsafe { read_last_error() }
     );
-    unsafe { returned_json(output) }
+    let executed = unsafe { returned_json(executed) };
+    executed["result"].clone()
+}
+
+/// Return the tool arguments this call was given.
+///
+/// The intercepts have already run by the time this is called, so what comes
+/// back is what they rewrote the arguments into — wrapped in the execution
+/// result shape a tool body answers with.
+unsafe extern "C" fn echo_tool_cb(
+    _user_data: *mut libc::c_void,
+    args_json: *const c_char,
+) -> *mut c_char {
+    let args: Json = serde_json::from_str(
+        unsafe { CStr::from_ptr(args_json) }
+            .to_str()
+            .unwrap_or("null"),
+    )
+    .unwrap_or(Json::Null);
+    CString::new(json!({ "result": args }).to_string())
+        .expect("no interior null")
+        .into_raw()
 }
 
 fn plugin_kinds() -> Vec<String> {
@@ -518,6 +757,7 @@ fn plugin_kinds() -> Vec<String> {
     serde_json::from_value(unsafe { returned_json(output) }).expect("plugin kinds JSON")
 }
 
+#[cfg(unix)]
 fn build_native_fixture() -> &'static Path {
     prepared_fixture("NEMO_RELAY_TEST_NATIVE_PLUGIN")
 }
@@ -556,6 +796,7 @@ fn prepared_fixture(environment: &str) -> &'static Path {
     Box::leak(path.into_boxed_path())
 }
 
+#[cfg(unix)]
 fn write_native_manifest(directory: &Path, library: &Path) -> PathBuf {
     let manifest = directory.join("relay-plugin.toml");
     std::fs::write(

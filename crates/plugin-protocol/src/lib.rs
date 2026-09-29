@@ -1,0 +1,2476 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Stable contract for executing native plugins outside the kernel process.
+//!
+//! Native plugins are loaded by an unsafe dynamic loader, and that loader holds
+//! almost all of the kernel's `unsafe`. Moving it into another crate inside the
+//! same process would reorganise the source without moving the trust boundary: a
+//! memory-corruption bug in the loader would still corrupt the kernel. The
+//! destination is therefore a separate process reached through this contract —
+//! the kernel owns the interface, the runtime supplies the implementation, and
+//! dynamic loading happens on the far side of the boundary.
+//!
+//! This crate is the vocabulary only. It defines the operations, the identities
+//! they act on, the structured failures, and the version handshake that lets a
+//! mismatch fail closed. It deliberately ships no loader, no transport, and no
+//! `unsafe`: the implementation stays where it is until the increment that moves
+//! it can be reviewed on its own.
+//!
+//! The kernel depends on this crate, and on it only as an interface: the plugin
+//! execution module names these types and enforces the deadline rule in front of
+//! every backend, while the loader and the transport stay behind the boundary.
+
+use nemo_relay_types::api::event::ScopeCategory;
+use serde::{Deserialize, Serialize};
+
+pub use nemo_relay_types::api::event::{
+    DataSchema, EventCategory, EventSanitizeFields, LogSeverity,
+};
+pub use nemo_relay_types::api::scope::ScopeType;
+pub use nemo_relay_types::codec::identity::{BuiltinLlmCodec, LlmCodecIdentity};
+pub use nemo_relay_types::execution::{DispatchState, OutcomeCertainty};
+pub use uuid::Uuid;
+
+/// The exact attachment point a registration installs itself at.
+///
+/// This is the runtime's own vocabulary rather than a second enum of the same
+/// sixteen values. Two lists describing one set of attachment points would drift,
+/// and the drift would appear as a proxy installed at the wrong point — the
+/// failure this field exists to make impossible. Re-exporting also means the
+/// loader can report what it registered without this crate having to describe
+/// the runtime to it.
+pub use nemo_relay_types::api::registry::RuntimeRegistrationKind as PluginRegistrationOperation;
+
+/// Version of the wire contract.
+///
+/// Bumped whenever any type below changes shape, because the two sides of the
+/// boundary are separate processes that may be deployed independently.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Largest framed message either side will accept.
+///
+/// A hostile or broken peer must not be able to make the other side allocate
+/// without bound, so the limit is part of the contract rather than a transport
+/// detail.
+pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
+
+/// The newest native ABI revision this boundary can carry.
+///
+/// The boundary represents a fixed set of attachment classes, so a host whose
+/// loader can load a newer ABI than the kernel can proxy is a host that would
+/// hand the kernel a registration it has no representation for. The number is
+/// written here rather than imported from the ABI crate on purpose: importing it
+/// would make the kernel's expectation and the host's capability the same
+/// constant, and a shared constant is not a check. A future ABI bump therefore
+/// fails the handshake until someone decides what the boundary does with the new
+/// revision, which is the decision the current ABI's classes each needed.
+pub const SUPPORTED_NATIVE_ABI_VERSION: u32 = 5;
+
+/// Stable identity of one loaded plugin instance.
+///
+/// `generation` exists for the same reason leases carry one: a handle from a
+/// previous load must not be able to address a later instance that reused the
+/// identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHandle {
+    /// Deployment-chosen identifier for the plugin.
+    pub plugin_id: String,
+    /// Monotonic generation, incremented on every load of this plugin.
+    pub generation: u64,
+}
+
+/// What a plugin declares about itself once loaded.
+///
+/// Every field that the host may genuinely not know is optional rather than
+/// defaulted. An empty string is a claim; `None` is the truth, and the
+/// difference matters because these values feed capability identity. The
+/// negotiated ABI version in particular is what the loaded library declared,
+/// never the host's maximum supported version — reporting the maximum would
+/// invent a guarantee the plugin never made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginDescriptor {
+    /// Deployment-chosen identifier the plugin was loaded under.
+    pub plugin_id: String,
+    /// Version the plugin reports for itself, when it reports one.
+    pub plugin_version: Option<String>,
+    /// ABI version negotiated with the loaded library, when it declared one.
+    pub negotiated_abi_version: Option<u16>,
+    /// Digest of the manifest the plugin was loaded from, when one was read.
+    pub manifest_digest: Option<String>,
+    /// Plugin kinds the host registered on the plugin's behalf.
+    pub registration_kinds: Vec<String>,
+    /// What each registration installs, so a proxy can be built from it.
+    pub registrations: Vec<PluginRegistrationDescriptor>,
+    /// Capabilities the plugin offers.
+    pub capabilities: Vec<PluginCapability>,
+}
+
+/// How a registration sits relative to others in its class.
+///
+/// Both fields are optional because the native ABI declares them for some
+/// registrations and not others: a subscriber carries no priority, and only the
+/// intercept and middleware hooks say whether a callback may break its chain. A
+/// default here would be a claim nobody made, and this descriptor exists so the
+/// side building a proxy knows what the plugin actually declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistrationOrdering {
+    /// Lower runs first, when the registration declares an order.
+    pub priority: Option<i32>,
+    /// Whether it may stop the chain it is part of, when that is declared.
+    pub may_break_chain: Option<bool>,
+}
+
+/// Whether a registration answers once or streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginExecutionShape {
+    /// One request, one response.
+    Unary,
+    /// One request, a sequence of responses.
+    Streaming,
+}
+
+/// The shape a registration at this attachment point has.
+///
+/// Derived rather than asserted, because the shape is a property of the
+/// attachment point: exactly one attachment point streams today, and a host
+/// reporting a streaming callback anywhere else would be describing something
+/// the runtime does not have.
+pub fn registration_shape(operation: PluginRegistrationOperation) -> PluginExecutionShape {
+    use PluginRegistrationOperation as Operation;
+    match operation {
+        Operation::Subscriber
+        | Operation::EventMetadataInjector
+        | Operation::MarkSanitizeGuardrail
+        | Operation::ScopeSanitizeStartGuardrail
+        | Operation::ScopeSanitizeEndGuardrail
+        | Operation::ToolSanitizeRequestGuardrail
+        | Operation::ToolSanitizeResponseGuardrail
+        | Operation::ToolConditionalExecutionGuardrail
+        | Operation::ToolRequestIntercept
+        | Operation::ToolExecutionIntercept
+        | Operation::LlmSanitizeRequestGuardrail
+        | Operation::LlmSanitizeResponseGuardrail
+        | Operation::LlmConditionalExecutionGuardrail
+        | Operation::LlmRequestIntercept
+        | Operation::LlmExecutionIntercept => PluginExecutionShape::Unary,
+        Operation::LlmStreamExecutionIntercept => PluginExecutionShape::Streaming,
+    }
+}
+
+/// Everything the kernel needs to re-create one registration as a proxy.
+///
+/// A loaded plugin is not a single thing the kernel invokes: it registers
+/// components that the runtime then calls, and each installs itself at an exact
+/// attachment point with an order and a shape of its own. A process host cannot
+/// hand back local objects, so it hands back this description and the runtime
+/// builds a proxy from it. "It registered a guardrail" is not enough to build
+/// anything: without the attachment point the kernel knows that something
+/// exists but not where to install it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistrationDescriptor {
+    /// Identity of this registration in the runtime's namespace.
+    ///
+    /// The qualified name rather than the name the plugin authored: the runtime
+    /// qualifies plugin-local names with the component namespace so two
+    /// components of one plugin cannot collide, and the qualified name is what
+    /// gates match and ordering applies to.
+    pub registration_id: String,
+    /// Component kind that made this registration.
+    pub component_kind: String,
+    /// The exact attachment point this registration installs itself at.
+    pub operation: PluginRegistrationOperation,
+    /// Where it sits relative to others, as far as it declares.
+    pub ordering: PluginRegistrationOrdering,
+    /// Whether its callback answers once or streams.
+    pub shape: PluginExecutionShape,
+    /// The registration this one gates, when it is a gate.
+    ///
+    /// A conditional middleware guardrail is not a component at an attachment
+    /// point: it decides whether another registration runs. The name is the one
+    /// the plugin supplied, which the runtime matches against the qualified
+    /// registration name, so a gate whose target does not exist matches nothing
+    /// rather than installing nothing. Describing a gate without its target
+    /// would leave a proxy that gates nothing.
+    pub gated_registration: Option<String>,
+    /// Configuration keys the component reads.
+    pub config_keys: Vec<String>,
+    /// Digest the plugin declares, when it declares one.
+    pub declared_digest: Option<String>,
+}
+
+/// One capability a plugin offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCapability {
+    /// Capability identifier.
+    pub id: String,
+    /// What kind of runtime work this capability performs.
+    pub kind: PluginCapabilityKind,
+    /// Digest of the capability's declared shape, when the plugin supplies one.
+    ///
+    /// A digest that the plugin supplies proves only that the plugin has not
+    /// changed its claim since it was loaded. Deriving it from a canonical
+    /// descriptor on the kernel side is a later concern, and this field is
+    /// deliberately named so that is not mistaken for something it is not.
+    pub declared_digest: Option<String>,
+}
+
+/// Kind of runtime work a capability performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCapabilityKind {
+    /// Intercepts or provides a tool.
+    Tool,
+    /// Intercepts or provides an LLM call.
+    Llm,
+    /// Observes events without changing them.
+    Subscriber,
+}
+
+/// First message either side sends, carrying the version it speaks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHandshake {
+    /// Protocol version the sender implements.
+    pub protocol_version: u16,
+}
+
+/// The session a handshake established.
+///
+/// Returned rather than asserted, because the host is the only party that knows
+/// which process it is and the kernel is the only party that can check the
+/// frame limit it offers. Nothing here is a claim the kernel simply adopts:
+/// `host_instance_id` and `host_nonce` exist so that a restarted host cannot be
+/// mistaken for the one an open session belongs to, and `maximum_frame_bytes`
+/// is compared against the kernel's own limit before it is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSessionIdentity {
+    /// Protocol version the session was established at.
+    pub protocol_version: u16,
+    /// What the host says it was built from.
+    ///
+    /// The host is a separate executable, so "the runtime and the host are the
+    /// same release" is a claim rather than a fact: nothing in the process model
+    /// makes a deployment replace both at once, and an installer that is
+    /// interrupted between two renames is a mixed pair. The kernel compares this
+    /// against what it expects before any operation, because a mismatch found
+    /// when a plugin is loaded is a mismatch found after the decision to hand
+    /// that host work.
+    pub host_build: PluginHostBuild,
+    /// The session every later operation names.
+    pub session_id: String,
+    /// Which host process this session belongs to.
+    pub host_instance_id: String,
+    /// Per-session nonce the host chose.
+    pub host_nonce: String,
+    /// Largest frame the host will accept.
+    pub maximum_frame_bytes: u32,
+    /// Features both sides agreed on.
+    pub supported_features: Vec<String>,
+    /// Kernel-held state this host accepted, and nothing else.
+    ///
+    /// Empty is the default and means the host reads nothing. The offer is the
+    /// kernel's decision, so this can only ever be a subset of it, and
+    /// [`PluginSessionIdentity::accepted_within`] is how the kernel checks that
+    /// rather than trusting the answer.
+    pub accepted_read_capabilities: Vec<PluginHostReadCapability>,
+}
+
+/// What a host says it was built from.
+///
+/// Both halves are the host's own account of itself. They are compared rather
+/// than used, in the same way every other host-supplied value on this boundary
+/// is: the host that lies about its release is a host that fails the check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHostBuild {
+    /// The release the host was built from.
+    pub release_version: String,
+    /// The newest native ABI revision the host's loader can load.
+    pub native_abi_version: u32,
+}
+
+impl PluginHostBuild {
+    /// The build this runtime expects a host to have been made from.
+    ///
+    /// The release is the one the caller is part of — a binding passes its own,
+    /// because the host beside it is the host that release packaged — and the
+    /// ABI revision is the newest this boundary can carry.
+    pub fn expected(release_version: impl Into<String>) -> Self {
+        Self {
+            release_version: release_version.into(),
+            native_abi_version: SUPPORTED_NATIVE_ABI_VERSION,
+        }
+    }
+
+    /// What the host is that this build is not, if anything is.
+    pub fn disagreement_with(&self, expected: &Self) -> Option<PluginHostDisagreement> {
+        if self.release_version != expected.release_version {
+            return Some(PluginHostDisagreement::Release {
+                host: self.release_version.clone(),
+                runtime: expected.release_version.clone(),
+            });
+        }
+        if self.native_abi_version != expected.native_abi_version {
+            return Some(PluginHostDisagreement::NativeAbi {
+                host: self.native_abi_version,
+                runtime: expected.native_abi_version,
+            });
+        }
+        None
+    }
+}
+
+/// One way a host's build can disagree with what the runtime expects.
+///
+/// Named rather than reported as a message so the refusal carries a code a
+/// caller can act on: a release mismatch is "install the pair together", and an
+/// ABI mismatch is "this runtime does not speak to that host's loader at all".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginHostDisagreement {
+    /// The host came from a different release than this runtime.
+    Release {
+        /// Release the host was built from.
+        host: String,
+        /// Release this runtime is.
+        runtime: String,
+    },
+    /// The host's loader carries a native ABI this boundary does not.
+    NativeAbi {
+        /// Native ABI revision the host's loader carries.
+        host: u32,
+        /// Native ABI revision this boundary carries.
+        runtime: u32,
+    },
+}
+
+impl PluginHostDisagreement {
+    /// The failure code and message a refusal should carry.
+    pub fn into_failure(self) -> (PluginFailureCode, String) {
+        match self {
+            Self::Release { host, runtime } => (
+                PluginFailureCode::Rejected,
+                format!(
+                    "the plugin host was built from release {host}, and this runtime is {runtime}: \
+                     a host and the runtime that starts it belong to the same release"
+                ),
+            ),
+            Self::NativeAbi { host, runtime } => (
+                PluginFailureCode::AbiMismatch {
+                    supported: u16::try_from(runtime).unwrap_or(u16::MAX),
+                    reported: u16::try_from(host).unwrap_or(u16::MAX),
+                },
+                format!(
+                    "the plugin host's loader carries native ABI v{host}, and this boundary carries \
+                     v{runtime}"
+                ),
+            ),
+        }
+    }
+}
+
+impl PluginSessionIdentity {
+    /// Whether this session accepted only what it was offered.
+    pub fn accepted_within(&self, offered: &[PluginHostReadCapability]) -> bool {
+        self.accepted_read_capabilities
+            .iter()
+            .all(|capability| offered.contains(capability))
+    }
+}
+
+/// Kernel-held state a plugin host may be allowed to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHostReadCapability {
+    /// The runtime's own diagnostics snapshot.
+    RuntimeDiagnostics,
+    /// The runtime's global registration inventory.
+    RegistrationInventory,
+}
+
+/// What a host asks for when it establishes a session.
+///
+/// The request is a request: what the host may read is what the kernel granted
+/// in the session it established, never what it asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHandshakeRequest {
+    /// Protocol version the host speaks.
+    pub protocol_version: u16,
+    /// Digest of the runtime identity the host expects to be bound to.
+    pub runtime_binding_digest: String,
+    /// Nonce the host chose for this session.
+    pub client_nonce: String,
+    /// Credential the supervisor passed out of band.
+    pub session_credential: String,
+    /// Largest frame the host will accept.
+    pub maximum_frame_bytes: u32,
+    /// Features the host offers.
+    pub supported_features: Vec<String>,
+    /// Kernel-held state the host is offered.
+    pub offered_read_capabilities: Vec<PluginHostReadCapability>,
+    /// Registration classes the kernel can install a proxy for.
+    ///
+    /// The host refuses to load a plugin whose registrations are not all in this
+    /// set, because the alternative is a load that reports success while a
+    /// registered callback disappears. It is per-session rather than per-plugin
+    /// because it is a property of the backend the kernel composed.
+    pub supported_registration_operations: Vec<PluginRegistrationOperation>,
+}
+
+/// A scope named by its canonical identity.
+///
+/// The UUID, not a name and not an opaque token: a name is not unique, and a
+/// token would have to be resolved before it meant anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginScopeReference {
+    /// The scope's UUID.
+    pub scope_id: Uuid,
+}
+
+impl PluginScopeReference {
+    /// Parse a scope identity from its canonical text.
+    ///
+    /// Canonical means the hyphenated form: `Uuid` also accepts simple, braced
+    /// and URN spellings of the same value, and accepting those would give the
+    /// boundary several spellings of one identity, so a log, a gate or a
+    /// comparison that used the text rather than the value would disagree with
+    /// itself.
+    pub fn from_canonical(text: &str) -> Result<Self, PluginProtocolError> {
+        let text = text.trim();
+        let scope_id = Uuid::parse_str(text).map_err(|_| {
+            PluginProtocolError::new(
+                PluginFailureCode::MalformedResponse,
+                format!("a scope identity that is not a UUID: {text:?}"),
+            )
+        })?;
+        if scope_id.hyphenated().to_string() != text {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::MalformedResponse,
+                format!("a scope identity that is not in canonical form: {text:?}"),
+            ));
+        }
+        Ok(Self { scope_id })
+    }
+}
+
+/// The complete payload of a mark.
+///
+/// Every field the ABI may omit is optional here rather than defaulted: the
+/// parent scope, metadata, data schema and severity all change the event a
+/// subscriber sees, and a default would be an event nobody asked for. The name
+/// is the minimum, because a mark without one addresses nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginMarkEmit {
+    /// Correlation identifier for the operation that emitted it.
+    pub operation_request_id: String,
+    /// Identity of this call, distinct from the operation it belongs to.
+    pub host_call_id: String,
+    /// The mark's name.
+    pub name: String,
+    /// The mark's payload, when it has one.
+    pub data_json: Option<String>,
+    /// The scope the mark belongs to, when it has one.
+    pub parent: Option<PluginScopeReference>,
+    /// Metadata attached to the mark, when it has any.
+    pub metadata_json: Option<String>,
+    /// The schema the payload is written against, when it declares one.
+    pub data_schema: Option<DataSchema>,
+    /// How severe the mark is, when it declares that.
+    pub severity: Option<LogSeverity>,
+    /// Microseconds since the Unix epoch, when the caller supplies a time.
+    pub timestamp_unix_micros: Option<u64>,
+}
+
+/// What a caller wants done with the scope stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginScopeOperation {
+    /// Read the current scope.
+    Current,
+    /// Push a new scope.
+    Push,
+    /// Pop a scope.
+    Pop,
+    /// Create an isolated stack.
+    CreateIsolated,
+    /// Release an isolated stack.
+    ReleaseIsolated,
+}
+
+impl PluginScopeOperation {
+    /// Whether this operation carries a payload.
+    ///
+    /// Push and pop describe a scope; the others name one that already exists
+    /// or needs no description. A payload on the wrong one is a request that
+    /// says two things, and the two cannot both be true.
+    pub const fn carries_payload(self) -> bool {
+        matches!(self, Self::Push | Self::Pop)
+    }
+}
+
+/// One call against the scope stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginScopeStackRequest {
+    /// Correlation identifier for the operation it belongs to.
+    pub operation_request_id: String,
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// What to do.
+    pub operation: PluginScopeOperation,
+    /// What to do it with, when the operation carries one.
+    pub payload_json: Option<String>,
+}
+
+/// Which codec operation is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCodecOperation {
+    /// Decode an LLM request.
+    LlmRequestDecode,
+    /// Encode an annotated LLM request.
+    LlmRequestEncode,
+    /// Decode an LLM response.
+    LlmResponseDecode,
+}
+
+/// One codec resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginResolveCodecRequest {
+    /// Correlation identifier for the operation it belongs to.
+    pub operation_request_id: String,
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// What to do.
+    pub operation: PluginCodecOperation,
+    /// What to do it with.
+    pub payload_json: String,
+}
+
+/// One chunk of a stream the runtime produces for a callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationChunk {
+    /// The continuation call this chunk belongs to.
+    pub host_call_id: String,
+    /// One-based order within that call.
+    pub sequence: u64,
+    /// The chunk.
+    pub chunk_json: String,
+}
+
+/// What a plugin decided about the chunk it received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginChunkDecision {
+    /// Produce the next chunk.
+    Continue,
+    /// Stop producing.
+    Stop,
+}
+
+/// The plugin's answer about one chunk.
+///
+/// The runtime does not produce the next chunk until this arrives, which is what
+/// makes the in-process callback's return value mean the same thing here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationDisposition {
+    /// The continuation call this answers.
+    pub host_call_id: String,
+    /// Which chunk it answers, so an answer cannot be applied to whichever
+    /// chunk happened to be outstanding.
+    pub sequence: u64,
+    /// Whether to continue, or the failure that ended the stream.
+    pub disposition: Result<PluginChunkDecision, PluginFailure>,
+}
+
+/// The result of one lifecycle operation.
+///
+/// Distinct from a transport failure, and from a malformed message. The peer
+/// answered coherently and the answer says either that the operation completed
+/// or that it failed for a reason this contract defines. Collapsing those into
+/// a transport error would lose the difference between "the host told me this
+/// plugin is already loaded" and "I could not reach the host".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleOutcome<T> {
+    /// The operation completed.
+    Completed(T),
+    /// The peer answered, and the answer is a structured failure.
+    Failed(PluginFailure),
+}
+
+impl<T> LifecycleOutcome<T> {
+    /// Turn a result into a lifecycle outcome.
+    ///
+    /// The two are the same distinction: a failure the peer reported is an
+    /// outcome, and anything else is not.
+    pub fn from_result(result: Result<T, PluginFailure>) -> Self {
+        match result {
+            Ok(value) => Self::Completed(value),
+            Err(failure) => Self::Failed(failure),
+        }
+    }
+
+    /// Read the outcome as a result.
+    ///
+    /// A reported failure is a result the caller has to handle, not an error the
+    /// conversion raised.
+    pub fn into_result(self) -> Result<T, PluginFailure> {
+        match self {
+            Self::Completed(value) => Ok(value),
+            Self::Failed(failure) => Err(failure),
+        }
+    }
+}
+
+/// Identity of the artifact a load was approved against.
+///
+/// The runtime approves this; whatever performs the load verifies it
+/// immediately before opening the library. A reference alone is not enough,
+/// because a reference can be verified and then left in place while the file
+/// behind it is replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginArtifactIdentity {
+    /// SHA-256 of the manifest, which decides what is loaded and how.
+    pub manifest_sha256: String,
+    /// SHA-256 of the library the manifest names.
+    pub library_sha256: String,
+}
+
+/// Load a plugin into the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLoadRequest {
+    /// Deployment-chosen identifier to load under.
+    pub plugin_id: String,
+    /// Host-specific location of the plugin artifact.
+    pub artifact: String,
+    /// What the runtime approved, for the loader to verify before opening.
+    pub identity: PluginArtifactIdentity,
+}
+
+/// Remove a loaded plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginUnloadRequest {
+    /// Instance to unload.
+    pub handle: PluginHandle,
+}
+
+/// Invoke one capability on a loaded plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInvokeRequest {
+    /// Instance to invoke.
+    pub handle: PluginHandle,
+    /// The registration to run, named as the host reported it.
+    ///
+    /// The identity is the one the host gave when the components were activated,
+    /// because that is what a kernel installs its proxy under: resolving a
+    /// capability or a component back to a registration could pick a different
+    /// one than the proxy stands for.
+    pub registration_id: String,
+    /// Canonical JSON arguments.
+    pub arguments: String,
+    /// Milliseconds the kernel will wait before it stops waiting.
+    ///
+    /// This is a deadline for the caller, not a promise about the plugin: a
+    /// plugin that ignores it is killed by the host, and the result is an
+    /// outcome the kernel cannot observe rather than a failure it can assume.
+    pub budget_millis: u64,
+}
+
+/// Result of one invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInvokeResponse {
+    /// Canonical JSON result.
+    pub output: String,
+}
+
+/// Ask the host what it currently holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInspectRequest {
+    /// Instance to describe, or `None` for every loaded instance.
+    pub handle: Option<PluginHandle>,
+}
+
+/// A request to join a session this host has already established.
+///
+/// The same three facts a handshake proves — the credential, the runtime binding
+/// and the protocol version — plus the session being joined. It carries no frame
+/// limit, no feature list and no read capabilities: those belong to the session,
+/// and a caller that could state them could state weaker ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAttachRequest {
+    /// The session being joined.
+    pub session_id: String,
+    /// The credential this host was started with.
+    pub session_credential: String,
+    /// Digest of the runtime identity the session is bound to.
+    pub runtime_binding_digest: String,
+    /// Protocol version of the attaching client.
+    pub protocol_version: u16,
+}
+
+/// The parameters of the session an attach joined.
+///
+/// Every field is what the session already fixed. An attaching client checks them
+/// against what it was told rather than using them to negotiate anything: its
+/// only decision is whether this is the session it meant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAttachedSession {
+    /// The session that was joined.
+    pub session_id: String,
+    /// Frame limit the session negotiated.
+    pub negotiated_frame_limit: u32,
+    /// Registration classes the session can serve.
+    pub supported_registration_operations: Vec<PluginRegistrationOperation>,
+    /// Kernel-held state this session accepted.
+    pub accepted_read_capabilities: Vec<PluginHostReadCapability>,
+    /// Digest of the runtime identity the session is bound to.
+    pub runtime_binding_digest: String,
+}
+
+/// Which sanitizer a projection is for.
+///
+/// Closed on purpose: three families share one shape, and a class outside this set
+/// has no runner to invoke it, so it is refused at conversion rather than carried
+/// and rejected later by a match arm somebody forgot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginEventSanitizeClass {
+    /// Sanitizes the mutable fields of a mark.
+    Mark,
+    /// Sanitizes the mutable fields of a scope-start event.
+    ScopeStart,
+    /// Sanitizes the mutable fields of a scope-end event.
+    ScopeEnd,
+}
+
+/// What a sanitizer is shown, and the whole of what it is shown.
+///
+/// This is a projection, not the event. The runtime's own sanitizer callbacks
+/// receive an `Event`, and passing that across the boundary because the in-process
+/// API happens to have one would ship the runtime's internal representation to a
+/// plugin for the host's convenience: the uuid, the timestamps, the propagation
+/// root, and every field `Event` grows later.
+///
+/// What crosses instead is the identity a sanitizer decides on — its name, the scope
+/// phase when it is a scope event, the semantic category, and the schema that
+/// describes the payload — plus the mutable observability fields it is allowed to
+/// change. Every one of those is kernel-authored and read-only to the plugin: the
+/// boundary grants a sanitizer the right to *read* what it needs to decide, and the
+/// right to *write* only the fields an observer would see.
+///
+/// The category and the data schema are here because a sanitizer decides with them
+/// rather than about them: the PII redaction component, which the repository ships,
+/// gates its scope sanitizers on `category` and recognizes a Relay metric mark by its
+/// `data_schema`. A projection without them would not have narrowed that sanitizer —
+/// it would have silently changed which path it takes.
+///
+/// The approved field set is enforced by a test rather than by this comment: a field
+/// added to `Event` does not reach a plugin until somebody deliberately adds it here,
+/// and a field added *here* fails that test until somebody deliberately approves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginEventSanitizeCall {
+    /// Which sanitizer family this is for.
+    pub class: PluginEventSanitizeClass,
+    /// The event's name.
+    pub name: String,
+    /// The scope lifecycle phase, for a scope event.
+    pub scope_category: Option<String>,
+    /// The event's semantic category, which a sanitizer may branch on.
+    ///
+    /// `None` is a mark that carries no category; a scope event always has one. Typed
+    /// rather than an open string so that a category a newer producer introduced keeps
+    /// its value instead of being flattened into whatever this side recognizes.
+    pub category: Option<EventCategory>,
+    /// The schema describing the payload, when the event declares one.
+    ///
+    /// A sanitizer that treats one kind of payload specially — a Relay metric mark, for
+    /// instance — decides with this, so it has to be the event's own value rather than
+    /// a summary of it.
+    pub data_schema: Option<DataSchema>,
+    /// The mutable observability fields the sanitizer may change.
+    pub fields: EventSanitizeFields,
+}
+
+impl PluginEventSanitizeClass {
+    /// The lifecycle phase this class sanitizes, when it sanitizes a scope event.
+    ///
+    /// A mark has none, and that is the whole difference between the three
+    /// directions: the phase is what separates the scope pair, so a projection that
+    /// says both a class and a phase has said the same thing twice, and this is the
+    /// statement that is authoritative.
+    pub fn scope_category(self) -> Option<ScopeCategory> {
+        match self {
+            Self::Mark => None,
+            Self::ScopeStart => Some(ScopeCategory::Start),
+            Self::ScopeEnd => Some(ScopeCategory::End),
+        }
+    }
+}
+
+/// The wire name of a lifecycle phase, as it appears in a projection.
+fn phase_name(category: ScopeCategory) -> &'static str {
+    match category {
+        ScopeCategory::Start => "start",
+        ScopeCategory::End => "end",
+    }
+}
+
+impl PluginEventSanitizeCall {
+    /// Project one event for one class.
+    ///
+    /// The class is part of the capability rather than a field inside the payload,
+    /// so an event the class was never meant to see is refused here rather than
+    /// shown to a plugin: a mark sanitizer is not shown a scope, and the two scope
+    /// directions are not each other.
+    pub fn from_event(
+        class: PluginEventSanitizeClass,
+        event: &nemo_relay_types::api::event::Event,
+        fields: EventSanitizeFields,
+    ) -> Result<Self, PluginProtocolError> {
+        let shown = match event {
+            nemo_relay_types::api::event::Event::Mark(_) => None,
+            nemo_relay_types::api::event::Event::Scope(scope) => Some(scope.scope_category),
+        };
+        if shown != class.scope_category() {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!(
+                    "a {class:?} sanitizer was handed {} rather than the event its class \
+                     sanitizes",
+                    match shown {
+                        None => "a mark".to_string(),
+                        Some(category) => format!("a scope {}", phase_name(category)),
+                    }
+                ),
+            ));
+        }
+        Ok(Self {
+            class,
+            name: event.name().to_owned(),
+            scope_category: class.scope_category().map(phase_name).map(str::to_owned),
+            // Read from the event rather than rebuilt from the class: a sanitizer
+            // branches on what the event actually is, not on what its class implies.
+            category: event.category().cloned(),
+            data_schema: event.data_schema().cloned(),
+            fields,
+        })
+    }
+
+    /// The event this projection stands for.
+    ///
+    /// The synthetic event *is* what the sanitizer was told it would see: the name
+    /// it decides on, the phase of the class it is for, the category and data schema it
+    /// may branch on, and the mutable fields. The rest of the runtime's own event never
+    /// crossed, so there is nothing else to rebuild — the identity fields here are this
+    /// process's own, which is why a sanitizer cannot rename the event it is
+    /// sanitizing.
+    pub fn into_event(self) -> Result<nemo_relay_types::api::event::Event, PluginProtocolError> {
+        use nemo_relay_types::api::event::{
+            BaseEvent, Event, EventCategory, MarkEvent, ScopeEvent,
+        };
+
+        let expected = self.class.scope_category();
+        if self.scope_category.as_deref() != expected.map(phase_name) {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!(
+                    "a {0:?} projection states the phase {1:?}, which is not the phase its class \
+                     sanitizes",
+                    self.class, self.scope_category
+                ),
+            ));
+        }
+        // A scope event's category is required, so a scope projection that carries none
+        // is describing something the runtime cannot have produced. Refused rather than
+        // defaulted: a sanitizer that branches on the category must not be handed a
+        // fabricated one.
+        if expected.is_some() && self.category.is_none() {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "a scope projection states no category, which a scope event always has",
+            ));
+        }
+        let EventSanitizeFields {
+            data,
+            category_profile,
+            metadata,
+        } = self.fields;
+        let base = BaseEvent::builder()
+            .name(self.name)
+            .data_opt(data)
+            .data_schema_opt(self.data_schema)
+            .metadata_opt(metadata)
+            .build();
+        Ok(match expected {
+            None => Event::Mark(MarkEvent::new(base, self.category, category_profile)),
+            Some(category) => Event::Scope(ScopeEvent::new(
+                base,
+                category,
+                Vec::new(),
+                self.category.unwrap_or_else(EventCategory::custom),
+                category_profile,
+            )),
+        })
+    }
+}
+
+/// Which direction of codec work a capability authorizes.
+///
+/// The two directions are different traits on this side — a request codec decodes and
+/// encodes, a response codec decodes only — so a capability for one is not a weaker
+/// capability for the other. Naming the direction in the capability is what makes that
+/// checkable rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodecDirection {
+    /// The codec that reads the request an LLM call is about to make.
+    Request,
+    /// The codec that reads the response an LLM call returned.
+    Response,
+}
+
+/// The prefix every capability reference carries.
+pub const CODEC_REFERENCE_PREFIX: &str = "codec-";
+
+/// The most bytes a capability reference may carry.
+///
+/// A bound rather than a promise about the peer: a reference travels into the
+/// runtime's own state, so its length is this side's decision even though its
+/// authority is never derived from its shape.
+pub const MAX_CODEC_REFERENCE_BYTES: usize = 96;
+
+/// An opaque reference to one invocation's codec capability.
+///
+/// The reference is not the capability. It names something the kernel issued for one
+/// operation and one direction; the authority is the kernel's record of having issued
+/// it, and a reference this side never issued is a string with no meaning. So the shape
+/// is validated for boundedness and nothing else — a peer that guesses a well-formed
+/// reference has guessed a name, not a permission — and every use is checked against
+/// the record that produced it.
+///
+/// The codec itself never crosses. What a plugin gets is the reference, and what the
+/// runtime does with it — decoding or encoding with the codec object it already holds —
+/// happens on the side that holds the object. That is why a capability can be
+/// invocation-scoped at all: nothing about it outlives the operation it was issued for
+/// except the string, and the string is worthless on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CodecRef(String);
+
+impl CodecRef {
+    /// Issue a fresh reference.
+    ///
+    /// Unguessable because it is a time-ordered UUID rather than a counter: a peer that
+    /// sees one reference learns nothing about the next, which matters because a
+    /// reference travels to a process this side does not control.
+    pub fn issue() -> Self {
+        Self(format!(
+            "{CODEC_REFERENCE_PREFIX}{}",
+            Uuid::now_v7().simple()
+        ))
+    }
+
+    /// Accept a reference from the wire.
+    ///
+    /// # Errors
+    /// Refuses a value that is empty, longer than [`MAX_CODEC_REFERENCE_BYTES`], missing
+    /// the prefix, or carrying anything but ASCII alphanumerics after it. The refusal is
+    /// about shape: a well-formed reference this side never issued is refused later, by
+    /// the record.
+    pub fn from_opaque(value: impl Into<String>) -> std::result::Result<Self, PluginProtocolError> {
+        let value = value.into();
+        let Some(suffix) = value.strip_prefix(CODEC_REFERENCE_PREFIX) else {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "a codec reference must carry the reference prefix",
+            ));
+        };
+        if value.len() > MAX_CODEC_REFERENCE_BYTES {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                format!("a codec reference may carry at most {MAX_CODEC_REFERENCE_BYTES} bytes"),
+            ));
+        }
+        if suffix.is_empty()
+            || !suffix
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err(PluginProtocolError::new(
+                PluginFailureCode::Rejected,
+                "a codec reference names nothing this side can look up",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// The reference as it travels.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One event, on its way to a plugin that observes it.
+///
+/// The event crosses whole rather than as a summary: a subscriber decides what a
+/// runtime event means, and a summary would be this side's guess at which fields
+/// that takes. It is the runtime's own event type, in its canonical form, so a
+/// subscriber in another process sees exactly what a subscriber in this one sees
+/// — and a field added to the event does not need a second definition here to
+/// reach it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginObservedEvent {
+    /// The event, in ATOF form.
+    pub event: nemo_relay_types::api::event::Event,
+}
+
+/// What a side of the boundary knows about one plugin identifier.
+///
+/// This is the lifecycle as a value rather than as a convention inside one
+/// implementation. The rules below are the ones every backend has to follow, and
+/// they are stated here because the backend that runs in a child process and the
+/// one that runs in the caller's process must refuse the same requests with the
+/// same codes — a caller cannot act on a refusal it cannot classify, and two
+/// implementations that disagree would make the same request succeed or fail
+/// depending on which one was composed.
+///
+/// `Unloading` is not a state: an unload takes the instance out of the table
+/// while it holds the lock, so no request can observe it half-removed. A state
+/// nothing can observe would be a claim about concurrency that no reader could
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum PluginLifecycle {
+    /// Nothing is known about this identifier.
+    Absent,
+    /// A load is in progress and holds the identifier.
+    Loading,
+    /// An instance is loaded at exactly this generation.
+    Loaded {
+        /// The generation this instance was loaded at.
+        generation: u64,
+    },
+}
+
+impl PluginLifecycle {
+    /// Whether a load may start from this state.
+    ///
+    /// A load is admitted only from `Absent`. `Loading` is a reservation: a
+    /// second load that also saw "not loaded" would run the loader twice and
+    /// leave one of the two instances unreachable, so the reservation is what
+    /// makes the answer a fact rather than a race.
+    pub fn admit_load(&self) -> Result<(), PluginFailureCode> {
+        match self {
+            Self::Absent => Ok(()),
+            Self::Loading => Err(PluginFailureCode::AlreadyLoading),
+            Self::Loaded { .. } => Err(PluginFailureCode::AlreadyLoaded),
+        }
+    }
+
+    /// Whether an operation naming one instance may proceed.
+    ///
+    /// Every operation that names a generation — inspect, unload, invoke —
+    /// follows the same rule, because the refusal is the same fact in each case:
+    /// the identifier is unknown, the instance is still loading, or the handle
+    /// is from a generation that no longer exists. A handle from before a reload
+    /// must not reach the instance that replaced it, which is the one thing the
+    /// generation exists to prevent.
+    pub fn admit_generation(&self, generation: u64) -> Result<(), PluginFailureCode> {
+        match self {
+            Self::Absent => Err(PluginFailureCode::UnknownPlugin),
+            Self::Loading => Err(PluginFailureCode::AlreadyLoading),
+            Self::Loaded { generation: loaded } if *loaded == generation => Ok(()),
+            Self::Loaded { .. } => Err(PluginFailureCode::StaleHandle),
+        }
+    }
+
+    /// The generation this state names, when it names one.
+    pub fn generation(&self) -> Option<u64> {
+        match self {
+            Self::Loaded { generation } => Some(*generation),
+            Self::Absent | Self::Loading => None,
+        }
+    }
+}
+
+/// One component the kernel wants activated.
+///
+/// The kind names the component the plugin was loaded as, and the configuration
+/// is what its register callback reads. Both come from the kernel, because the
+/// kernel is the side that decides what a loaded plugin's components are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginComponentConfiguration {
+    /// Component kind, which is the kind the plugin was loaded under.
+    pub kind: String,
+    /// Canonical JSON configuration for it.
+    pub config_json: String,
+}
+
+/// Ask the host to activate components and report what they registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginActivateRequest {
+    /// Components to activate.
+    pub components: Vec<PluginComponentConfiguration>,
+    /// Whether this session is inspecting rather than serving.
+    ///
+    /// Activation runs a plugin's register callbacks, and a serving session
+    /// refuses a plugin *whole* when it registers a class that session cannot
+    /// serve — because a load reporting success while a callback disappears is
+    /// worse than a refused load. Inspection wants the opposite: it exists to find
+    /// the classes this kernel cannot serve, so it reports every descriptor,
+    /// unsupported ones included, and installs nothing.
+    ///
+    /// The flag cannot widen what a session may do: the host installs no proxies
+    /// either way — it reports what the plugin registered, and the kernel decides
+    /// what to install from that — and proxy installation refuses a class the
+    /// backend does not support. So a discovery request changes what is *reported*
+    /// and nothing else.
+    #[serde(default)]
+    pub discovery: bool,
+}
+
+/// Liveness and resource state of the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHostHealth {
+    /// Protocol version the host speaks.
+    pub protocol_version: u16,
+    /// Whether the host is accepting work.
+    pub accepting_work: bool,
+    /// Instances the host currently holds.
+    pub loaded: Vec<PluginHandle>,
+}
+
+/// Identity, binding, and budget for one operation.
+///
+/// Every operation carries one of these, and the implementation is not free to
+/// invent its own: a process backend that derived its own deadline or frame
+/// budget from somewhere else would be enforcing a different contract than the
+/// in-process one, and the two would drift the first time either changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutionContext {
+    /// Correlation identifier for this operation.
+    ///
+    /// Host calls made by the plugin while it runs carry the same identifier, so
+    /// a call belongs to exactly one operation even when several are in flight.
+    /// It is named for the operation rather than for the request because each
+    /// callback needs its own identity within it.
+    pub operation_request_id: String,
+    /// Protocol version the caller speaks.
+    pub protocol_version: u16,
+    /// Digest of the runtime identity this operation is bound to.
+    pub runtime_binding_digest: String,
+    /// Wall-clock deadline in milliseconds since the Unix epoch.
+    ///
+    /// Absolute, so it survives logging and audit: a duration means nothing
+    /// once the message has been sitting in a queue.
+    pub deadline_unix_ms: u64,
+    /// What is actually left of the budget, for enforcement.
+    ///
+    /// The host enforces this one. It is derived from the trusted action budget
+    /// rather than chosen by the caller, and both forms travel because the
+    /// absolute deadline answers "when" for an auditor while this answers "how
+    /// long" for a timer.
+    pub remaining_budget_millis: u64,
+    /// Largest response the caller will accept.
+    pub max_response_bytes: u32,
+}
+
+/// The session and context every host operation carries.
+///
+/// Validated before the payload is looked at, so a message that names no
+/// session, or carries no context, or carries one this side cannot use, is
+/// refused as an envelope rather than while half of a payload has already been
+/// converted. The context is what the operation's budget comes from, so a
+/// request without one has no deadline at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOperationEnvelope {
+    /// The session the operation belongs to.
+    pub session_id: String,
+    /// Identity, binding and budget for the operation.
+    pub context: PluginExecutionContext,
+}
+
+/// A request to continue the interceptor chain.
+///
+/// A plugin's interceptor that rewrites a request and then continues is asking
+/// the runtime to run everything after it: the other interceptors, then the
+/// call itself. In process that work is the runtime's, so the request crosses;
+/// the operation identity is what lets the runtime resume the right chain
+/// position rather than starting a new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContinuationRequest {
+    /// Correlation identifier for the operation being continued.
+    pub operation_request_id: String,
+    /// Identity of this call, distinct from the operation it belongs to.
+    pub host_call_id: String,
+    /// The invocation to continue with, after any rewriting.
+    pub invocation_json: String,
+}
+
+/// How far an invocation got before it stopped.
+///
+/// The distinction is the difference between a fact and a guess. A refusal the
+/// manager made before reaching a backend is proof that nothing ran; an error
+/// that came back *after* the backend was entered is not proof of anything,
+/// because the request may have reached the plugin before the channel, the
+/// process or the deadline ended it. Collapsing the two would let a runtime
+/// state "this did not happen" about work it cannot account for, which is the
+/// one claim NEMO's effect machinery exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInvocationPhase {
+    /// The invocation was refused before any backend was reached.
+    RefusedBeforeBackend,
+    /// The backend was entered and no trustworthy terminal outcome came back.
+    BackendEntered,
+}
+
+/// Why an invocation produced no outcome, and how far it got.
+///
+/// The failure is the plugin's own vocabulary; the phase is what the caller
+/// needs to decide what may be asserted about effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInvocationError {
+    /// Why the invocation stopped.
+    pub failure: PluginFailure,
+    /// How far it got.
+    pub phase: PluginInvocationPhase,
+}
+
+impl PluginInvocationError {
+    /// What may be asserted about dispatch, given only the phase.
+    ///
+    /// A refusal before the backend means nothing was attempted. Anything after
+    /// that leaves the callback's execution unaccounted for, so the honest answer
+    /// is "an attempt was made and the outcome is unknown" rather than a
+    /// definite negative.
+    pub fn dispatch(&self) -> DispatchState {
+        match self.phase {
+            PluginInvocationPhase::RefusedBeforeBackend => DispatchState::NotDispatched,
+            PluginInvocationPhase::BackendEntered => DispatchState::DispatchAttempted,
+        }
+    }
+
+    /// What the caller can prove about the outcome, given only the phase.
+    pub fn certainty(&self) -> OutcomeCertainty {
+        match self.phase {
+            PluginInvocationPhase::RefusedBeforeBackend => OutcomeCertainty::ConfirmedFailure,
+            PluginInvocationPhase::BackendEntered => OutcomeCertainty::Unknown,
+        }
+    }
+}
+
+/// The answer to a host call that returns a value or a structured failure.
+///
+/// One type rather than one per call: the shape is the same for every host call
+/// that answers with a payload, and a second copy would be a second place for
+/// "the peer refused" to be represented differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHostCallOutcome {
+    /// The answer, or the failure that replaced it.
+    pub result: Result<String, PluginFailure>,
+}
+
+/// One frame of a streaming invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamChunk {
+    /// The operation the stream belongs to.
+    pub operation_request_id: String,
+    /// What this frame carries.
+    pub chunk: PluginStreamChunkKind,
+    /// Whether the plugin may have reached an external system.
+    pub dispatch: DispatchState,
+    /// What the runtime can prove about the outcome.
+    pub certainty: OutcomeCertainty,
+}
+
+/// What one frame of a streaming invocation carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginStreamChunkKind {
+    /// One frame of output.
+    Data(String),
+    /// The stream ended because the plugin finished.
+    End,
+    /// The stream ended because the plugin failed.
+    Failed(PluginFailure),
+}
+
+/// One message on the duplex channel between the kernel and a plugin host.
+///
+/// This channel carries the two families of call that one request and one
+/// answer cannot express: a completion the plugin settles after the callback
+/// that produced it has returned, and a downstream stream the plugin opens,
+/// paces one pull at a time, and may cancel or release while a pull is
+/// outstanding. Everything else — operations, marks, scope stack, codec
+/// resolution, registration — keeps its own single representation as a typed
+/// request; a second way to perform one of those would be a second thing that
+/// can disagree with the first.
+///
+/// The session is part of every message rather than of the channel, so a peer
+/// that receives a message from a session it no longer holds can say so instead
+/// of acting on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSessionMessage {
+    /// The session this message belongs to.
+    pub session_id: String,
+    /// What the message is.
+    pub message: PluginSessionPayload,
+}
+
+/// The messages a session carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "message")]
+pub enum PluginSessionPayload {
+    /// Open a downstream stream for one operation.
+    StreamOpen(PluginStreamOpenRequest),
+    /// The stream the kernel opened.
+    StreamOpened(PluginStreamOpened),
+    /// The kernel refused to open it.
+    StreamOpenFailed(PluginStreamOpenFailed),
+    /// Pull the next item.
+    StreamPull(PluginStreamPullRequest),
+    /// One item.
+    StreamItem(PluginStreamItem),
+    /// The stream produced everything it had.
+    StreamEnd(PluginStreamEnd),
+    /// The stream failed.
+    StreamFailed(PluginStreamFailed),
+    /// Stop producing.
+    StreamCancel(PluginStreamControl),
+    /// Drop the plugin's reference to the stream.
+    StreamRelease(PluginStreamControl),
+    /// Settle a callback that returned before its result existed.
+    CompletionSettle(PluginCompletionSettlement),
+    /// The kernel's answer to a settlement.
+    CompletionOutcome(PluginCompletionOutcome),
+    /// The awaiting runtime cancelled a pending completion.
+    CompletionCancelled(PluginCompletionCancelled),
+    /// One chunk of a stream the runtime produces for a callback.
+    ContinuationChunk(PluginContinuationChunk),
+    /// The plugin's answer about one chunk.
+    ContinuationDisposition(PluginContinuationDisposition),
+    /// Capacity the kernel grants the plugin's output stream.
+    OutputCredit(PluginOutputCredit),
+}
+
+/// Capacity for one operation's output stream.
+///
+/// The ABI's "the producer may continue" is a statement about the consumer's
+/// capacity, and transport flow control is a different statement. Making the
+/// grant explicit is what lets a host report backpressure for the same reason
+/// in process and across a boundary, instead of inferring it from a socket
+/// buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOutputCredit {
+    /// The operation whose stream the credit applies to.
+    pub operation_request_id: String,
+    /// Additional items the producer may send.
+    pub items: u64,
+}
+
+/// A request to open a downstream stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamOpenRequest {
+    /// Identity of this call, distinct from the operation it belongs to.
+    pub host_call_id: String,
+    /// The operation the stream is opened for.
+    pub operation_request_id: String,
+    /// The request to send downstream.
+    pub request_json: String,
+}
+
+/// The stream the kernel opened, addressed by identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamOpened {
+    /// Identity of the open call being answered.
+    pub host_call_id: String,
+    /// Identity of the stream every later message names.
+    pub stream_id: String,
+}
+
+/// A refusal to open a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamOpenFailed {
+    /// Identity of the open call being answered.
+    pub host_call_id: String,
+    /// Why it was refused.
+    pub failure: PluginFailure,
+}
+
+/// A request for the next item of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamPullRequest {
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// The stream to pull from.
+    pub stream_id: String,
+}
+
+/// One item of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamItem {
+    /// Identity of the pull being answered.
+    pub host_call_id: String,
+    /// The stream it belongs to.
+    pub stream_id: String,
+    /// The item.
+    pub chunk_json: String,
+}
+
+/// Clean completion of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamEnd {
+    /// Identity of the pull being answered.
+    pub host_call_id: String,
+    /// The stream that ended.
+    pub stream_id: String,
+}
+
+/// Failed completion of a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamFailed {
+    /// Identity of the pull being answered.
+    pub host_call_id: String,
+    /// The stream that failed.
+    pub stream_id: String,
+    /// Why it failed.
+    pub failure: PluginFailure,
+}
+
+/// A stream control message that names only the call and the stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStreamControl {
+    /// Identity of this call.
+    pub host_call_id: String,
+    /// The stream to act on.
+    pub stream_id: String,
+}
+
+/// A settlement of a callback that returned before its result existed.
+///
+/// The value and the failure share a `Result` rather than two fields, because a
+/// settlement that carried both would describe two outcomes for one callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCompletionSettlement {
+    /// Identity of the completion being settled.
+    pub completion_id: String,
+    /// The operation the callback belonged to.
+    pub operation_request_id: String,
+    /// The settled value, or the failure that replaced it.
+    pub result: Result<String, PluginFailure>,
+}
+
+/// The kernel's answer to a settlement.
+///
+/// `Ok(())` means the settlement was taken. A failure means it was refused —
+/// because the completion was already settled or already cancelled — and the
+/// plugin has to learn that rather than assume its result arrived, since
+/// nothing else is waiting on that callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCompletionOutcome {
+    /// Identity of the completion this answers.
+    pub completion_id: String,
+    /// Whether the settlement was taken.
+    pub result: Result<(), PluginFailure>,
+}
+
+/// Notification that the runtime awaiting a callback cancelled it.
+///
+/// The plugin is under no obligation to stop — the kernel does not trust a
+/// plugin to honour cancellation, and enforces its own deadline regardless —
+/// but a plugin that knows can release what it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCompletionCancelled {
+    /// Identity of the cancelled completion.
+    pub completion_id: String,
+}
+
+/// Result of one operation together with what is known about dispatch.
+///
+/// A failure alone is not enough to decide what happens next. If a plugin that
+/// performs a consequential external operation dies after dispatch, the effect
+/// may have happened, and the runtime has to record `UNKNOWN` rather than
+/// `FAILED`. Reporting dispatch alongside the result keeps that decision
+/// available instead of collapsing it into the failure enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutionOutcome {
+    /// Whether the plugin may have reached an external system.
+    pub dispatch: DispatchState,
+    /// Certainty about the outcome.
+    pub certainty: OutcomeCertainty,
+    /// The response, or the structured failure that replaced it.
+    pub result: Result<PluginSuccess, PluginFailure>,
+}
+
+/// Result of loading a plugin.
+///
+/// The handle is returned rather than left for the caller to derive: only the
+/// backend knows the generation it assigned, and a handle without one would
+/// address nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLoadResponse {
+    /// Identity of the loaded instance.
+    pub handle: PluginHandle,
+    /// What the plugin declares about itself.
+    pub descriptor: PluginDescriptor,
+}
+
+/// A successful response across the boundary.
+///
+/// There is deliberately no `Failed` variant. A failure travels as
+/// [`PluginFailure`] in the error channel, so a result can never say both
+/// "succeeded, and the answer is a failure" and "failed", which are the same
+/// event described two ways and would eventually disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum PluginSuccess {
+    /// Version negotiation reply.
+    Handshake(PluginHandshake),
+    /// A plugin is loaded.
+    Loaded(PluginLoadResponse),
+    /// A plugin is unloaded.
+    Unloaded,
+    /// An invocation produced output.
+    Invoked(PluginInvokeResponse),
+    /// Descriptions of loaded plugins.
+    Inspected(Vec<PluginDescriptor>),
+    /// Host liveness.
+    Health(PluginHostHealth),
+}
+
+/// Structured failure returned across the boundary, or raised before it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginFailure {
+    /// Machine-readable classification.
+    pub code: PluginFailureCode,
+    /// Human-readable detail. Never parsed.
+    pub message: String,
+}
+
+/// Why a plugin operation did not produce a result.
+///
+/// The variants are the cases the kernel has to reason about. A plugin that
+/// hangs, crashes, or answers with something unreadable is not the same as a
+/// plugin that answered with a refusal, and the caller cannot treat them alike.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PluginFailureCode {
+    /// The peer speaks a different protocol version.
+    VersionMismatch {
+        /// Version this side implements.
+        expected: u16,
+        /// Version the peer sent.
+        received: u16,
+    },
+    /// The plugin's own ABI does not match what the host supports.
+    AbiMismatch {
+        /// ABI version the host supports.
+        supported: u16,
+        /// ABI version the plugin reported.
+        reported: u16,
+    },
+    /// No loaded instance matches the handle.
+    UnknownPlugin,
+    /// The handle names a generation that is no longer the loaded one.
+    ///
+    /// Distinct from `UnknownPlugin`: the plugin exists, but a handle from
+    /// before a reload must not be able to address the instance that replaced
+    /// it, and a caller needs to be able to tell those apart.
+    StaleHandle,
+    /// Another request is already loading this plugin.
+    AlreadyLoading,
+    /// The plugin is already loaded.
+    AlreadyLoaded,
+    /// The operation was cancelled before it produced a result.
+    Cancelled,
+    /// The monotonic generation counter cannot advance.
+    GenerationExhausted,
+    /// The plugin answered, and the answer was refused.
+    Rejected,
+    /// A frame exceeded [`MAX_FRAME_BYTES`].
+    OversizedFrame {
+        /// Bytes the peer announced or sent.
+        observed: u64,
+        /// Limit in force.
+        limit: u32,
+    },
+    /// The caller's deadline elapsed before a result arrived.
+    DeadlineExceeded,
+    /// The host process died.
+    HostCrashed,
+    /// The peer's response could not be decoded.
+    MalformedResponse,
+    /// The boundary itself is unavailable.
+    Unavailable,
+}
+
+/// Failure raised while talking to a plugin host.
+#[derive(Debug, thiserror::Error)]
+#[error("plugin host failure: {failure:?}")]
+pub struct PluginProtocolError {
+    /// Structured cause.
+    pub failure: PluginFailure,
+}
+
+impl PluginProtocolError {
+    /// Build an error carrying `code` and `message`.
+    pub fn new(code: PluginFailureCode, message: impl Into<String>) -> Self {
+        Self {
+            failure: PluginFailure {
+                code,
+                message: message.into(),
+            },
+        }
+    }
+}
+
+/// Check the peer's protocol version, failing closed on any mismatch.
+///
+/// Negotiation is deliberately not "use the lower of the two": the two sides
+/// are separately deployed processes, and a mismatch means one of them is
+/// interpreting fields the other does not send. Guessing is worse than
+/// refusing.
+/// Validate an operation's context against the session it claims.
+///
+/// One function, called by both sides, because the contract has to be the same
+/// on both: the kernel refuses before it dispatches, and the host refuses before
+/// it acts, so a peer that reaches the service with a structurally valid but
+/// semantically unusable context is rejected by the host as well rather than
+/// only by the side that happened to check first. `runtime_binding_digest` is
+/// the session's binding, which is what makes this a check against the session
+/// rather than against the message.
+pub fn check_execution_context(
+    context: &PluginExecutionContext,
+    runtime_binding_digest: &str,
+    now_unix_ms: u64,
+) -> Result<(), PluginProtocolError> {
+    if context.protocol_version != PROTOCOL_VERSION {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::VersionMismatch {
+                expected: PROTOCOL_VERSION,
+                received: context.protocol_version,
+            },
+            "the operation declares a protocol version this side does not speak",
+        ));
+    }
+    if context.operation_request_id.trim().is_empty() {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "the operation carries no request identity",
+        ));
+    }
+    if context.runtime_binding_digest.trim().is_empty() {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "the operation carries no runtime binding",
+        ));
+    }
+    if !runtime_binding_digest.is_empty()
+        && context.runtime_binding_digest != runtime_binding_digest
+    {
+        // A context bound to another runtime is a message from another session
+        // wearing this one's identity.
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::Rejected,
+            "the operation is bound to a different runtime than this session",
+        ));
+    }
+    if context.max_response_bytes == 0 || context.max_response_bytes > MAX_FRAME_BYTES {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::OversizedFrame {
+                observed: u64::from(context.max_response_bytes),
+                limit: MAX_FRAME_BYTES,
+            },
+            "the operation's response budget is outside the protocol's frame limit",
+        ));
+    }
+    if context.remaining_budget_millis == 0 {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::DeadlineExceeded,
+            "the operation carries no remaining budget to enforce",
+        ));
+    }
+    if deadline_expired(context.deadline_unix_ms, now_unix_ms) {
+        return Err(PluginProtocolError::new(
+            PluginFailureCode::DeadlineExceeded,
+            "the operation's deadline has already passed",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a peer that speaks another protocol version.
+pub fn check_protocol_version(received: u16) -> Result<(), PluginProtocolError> {
+    if received == PROTOCOL_VERSION {
+        return Ok(());
+    }
+    Err(PluginProtocolError::new(
+        PluginFailureCode::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            received,
+        },
+        format!("peer speaks protocol version {received}, this side speaks {PROTOCOL_VERSION}"),
+    ))
+}
+
+/// Return whether `deadline_unix_ms` has passed at `now_unix_ms`.
+pub const fn deadline_expired(deadline_unix_ms: u64, now_unix_ms: u64) -> bool {
+    now_unix_ms >= deadline_unix_ms
+}
+
+/// Check a deadline against a supplied instant.
+///
+/// Split from the clock-reading form so the rule itself is testable. The
+/// boundary is inclusive at the deadline: at the deadline there is no time left,
+/// so the operation is refused rather than started and abandoned.
+pub fn check_deadline_at(
+    deadline_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<(), PluginProtocolError> {
+    if !deadline_expired(deadline_unix_ms, now_unix_ms) {
+        return Ok(());
+    }
+    Err(PluginProtocolError::new(
+        PluginFailureCode::DeadlineExceeded,
+        format!(
+            "the operation deadline ({deadline_unix_ms} ms since the epoch) had already \
+             passed at {now_unix_ms} ms"
+        ),
+    ))
+}
+
+/// Check a deadline against the wall clock.
+///
+/// The caller is expected to refuse the operation without invoking the backend
+/// when this fails, because an operation that is already out of time cannot
+/// produce a result anyone is still waiting for.
+pub fn check_deadline(deadline_unix_ms: u64) -> Result<(), PluginProtocolError> {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
+    check_deadline_at(deadline_unix_ms, now_unix_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fields a sanitizer is allowed to see: the projection's own fields and
+    /// the mutable fields inside it. One list, because both are disclosure.
+    const APPROVED_SANITIZER_FIELDS: &[&str] = &[
+        "class",
+        "name",
+        "scope_category",
+        "category",
+        "data_schema",
+        "fields",
+        "data",
+        "category_profile",
+        "metadata",
+    ];
+
+    /// The names inside a `DataSchema`, which is one approved field carried as an
+    /// object rather than as a scalar.
+    const APPROVED_DATA_SCHEMA_FIELDS: &[&str] = &["name", "version"];
+
+    /// Every key the projection serialises, at either level.
+    fn serialized_projection_keys() -> std::collections::BTreeSet<String> {
+        let call = PluginEventSanitizeCall {
+            class: PluginEventSanitizeClass::Mark,
+            name: "example.mark".into(),
+            scope_category: Some("start".into()),
+            category: Some(EventCategory::tool()),
+            data_schema: Some(
+                DataSchema::builder()
+                    .name("example.schema")
+                    .version("1")
+                    .build(),
+            ),
+            fields: EventSanitizeFields {
+                data: Some(serde_json::json!({"k": 1})),
+                category_profile: Some(nemo_relay_types::api::event::CategoryProfile {
+                    subtype: Some("example".into()),
+                    ..Default::default()
+                }),
+                metadata: Some(serde_json::json!({"k": 2})),
+            },
+        };
+        let serialized = serde_json::to_value(&call).expect("a serializable projection");
+        let mut keys = std::collections::BTreeSet::new();
+        let object = serialized.as_object().expect("a projection is an object");
+        for (key, value) in object {
+            keys.insert(key.clone());
+            if key == "fields"
+                && let Some(fields) = value.as_object()
+            {
+                for field in fields.keys() {
+                    keys.insert(field.clone());
+                }
+            }
+            if key == "data_schema"
+                && let Some(schema) = value.as_object()
+            {
+                for field in schema.keys() {
+                    keys.insert(field.clone());
+                }
+            }
+        }
+        keys
+    }
+
+    /// The fields the kernel keeps. Written as a list rather than as a comment because
+    /// the point of the projection is that disclosure is a decision: a field that
+    /// crosses the boundary has to be added to the approved set deliberately, and one
+    /// that is *not* on this list has to be shown not to cross.
+    ///
+    /// `category` and `data_schema` used to be here and are not any more: they are
+    /// kernel-owned *inputs* now, read-only to a plugin and authoritative on this side.
+    /// The distinction is the reason this list is named for what the kernel retains
+    /// rather than for what a plugin may never mention.
+    const KERNEL_RETAINED_FIELDS: &[&str] = &[
+        "uuid",
+        "timestamp",
+        "parent_uuid",
+        "propagation_root_uuid",
+        "atof_version",
+        "kind",
+    ];
+
+    /// What the kernel retains does not cross, by key or by value.
+    ///
+    /// The serialized-value check is what catches a field smuggled inside another one;
+    /// the key check is what catches a field the projection grows.
+    #[test]
+    fn a_projection_carries_no_kernel_retained_field() {
+        for class in [
+            PluginEventSanitizeClass::Mark,
+            PluginEventSanitizeClass::ScopeStart,
+            PluginEventSanitizeClass::ScopeEnd,
+        ] {
+            let call = PluginEventSanitizeCall {
+                class,
+                name: "example".into(),
+                scope_category: class.scope_category().map(|_| "start".to_string()),
+                category: Some(EventCategory::llm()),
+                data_schema: None,
+                fields: EventSanitizeFields::default(),
+            };
+            let serialized = serde_json::to_value(&call).expect("a serializable projection");
+            let keys: std::collections::BTreeSet<&str> = serialized
+                .as_object()
+                .expect("a projection is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            for retained in KERNEL_RETAINED_FIELDS {
+                assert!(
+                    !keys.contains(retained),
+                    "{retained} is the kernel's and crossed in this projection: {call:?}"
+                );
+            }
+        }
+    }
+
+    /// The capability boundary, enforced rather than described.
+    ///
+    /// The property is not "the projection serialises". It is that the set of
+    /// fields a plugin can see equals the set somebody approved. A field added to
+    /// the runtime's `Event` changes nothing here — which is the point, because
+    /// disclosure should be a decision — and a field added to *this* projection
+    /// fails until it is approved in the same change. Verified by adding a field
+    /// name to this list and watching the test refuse it.
+    #[test]
+    fn the_sanitizer_projection_discloses_exactly_its_approved_fields() {
+        let approved: std::collections::BTreeSet<String> = APPROVED_SANITIZER_FIELDS
+            .iter()
+            .chain(APPROVED_DATA_SCHEMA_FIELDS.iter())
+            .map(|field| (*field).to_owned())
+            .collect();
+        let serialized = serialized_projection_keys();
+        let unexpected: Vec<&String> = serialized.difference(&approved).collect();
+        let missing: Vec<&String> = approved.difference(&serialized).collect();
+        assert!(
+            unexpected.is_empty() && missing.is_empty(),
+            "the projection must disclose exactly the approved fields: unexpected {unexpected:?}, \
+             missing {missing:?}. Adding a field to a plugin's view is a capability decision, so \
+             it takes an edit to this list as well as to the type."
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_refuses_a_load_from_anything_but_absent() {
+        assert!(PluginLifecycle::Absent.admit_load().is_ok());
+        assert_eq!(
+            PluginLifecycle::Loading.admit_load().unwrap_err(),
+            PluginFailureCode::AlreadyLoading
+        );
+        assert_eq!(
+            PluginLifecycle::Loaded { generation: 3 }
+                .admit_load()
+                .unwrap_err(),
+            PluginFailureCode::AlreadyLoaded
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_refuses_every_generation_that_is_not_the_loaded_one() {
+        // Four facts stay four facts: never there, not there yet, no longer
+        // there, and the instance the handle names. Collapsing any pair would
+        // leave a caller unable to tell a retry from a stale handle.
+        assert_eq!(
+            PluginLifecycle::Absent.admit_generation(1).unwrap_err(),
+            PluginFailureCode::UnknownPlugin
+        );
+        assert_eq!(
+            PluginLifecycle::Loading.admit_generation(1).unwrap_err(),
+            PluginFailureCode::AlreadyLoading
+        );
+        for generation in [3, 5] {
+            assert_eq!(
+                PluginLifecycle::Loaded { generation: 4 }
+                    .admit_generation(generation)
+                    .unwrap_err(),
+                PluginFailureCode::StaleHandle,
+                "generation {generation} is not the loaded one"
+            );
+        }
+        assert!(
+            PluginLifecycle::Loaded { generation: 4 }
+                .admit_generation(4)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_a_loaded_state_names_a_generation() {
+        assert_eq!(PluginLifecycle::Absent.generation(), None);
+        assert_eq!(PluginLifecycle::Loading.generation(), None);
+        assert_eq!(
+            PluginLifecycle::Loaded { generation: 7 }.generation(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn every_message_this_crate_declares_survives_its_own_serialization() {
+        // The vocabulary is `Serialize` so bindings and stored state can carry
+        // it. A tagged enum whose arm is not a map, or a field whose type does
+        // not round-trip, would fail here rather than at a boundary where the
+        // failure looks like a peer sending nonsense.
+        let messages = [
+            PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: PluginSessionPayload::StreamItem(PluginStreamItem {
+                    host_call_id: "call-1".into(),
+                    stream_id: "stream-1".into(),
+                    chunk_json: r#"{"delta":"hi"}"#.into(),
+                }),
+            },
+            PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: PluginSessionPayload::CompletionSettle(PluginCompletionSettlement {
+                    completion_id: "completion-1".into(),
+                    operation_request_id: "operation-1".into(),
+                    result: Err(PluginFailure {
+                        code: PluginFailureCode::Cancelled,
+                        message: "the awaiting runtime cancelled it".into(),
+                    }),
+                }),
+            },
+            PluginSessionMessage {
+                session_id: "session-1".into(),
+                message: PluginSessionPayload::ContinuationDisposition(
+                    PluginContinuationDisposition {
+                        host_call_id: "call-1".into(),
+                        sequence: 2,
+                        disposition: Ok(PluginChunkDecision::Stop),
+                    },
+                ),
+            },
+        ];
+
+        for message in messages {
+            let text = serde_json::to_string(&message).expect("serialize a session message");
+            let back: PluginSessionMessage =
+                serde_json::from_str(&text).expect("deserialize a session message");
+            assert_eq!(back, message);
+        }
+
+        // The mark carries types this crate re-exports, so their serialized
+        // form is part of this crate's promise too.
+        let mark = PluginMarkEmit {
+            operation_request_id: "operation-1".into(),
+            host_call_id: "call-1".into(),
+            name: "example.mark".into(),
+            data_json: Some(r#"{"value":1}"#.into()),
+            parent: Some(
+                PluginScopeReference::from_canonical("018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b")
+                    .expect("a canonical scope"),
+            ),
+            metadata_json: None,
+            data_schema: Some(DataSchema {
+                name: "example".into(),
+                version: "1".into(),
+            }),
+            severity: Some(LogSeverity::Warn),
+            timestamp_unix_micros: Some(1_700_000_000_000_000),
+        };
+        let text = serde_json::to_string(&mark).expect("serialize a mark");
+        assert!(
+            text.contains("\"warn\""),
+            "severity writes its canonical name: {text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PluginMarkEmit>(&text).expect("deserialize a mark"),
+            mark
+        );
+    }
+
+    #[test]
+    fn a_scope_identity_has_one_spelling() {
+        let canonical = "018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b";
+        let reference = PluginScopeReference::from_canonical(canonical).expect("a UUID");
+        assert_eq!(reference.scope_id.to_string(), canonical);
+
+        for other in [
+            "018f0b3c5f5a7c3e9a2b1c2d3e4f5a6b",
+            "{018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b}",
+            "urn:uuid:018f0b3c-5f5a-7c3e-9a2b-1c2d3e4f5a6b",
+            "not-a-uuid",
+        ] {
+            assert!(
+                PluginScopeReference::from_canonical(other).is_err(),
+                "{other} is the same value written differently"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deadline_is_refused_at_the_boundary_and_before_it() {
+        // At the deadline there is no time left, so the operation must not
+        // start. A comparison that allowed equality would start work that is
+        // already out of time.
+        assert!(check_deadline_at(1_000, 1_000).is_err());
+        assert!(check_deadline_at(1_000, 1_001).is_err());
+        assert!(check_deadline_at(1_000, 999).is_ok());
+    }
+
+    #[test]
+    fn an_expired_deadline_is_reported_as_a_deadline_and_not_a_crash() {
+        // A host killed because the deadline passed is still a deadline. Losing
+        // that distinction would make a timeout indistinguishable from a
+        // process that died on its own.
+        let failure = check_deadline_at(1_000, 1_000).expect_err("expired");
+        assert_eq!(failure.failure.code, PluginFailureCode::DeadlineExceeded);
+        assert_ne!(failure.failure.code, PluginFailureCode::HostCrashed);
+    }
+
+    #[test]
+    fn dispatch_certainty_travels_with_the_result() {
+        let outcome = PluginExecutionOutcome {
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+            result: Err(PluginFailure {
+                code: PluginFailureCode::HostCrashed,
+                message: "the plugin host exited during dispatch".into(),
+            }),
+        };
+
+        let encoded = serde_json::to_string(&outcome).expect("encode outcome");
+        let decoded: PluginExecutionOutcome = serde_json::from_str(&encoded).expect("decode");
+
+        assert_eq!(decoded, outcome);
+        // The point of the envelope: the failure is not reported as a definite
+        // outcome, so a caller cannot turn it into FAILED.
+        assert_eq!(decoded.certainty, OutcomeCertainty::Unknown);
+        assert_eq!(decoded.dispatch, DispatchState::DispatchAttempted);
+    }
+
+    #[test]
+    fn the_contract_speaks_one_version_and_accepts_it() {
+        assert!(check_protocol_version(PROTOCOL_VERSION).is_ok());
+    }
+
+    #[test]
+    fn a_protocol_version_mismatch_fails_closed_in_both_directions() {
+        for peer_version in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
+            let failure = check_protocol_version(peer_version)
+                .expect_err("a mismatch must not be negotiated around");
+            let PluginFailureCode::VersionMismatch { expected, received } = failure.failure.code
+            else {
+                panic!("unexpected failure code: {:?}", failure.failure.code);
+            };
+            assert_eq!(expected, PROTOCOL_VERSION);
+            // Against the peer's version, not against itself. The earlier form
+            // destructured into a name that shadowed the loop variable, so the
+            // assertion was true whatever the code returned.
+            assert_eq!(received, peer_version);
+        }
+    }
+
+    #[test]
+    fn a_failure_travels_in_the_error_channel_and_nowhere_else() {
+        // One representation only: a result that says both "succeeded" and
+        // "the answer is a failure" is the same event described twice, and the
+        // two descriptions eventually disagree.
+        let failure = PluginFailure {
+            code: PluginFailureCode::DeadlineExceeded,
+            message: "plugin did not answer within the action budget".into(),
+        };
+        let outcome = PluginExecutionOutcome {
+            dispatch: DispatchState::DispatchAttempted,
+            certainty: OutcomeCertainty::Unknown,
+            result: Err(failure.clone()),
+        };
+
+        let encoded = serde_json::to_string(&outcome).expect("encode outcome");
+        let decoded: PluginExecutionOutcome =
+            serde_json::from_str(&encoded).expect("decode outcome");
+
+        assert_eq!(decoded, outcome);
+        assert!(matches!(decoded.result, Err(ref carried) if carried == &failure));
+    }
+
+    /// A mark event whose identity is unmistakable, so a projection that carried any
+    /// of it would be caught by value rather than by key alone.
+    fn marked_event() -> nemo_relay_types::api::event::Event {
+        use nemo_relay_types::api::event::{BaseEvent, Event, MarkEvent};
+
+        let identity = Uuid::now_v7();
+        let root = Uuid::now_v7();
+        Event::Mark(MarkEvent::new(
+            BaseEvent::builder()
+                .name("example.mark")
+                .uuid(identity)
+                .parent_uuid_opt(Some(root))
+                .propagation_root_uuid_opt(Some(identity))
+                .data_opt(Some(serde_json::json!({ "payload": "value" })))
+                .metadata_opt(Some(serde_json::json!({ "key": "value" })))
+                .build(),
+            None,
+            None,
+        ))
+    }
+
+    /// The projection is the capability, so it carries the identity a sanitizer
+    /// decides on and nothing else the runtime happens to hold.
+    #[test]
+    fn a_projection_carries_no_event_identity() {
+        use nemo_relay_types::api::event::Event;
+
+        let event = marked_event();
+        let Event::Mark(mark) = &event else {
+            unreachable!("the helper builds a mark")
+        };
+        let call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::Mark,
+            &event,
+            event.sanitize_fields(),
+        )
+        .expect("a mark projection");
+        let serialized = serde_json::to_string(&call).expect("a serializable projection");
+
+        assert_eq!(call.name, "example.mark");
+        assert!(call.scope_category.is_none(), "a mark has no phase");
+        assert!(
+            serialized.contains("\"payload\":\"value\"")
+                && serialized.contains("\"key\":\"value\""),
+            "the mutable fields are what a sanitizer is shown: {serialized}"
+        );
+        let identity = mark.base.uuid.to_string();
+        let parent = mark.base.parent_uuid.expect("a parent").to_string();
+        let timestamp = mark.base.timestamp.to_rfc3339();
+        for carried in [identity, parent, timestamp, "atof_version".to_string()] {
+            assert!(
+                !serialized.contains(carried.as_str()),
+                "the projection carried {carried}: {serialized}"
+            );
+        }
+    }
+
+    /// The class is not interchangeable: a class is shown the kind of event it
+    /// sanitizes, and the two scope directions are not each other.
+    #[test]
+    fn a_projection_refuses_the_event_of_another_class() {
+        use nemo_relay_types::api::event::{
+            BaseEvent, Event, EventCategory, ScopeCategory, ScopeEvent,
+        };
+
+        let scope = |category| {
+            Event::Scope(ScopeEvent::new(
+                BaseEvent::builder().name("example.scope").build(),
+                category,
+                Vec::new(),
+                EventCategory::custom(),
+                None,
+            ))
+        };
+        let mark = marked_event();
+        let cases = [
+            (
+                PluginEventSanitizeClass::Mark,
+                scope(ScopeCategory::Start),
+                "a mark sanitizer",
+            ),
+            (
+                PluginEventSanitizeClass::Mark,
+                scope(ScopeCategory::End),
+                "a mark sanitizer",
+            ),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                mark.clone(),
+                "a start sanitizer",
+            ),
+            (PluginEventSanitizeClass::ScopeEnd, mark, "an end sanitizer"),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                scope(ScopeCategory::End),
+                "a start sanitizer",
+            ),
+            (
+                PluginEventSanitizeClass::ScopeEnd,
+                scope(ScopeCategory::Start),
+                "an end sanitizer",
+            ),
+        ];
+        for (class, event, what) in cases {
+            let fields = event.sanitize_fields();
+            let refused = PluginEventSanitizeCall::from_event(class, &event, fields);
+            assert!(refused.is_err(), "{what} was shown {:?}", event.kind());
+        }
+    }
+
+    /// The synthetic event is what the sanitizer was told it would see, and the
+    /// identity it is given is this process's rather than the runtime's.
+    #[test]
+    fn the_synthetic_event_is_what_the_projection_says() {
+        use nemo_relay_types::api::event::{Event, ScopeCategory};
+
+        let event = marked_event();
+        let fields = event.sanitize_fields();
+        let call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::Mark,
+            &event,
+            fields.clone(),
+        )
+        .expect("a mark projection");
+        let synthetic = call.into_event().expect("a synthetic mark");
+
+        assert_eq!(synthetic.name(), "example.mark");
+        assert_eq!(synthetic.sanitize_fields(), fields);
+        assert_ne!(
+            synthetic.uuid(),
+            event.uuid(),
+            "the sanitizer's copy is not the runtime's event"
+        );
+
+        // And a scope projection states its phase once: through its class.
+        let mut started = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::ScopeStart,
+            &Event::Scope(nemo_relay_types::api::event::ScopeEvent::new(
+                nemo_relay_types::api::event::BaseEvent::builder()
+                    .name("example.scope")
+                    .build(),
+                ScopeCategory::Start,
+                Vec::new(),
+                nemo_relay_types::api::event::EventCategory::custom(),
+                None,
+            )),
+            EventSanitizeFields::default(),
+        )
+        .expect("a start projection");
+        assert_eq!(started.scope_category.as_deref(), Some("start"));
+        let synthetic = started.clone().into_event().expect("a synthetic scope");
+        assert_eq!(synthetic.scope_category(), Some(ScopeCategory::Start));
+
+        started.scope_category = Some("end".to_string());
+        assert!(
+            started.into_event().is_err(),
+            "a projection stating the other phase is refused rather than believed"
+        );
+    }
+
+    /// The two read-only discriminators make the round trip for every class.
+    ///
+    /// They are what a sanitizer decides with, so a projection that lost them — or a
+    /// synthetic event that dropped them — would change which path a sanitizer takes
+    /// while every other test still passed.
+    #[test]
+    fn the_category_and_data_schema_survive_every_class() {
+        use nemo_relay_types::api::event::{
+            BaseEvent, DataSchema, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
+        };
+
+        let schema = DataSchema::builder()
+            .name("nemo.relay.metric_measurements")
+            .version("1")
+            .build();
+        let mark = Event::Mark(MarkEvent::new(
+            BaseEvent::builder()
+                .name("example.mark")
+                .data_schema_opt(Some(schema.clone()))
+                .build(),
+            Some(EventCategory::tool()),
+            None,
+        ));
+        let scope = |category| {
+            Event::Scope(ScopeEvent::new(
+                BaseEvent::builder()
+                    .name("example.scope")
+                    .data_schema_opt(Some(schema.clone()))
+                    .build(),
+                category,
+                Vec::new(),
+                EventCategory::llm(),
+                None,
+            ))
+        };
+
+        for (class, event) in [
+            (PluginEventSanitizeClass::Mark, mark),
+            (
+                PluginEventSanitizeClass::ScopeStart,
+                scope(ScopeCategory::Start),
+            ),
+            (
+                PluginEventSanitizeClass::ScopeEnd,
+                scope(ScopeCategory::End),
+            ),
+        ] {
+            let expected_category = event.category().cloned();
+            let fields = event.sanitize_fields();
+            let call = PluginEventSanitizeCall::from_event(class, &event, fields)
+                .unwrap_or_else(|error| panic!("{class:?} should project: {error:?}"));
+            assert_eq!(call.category, expected_category, "{class:?}");
+            assert_eq!(call.data_schema, Some(schema.clone()), "{class:?}");
+
+            let synthetic = call
+                .into_event()
+                .unwrap_or_else(|error| panic!("{class:?} should rebuild: {error:?}"));
+            assert_eq!(
+                synthetic.category(),
+                expected_category.as_ref(),
+                "{class:?}"
+            );
+            assert_eq!(synthetic.data_schema(), Some(&schema), "{class:?}");
+        }
+
+        // And a scope projection without one is refused rather than defaulted: a
+        // sanitizer that branches on the category is not handed a fabricated one.
+        let scope_event = scope(ScopeCategory::Start);
+        let mut call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::ScopeStart,
+            &scope_event,
+            scope_event.sanitize_fields(),
+        )
+        .expect("a start projection");
+        call.category = None;
+        assert!(call.into_event().is_err());
+    }
+
+    /// The answer has nowhere to put either discriminator.
+    ///
+    /// This is the proof that "the response cannot alter them" is a property of the
+    /// type rather than of a check somebody remembered to write: what a sanitizer
+    /// returns is three mutable fields, and neither a category nor a data schema is
+    /// one of them.
+    #[test]
+    fn the_response_type_cannot_carry_a_discriminator() {
+        use nemo_relay_types::api::event::{BaseEvent, Event, ScopeCategory, ScopeEvent};
+
+        let serialized = serde_json::to_value(EventSanitizeFields {
+            data: Some(serde_json::json!({ "category": "llm", "data_schema": "forged" })),
+            category_profile: None,
+            metadata: None,
+        })
+        .expect("a serializable answer");
+        let keys: std::collections::BTreeSet<&str> = serialized
+            .as_object()
+            .expect("fields are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["category_profile", "data", "metadata"]
+                .into_iter()
+                .collect(),
+            "the answer is the mutable fields and nothing else"
+        );
+
+        // A payload that spells a category is still only a payload: what a sanitizer
+        // returns is applied to the fields, and the projection's own values are what
+        // the rebuilt event carries.
+        let scope_event = Event::Scope(ScopeEvent::new(
+            BaseEvent::builder().name("example.scope").build(),
+            ScopeCategory::Start,
+            Vec::new(),
+            EventCategory::llm(),
+            None,
+        ));
+        let call = PluginEventSanitizeCall::from_event(
+            PluginEventSanitizeClass::ScopeStart,
+            &scope_event,
+            EventSanitizeFields::default(),
+        )
+        .expect("a start projection");
+        let mut rebuilt = call.into_event().expect("a synthetic scope");
+        rebuilt.apply_sanitize_fields(EventSanitizeFields {
+            data: Some(serde_json::json!({ "category": "tool", "data_schema": "forged" })),
+            category_profile: None,
+            metadata: None,
+        });
+        assert_eq!(
+            rebuilt.category(),
+            Some(&EventCategory::llm()),
+            "a sanitizer's answer cannot move the category"
+        );
+        assert!(
+            rebuilt.data_schema().is_none(),
+            "and cannot invent one either"
+        );
+    }
+
+    /// A reference is issued, travels as a string, and comes back as itself.
+    #[test]
+    fn a_codec_reference_round_trips_through_the_wire() {
+        let issued = CodecRef::issue();
+        let carried = serde_json::to_string(&issued).expect("a serializable reference");
+        assert_eq!(
+            carried,
+            format!("\"{}\"", issued.as_str()),
+            "the reference is its own string on the wire"
+        );
+        let decoded: CodecRef = serde_json::from_str(&carried).expect("a decodable reference");
+        assert_eq!(decoded, issued);
+        assert_eq!(
+            CodecRef::from_opaque(issued.as_str().to_string()).expect("a shaped reference"),
+            issued
+        );
+
+        // Two issues are two references: a peer that has seen one learns nothing about
+        // the next.
+        assert_ne!(CodecRef::issue().as_str(), CodecRef::issue().as_str());
+    }
+
+    /// Shape is validated and bounded; authority is not in the shape.
+    #[test]
+    fn a_codec_reference_that_is_not_shaped_like_one_is_refused() {
+        for refused in [
+            String::new(),
+            "codec-".to_string(),
+            "capability-1".to_string(),
+            "codec-../escape".to_string(),
+            format!("codec-{}", "a".repeat(MAX_CODEC_REFERENCE_BYTES)),
+        ] {
+            assert!(
+                CodecRef::from_opaque(refused.clone()).is_err(),
+                "{refused} is not a reference this side will carry"
+            );
+        }
+        // A well-formed reference is accepted even though nothing issued it: the shape
+        // says what it is, and the record says whether it means anything.
+        assert!(CodecRef::from_opaque("codec-0123456789abcdef").is_ok());
+    }
+}

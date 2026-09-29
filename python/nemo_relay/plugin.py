@@ -421,6 +421,17 @@ class PluginHostActivation:
         """
         return self._native.is_active
 
+    @property
+    def host_pid(self) -> int | None:
+        """Return the process the native plugins are running in.
+
+        ``None`` when this activation holds no host: it started none, or it has
+        closed and the process it started is gone. It is the isolation claim as a
+        value rather than a description — the plugins do not run in this process,
+        and comparing this to :func:`os.getpid` is what says so.
+        """
+        return self._native.host_pid
+
     async def close(self) -> None:
         """Clear callbacks and unload plugins; repeated calls are safe."""
         await self._native.close()

@@ -7,12 +7,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Rust plugin authoring SDK and stable native plugin ABI for NeMo Relay."
+description = "Rust authoring SDK for native NeMo Relay plugins, re-exporting the native plugin ABI."
 
 [lints]
 workspace = true
 
 [dependencies]
+nemo-relay-native-abi.workspace = true
 futures = "0.3"
 nemo-relay-types.workspace = true
 serde = { version = "1", features = ["derive"] }

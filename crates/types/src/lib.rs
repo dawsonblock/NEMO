@@ -13,6 +13,8 @@
 pub mod api;
 /// Normalized LLM request and response data types.
 pub mod codec;
+/// Dispatch-certainty vocabulary shared across the execution boundary.
+pub mod execution;
 /// Plugin configuration diagnostic data types.
 pub mod plugin;
 

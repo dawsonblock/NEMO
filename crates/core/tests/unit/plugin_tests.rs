@@ -3517,3 +3517,52 @@ fn test_plugin_config_overlay_applies_non_default_values() {
         "a non-default field overrides the file"
     );
 }
+
+/// A registry that cannot be read is a registry whose teardown was not observed.
+///
+/// This is the kernel's half of a property the loader's activation also asserts:
+/// when the registry lock is poisoned, a deregistration cannot say whether the
+/// registration is gone, so the failure has to be reported and the process-wide
+/// owner has to stay claimed. Releasing the owner would let a second activation
+/// take the claim while the first one's registrations may still be live, which is
+/// the state the lease exists to make impossible.
+#[test]
+fn a_poisoned_registry_keeps_the_host_owner_claimed() {
+    struct RestoreRegistry;
+    impl Drop for RestoreRegistry {
+        fn drop(&mut self) {
+            PLUGIN_HANDLERS.clear_poison();
+            if let Ok(mut owner) = PLUGIN_MUTATION_OWNER.lock() {
+                *owner = PluginMutationOwner::Idle;
+            }
+        }
+    }
+
+    let _guard = crate::shared_runtime::runtime_owner_test_mutex()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _restore = RestoreRegistry;
+    let claim = acquire_plugin_host_lease().expect("the test should take the host claim");
+    let owner_id = claim.owner_id();
+
+    std::thread::spawn(|| {
+        let _registry = PLUGIN_HANDLERS.write().unwrap();
+        panic!("poison the plugin registry for this test");
+    })
+    .join()
+    .expect_err("the registry writer should have panicked");
+
+    let error = deregister_plugin_registration_checked("fixture.poisoned", 0)
+        .expect_err("an unreadable registry cannot report a removal")
+        .to_string();
+    assert!(error.contains("plugin registry lock poisoned"), "{error}");
+    assert_eq!(
+        *PLUGIN_MUTATION_OWNER.lock().unwrap(),
+        PluginMutationOwner::Host(owner_id),
+        "an uncertain teardown must not give the claim back"
+    );
+    assert!(matches!(
+        acquire_plugin_host_lease(),
+        Err(PluginError::Conflict(_))
+    ));
+}

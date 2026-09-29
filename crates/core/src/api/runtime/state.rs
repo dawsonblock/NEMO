@@ -52,7 +52,8 @@ use crate::api::tool::{
 use crate::codec::request::AnnotatedLlmRequest;
 use crate::codec::response::AnnotatedLlmResponse;
 use crate::context::registries::{
-    merge_event_metadata_injector_entries, merge_execution_intercept_callables,
+    exact_guardrail_entry, merge_event_metadata_injector_entries,
+    merge_execution_intercept_callables, merge_execution_intercept_entries,
     merge_guardrail_entries, merge_intercept_entries,
 };
 use crate::error::FlowError;
@@ -887,6 +888,27 @@ impl NemoRelayContextState {
             .collect()
     }
 
+    /// The entry a named exact-registration door runs.
+    ///
+    /// A name is unique *within* one registry — a second registration under a name a
+    /// registry already holds is refused when it is made — so two entries can share a
+    /// name only when one is process-global and the other is scope-local, and a merged
+    /// chain holds both. A door runs the entry the chain would run *first*, which is
+    /// what [`Self::event_sanitize_entries`] already ordered: ascending priority, and
+    /// on a tie the global registration before a scope-local one, because the merge
+    /// appends the globals first and sorts stably.
+    ///
+    /// That rule is stated and tested rather than left to whichever order a merged
+    /// vector happened to be built in: a caller names *one* registration and the
+    /// answer is a value, so which one it got has to be a decision rather than an
+    /// accident of iteration.
+    pub(crate) fn exact_event_sanitize_entry(
+        entries: &[Guardrail<EventSanitizeFn>],
+        registration: &str,
+    ) -> Option<Guardrail<EventSanitizeFn>> {
+        exact_guardrail_entry(entries, registration)
+    }
+
     /// Snapshot Event metadata injector entries in deterministic priority order.
     pub(crate) fn event_metadata_injector_entries(
         global: &SortedRegistry<EventMetadataInjector>,
@@ -975,44 +997,79 @@ impl NemoRelayContextState {
         }
         event
     }
+    /// Apply one event sanitizer entry to an event.
+    ///
+    /// The event comes back as it should be published — the sanitizer's answer
+    /// applied, or the observability fields cleared when it did not answer — and the
+    /// second value is the sanitizer's own words in that case.
+    ///
+    /// Clearing is the fail-closed answer and it stays the family's rule. The reason
+    /// travels beside it because the log line that records it here is not a record a
+    /// caller running a registration for *someone else* can read: a host that
+    /// executes a plugin's callback has to be able to say the callback failed, or the
+    /// kernel it answers sees a sanitizer that cleared everything rather than one
+    /// that broke.
+    pub(crate) async fn event_sanitize_one(
+        mut event: Event,
+        entry: &Guardrail<EventSanitizeFn>,
+    ) -> (Event, Option<String>) {
+        let fields = event.sanitize_fields();
+        let callback = Arc::clone(&entry.payload);
+        let context = Arc::new(event);
+        let callback_context = Arc::clone(&context);
+        let outcome = AssertUnwindSafe(async move { callback(callback_context, fields).await })
+            .catch_unwind()
+            .await;
+        event = Arc::try_unwrap(context).unwrap_or_else(|context| (*context).clone());
+        match outcome {
+            Ok(Ok(fields)) => {
+                event.apply_sanitize_fields(fields);
+                (event, None)
+            }
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "event_sanitizer_failed",
+                    sanitizer = entry.name.as_str(),
+                    event_name = event.name();
+                    "Event sanitizer failed; clearing observability fields: {error}"
+                );
+                event.apply_sanitize_fields(EventSanitizeFields::default());
+                (event, Some(error.to_string()))
+            }
+            Err(_) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "event_sanitizer_panicked",
+                    sanitizer = entry.name.as_str(),
+                    event_name = event.name();
+                    "Event sanitizer panicked; clearing observability fields"
+                );
+                event.apply_sanitize_fields(EventSanitizeFields::default());
+                (
+                    event,
+                    Some("the event sanitizer panicked rather than answering".to_string()),
+                )
+            }
+        }
+    }
+
     /// Apply an event sanitizer snapshot to the mutable observability fields.
+    ///
+    /// The chain's rule is unchanged: an entry that does not answer clears the
+    /// observability fields and the entries after it do not run, because a payload
+    /// nobody could sanitize is not published unsanitized. What the entries say about
+    /// *why* is [`Self::event_sanitize_one`]'s second value, and this loop is not a
+    /// caller that can act on it.
     pub(crate) async fn event_sanitize_snapshot_chain(
         mut event: Event,
         entries: &[Guardrail<EventSanitizeFn>],
     ) -> Event {
         for entry in entries {
-            let fields = event.sanitize_fields();
-            let callback = Arc::clone(&entry.payload);
-            let context = Arc::new(event);
-            let callback_context = Arc::clone(&context);
-            let outcome = AssertUnwindSafe(async move { callback(callback_context, fields).await })
-                .catch_unwind()
-                .await;
-            event = Arc::try_unwrap(context).unwrap_or_else(|context| (*context).clone());
-            match outcome {
-                Ok(Ok(fields)) => event.apply_sanitize_fields(fields),
-                Ok(Err(_error)) => {
-                    log::error!(
-                        target: "nemo_relay.runtime",
-                        event = "event_sanitizer_failed",
-                        sanitizer = entry.name.as_str(),
-                        event_name = event.name();
-                        "Event sanitizer failed; clearing observability fields"
-                    );
-                    event.apply_sanitize_fields(EventSanitizeFields::default());
-                    break;
-                }
-                Err(_) => {
-                    log::error!(
-                        target: "nemo_relay.runtime",
-                        event = "event_sanitizer_panicked",
-                        sanitizer = entry.name.as_str(),
-                        event_name = event.name();
-                        "Event sanitizer panicked; clearing observability fields"
-                    );
-                    event.apply_sanitize_fields(EventSanitizeFields::default());
-                    break;
-                }
+            let (sanitized, failure) = Self::event_sanitize_one(event, entry).await;
+            event = sanitized;
+            if failure.is_some() {
+                break;
             }
         }
         event
@@ -1286,6 +1343,66 @@ impl NemoRelayContextState {
         .collect()
     }
 
+    /// Snapshot the tool execution intercepts visible to the calling scope.
+    ///
+    /// Entries rather than callables, because the caller here runs exactly one
+    /// registration *by name*: the dynamic-plugin boundary holds registrations
+    /// that were made in another process, and the invocation it receives names
+    /// the one it means. A callable alone would not say which name it answers
+    /// for.
+    pub(crate) fn tool_execution_intercept_entries(
+        &self,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<ToolExecutionFn>>],
+    ) -> Vec<ExecutionIntercept<ToolExecutionFn>> {
+        merge_execution_intercept_entries(
+            &self.tool_execution_intercepts,
+            scope_locals,
+            RuntimeRegistrationKind::ToolExecutionIntercept,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    /// Snapshot the streaming LLM execution intercepts visible to the calling
+    /// scope.
+    ///
+    /// The third entry point's twin: a hosted plugin answers with a stream rather
+    /// than a value, so the caller runs exactly one registration *by name* and
+    /// receives the stream that registration produced.
+    pub(crate) fn llm_stream_execution_intercept_entries(
+        &self,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmStreamExecutionFn>>],
+    ) -> Vec<ExecutionIntercept<LlmStreamExecutionFn>> {
+        merge_execution_intercept_entries(
+            &self.llm_stream_execution_intercepts,
+            scope_locals,
+            RuntimeRegistrationKind::LlmStreamExecutionIntercept,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    /// Snapshot the LLM execution intercepts visible to the calling scope.
+    ///
+    /// The tool entry point's twin, for the same reason: a hosted plugin runs
+    /// exactly one registration by name, and a callable does not know the name it
+    /// answers for.
+    pub(crate) fn llm_execution_intercept_entries(
+        &self,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmExecutionFn>>],
+    ) -> Vec<ExecutionIntercept<LlmExecutionFn>> {
+        merge_execution_intercept_entries(
+            &self.llm_execution_intercepts,
+            scope_locals,
+            RuntimeRegistrationKind::LlmExecutionIntercept,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
     /// Run a snapshot of tool request intercepts in priority order.
     ///
     /// # Parameters
@@ -1455,36 +1572,54 @@ impl NemoRelayContextState {
         let mut value = Some(request);
         for entry in entries {
             if let Some(current) = value.take() {
-                let callback = Arc::clone(&entry.payload);
-                let callback_value = current.clone();
-                let callback_context = context.clone();
-                match AssertUnwindSafe(
-                    async move { callback(callback_value, callback_context).await },
-                )
-                .catch_unwind()
-                .await
-                {
-                    Ok(Ok(next)) => value = next,
-                    Ok(Err(_error)) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_request_sanitizer_failed",
-                            sanitizer = entry.name.as_str();
-                            "LLM request sanitizer failed; omitting the observability payload"
-                        );
-                    }
-                    Err(_) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_request_sanitizer_panicked",
-                            sanitizer = entry.name.as_str();
-                            "LLM request sanitizer panicked; omitting the observability payload"
-                        );
-                    }
-                }
+                let (next, _failure) =
+                    Self::llm_sanitize_request_one(current, context.clone(), entry).await;
+                value = next;
             }
         }
         value
+    }
+
+    /// Sanitize one LLM request with one registration, reporting when it did not answer.
+    ///
+    /// The family's rule is omission, and it is unchanged: a payload nobody could
+    /// sanitize is not published, and the entries after a failure have nothing left to
+    /// decide about because there is no payload to hand them. The reason travels beside
+    /// the answer for the caller that has to account for the failure — a host running the
+    /// registration for another process, whose log line is not this one.
+    pub(crate) async fn llm_sanitize_request_one(
+        request: LlmRequest,
+        context: LlmSanitizeRequestContext,
+        entry: &Guardrail<LlmSanitizeRequestFn>,
+    ) -> (Option<LlmRequest>, Option<String>) {
+        let callback = Arc::clone(&entry.payload);
+        match AssertUnwindSafe(async move { callback(request, context).await })
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(next)) => (next, None),
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_request_sanitizer_failed",
+                    sanitizer = entry.name.as_str();
+                    "LLM request sanitizer failed; omitting the observability payload: {error}"
+                );
+                (None, Some(error.to_string()))
+            }
+            Err(_) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_request_sanitizer_panicked",
+                    sanitizer = entry.name.as_str();
+                    "LLM request sanitizer panicked; omitting the observability payload"
+                );
+                (
+                    None,
+                    Some("the LLM request sanitizer panicked rather than answering".to_string()),
+                )
+            }
+        }
     }
 
     /// Snapshot LLM response sanitizers in priority order.
@@ -1527,36 +1662,52 @@ impl NemoRelayContextState {
         let mut value = Some(response);
         for entry in entries {
             if let Some(current) = value.take() {
-                let callback = Arc::clone(&entry.payload);
-                let callback_value = current.clone();
-                let callback_context = context.clone();
-                match AssertUnwindSafe(
-                    async move { callback(callback_value, callback_context).await },
-                )
-                .catch_unwind()
-                .await
-                {
-                    Ok(Ok(next)) => value = next,
-                    Ok(Err(_error)) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_response_sanitizer_failed",
-                            sanitizer = entry.name.as_str();
-                            "LLM response sanitizer failed; omitting the observability payload"
-                        );
-                    }
-                    Err(_) => {
-                        log::error!(
-                            target: "nemo_relay.runtime",
-                            event = "llm_response_sanitizer_panicked",
-                            sanitizer = entry.name.as_str();
-                            "LLM response sanitizer panicked; omitting the observability payload"
-                        );
-                    }
-                }
+                let (next, _failure) =
+                    Self::llm_sanitize_response_one(current, context.clone(), entry).await;
+                value = next;
             }
         }
         value
+    }
+
+    /// Sanitize one LLM response with one registration, reporting when it did not answer.
+    ///
+    /// The response direction of [`Self::llm_sanitize_request_one`], with the same rule:
+    /// an answer nobody could sanitize is omitted rather than published, and the reason
+    /// is reported to whoever has to account for it.
+    pub(crate) async fn llm_sanitize_response_one(
+        response: Json,
+        context: LlmSanitizeResponseContext,
+        entry: &Guardrail<LlmSanitizeResponseFn>,
+    ) -> (Option<Json>, Option<String>) {
+        let callback = Arc::clone(&entry.payload);
+        match AssertUnwindSafe(async move { callback(response, context).await })
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(next)) => (next, None),
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_response_sanitizer_failed",
+                    sanitizer = entry.name.as_str();
+                    "LLM response sanitizer failed; omitting the observability payload: {error}"
+                );
+                (None, Some(error.to_string()))
+            }
+            Err(_) => {
+                log::error!(
+                    target: "nemo_relay.runtime",
+                    event = "llm_response_sanitizer_panicked",
+                    sanitizer = entry.name.as_str();
+                    "LLM response sanitizer panicked; omitting the observability payload"
+                );
+                (
+                    None,
+                    Some("the LLM response sanitizer panicked rather than answering".to_string()),
+                )
+            }
+        }
     }
 
     /// Snapshot LLM conditional-execution guardrails in priority order.

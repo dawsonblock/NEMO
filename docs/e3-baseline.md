@@ -20,9 +20,9 @@ tree carries **no** qualification certificate.
 | Field | Value |
 | --- | --- |
 | Workspace version | `0.9.1-rc.4` |
-| Workspace members | `core`, `types`, `plugin`, `worker-proto`, `worker`, `adaptive`, `pii-redaction`, `authority`, `ledger`, `executor`, `effect-qualification`, `effect-runtime`, `isolation`, `dlp`, `cli`, `python`, `ffi`, `node` |
+| Workspace members | `core`, `types`, `plugin`, `plugin-protocol`, `plugin-host`, `plugin-proto`, `worker-proto`, `worker`, `adaptive`, `pii-redaction`, `authority`, `ledger`, `executor`, `effect-qualification`, `effect-runtime`, `isolation`, `dlp`, `cli`, `python`, `ffi`, `node` |
 | EffectStore migration version | `1` (`crates/ledger/migrations/0001_effect_store.sql`) |
-| Native plugin ABI version | `4` (`NEMO_RELAY_NATIVE_ABI_VERSION`) |
+| Native plugin ABI version | `5` (`NEMO_RELAY_NATIVE_ABI_VERSION`) |
 | EffectStore contract version | unversioned; the executable contract is `crates/ledger/src/conformance.rs` |
 | Schema fingerprint algorithm | `1` (`crates/ledger/src/schema.rs`) |
 | Qualification status | `UNQUALIFIED` until a run produces evidence for this exact tree |
@@ -339,10 +339,12 @@ level instead of one constructor:
   environment, at least one admitted `MUTATION` or `CRITICAL` capability, and a
   store that implements the sealed `ProductionEffectStore` trait and attests
   readiness.
-- `Kernel::new_unchecked_for_tests` is the raw escape hatch, doc-hidden and named
-  so every use site is visible. An architectural test fails the build if a
-  user-facing crate (`cli`, `python`, `node`, `ffi`) reaches it, and a second
-  test asserts the composition root is its only non-test user.
+- The raw assembly step is private. `Kernel::assemble` performs no admission
+  checks of its own and is reachable only through the two constructors above,
+  and the unchecked test constructor is compiled only for core's own test
+  builds. An architectural test fails the build if a user-facing crate (`cli`,
+  `python`, `node`, `ffi`) reaches it, and a second test asserts that no crate
+  reaches it at all.
 
 The load-bearing part is the store bound. `ProductionEffectStore` is declared
 with a supertrait whose module is private to the ledger crate, so no other crate

@@ -11,9 +11,9 @@ use nemo_relay::api::event::Event;
 use nemo_relay::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use nemo_relay::api::tool::{ToolCallExecuteParams, ToolExecutionResult, tool_call_execute};
 use nemo_relay::plugin::PluginConfig;
-use nemo_relay::plugin::dynamic::{
-    DynamicPluginActivationSpec, DynamicPluginKind, PluginHostActivation,
-};
+use nemo_relay::plugin::dynamic::DynamicPluginKind;
+use nemo_relay_native_loader::PluginHostActivation;
+use nemo_relay::plugin::dynamic::DynamicPluginActivationSpec;
 use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;

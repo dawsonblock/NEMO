@@ -34,8 +34,8 @@ use nemo_relay_plugin::{
     NemoRelayNativeAsyncStreamMiddlewareCb, NemoRelayNativeConditionalMiddlewareCb,
     NemoRelayNativeEventSanitizeCb, NemoRelayNativeEventSubscriberCb, NemoRelayNativeFreeFn,
     NemoRelayNativeHostApiV1, NemoRelayNativeHostApiV3, NemoRelayNativeHostApiV4,
-    NemoRelayNativeLlmAsyncStream, NemoRelayNativeLlmCodecKind, NemoRelayNativeLlmConditionalCb,
-    NemoRelayNativeLlmExecutionCb, NemoRelayNativeLlmRequestCodec,
+    NemoRelayNativeHostApiV5, NemoRelayNativeLlmAsyncStream, NemoRelayNativeLlmCodecKind,
+    NemoRelayNativeLlmConditionalCb, NemoRelayNativeLlmExecutionCb, NemoRelayNativeLlmRequestCodec,
     NemoRelayNativeLlmRequestInterceptCb, NemoRelayNativeLlmResponseCodec,
     NemoRelayNativeLlmSanitizeRequestCb, NemoRelayNativeLlmSanitizeRequestContext,
     NemoRelayNativeLlmSanitizeResponseCb, NemoRelayNativeLlmSanitizeResponseContext,
@@ -45,7 +45,7 @@ use nemo_relay_plugin::{
     NemoRelayNativeString, NemoRelayNativeToolConditionalCb, NemoRelayNativeToolExecutionCb,
     NemoRelayNativeToolJsonCb, NemoRelayNativeWithScopeStackCb, NemoRelayStatus, PendingMarkSpec,
     PluginContext, PluginRuntime, ScopeType, ToolExecutionInterceptOutcome, ToolExecutionResult,
-    ToolNext,
+    ToolNext, native_scope_type,
 };
 use serde_json::{Map, json};
 
@@ -445,7 +445,7 @@ static UNAVAILABLE_CONTEXT_GATE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn native_abi_struct_sizes_are_self_describing() {
-    assert_eq!(NEMO_RELAY_NATIVE_ABI_VERSION, 4);
+    assert_eq!(NEMO_RELAY_NATIVE_ABI_VERSION, 5);
     assert_eq!(
         size_of::<NemoRelayNativeHostApiV1>(),
         test_host().struct_size
@@ -482,6 +482,20 @@ fn assert_native_abi_platform_layout() {
     );
     assert_type_layout::<NemoRelayNativeHostApiV4>(8, 600);
     assert_eq!(offset_of!(NemoRelayNativeHostApiV4, v3), 0);
+    assert_type_layout::<NemoRelayNativeHostApiV5>(8, 624);
+    assert_eq!(offset_of!(NemoRelayNativeHostApiV5, v4), 0);
+    assert_eq!(
+        offset_of!(NemoRelayNativeHostApiV5, capture_mark_window_thread),
+        600
+    );
+    assert_eq!(
+        offset_of!(NemoRelayNativeHostApiV5, release_mark_window),
+        608
+    );
+    assert_eq!(
+        offset_of!(NemoRelayNativeHostApiV5, emit_mark_in_window),
+        616
+    );
     assert_eq!(offset_of!(NemoRelayNativeHostApiV4, emit_mark_v2), 512);
     assert_eq!(
         offset_of!(NemoRelayNativeHostApiV4, get_runtime_diagnostics),
@@ -3506,17 +3520,17 @@ fn scope_guard_drops_unclosed_scope_and_maps_scope_types() {
 
     assert_eq!(
         [
-            NemoRelayNativeScopeType::from(ScopeType::Agent),
-            NemoRelayNativeScopeType::from(ScopeType::Function),
-            NemoRelayNativeScopeType::from(ScopeType::Tool),
-            NemoRelayNativeScopeType::from(ScopeType::Llm),
-            NemoRelayNativeScopeType::from(ScopeType::Retriever),
-            NemoRelayNativeScopeType::from(ScopeType::Embedder),
-            NemoRelayNativeScopeType::from(ScopeType::Reranker),
-            NemoRelayNativeScopeType::from(ScopeType::Guardrail),
-            NemoRelayNativeScopeType::from(ScopeType::Evaluator),
-            NemoRelayNativeScopeType::from(ScopeType::Custom),
-            NemoRelayNativeScopeType::from(ScopeType::Unknown),
+            native_scope_type(ScopeType::Agent),
+            native_scope_type(ScopeType::Function),
+            native_scope_type(ScopeType::Tool),
+            native_scope_type(ScopeType::Llm),
+            native_scope_type(ScopeType::Retriever),
+            native_scope_type(ScopeType::Embedder),
+            native_scope_type(ScopeType::Reranker),
+            native_scope_type(ScopeType::Guardrail),
+            native_scope_type(ScopeType::Evaluator),
+            native_scope_type(ScopeType::Custom),
+            native_scope_type(ScopeType::Unknown),
         ],
         [
             NemoRelayNativeScopeType::Agent,

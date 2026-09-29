@@ -3,40 +3,64 @@ SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NeMo Relay
+<div align="center">
 
-**A managed execution kernel for agent applications.**
+# NEMO
 
-[![License](https://img.shields.io/github/license/dawsonblock/NEMO)](LICENSE)
-[![Development line](https://img.shields.io/badge/development-0.9.1--rc.4-blue)](RELEASING.md)
-[![Rust](https://img.shields.io/badge/Rust-1.96.1-orange?logo=rust)](https://www.rust-lang.org/)
+**A managed execution kernel for agent applications, with a trust boundary you can measure.**
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Line](https://img.shields.io/badge/line-0.9.1--rc.4-orange)](RELEASING.md)
+[![Rust](https://img.shields.io/badge/Rust-1.96.1-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-24.x-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 
-NeMo Relay sits between an agent harness and the functions, tools, models, and
-providers that the harness calls. It gives those calls one consistent runtime
-boundary for identity, scopes, middleware, schemas, capability admission,
-route binding, lifecycle events, and observability.
+[Documentation](https://docs.nvidia.com/nemo/relay) ·
+[Quick start](#quick-start) ·
+[Security posture](#security-posture) ·
+[Contributing](CONTRIBUTING.md) ·
+[Security policy](SECURITY.md)
 
-Relay is intentionally not an agent planner or a durable side-effect service.
-The application owns orchestration and provider credentials. Correct-Once owns
-authority and approvals. Effect Fabric owns durable mutations. Relay connects
-those systems without pretending to replace them.
+</div>
 
-> **Development status:** `0.9.1-rc.4` is a hardening development line. The
-> checked-in qualification record is provenance-bound but currently
+> **Development status.** `0.9.1-rc.4` is a hardening development line. The
+> checked-in qualification record is provenance-bound but reports
 > `INCONCLUSIVE` with `DEV` promotion. It is not a production certificate.
 
-## The kernel boundary
+---
+
+## What this is
+
+NEMO sits between an agent harness and the functions, tools, models, and
+providers that harness calls. It gives those calls one runtime boundary for
+identity, capability admission, route binding, schemas, middleware, lifecycle
+events, and observability — across Rust, Python, and Node.js.
+
+It is deliberately **not** an agent planner and **not** a durable side-effect
+service. The application owns orchestration and provider credentials.
+
+| NEMO owns | Something else owns |
+| --- | --- |
+| Immutable capability registration and schema enforcement | LLM planning, agent memory, workflow orchestration |
+| Runtime identity and execution-class pinning | Authoritative policy language and approvals — [Correct-Once](integrations/correct-once) |
+| Admission, route binding, and bounded provider execution | Durable mutations and exactly-once execution — Effect Fabric |
+| Scopes, middleware, interceptors, lifecycle events, telemetry | Hostile-code isolation and outbound DLP — enforcement is still scaffolding |
+
+The `authority`, `ledger`, `executor`, `isolation`, and `dlp` crates here are
+interface contracts. Their enforcement flags stay disabled until qualified
+implementations are connected, and this file says so rather than implying
+otherwise.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[Agent harness\nOpenAI / PydanticAI / LangGraph / custom]
-    N[NeMo Relay kernel\nidentity • schemas • admission\ngrants • routing • lifecycle]
-    F[Function Hooks\nPURE / READ fast path]
-    C[Correct-Once\nauthority • approvals]
-    E[Effect Fabric\ndurable mutations • receipts]
-    X[MCP / API / OS / worker]
+    A["Agent harness<br/>OpenAI · PydanticAI · LangGraph · custom"]
+    N["NEMO kernel<br/>identity · schemas · admission<br/>grants · routing · lifecycle"]
+    F["Function Hooks<br/>PURE / READ"]
+    C["Correct-Once<br/>authority · approvals"]
+    E["Effect Fabric<br/>mutations · receipts"]
+    X["MCP · API · OS · worker"]
 
     A --> N
     N --> F
@@ -46,160 +70,39 @@ flowchart LR
     E --> X
 ```
 
-### Relay owns
+### How a call is routed
 
-- Immutable capability registration and restricted schema enforcement
-- Runtime identity and execution-class pinning
-- Admission and bounded provider execution
-- Exact argument and route binding; signed grant binding in the Correct-Once integration
-- Scopes, middleware, interceptors, lifecycle events, and telemetry
-- Backend selection between fast execution and consequential effects
+A harness submits a capability ID and arguments. Nothing else. The kernel
+resolves the registered execution class, identity, route, admission, policy
+values, and argument digest itself, so a caller cannot downgrade the class,
+replace the identity, or redirect the route.
 
-### Relay does not own
+| Class | Runtime path | Examples |
+| --- | --- | --- |
+| `PURE` | Function Hooks | deterministic transforms, hashing, local calculation |
+| `READ` | Function Hooks | search, lookup, snapshot, provider reads |
+| `MUTATION` | Correct-Once → Effect Fabric | file writes, issue creation, state changes |
+| `CRITICAL` | Correct-Once approval → Effect Fabric | send, delete, publish, security-sensitive actions |
 
-- LLM planning, agent memory, or workflow/DAG orchestration
-- An authoritative policy language or approval service
-- A durable effect ledger or exactly-once provider execution
-- Hostile-code VM/container implementation
-- Provider-specific credentials, retry engines, or MCP servers
+Managed execution runs in a fixed order:
 
-The authority, ledger, executor, isolation, and DLP crates in this repository
-are explicit interface contracts. Their enforcement flags remain disabled until
-qualified implementations are connected.
+**conditional guardrails → request interceptors → request sanitizers →
+execution interceptors → your callback → response sanitizers → lifecycle
+events.**
 
-## Capability routing
+Sanitizers change emitted observability data only; they never rewrite the real
+callback arguments or return value. ATOF is the canonical lifecycle event
+format, and ATIF, OpenTelemetry, and OpenInference are projections of it.
 
-Capabilities are registered with an immutable descriptor, input schema,
-execution class, and route. The Rust kernel accepts only a capability ID and
-arguments from a harness, then resolves the registered class, identity, route,
-admission, policy values, and argument digest itself. The caller cannot
-downgrade the class, replace the identity, or redirect the route.
-
-| Class      | Runtime path                          | Typical examples                                      |
-| ---------- | ------------------------------------- | ----------------------------------------------------- |
-| `PURE`     | Function Hooks                        | deterministic transforms, hashing, local calculations |
-| `READ`     | Function Hooks                        | search, lookup, snapshot, provider reads              |
-| `MUTATION` | Correct-Once → Effect Fabric          | file writes, issue creation, state changes            |
-| `CRITICAL` | Correct-Once approval → Effect Fabric | send, delete, publish, security-sensitive actions     |
-
-The Node Correct-Once integration uses signed `coap3` grants bound to the
-subject, capability, admission, policy version, operation, registered route,
-action ID, idempotency key, and canonical argument digest. The opt-in Rust
-kernel accepts a `VerifiedGrant` only after its external `GrantVerifier` checks
-the authority artifact and Relay confirms that every security-sensitive claim
-matches the bound request. Relay does not issue Correct-Once grants or own the
-authority's signing keys.
-
-Malformed or mismatched gateway receipts are treated as
-`RECONCILIATION_REQUIRED`, never as ordinary retryable failures. The reference
-bridge records `PREPARED → DISPATCHING → COMMITTED|FAILED|UNKNOWN`; durable
-state and reconciliation remain Effect Fabric responsibilities.
-
-### Kernel adapter wiring
-
-The opt-in Rust `unstable-hardening` feature exposes `Kernel::begin` as the
-capability entry point. A harness submits only a capability ID, arguments, and
-optional trace context. The kernel resolves the immutable registration,
-validates the schema, binds runtime identity and canonical argument digest, and
-creates an opaque request for its internal `BackendRouter`. Consequential
-actions are atomically claimed through the supplied `DurableEffectStore` before
-authority evaluation. The router selects Function Hooks for `PURE`/`READ` and
-requires a verified authority grant before dispatching `MUTATION`/`CRITICAL`
-work to an `ExecutionBackend`.
-
-When authority requires approval, `Kernel::begin` returns an opaque
-`PendingAction`; `Kernel::resume` accepts only an approval reference and keeps
-the original action and idempotency identities. Effect Fabric supplies one
-`DurableEffectStore` that owns action lifecycle and evidence state. Terminal
-receipt insertion and action terminalization are one fenced operation;
-reconciliation starts atomically from one evidence snapshot and completion is
-conditioned on its evidence revision. Relay does not claim durable storage,
-retries, or provider reconciliation of its own.
-
-The execution lane is descriptor-owned. A harness cannot supply an execution
-class or route: `PURE` and `READ` always use Function Hooks, while `MUTATION`
-and `CRITICAL` always use Effect Fabric. Both concrete backend adapters reject
-a request from the wrong class as a defense-in-depth check. Provider calls occur
-after a dispatch lease is committed and before the terminal store transaction;
-an Effect Fabric implementation must not hold a database transaction open while
-calling an external provider.
-
-The optional `unstable-postgres` ledger feature supplies a pooled
-`PostgresEffectStore`. Its migration creates action, primary-receipt, and
-deduplicated conflict tables; all lease decisions use `clock_timestamp()` and
-terminalization locks the action row and commits receipt, terminal state, lease
-release, and evidence revision together. Run its isolated-schema certification
-against a disposable database with
-`NEMO_RELAY_TEST_POSTGRES_URL=... just test-postgres-effect-store`.
-The distinct `just test-postgres-crash-recovery` gate kills a child process at
-the terminal transaction boundaries and verifies recovery from a fresh process;
-it is intentionally narrower than full machine, network, and provider chaos
-qualification.
-
-`BackendRouter` is deliberately a post-binding component, not a public
-harness entry point. Correct-Once and Effect Fabric implementations plug into
-the contracts; Relay does not import their policy, database, or provider
-internals.
-
-## Start here
-
-| Goal                          | Guide                                                                                              |
-| ----------------------------- | -------------------------------------------------------------------------------------------------- |
-| Add Relay to Python           | [Python quick start](https://docs.nvidia.com/nemo/relay/getting-started/quick-start/python)        |
-| Add Relay to Node.js          | [Node.js quick start](https://docs.nvidia.com/nemo/relay/getting-started/quick-start/nodejs)       |
-| Add Relay to Rust             | [Rust quick start](https://docs.nvidia.com/nemo/relay/getting-started/quick-start/rust)            |
-| Wrap a tool or model          | [Framework integration guides](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/about) |
-| Observe Codex or Claude Code  | [Relay CLI](https://docs.nvidia.com/nemo/relay/nemo-relay-cli/about)                               |
-| Build a plugin                | [Plugin guide](https://docs.nvidia.com/nemo/relay/build-plugins/about)                             |
-| Contribute to this repository | [Contributing](CONTRIBUTING.md)                                                                    |
-
-## Install
+## Quick start
 
 ### Python
 
 ```bash
 uv add nemo-relay
-```
-
-Optional framework integrations:
-
-```bash
+# framework integrations:
 uv add "nemo-relay[langchain,langgraph,deepagents]"
 ```
-
-### Node.js
-
-Use Node.js 24.x for this development line:
-
-```bash
-nvm use
-npm install nemo-relay-node@0.9.1-rc.4
-```
-
-### Rust
-
-```bash
-cargo add nemo-relay
-```
-
-### CLI
-
-```bash
-pip install nemo-relay-cli-bin
-nemo-relay --version
-```
-
-The upstream installer targets NVIDIA GitHub Releases and does not install
-this unpublished development branch:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh | sh
-```
-
-## Quick start: Python
-
-Relay wraps an application-owned callback; it does not take ownership of the
-provider or planner.
 
 ```python
 import asyncio
@@ -232,161 +135,180 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Continue with [LLM wrapping](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-llm-calls),
+Relay wraps a callback your application owns. Next steps:
+[LLM wrapping](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-llm-calls),
 [tool wrapping](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/wrap-tool-calls),
-and [provider codecs](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/using-codecs).
+[provider codecs](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/using-codecs).
 
-## Quick start: Correct-Once boundary
+### Node.js
 
-The self-contained Node integration demonstrates the intended routing contract:
+```bash
+nvm use                                     # Node 24.x
+npm install nemo-relay-node@0.9.1-rc.4
+```
+
+### Rust
+
+```bash
+cargo add nemo-relay
+```
+
+### CLI
+
+```bash
+pip install nemo-relay-cli-bin
+nemo-relay --version
+```
+
+### See the routing contract end to end
 
 ```bash
 npm ci --ignore-scripts
 npm test --workspace=nemo-relay-correct-once
 ```
 
-Use the real Correct-Once authority and the real Effect Fabric for consequential
-production effects. The local `EffectFabricBridge` is a reference adapter with
-process-local receipts and in-flight protection; it is not durable exactly-once
-execution.
+The local `EffectFabricBridge` in that integration is a reference adapter with
+process-local receipts. Use the real Correct-Once authority and the real Effect
+Fabric for consequential production effects.
 
-## Runtime contract
+## Security posture
 
-Managed execution follows this order:
+NEMO treats its own trusted computing base as a measured quantity rather than a
+claim, and the measurement is enforced in CI.
 
-1. Conditional guardrails
-2. Request interceptors
-3. Request observation sanitizers
-4. Execution interceptors
-5. The application callback
-6. Response observation sanitizers
-7. Lifecycle events and exporters
+```bash
+just tcb-report          # trusted surface, budgets, and forbidden dependencies
+just layer-report        # dependency-layer rules; fails on a new upward edge
+just test-tcb-scripts    # the gates' own tests
+```
 
-Sanitizers change emitted observability data only. They do not silently rewrite
-the real callback arguments or return value. ATOF is the canonical lifecycle
-event format; ATIF, OpenTelemetry, and OpenInference outputs are projections.
+`security/tcb.toml` records three surfaces separately, because they answer
+different questions:
 
-## Current safeguards
+| Surface | What it is |
+| --- | --- |
+| Invariant-enforcing | Code that *enforces* a kernel invariant. A function earns a place here by enforcing one of the properties in `security/INVARIANTS.md`. |
+| Effective in-process | Everything linked into the same process, which can subvert an invariant without enforcing it. |
+| Plugin host | The process that will host native plugins, reported separately and not counted against the kernel. |
 
-| Boundary           | Current guarantee                                                                                                                           |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| Identity           | Runtime subject cannot be overridden per call.                                                                                              |
-| Schema             | Registered restricted-schema descriptors are cloned, frozen, and validated before grants. Unsupported or malformed constraints fail closed. |
-| Grant binding      | The Correct-Once integration signs arguments, execution class, route, admission, policy version, action, and idempotency together.          |
-| Critical receipts  | Missing, malformed, mismatched, or ambiguous gateway receipts become `UNKNOWN` and require reconciliation.                                  |
-| Effect lifecycle   | Reference journaling enforces `PREPARED → DISPATCHING → COMMITTED / FAILED / UNKNOWN`.                                                      |
-| Provider admission | Rust adaptive admission bounds active work and pending work, preserves stream permits, and schedules eligible waiters under one state lock. |
-| Qualification      | Source, lockfiles, Git lineage, environment, and archive digests are checked explicitly.                                                    |
+Every budget is a ratchet: exceeding one fails the build, and each crate's
+resolved dependency set — versions included — is pinned by digest, so swapping a
+package for another cannot pass by keeping the count equal. `just tcb-report`
+prints the live figures; they move with the code, which is why they are not
+copied here.
 
-These safeguards do not claim durable authorization, crash-safe external
-execution, hostile-code containment, or outbound DLP. Those guarantees require
-the external systems named above.
+What the numbers currently show, and what they do not:
+
+- Runtime identity, capability and grant verification, routing, idempotency,
+  effect state transitions, receipts, and lease fencing are enforced, and
+  several are structural rather than conventional — only a sealed registry can
+  produce a kernel, and an action that may have been dispatched becomes
+  `UNKNOWN` rather than `FAILED` by a total `match` with no catch-all.
+- The kernel is still larger than its target, and most of its remaining `unsafe`
+  is the dynamic native plugin loader. Relocating that loader to another crate
+  would change nothing, because it would still share the address space;
+  `security/PLUGIN-ISOLATION.md` records the program to move it behind a process
+  boundary, and `kernel-process unsafe tokens` is the number that has to fall.
+- DLP, sandboxing, and provider isolation are contracts, not enforcement. Their
+  flags are `false` in the source, deliberately.
+
+Full detail: [hardening reference](docs/reference/hardening.mdx) ·
+[invariants](security/INVARIANTS.md) · [TCB policy](security/tcb.toml) ·
+[plugin isolation program](security/PLUGIN-ISOLATION.md).
 
 ## Support matrix
 
-| Surface         | Status       | Notes                                                                |
-| --------------- | ------------ | -------------------------------------------------------------------- |
-| Rust runtime    | Supported    | Source of truth for runtime semantics; Rust 1.96.1 in this checkout. |
-| Python binding  | Supported    | Python 3.11+ with PyO3 native extension.                             |
-| Node.js binding | Supported    | Node.js 24.x with N-API and TypeScript declarations.                 |
-| Relay CLI       | Supported    | Hooks, gateway, and observability workflows.                         |
-| Go binding      | Experimental | Source-first CGo binding over the FFI library.                       |
-| Raw C FFI       | Experimental | Downstream binding surface.                                          |
+| Surface | Status | Notes |
+| --- | --- | --- |
+| Rust runtime | Supported | Source of truth for runtime semantics |
+| Python binding | Supported | Python 3.11+, PyO3 native extension |
+| Node.js binding | Supported | Node.js 24.x, N-API with TypeScript declarations |
+| Relay CLI | Supported | Hooks, gateway, observability |
+| Go binding | Experimental | Source-first CGo over the FFI library |
+| Raw C FFI | Experimental | Downstream binding surface |
 
-Framework integrations include LangChain, LangGraph, Deep Agents, and OpenClaw.
-Host capabilities depend on the interfaces exposed by each framework.
+Integrations cover LangChain, LangGraph, Deep Agents, and OpenClaw. What each
+supports depends on the interfaces that framework exposes.
 
 ## Repository layout
 
 ```text
-crates/core/       Rust runtime and public execution APIs
-crates/adaptive/   Admission, adaptive hints, cache, and telemetry
-crates/plugin/     Plugin SDK and lifecycle helpers
-crates/cli/        Relay gateway, agent hooks, and CLI
-crates/python/     PyO3 native extension
-crates/node/       N-API binding and TypeScript package
-crates/authority/  Authority interface contracts
-crates/ledger/     Effect journal and receipt-store contracts
-crates/executor/   Execution backend contracts
-crates/isolation/  Worker-isolation contracts
-crates/dlp/        Outbound-DLP contracts
-python/            Python package and tests
-go/                Experimental Go binding
-integrations/      Correct-Once and framework integrations
-scripts/           Build, test, docs, and qualification wrappers
+crates/
+  core/              runtime and public execution APIs
+  adaptive/          admission, adaptive hints, cache, telemetry
+  plugin/            plugin SDK and lifecycle helpers
+  plugin-protocol/   domain vocabulary and invariants for plugin execution
+  plugin-proto/      gRPC wire schema for the plugin process boundary
+  plugin-host/       plugin execution backends and their conformance suite
+  cli/               gateway, agent hooks, CLI
+  python/ node/ ffi/ language bindings
+  authority/ ledger/ executor/ isolation/ dlp/   interface contracts
+python/              Python package and tests
+go/                  experimental Go binding
+integrations/        Correct-Once and framework integrations
+security/            TCB policy, layer policy, invariants, baselines
+qualification/       evidence, baselines, ABI vectors
+scripts/             build, test, docs, and qualification entry points
 ```
 
-## Build and test from source
+## Build and test
 
-Prerequisites: Rust 1.96.1, Python 3.11+, Node.js 24.x, Go 1.21+, `uv`, and
-`just`.
+Prerequisites: Rust 1.96.1, Python 3.11+, Node.js 24.x, Go 1.21+, `uv`, `just`.
 
 ```bash
 uv sync
 npm ci --ignore-scripts
 
 just build-all
-just test-rust
-just test-python
-just test-node
-just test-go
+just test-all          # or: just test-rust / test-python / test-node / test-go
 ```
 
-For the adapter contracts specifically:
+Before opening a pull request:
 
 ```bash
-cargo fmt --all -- --check
-cargo check -p nemo-relay-authority -p nemo-relay-ledger \
-  -p nemo-relay-executor -p nemo-relay-isolation -p nemo-relay-dlp --all-features
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+uv run pre-commit run --all-files
 ```
 
-## Qualification and provenance
+Touching the Rust core invalidates every binding, so run the whole matrix rather
+than the crate you changed.
 
-The qualification pipeline is fail-closed. `NOT_RUN` and `INCONCLUSIVE` never
+## Qualification
+
+The qualification pipeline is fail-closed: `NOT_RUN` and `INCONCLUSIVE` never
 become implicit passes.
 
 ```bash
-# Verify the current source against the checked-in evidence.
-just provenance-check
-
-# Run the full pinned matrix in the devcontainer.
-just qualification
-
-# Bind the final archive to an unchanged valid full qualification.
-just qualification provenance
+just provenance-check     # verify this source against the checked-in evidence
+just qualification        # run the full pinned matrix in the devcontainer
 ```
 
 To build and bind a deterministic source archive:
 
 ```bash
-python3 scripts/qualification/package_release.py \
-  --version 0.9.1-rc.4
-
+python3 scripts/qualification/package_release.py --version 0.9.1-rc.4
 export NEMO_RELAY_RELEASE_ARCHIVE=release/artifacts/NEMO-0.9.1-rc.4-source.zip
 export NEMO_RELAY_SOURCE_ARCHIVE="$NEMO_RELAY_RELEASE_ARCHIVE"
 just qualification provenance
 just provenance-check
 ```
 
-Packaging refuses a missing, invalid, or source-mismatched qualification
-record. The resulting archive has normalized paths, timestamps, and
-permissions. It is an evidence-bound source candidate; it is not a production
-certificate until the complete Rust, Python, Node, Go, security, provider, and
-recovery gates actually pass.
+Packaging refuses a missing, invalid, or source-mismatched record. The archive
+has normalized paths, timestamps, and permissions, and is an evidence-bound
+source candidate rather than a production certificate.
 
-## Documentation and contribution
+## Contributing
 
-- [Documentation](https://docs.nvidia.com/nemo/relay)
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Release process](RELEASING.md)
-- [Fork provenance](FORK_PROVENANCE.md)
-- [Local hardening notes](docs/reference/hardening.mdx)
+Please open an issue before an external contribution. Keep public behavior
+aligned across Rust, Python, and Node.js, and include focused tests for every
+binding a runtime-contract change touches.
 
-Please open an issue before submitting an external contribution. Keep public
-behavior aligned across Rust, Python, and Node.js, and include focused tests for
-every binding affected by a runtime contract change.
+- [Contributing](CONTRIBUTING.md) · [Release process](RELEASING.md) · [Security policy](SECURITY.md)
+- [Fork provenance](FORK_PROVENANCE.md) — NEMO is a derived development fork of
+  [NVIDIA NeMo Relay](https://github.com/NVIDIA/NeMo-Relay), not an official
+  NVIDIA release
 
 ## License
 
-NeMo Relay is licensed under the [Apache License 2.0](LICENSE).
+[Apache License 2.0](LICENSE).

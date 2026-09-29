@@ -122,6 +122,20 @@ Runtime and migration credentials are separate. Production startup calls
 `effect_schema_state`. A runtime credential that can rewrite the ledger it
 trusts can hide drift from every later check.
 
+The role check covers the powers that need no grant as well as the ones that
+do. A runtime role is rejected for `SUPERUSER`, `BYPASSRLS`, and `CREATEROLE`,
+and for owning the effect schema or any effect-store relation, because
+ownership conveys powers that an ordinary `GRANT` list never shows.
+
+Readiness also compares the server's settings against a policy instead of only
+reporting them. `DatabaseReadinessPolicy` requires a server at or above the
+qualified major version, a `synchronous_commit` that keeps a committed write
+durable, and a transaction isolation level the runtime accepts, so a database
+running `synchronous_commit = off` no longer passes. Wait timeouts and the
+session time zone are reported but deliberately not enforced: the adapter sets
+statement and lock timeouts on every checked-out session from the action
+budget, so the server defaults are not the binding constraint.
+
 PostgreSQL waits are bounded by the action, not only by a fixed maximum. The
 configured budgets remain upper bounds, and
 `PostgresOperationBudgets::for_remaining` derives
@@ -132,10 +146,57 @@ sharing the same pool but carrying a trusted deadline, so every call made
 through it is bounded by what is left of that deadline without changing the
 shared store traits.
 
+The kernel reaches that path for terminal receipt finalization, which is the
+last place a database wait can outlive the action it serves. `EffectStore` has
+a budget-aware finalization form whose default implementation delegates to the
+plain one, so a store that cannot block stays valid, and the PostgreSQL adapter
+overrides it to derive its waits from what is left. When the trusted deadline
+has already passed, the kernel does not call the store at all: it records the
+action as `UNKNOWN` for reconciliation rather than handing over a zero budget
+that would fail inside the transaction it was meant to bound.
+
 The authority, ledger, and executor crates provide experimental kernel
 contracts and adapter boundaries. Production authority enforcement, durable
 action/receipt storage, isolation enforcement, and outbound DLP remain
 external and unconfigured in this development release.
+
+### Trusted computing base budget
+
+`security/tcb.toml` names the crates whose failure could directly violate the
+kernel guarantees and records what they are allowed to reach. It defines two
+tiers, because "code that enforces an invariant" and "code that can subvert one"
+are different questions: the crates that enforce an invariant, and every
+additional crate linked into the same process. Both are measured, since the
+second is the real attack surface until process isolation exists.
+
+`just tcb-report` measures the resolved dependency tree with
+`cargo tree --all-features`, counts source lines and `unsafe` occurrences, and
+fails when a trusted crate reaches a database driver or a foreign-function
+binding, or when any budget grows. Alongside the ceilings, each crate's direct
+and transitive dependency sets are pinned by digest, so swapping a harmless
+package for a dangerous one cannot pass by keeping the count the same. Source
+counts are upper bounds that include inline test modules.
+
+`security/INVARIANTS.md` records the properties the kernel protects and where
+each one is enforced, including the ones that are not yet enforced. It is the
+reference for deciding what may move out of the kernel, since a component earns
+a place there only by enforcing one of those properties. `security/BASELINE.md`
+records the frozen revision and digests the refactor is measured against.
+
+`security/layers.toml` places every workspace crate in a layer, and
+`just layer-report` fails when a dependency points upward. Edges that point the
+wrong way today are recorded as grandfathered, so the check is green on arrival.
+A grandfathered entry that no longer describes a real edge fails too, so the
+layer debt can only shrink and an exception cannot be reused by a later
+regression.
+
+`security/PLUGIN-ISOLATION.md` records the milestone that moves native plugin
+loading across a process boundary. Almost all of the kernel's `unsafe` is the
+native plugin path, and relocating that loader to another crate would leave the
+same code in the same address space, so the milestone is judged on
+`kernel-process unsafe tokens` from `just tcb-report` rather than on crate
+organisation. The message contract already exists in
+`crates/plugin-protocol`; the kernel does not depend on it yet.
 
 ## Experimental effect-state contracts
 
@@ -328,7 +389,13 @@ local Unix socket or verified TLS/mTLS, and verifying the versioned
 `effect_schema_migrations` ledger. Normal workers never call `migrate()`;
 that method is reserved for a dedicated migration role. Production mode rejects
 plaintext loopback PostgreSQL and identities whose environment is not
-`production`.
+`production`. The profile is not a field a caller sets next to the evidence:
+configurations are built by `production`, `qualification`, or `development`,
+and each constructor pairs its profile with the evidence that justifies it. A
+deployment therefore cannot hold a production identity while declaring a
+profile that skips production admission, and no contradictory combination is
+representable. Every profile then composes the kernel through a checked
+constructor.
 
 The adapter sets bounded pool-acquire, lock, statement, and idle-transaction
 budgets on checked-out PostgreSQL sessions. A timeout after provider dispatch

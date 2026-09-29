@@ -48,7 +48,13 @@ struct TestHttpServer {
 const RUN_ENV: &str = "NEMO_RELAY_RUN_S3_TESTS";
 const BUCKET_ENV: &str = "NEMO_RELAY_S3_TEST_BUCKET";
 const KEY_PREFIX_ENV: &str = "NEMO_RELAY_S3_TEST_KEY_PREFIX";
-const HTTP_SERVER_HARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the test's own HTTP server waits for the exporter to deliver.
+///
+/// Ten seconds was a statement about an idle machine: the suite runs its tests in
+/// one process and the delivery is background work, so a loaded run can take far
+/// longer to get there. What is under test is that the trajectory is delivered, not
+/// how promptly.
+const HTTP_SERVER_HARD_TIMEOUT: Duration = Duration::from_secs(60);
 static PLUGIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl TestHttpServer {

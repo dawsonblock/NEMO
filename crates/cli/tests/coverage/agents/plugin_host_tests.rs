@@ -3920,7 +3920,7 @@ fn healthz_times_out_for_bad_port_occupant() {
         };
         accepted_sender.send(()).unwrap();
         release_receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC)
             .unwrap();
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
     });
@@ -3931,9 +3931,9 @@ fn healthz_times_out_for_bad_port_occupant() {
     });
 
     accepted_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC)
         .unwrap();
-    let result = result_receiver.recv_timeout(Duration::from_secs(5));
+    let result = result_receiver.recv_timeout(crate::test_support::WAIT_FOR_TEST_TRAFFIC);
     release_sender.send(()).unwrap();
     server.join().unwrap();
     health.join().unwrap();

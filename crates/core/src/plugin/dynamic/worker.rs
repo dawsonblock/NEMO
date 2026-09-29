@@ -100,8 +100,8 @@ use crate::plugin::{
 };
 
 use super::{
-    DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad,
-    DynamicPluginTeardownOutcome, WorkerRuntime, deregister_tracked_registrations_checked,
+    DynamicPluginKind, DynamicPluginManifest, DynamicPluginManifestLoad, RegistrationTeardown,
+    WorkerRuntime, deregister_tracked_registrations_checked,
     validate_annotated_request_consumer_compatibility, validate_dynamic_plugin_relay_compatibility,
 };
 
@@ -164,12 +164,23 @@ impl WorkerPluginActivation {
     /// Consumes the activation; deregistration runs from `Drop`.
     pub fn clear(self) {}
 
-    pub(crate) fn deregister_plugin_kinds_checked(&mut self) -> DynamicPluginTeardownOutcome {
+    /// Remove every plugin kind this activation registered, newest first.
+    ///
+    /// A composition that owns more than one lane runs this before releasing the
+    /// host claim, so a kind that could not be removed is reported rather than
+    /// silently left behind — and the outcome says whether the worker may be
+    /// unloaded, which is a different question from whether every removal worked.
+    pub fn deregister_plugin_kinds_checked(&mut self) -> RegistrationTeardown {
         deregister_tracked_registrations_checked(&mut self.plugin_registrations, "worker")
     }
 
-    pub(crate) fn shutdown_plugins_checked(&self) -> DynamicPluginTeardownOutcome {
-        let mut outcome = DynamicPluginTeardownOutcome::success();
+    /// Stop the worker processes this activation started.
+    ///
+    /// Only meaningful once every kind is known to be absent from the registry: a
+    /// worker stopped while its adapter is still callable would turn a live call
+    /// into a crash.
+    pub fn shutdown_plugins_checked(&self) -> RegistrationTeardown {
+        let mut outcome = RegistrationTeardown::success();
         for plugin in self.plugins.iter().rev() {
             outcome.merge(plugin.shutdown_checked());
         }
@@ -275,13 +286,13 @@ struct WorkerPluginInstance {
 impl Drop for WorkerPluginInstance {
     fn drop(&mut self) {
         let outcome = self.shutdown_checked();
-        if !outcome.errors.is_empty() {
+        if !outcome.errors().is_empty() {
             log::error!(
                 target: "nemo_relay.worker",
                 event = "worker_cleanup_failed",
                 plugin_id = self.plugin_kind.as_str(),
-                failure_count = outcome.errors.len(),
-                safe_to_unload = outcome.safe_to_unload;
+                failure_count = outcome.errors().len(),
+                safe_to_unload = outcome.safe_to_unload();
                 "Worker plugin cleanup failed during drop"
             );
         }
@@ -289,8 +300,8 @@ impl Drop for WorkerPluginInstance {
 }
 
 impl WorkerPluginInstance {
-    fn shutdown_checked(&self) -> DynamicPluginTeardownOutcome {
-        let mut outcome = DynamicPluginTeardownOutcome::success();
+    fn shutdown_checked(&self) -> RegistrationTeardown {
+        let mut outcome = RegistrationTeardown::success();
         if self.teardown_started.swap(true, Ordering::AcqRel) {
             return outcome;
         }
@@ -357,7 +368,7 @@ impl WorkerPluginInstance {
         }
 
         self.stop_process_checked(&mut outcome);
-        if outcome.safe_to_unload
+        if outcome.safe_to_unload()
             && let Err(error) = std::fs::remove_dir_all(&self.activation_dir)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -370,7 +381,7 @@ impl WorkerPluginInstance {
                 true,
             );
         }
-        if outcome.errors.is_empty() {
+        if outcome.errors().is_empty() {
             log::info!(
                 target: "nemo_relay.worker",
                 event = "worker_stopped",
@@ -381,7 +392,7 @@ impl WorkerPluginInstance {
         outcome
     }
 
-    fn stop_process_checked(&self, outcome: &mut DynamicPluginTeardownOutcome) {
+    fn stop_process_checked(&self, outcome: &mut RegistrationTeardown) {
         let mut process = match self.process.lock() {
             Ok(process) => process,
             Err(error) => {

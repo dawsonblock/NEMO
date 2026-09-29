@@ -1798,12 +1798,12 @@ dependencies = [
  "futures",
  "futures-util",
  "hyper-util",
- "libloading",
  "log",
  "nemo-relay-authority",
  "nemo-relay-executor",
  "nemo-relay-ledger",
- "nemo-relay-plugin",
+ "nemo-relay-native-loader",
+ "nemo-relay-plugin-protocol",
  "nemo-relay-types",
  "nemo-relay-worker-proto",
  "object_store",
@@ -1895,6 +1895,8 @@ dependencies = [
  "nemo-relay",
  "nemo-relay-adaptive",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
+ "nemo-relay-plugin-protocol",
  "opentelemetry",
  "opentelemetry_sdk",
  "percent-encoding",
@@ -1939,6 +1941,7 @@ name = "nemo-relay-executor"
 version = "0.9.1-rc.4"
 dependencies = [
  "nemo-relay-ledger",
+ "nemo-relay-types",
  "serde",
  "serde_json",
 ]
@@ -1953,6 +1956,7 @@ dependencies = [
  "nemo-relay",
  "nemo-relay-adaptive",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
  "serde",
  "serde_json",
  "tempfile",
@@ -1986,16 +1990,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-native-abi"
+version = "0.9.1-rc.4"
+
+[[package]]
+name = "nemo-relay-native-loader"
+version = "0.9.1-rc.4"
+dependencies = [
+ "chrono",
+ "futures",
+ "futures-util",
+ "hyper-util",
+ "libloading",
+ "log",
+ "nemo-relay",
+ "nemo-relay-native-abi",
+ "nemo-relay-plugin-host",
+ "nemo-relay-plugin-proto",
+ "nemo-relay-plugin-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spdlog-rs",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nemo-relay-node"
 version = "0.9.1-rc.4"
 dependencies = [
  "chrono",
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",
  "nemo-relay",
  "nemo-relay-adaptive",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
  "serde",
  "serde_json",
  "tokio",
@@ -2027,11 +2066,60 @@ name = "nemo-relay-plugin"
 version = "0.9.1-rc.4"
 dependencies = [
  "futures",
+ "nemo-relay-native-abi",
  "nemo-relay-types",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "nemo-relay-plugin-host"
+version = "0.9.1-rc.4"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hyper-util",
+ "nemo-relay",
+ "nemo-relay-native-loader",
+ "nemo-relay-plugin-proto",
+ "nemo-relay-plugin-protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+]
+
+[[package]]
+name = "nemo-relay-plugin-proto"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay-plugin-protocol",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "serde_json",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "nemo-relay-plugin-protocol"
+version = "0.9.1-rc.4"
+dependencies = [
+ "nemo-relay-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -2042,11 +2130,13 @@ dependencies = [
  "nemo-relay",
  "nemo-relay-adaptive",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
  "pyo3",
  "pyo3-async-runtimes",
  "pythonize",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "uuid",

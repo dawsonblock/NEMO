@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-native-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Loads native NeMo Relay plugins: the loader, the host process's own end of the protocol, and the nemo-plugin-host binary."
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nemo-relay.workspace = true
+nemo-relay-plugin-host.workspace = true
+nemo-relay-plugin-proto.workspace = true
+nemo-relay-native-abi.workspace = true
+nemo-relay-plugin-protocol.workspace = true
+chrono = "0.4"
+futures-util = "0.3"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["io-util", "net", "process", "rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
+log = { version = "0.4", features = ["kv"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router", "transport"] }
+
+[features]
+# The worker lane: a plugin whose code runs in a process the kernel starts.
+worker-grpc = ["nemo-relay/worker-grpc"]
+
+[[test]]
+name = "native_plugin_integration"
+path = "tests/integration/native_plugin_tests.rs"
+
+[target.'cfg(unix)'.dev-dependencies]
+futures = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+spdlog-rs = { version = "0.5", features = ["log", "multi-thread"] }
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+toml = "0.9"

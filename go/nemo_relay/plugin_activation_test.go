@@ -654,7 +654,16 @@ func TestInitializeWithDynamicPluginsIgnoresProjectPluginConfig(t *testing.T) {
 		t.Fatalf("static registrations = %d, want 0", staticRegistrations.Load())
 	}
 
-	transformed, err := ToolRequestIntercepts(goNativeToolName, json.RawMessage(`{"input":true}`))
+	// Through a managed call rather than through the intercept entry point: the
+	// registration this asserts on is a proxy to another process, and a proxy has no
+	// budget of its own to run under. The managed action supplies one, which is the
+	// rule the process boundary is built on — a bare call is refused rather than given
+	// a budget nobody declared.
+	var transformed json.RawMessage
+	_, err = ToolCallExecute(goNativeToolName, json.RawMessage(`{"input":true}`), func(args json.RawMessage) (ToolExecutionResult, error) {
+		transformed = args
+		return toolExecutionResult(args), nil
+	})
 	if err != nil {
 		t.Fatalf(toolInterceptErrorFmt, err)
 	}
@@ -802,7 +811,14 @@ func assertNativePluginInterception(t *testing.T, pluginsTOML string, staticCall
 		t.Fatalf("mutate plugins.toml error = %v", err)
 	}
 
-	transformed, err := ToolRequestIntercepts(goNativeToolName, json.RawMessage(`{"input":true}`))
+	// Through a managed call: the dynamic registration is a proxy to another process
+	// and has no budget of its own to run under, which is the rule the boundary is
+	// built on. The managed action supplies one.
+	var transformed json.RawMessage
+	_, err := ToolCallExecute(goNativeToolName, json.RawMessage(`{"input":true}`), func(args json.RawMessage) (ToolExecutionResult, error) {
+		transformed = args
+		return toolExecutionResult(args), nil
+	})
 	if err != nil {
 		t.Fatalf(toolInterceptErrorFmt, err)
 	}
@@ -829,9 +845,16 @@ func assertNativePluginCleanup(t *testing.T, activation *PluginActivation, plugi
 	if err := activation.Close(); err != nil {
 		t.Fatalf(closeErrorFmt, err)
 	}
-	afterClose, err := ToolRequestIntercepts(goNativeToolName, json.RawMessage(`{"input":true}`))
+	// The same managed call after the activation is gone. Nothing the activation
+	// configured is left — the static base it layered over the discovered
+	// configuration included — so the args come back as they were sent.
+	var afterClose json.RawMessage
+	_, err := ToolCallExecute(goNativeToolName, json.RawMessage(`{"input":true}`), func(args json.RawMessage) (ToolExecutionResult, error) {
+		afterClose = args
+		return toolExecutionResult(args), nil
+	})
 	if err != nil {
-		t.Fatalf("ToolRequestIntercepts() after Close error = %v", err)
+		t.Fatalf("ToolCallExecute() after Close error = %v", err)
 	}
 	if string(afterClose) != `{"input":true}` {
 		t.Fatalf("tool args after Close = %s, want unchanged args", afterClose)

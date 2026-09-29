@@ -253,7 +253,6 @@ class TestDynamicConfigContract:
         assert config.policy is policy
         assert config.response_cache is None
 
-
     def test_response_cache_rides_the_adaptive_component(self):
         component = ComponentSpec(AdaptiveConfig(response_cache=ResponseCacheConfig(namespace="dev"))).to_dict()
         assert component["kind"] == "adaptive"

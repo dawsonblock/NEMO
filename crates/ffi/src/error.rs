@@ -126,6 +126,11 @@ impl From<&FlowError> for NemoRelayStatus {
             // Admission timeouts are bounded overload, not runtime defects.
             // Preserve the retryable capacity signal across the stable ABI.
             FlowError::Timeout { .. } => NemoRelayStatus::ResourceExhausted,
+            // A registration a plugin made failed while the runtime invoked it.
+            // The dispatch state and certainty stay in the message rather than
+            // becoming a status: a binding caller deciding about effects reads
+            // them from the runtime error, not from the ABI status.
+            FlowError::PluginInvocation { .. } => NemoRelayStatus::Internal,
             FlowError::Upstream(_)
             | FlowError::Internal(_)
             | FlowError::CallbackException { .. } => NemoRelayStatus::Internal,
@@ -152,6 +157,25 @@ pub fn status_from_plugin_error(e: &PluginError) -> NemoRelayStatus {
         }
         PluginError::ResourceExhausted { .. } => NemoRelayStatus::ResourceExhausted,
         PluginError::Internal(_) | PluginError::RegistrationFailed(_) => NemoRelayStatus::Internal,
+    }
+}
+
+/// Report an activation failure in the status this ABI hands callers.
+///
+/// An activation failure that carries a plugin error keeps that error's status, so
+/// a foreign caller can still tell "the plugin was not found" from "the
+/// configuration was wrong": flattening every activation failure into one status
+/// would make the actionable half unreachable. A boundary or retained failure has
+/// no plugin-error equivalent and reports as internal, with its message set.
+pub fn status_from_activation_error(
+    error: &nemo_relay_plugin_host::activation::PluginActivationError,
+) -> NemoRelayStatus {
+    match error.as_plugin_error() {
+        Some(error) => status_from_plugin_error(error),
+        None => {
+            set_last_error(&error.to_string());
+            NemoRelayStatus::Internal
+        }
     }
 }
 

@@ -26,8 +26,8 @@ use nemo_relay::api::scope::{ScopeHandle, ScopeType};
 use nemo_relay::api::tool::ToolAttributes;
 use nemo_relay::api::tool::ToolHandle;
 use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
-use nemo_relay::plugin::dynamic::PluginHostActivation;
 use nemo_relay_adaptive::AdaptiveRuntime;
+use nemo_relay_plugin_host::activation::ActivatedPluginRuntime;
 
 use crate::convert::{json_to_c_string, str_to_c_string};
 use crate::error::set_last_error;
@@ -77,7 +77,9 @@ pub struct FfiAdaptiveRuntime(pub std::sync::Mutex<Option<AdaptiveRuntime>>);
 ///
 /// The inner option allows explicit activation cleanup to be idempotent while
 /// retaining a stable allocation until the foreign caller frees the handle.
-pub struct FfiPluginActivation(pub std::sync::Mutex<Option<PluginHostActivation>>);
+/// What it holds is the shared activation: the ownership, the configuration's
+/// own components, and the process the native plugins run in.
+pub struct FfiPluginActivation(pub std::sync::Mutex<Option<ActivatedPluginRuntime>>);
 /// Opaque plugin registration context.
 ///
 /// This wrapper contains a borrowed raw pointer to an

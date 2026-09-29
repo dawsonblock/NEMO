@@ -16,8 +16,11 @@ use std::sync::OnceLock;
 use crate::error::FlowError;
 use crate::error::Result;
 
-const BINDING_KIND_ENV: &str = "NEMO_RELAY_BINDING_KIND";
-const OWNER_TOKEN_ENV: &str = "NEMO_RELAY_RUNTIME_OWNER";
+// Visible to the crate's tests: a suite that has to put the process in a state the
+// owner check refuses has to write the same variables the check reads, and a second
+// spelling of either name in a test is a test that stops testing the real one.
+pub(crate) const BINDING_KIND_ENV: &str = "NEMO_RELAY_BINDING_KIND";
+pub(crate) const OWNER_TOKEN_ENV: &str = "NEMO_RELAY_RUNTIME_OWNER";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeOwner {

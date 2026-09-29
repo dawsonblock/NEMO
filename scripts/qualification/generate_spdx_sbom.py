@@ -20,9 +20,7 @@ def package_id(package: dict[str, Any]) -> str:
 
 def main() -> int:
     if len(sys.argv) != 4:
-        raise SystemExit(
-            "usage: generate_spdx_sbom.py <cargo-about.json> <spdx.json> <release-version>"
-        )
+        raise SystemExit("usage: generate_spdx_sbom.py <cargo-about.json> <spdx.json> <release-version>")
 
     inventory = json.loads(pathlib.Path(sys.argv[1]).read_text())
     release_version = sys.argv[3]

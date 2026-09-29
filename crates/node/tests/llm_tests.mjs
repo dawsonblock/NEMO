@@ -192,6 +192,42 @@ describe('LLM lifecycle', () => {
 // ===========================================================================
 
 describe('LLM execute', () => {
+  it('creates its promise under a promise hook', async () => {
+    // The entry point assembles a pipeline and then asks NAPI for a promise, and
+    // the promise hook V8 runs at that moment is JavaScript. When the pipeline
+    // sits in the frame V8 calls back into, the hook is deeper than V8's own
+    // limit for this thread and V8 dies in its unwinder instead of failing an
+    // assertion: `Maximum call stack size exceeded` from the hook, then SIGSEGV
+    // — a process failure, not a rejected promise. `async_hooks` is what turns
+    // that hook on, so a managed call made under one is the whole check, and it
+    // has to be a test rather than a debugger session because nothing above the
+    // process can catch it.
+    const asyncHooks = await import('node:async_hooks');
+    const seen = [];
+    const hook = asyncHooks.createHook({
+      init(_asyncId, type) {
+        seen.push(type);
+      },
+    });
+    hook.enable();
+    try {
+      const result = await llmCallExecute(
+        'exec_llm_under_promise_hook',
+        makeNative(),
+        (request) => ({ content: request.content, answered: true }),
+        null,
+        null,
+        null,
+        null,
+        null,
+      );
+      assert.equal(result.answered, true);
+      assert.ok(seen.includes('PROMISE'), `promise init was not observed: ${seen.join(', ')}`);
+    } finally {
+      hook.disable();
+    }
+  });
+
   it('basic execute', async () => {
     const native = makeNative();
     const result = await llmCallExecute(

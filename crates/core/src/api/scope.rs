@@ -159,6 +159,44 @@ pub struct PopScopeParams<'a> {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
+/// One mark in the shape a host process forwards it.
+///
+/// The correlation identities are absent by design: the process running the
+/// callback knows which operation it is in, and the event parameters do not
+/// carry that.
+pub(crate) fn forwarded_mark(
+    params: &EmitMarkEventParams<'_>,
+) -> Result<crate::plugin::execution::ForwardedMark> {
+    let encode = |value: &Json, what: &str| -> Result<String> {
+        serde_json::to_string(value).map_err(|error| {
+            FlowError::InvalidArgument(format!("{what} cannot be encoded: {error}"))
+        })
+    };
+    Ok(crate::plugin::execution::ForwardedMark {
+        name: params.name.to_string(),
+        parent: params
+            .parent
+            .map(|handle| nemo_relay_plugin_protocol::PluginScopeReference {
+                scope_id: handle.uuid,
+            }),
+        data_json: params
+            .data
+            .as_ref()
+            .map(|data| encode(data, "mark data"))
+            .transpose()?,
+        metadata_json: params
+            .metadata
+            .as_ref()
+            .map(|metadata| encode(metadata, "mark metadata"))
+            .transpose()?,
+        data_schema: params.data_schema.clone(),
+        severity: params.severity,
+        timestamp_unix_micros: params
+            .timestamp
+            .and_then(|timestamp| u64::try_from(timestamp.timestamp_micros()).ok()),
+    })
+}
+
 /// Builder parameters for [`event`].
 #[derive(TypedBuilder)]
 #[builder(field_defaults(setter(strip_option(ignore_invalid, fallback_suffix = "_opt"))))]
@@ -452,6 +490,13 @@ fn pop_scope_inner(
 /// from the active scope stack.
 pub fn event(params: EmitMarkEventParams<'_>) -> Result<()> {
     ensure_runtime_owner()?;
+    // A host process runs a plugin's callbacks, and the marks those raise belong
+    // to the kernel's event stream rather than to this process's copy of it. When
+    // a forwarder is in scope the mark leaves instead of being emitted here:
+    // emitting both would show subscribers two events for one mark.
+    if let Some(forwarder) = crate::plugin::execution::current_mark_forwarder() {
+        return forwarder.forward(&forwarded_mark(&params)?);
+    }
     let parent_uuid = resolve_parent_uuid(params.parent);
     let metadata = metadata_with_log_severity(params.metadata, params.severity)?;
     let scope_stack = current_scope_stack();
@@ -492,6 +537,73 @@ pub fn event(params: EmitMarkEventParams<'_>) -> Result<()> {
     let _ = subscriber_dispatcher::dispatch_sanitized_event(
         event,
         sanitizers,
+        &subscribers,
+        emission_scope_stack,
+    );
+    Ok(())
+}
+
+/// Publish a mark the runtime itself raises, without asking the event sanitizers
+/// about it.
+///
+/// The rule this states is the one observers already follow: a record of a failure
+/// is the runtime's own, and asking a family about its own failure records is how a
+/// sanitizer that cannot answer loops. The record of the first failure is itself a
+/// mark, the same sanitizer is shown it, it fails again, and the runtime records
+/// another — which is a stack that does not end. What these records carry is a
+/// registration name and a reason the runtime wrote, so there is nothing in them for
+/// a sanitizer to decide.
+///
+/// This is not a way to publish something a sanitizer should see. A plugin's own
+/// marks are forwarded and published through [`event`] like any other, and a call to
+/// this from a host process stays in that process — where the kernel has no
+/// subscribers — rather than travelling to the kernel as a mark does.
+///
+/// # Parameters
+/// The same shape [`event`] takes.
+///
+/// # Returns
+/// A [`Result`] that is `Ok(())` after the mark has been queued for publication.
+///
+/// # Errors
+/// Returns an error when the runtime owner check fails or when internal state cannot
+/// be read safely, and [`FlowError::InvalidArgument`] when a typed severity is
+/// provided with non-object metadata.
+pub fn runtime_mark(params: EmitMarkEventParams<'_>) -> Result<()> {
+    ensure_runtime_owner()?;
+    let parent_uuid = resolve_parent_uuid(params.parent);
+    let metadata = metadata_with_log_severity(params.metadata, params.severity)?;
+    let scope_stack = current_scope_stack();
+    let (event, subscribers, emission_scope_stack) = {
+        let subscribers = {
+            let scope_guard = scope_stack
+                .read()
+                .map_err(|error| scope_stack_lock_error(&error, "runtime mark"))?;
+            snapshot_event_subscribers(scope_guard.collect_scope_local_subscribers())?
+        };
+        let context = global_context();
+        let state = context
+            .read()
+            .map_err(|error| FlowError::Internal(error.to_string()))?;
+        let event = state.create_event(MarkEvent::new(
+            BaseEvent::builder()
+                .name(params.name)
+                .parent_uuid_opt(parent_uuid)
+                .timestamp(params.timestamp.unwrap_or_else(Utc::now))
+                .data_opt(params.data)
+                .data_schema_opt(params.data_schema)
+                .metadata_opt(metadata)
+                .build(),
+            params.category,
+            params.category_profile,
+        ));
+        (event, subscribers, scope_stack.clone())
+    };
+    // No sanitizers and no injectors: this event is the runtime's record, and the
+    // chain that would decide what observers see is what produced it.
+    let _ = subscriber_dispatcher::dispatch_sanitized_event(
+        event,
+        Vec::new(),
         &subscribers,
         emission_scope_stack,
     );

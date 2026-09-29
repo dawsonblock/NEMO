@@ -35,11 +35,15 @@ use nemo_relay::api::registry::{
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, register_subscriber};
 use nemo_relay::error::Result as FlowResult;
+use nemo_relay::plugin::dynamic::{DynamicPluginActivationSpec, DynamicPluginKind};
 use nemo_relay::plugin::{
-    ConfigDiagnostic, DiagnosticLevel, DynamicPluginActivationSpec, Plugin, PluginConfig,
-    PluginError, PluginHostActivation, PluginRegistration, PluginRegistrationContext,
-    active_plugin_report, clear_plugin_configuration, deregister_plugin, initialize_plugins,
-    list_plugin_kinds, register_plugin, rollback_registrations, validate_plugin_config,
+    ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
+    PluginRegistrationContext, active_plugin_report, clear_plugin_configuration, deregister_plugin,
+    initialize_plugins, list_plugin_kinds, register_plugin, rollback_registrations,
+    validate_plugin_config,
+};
+use nemo_relay_plugin_host::activation::{
+    ActivatedPluginRuntime, IsolationPolicy, PluginActivationError,
 };
 
 use crate::convert::{json_to_py, py_to_json};
@@ -802,6 +806,7 @@ struct PluginTeardownError {
 }
 
 impl PluginTeardownError {
+    /// Report a plugin error as the Python exception it corresponds to.
     fn from_plugin_error(error: PluginError) -> Self {
         let message = error.to_string();
         let kind = match error {
@@ -815,6 +820,32 @@ impl PluginTeardownError {
             | PluginError::ResourceExhausted { .. } => PluginTeardownErrorKind::Runtime,
         };
         Self { kind, message }
+    }
+
+    /// Report an activation failure as the Python exception it corresponds to.
+    ///
+    /// A failure that carries a plugin error keeps that error's kind, so a caller
+    /// can still tell "not found" from "invalid configuration"; a boundary or
+    /// retained failure has no plugin-error equivalent and is a runtime error,
+    /// with its own message.
+    fn from_activation_error(error: PluginActivationError) -> Self {
+        match error.as_plugin_error() {
+            Some(error) => {
+                let message = error.to_string();
+                let kind = match error {
+                    PluginError::InvalidConfig(_) | PluginError::Serialization(_) => {
+                        PluginTeardownErrorKind::Value
+                    }
+                    PluginError::NotFound(_) => PluginTeardownErrorKind::NotFound,
+                    PluginError::Conflict(_)
+                    | PluginError::Internal(_)
+                    | PluginError::RegistrationFailed(_)
+                    | PluginError::ResourceExhausted { .. } => PluginTeardownErrorKind::Runtime,
+                };
+                Self { kind, message }
+            }
+            None => Self::runtime(error.to_string()),
+        }
     }
 
     fn runtime(message: impl Into<String>) -> Self {
@@ -871,7 +902,7 @@ impl PluginTeardownCompletion {
 }
 
 enum PluginHostCloseStatus {
-    Active(Option<PluginHostActivation>),
+    Active(Option<ActivatedPluginRuntime>),
     Closing,
     Closed,
 }
@@ -882,7 +913,7 @@ struct PluginHostCloseState {
 }
 
 impl PluginHostCloseState {
-    fn new(activation: PluginHostActivation) -> Self {
+    fn new(activation: ActivatedPluginRuntime) -> Self {
         Self {
             status: Mutex::new(PluginHostCloseStatus::Active(Some(activation))),
             completion: PluginTeardownCompletion::new(),
@@ -897,8 +928,21 @@ impl PluginHostCloseState {
         match &*status {
             PluginHostCloseStatus::Active(activation) => activation
                 .as_ref()
-                .is_some_and(PluginHostActivation::is_active),
+                .is_some_and(ActivatedPluginRuntime::is_active),
             PluginHostCloseStatus::Closing | PluginHostCloseStatus::Closed => false,
+        }
+    }
+
+    fn host_pid(&self) -> Option<u32> {
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*status {
+            PluginHostCloseStatus::Active(activation) => activation
+                .as_ref()
+                .and_then(ActivatedPluginRuntime::native_process_id),
+            PluginHostCloseStatus::Closing | PluginHostCloseStatus::Closed => None,
         }
     }
 
@@ -941,7 +985,9 @@ impl PluginHostCloseState {
                         .map_err(|_| {
                             PluginTeardownError::runtime("dynamic plugin teardown task panicked")
                         })
-                        .and_then(|result| result.map_err(PluginTeardownError::from_plugin_error))
+                        .and_then(|result| {
+                            result.map_err(PluginTeardownError::from_activation_error)
+                        })
                     }
                     None => Err(PluginTeardownError::runtime(
                         "dynamic plugin teardown task lost its activation",
@@ -1081,6 +1127,18 @@ impl PyPluginHostActivation {
         Ok(self.close_state.is_active())
     }
 
+    /// Return the process the native plugins are running in.
+    ///
+    /// ``None`` when this activation holds no host: it started none, or it has
+    /// closed and the process it started is gone. It is the isolation claim as a
+    /// value rather than a description — the plugins did not run in the process
+    /// that asked for them, and a caller comparing this to its own pid is what
+    /// says so.
+    #[getter]
+    fn host_pid(&self) -> PyResult<Option<u32>> {
+        Ok(self.close_state.host_pid())
+    }
+
     /// Clear callbacks and unload the dynamic plugin host.
     #[pyo3(signature = () -> "None", text_signature = "($self) -> None")]
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1117,10 +1175,53 @@ fn initialize_with_dynamic_plugins_py<'py>(
         serde_json::from_value(dynamic_plugins_json)
             .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (activation, report) =
-            PluginHostActivation::activate_with_discovered_config(config, dynamic_plugins)
-                .await
-                .map_err(plugin_error_to_py_err)?;
+        // The one activation path, shared with the CLI and the other bindings:
+        // it resolves the discovered configuration, activates what this process
+        // runs, starts the native plugins in a host process, and rolls the whole
+        // thing back if any stage fails.
+        // The host is resolved from this installation rather than from the
+        // interpreter that happens to be running: a package that carries the
+        // companion is the thing that decides which one runs, and the runtime
+        // keeps the authority to refuse a build it did not expect. A deployment
+        // that named a host in the environment is still the one in charge.
+        let isolation =
+            nemo_relay_plugin_host::isolation_policy::NativeIsolationPolicy::from_environment()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let policy =
+            IsolationPolicy::for_runtime("nemo-relay-python").with_native_isolation(isolation);
+        let needs_native_host = needs_native_host(&dynamic_plugins);
+        let policy = if needs_native_host {
+            match crate::plugin_host_location::resolved_host() {
+                Some(host) => policy.with_host(host),
+                None => {
+                    // Nothing named a host and this extension never learned where it
+                    // lives, so there is no installation whose companion it could
+                    // name. The runtime would search beside the process, which is
+                    // exactly the behaviour the derivation above exists to remove: an
+                    // executable that runs plugin code should come from the package
+                    // that shipped it or from a deployment that named it. Failing
+                    // closed costs a deployment nothing it can reproduce — the
+                    // documented answer is `NEMO_RELAY_PLUGIN_HOST`, or an
+                    // installation the extension can see — and it removes the case
+                    // where this binding runs a host nobody chose.
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "this nemo_relay extension cannot tell which installation it came from, so \
+                     it will not search for a plugin host beside the process. Install the \
+                     package, or name the host explicitly in NEMO_RELAY_PLUGIN_HOST.",
+                    ));
+                }
+            }
+        } else {
+            policy
+        };
+        let activation = ActivatedPluginRuntime::activate_with_discovered_config(
+            config,
+            dynamic_plugins,
+            policy,
+        )
+        .await
+        .map_err(activation_error_to_py_err)?;
+        let report = activation.report().clone();
         reset_plugin_configuration_clear_state();
         Python::attach(|py| {
             Py::new(
@@ -1219,8 +1320,44 @@ fn to_py_err(err: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
 }
 
+fn activation_error_to_py_err(error: PluginActivationError) -> PyErr {
+    PluginTeardownError::from_activation_error(error).to_py_err()
+}
+
+fn needs_native_host(dynamic_plugins: &[DynamicPluginActivationSpec]) -> bool {
+    dynamic_plugins
+        .iter()
+        .any(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
+}
+
+/// Report a plugin error as the Python exception it corresponds to.
+///
+/// Kept beside the activation mapping because the two are the same question
+/// asked of two error types: the test that pins the mapping exercises both.
+#[cfg(test)]
 fn plugin_error_to_py_err(error: PluginError) -> PyErr {
     PluginTeardownError::from_plugin_error(error).to_py_err()
+}
+
+#[cfg(test)]
+mod native_host_resolution_tests {
+    use super::*;
+
+    fn spec(kind: DynamicPluginKind) -> DynamicPluginActivationSpec {
+        DynamicPluginActivationSpec {
+            plugin_id: "fixture".into(),
+            kind,
+            manifest_ref: "relay-plugin.toml".into(),
+            environment_ref: None,
+            config: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn worker_only_activation_does_not_need_a_native_host() {
+        assert!(!needs_native_host(&[spec(DynamicPluginKind::Worker)]));
+        assert!(needs_native_host(&[spec(DynamicPluginKind::RustDynamic)]));
+    }
 }
 
 #[cfg(test)]
