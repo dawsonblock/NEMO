@@ -135,6 +135,19 @@ jobs:
         with:
           tool: cargo-llvm-cov@${{ steps.ci-config.outputs.cargo_llvm_cov_version }},cargo-nextest@${{ steps.ci-config.outputs.cargo_nextest_version }},just@${{ steps.ci-config.outputs.just_version }}
 
+      - name: Install OpenSSL for Windows workspace compilation
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if ([string]::IsNullOrWhiteSpace($vcpkgRoot) -or !(Test-Path "$vcpkgRoot\vcpkg.exe")) {
+            throw "The Windows runner's vcpkg installation was not found"
+          }
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          $triplet = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64-windows" } else { "x64-windows" }
+          & "$vcpkgRoot\vcpkg.exe" install "openssl:$triplet" --disable-metrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Check Windows workspace compilation boundary
         if: ${{ runner.os == 'Windows' }}
         working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
