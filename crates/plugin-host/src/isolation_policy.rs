@@ -29,14 +29,12 @@ use crate::host_location;
 
 /// Whether the end-to-end approved artifact load path is qualified for restriction.
 ///
-/// The restricted host now creates its two Unix-domain endpoints inside the
-/// sandbox container and reports them through the startup pipe. The parent binds
-/// the callback endpoint there before releasing host startup. App Sandbox tags
-/// newly created library files with quarantine, and macOS denies removing that
-/// metadata from inside the sandbox; the documented executable-writing
-/// entitlement also did not prevent it. Keep startup fail-closed until an approved
-/// architecture for this platform behavior is implemented and qualified.
-const RESTRICTED_ARTIFACT_LOAD_QUALIFIED: bool = false;
+/// The confined host stages to a deterministic path beneath its app container.
+/// After the authenticated transfer is approved, the unconfined supervisor opens
+/// that path without following symlinks, checks the approved digest again, and
+/// removes only the quarantine attribute through the open file descriptor. Keep
+/// this enabled only while the signed-bundle end-to-end load remains qualified.
+const RESTRICTED_ARTIFACT_LOAD_QUALIFIED: bool = true;
 
 /// How much a host process is contained.
 ///

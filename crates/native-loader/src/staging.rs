@@ -284,12 +284,13 @@ impl StagedArtifact {
         for directory in [&session_directory, &incoming_directory, &approved_root] {
             create_directory(directory)?;
         }
-        // Each transfer gets a fresh, host-chosen destination. Repeated or
-        // concurrent transfer IDs cannot replace an earlier approved path.
-        let approved_directory = approved_root.join(format!(
-            "artifact-{}",
-            nemo_relay_plugin_protocol::Uuid::now_v7().simple()
-        ));
+        // The kernel mints artifact IDs before transfer. Deriving the directory
+        // from that ID lets the unconfined supervisor address this one staged
+        // file for the macOS quarantine handoff without accepting a path from
+        // the confined host. Repeated or concurrent transfer IDs cannot replace
+        // an earlier approved path because creation remains exclusive.
+        let approved_directory =
+            approved_root.join(format!("artifact-{}", hash_name(&transfer.artifact_id)));
         // A fresh name this host chose, created exclusively: the plugin never
         // names the file it is written to, the file cannot be a symlink someone
         // placed in advance, and a name already taken is a name this transfer

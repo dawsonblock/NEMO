@@ -374,7 +374,7 @@ terms = [
   "verified transfer inside the container",
   "restricted macOS host",
 ]
-note = "The opt-in process test launches the signed host and completes authenticated transfer and digest verification, but App Sandbox denies clearing com.apple.quarantine from the private load copy, so dlopen has not completed. The documented executable-writing entitlement did not prevent quarantine on the staged library. Apple DTS confirms there is no in-sandbox removal API. A separate design decision is needed between a narrowly scoped operation outside the sandbox and a different plugin signing/trust model; restricted mode remains fail-closed."
+note = "The opt-in signed-bundle process test completes authenticated transfer, staged digest verification, native load and a real registration. The unconfined supervisor derives the staged path from kernel-minted session and artifact IDs, walks without following symlinks, rechecks the approved SHA-256 and removes only com.apple.quarantine by file descriptor. The restricted loader loads this container-owned file in place and rechecks its digest after dlopen. The sandbox probe separately confirms filesystem and network denials under the same entitlement set."
 
 [[claim]]
 id = "every-hosting-consumer-carries-its-own-host"

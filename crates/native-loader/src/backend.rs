@@ -138,6 +138,7 @@ fn registration_descriptors(
 pub struct InProcessPluginBackend {
     loaded: Mutex<HashMap<String, Entry>>,
     generations: AtomicU64,
+    load_approved_in_place: bool,
 }
 
 impl Default for InProcessPluginBackend {
@@ -152,6 +153,17 @@ impl InProcessPluginBackend {
         Self {
             loaded: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(1),
+            load_approved_in_place: false,
+        }
+    }
+
+    /// Create the backend used by a restricted host whose authenticated staging
+    /// service owns approved artifacts inside the app container.
+    pub fn new_for_restricted_host() -> Self {
+        Self {
+            loaded: Mutex::new(HashMap::new()),
+            generations: AtomicU64::new(1),
+            load_approved_in_place: true,
         }
     }
 
@@ -273,23 +285,30 @@ impl PluginExecutionBackend for InProcessPluginBackend {
             }
 
             // The approval travels with the load rather than being checked
-            // separately: the loader confirms it against the bytes of an open
-            // handle immediately before it opens the library, so the digest and
-            // the file it describes are the same instance.
+            // separately. Ordinary hosts get a private copy; restricted hosts
+            // verify their authenticated container file before and after dlopen.
             let approved = request.identity.clone();
-            let activation =
-                match load_native_plugins([NativePluginLoadSpec::with_approved_identity(
+            let spec = if self.load_approved_in_place {
+                NativePluginLoadSpec::with_approved_identity_in_place(
                     request.plugin_id.clone(),
                     request.artifact.clone(),
                     approved.clone(),
-                )]) {
-                    Ok(activation) => activation,
-                    Err(error) => {
-                        // Release the reservation so a later attempt is possible.
-                        self.loaded().remove(&request.plugin_id);
-                        return Err(refused(error.to_string()));
-                    }
-                };
+                )
+            } else {
+                NativePluginLoadSpec::with_approved_identity(
+                    request.plugin_id.clone(),
+                    request.artifact.clone(),
+                    approved.clone(),
+                )
+            };
+            let activation = match load_native_plugins([spec]) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    // Release the reservation so a later attempt is possible.
+                    self.loaded().remove(&request.plugin_id);
+                    return Err(refused(error.to_string()));
+                }
+            };
 
             // Checked rather than wrapping: a generation that silently reused a
             // number would let a stale handle address a newer instance, which

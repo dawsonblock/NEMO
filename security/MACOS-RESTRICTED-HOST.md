@@ -28,19 +28,19 @@ the sections below say which is which):
   path are writable, while shared temporary storage, the account's real home, an
   outbound connection and a library outside the container are refused. The lane
   also requires the release host binary to exist, but the probe is not that host.
-- **Transfer and container-owned IPC are implemented, but Restricted mode
-  remains refused.** An authenticated client stream carries the approved manifest
-  and bounded library chunks into per-session staging. The host checks offsets,
-  length and both stream/file SHA-256 values, fsyncs and atomically promotes the
-  artifact, and resolves loads only through the approved copy. The parent and host
-  now establish their sockets inside the host container using endpoints announced
-  on a startup pipe; the sandboxed test reaches the transfer and verifies the
-  staged copy. App Sandbox adds `com.apple.quarantine` to files the host creates,
-  and denies removing it. The documented executable-writing entitlement did not
-  prevent quarantine on the staged dylib, so `dlopen` still times out. Apple DTS
-  states there is no in-sandbox API to remove this attribute; resolving it needs a
-  separate architecture decision about a narrowly scoped unsandboxed helper or a
-  different plugin signing/trust model. Restricted mode remains fail-closed.
+- **Transfer, quarantine handoff, and the confined load are implemented and
+  qualified on macOS.** An authenticated client stream carries the approved
+  manifest and bounded library chunks into per-session staging. The host checks
+  offsets, length and both stream/file SHA-256 values, fsyncs and atomically
+  promotes the artifact, and resolves loads only through the approved copy. The
+  unconfined supervisor derives its location from the session and kernel-minted
+  artifact IDs, opens each path component without following symlinks, rechecks the
+  approved library digest, and removes only `com.apple.quarantine` through that
+  file descriptor. The loader then loads that container-owned file in place and
+  checks its digest again after `dlopen`; it does not try to create a second copy
+  outside the sandbox. The signed-bundle process test completes transfer, load,
+  and a real registration, while the focused probe verifies the same entitlements'
+  filesystem and network denials.
 
 ## Target
 
@@ -88,10 +88,10 @@ HOSTILE      a VM boundary                 (not implemented; a different mechani
 
 ## The first principle: the host owns its container
 
-The sandboxed host cannot read the path the kernel approved — that is the point of
-it — so the artifact cannot cross the boundary as a pathname. It crosses as bytes,
-over the session that is already authenticated, and the host writes them where the
-platform allows it to write:
+The sandboxed host cannot read the source path the kernel approved — that is the
+point of it — so the source path never crosses the boundary. The artifact crosses
+as bytes over the authenticated session, and the host writes it where the platform
+allows it to write:
 
 ```text
 kernel reads the approved artifact, verifies its digest
@@ -113,14 +113,18 @@ SHA256(bytes the host wrote) == the digest the kernel approved → dlopen
 
 Two things this buys, and one it costs:
 
-- The parent never learns Apple's container layout, so "where the container is"
-  does not become a contract between the kernel and the platform.
+- The supervisor does not choose an arbitrary path inside the app container. It
+  derives the one approved library location from the stable bundle container,
+  session ID, artifact ID and manifest path only for the quarantine handoff.
 - The integrity story gets *stronger* rather than weaker: what is loaded is what
   the kernel approved, verified again on the side that loads it, and the file it
   is loaded from was written by the process that loads it.
-- The cost is a copy through the session, bounded by the length the kernel
+- The costs are a copy through the session, bounded by the length the kernel
   announces in the begin message — an announced length the host enforces, so a
-  malformed far side cannot turn the transfer into unbounded disk use.
+  malformed far side cannot turn the transfer into unbounded disk use — and a
+  narrow xattr-removal operation in the unconfined supervisor. That operation is
+  part of the trusted computing base and refuses paths, symlinks, files or digests
+  outside the kernel-approved staging record.
 
 Security-scoped bookmarks are deliberately **not** part of this milestone. They
 are the right mechanism for a plugin that genuinely needs a user-selected file,
@@ -136,6 +140,7 @@ and they belong with the capability types (`ReadFile(bookmark)`,
 | The bundle has the layout macOS reads entitlements from | `test_the_bundle_has_the_layout_macos_reads_entitlements_from` |
 | The weaker entitlement is not what a build gets by default | `test_the_weakening_variant_is_not_the_default` |
 | The confinement denies what it must and permits what the host is for | `just verify-macos-sandbox` in the macOS lane |
+| The parent removes only quarantine from the kernel-approved staged dylib | `macos_quarantine::tests::clears_only_quarantine_after_rechecking_the_approved_digest`, plus the signed-bundle process test |
 
 The bundle layout, entitlements and resolver have structural tests. The actual
 host's sandboxed launch, transfer and load are exercised by the opt-in
@@ -152,15 +157,17 @@ the operating-system denial behavior; neither result substitutes for the other.
    approved load resolution and per-session cleanup. Digest mismatch, interruption,
    and over-limit behavior are covered at the staging layer. These tests run
    outside App Sandbox, so they do not prove the complete confined transfer path.
-2. **The macOS quarantine interaction does not have an in-sandbox resolution.**
-   Apple documents that sandbox-created files are quarantined and its developer
-   support confirms the sandbox cannot remove that attribute. The
-   `com.apple.security.files.user-selected.executable` entitlement, intended for
-   executable files written to user-selected locations, was tested and did not
-   change the quarantine on a file staged in the host container. A future design
-   must either introduce a narrowly scoped operation outside the sandbox or require
-   a signing/trust model that Gatekeeper accepts. Neither is implemented here; the
-   restricted policy refuses startup while the real native load is unqualified.
+2. **The macOS quarantine interaction is handled by the supervisor.** Apple
+   documents that sandbox-created files are quarantined and developer support
+   confirms the sandbox cannot remove that attribute. The
+   `com.apple.security.files.user-selected.executable` entitlement did not change
+   quarantine on the staged library. The kernel therefore performs a narrowly
+   scoped handoff after the host approves the transferred bytes: it derives the
+   expected bundle-container path, walks it without following symlinks, verifies
+   the approved SHA-256 on an open file descriptor, and removes only the
+   quarantine attribute. This adds filesystem metadata mutation to the kernel's
+   trusted computing base. The end-to-end test confirms the staged file loads and
+   executes a registration with the restricted entitlements.
    See [Apple's App Sandbox guidance](https://developer.apple.com/library/archive/documentation/Miscellaneous/Reference/EntitlementKeyReference/Chapters/EnablingAppSandbox.html)
    and [Apple DTS's quarantine guidance](https://developer.apple.com/forums/thread/811450).
 3. **Packaging.** The bundle has to travel in the artifacts that carry a host: the
@@ -168,8 +175,9 @@ the operating-system denial behavior; neither result substitutes for the other.
    Each needs its install layout decided rather than assumed — a wheel's
    `.data/scripts` is a directory pip fills, and npm's `bin` is one flat
    directory — and that is why it is a step of its own.
-4. **The combined qualification suite.** The positive and negative cases, on a macOS
-   runner, with the sandbox actually applied:
+4. **The macOS qualification lanes.** The real signed-bundle process test covers
+   transfer, load and registration. `just verify-macos-sandbox` covers these
+   filesystem and network denials with a probe signed using the same entitlements:
 
    ```text
    ✓ the plugin loads from the host's container
@@ -182,12 +190,10 @@ the operating-system denial behavior; neither result substitutes for the other.
    ✗ cannot load a library that is not the staged one
    ```
 
-   The sandbox probe currently proves the denial cases against a signed probe
-   bundle. A macOS process-backend run still needs to combine the real host,
-   transfer, load, registration and denial cases before this matrix is qualified.
-   Plus the one that proves the new path did not weaken what was already
-   qualified: the staged bytes are mutated before the load, and the host refuses
-   them.
+   These are complementary checks: the host process test verifies the plugin path,
+   and the probe verifies the OS denials imposed by the same signed entitlements.
+   The approved digest is also rechecked by the supervisor before quarantine is
+   removed and by the loader after `dlopen`.
 5. **Capabilities.** A way for a plugin to declare what it needs and for the
    runtime to grant exactly that, rather than widening the bundle every plugin
    runs inside.

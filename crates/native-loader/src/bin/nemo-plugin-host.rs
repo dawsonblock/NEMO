@@ -237,7 +237,11 @@ fn main() -> ExitCode {
         // same code the kernel ran before this boundary existed, which is what
         // makes the two comparable while the loader is still in the kernel's
         // dependency graph.
-        let backend = std::sync::Arc::new(InProcessPluginBackend::new());
+        let backend = std::sync::Arc::new(if restricted {
+            InProcessPluginBackend::new_for_restricted_host()
+        } else {
+            InProcessPluginBackend::new()
+        });
         // The kernel's own socket: a plugin's marks belong to the kernel's event
         // stream, so this process forwards them rather than emitting them into a
         // runtime whose subscribers nobody reads. A host started without one

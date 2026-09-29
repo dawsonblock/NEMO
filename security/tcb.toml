@@ -475,15 +475,16 @@ transitive_dependency_digest = "32c66b87cc783b216a5e49aafac47240f7de9c9fbdd31d42
 max_direct_dependencies = 17
 # Raised to the platform union; see the measurement note at the top of this file.
 max_transitive_packages = 295
-# Raised for the bounded artifact staging state machine, streaming service, and
-# sandbox-compatible IPC startup path. The additional source is the implementation
-# of an authenticated transfer, per-session private staging, incremental and final
-# digest checks, atomic promotion, restricted load resolution, and container-owned
-# socket setup. This is a material increase in the host-side trusted surface, so the
-# count and digest are reviewed explicitly; the kernel-process unsafe budget is
-# unchanged and the restricted startup policy remains fail-closed pending real
-# sandboxed dlopen qualification.
-max_source_lines = 16475
+# Raised for the bounded artifact staging state machine, streaming service,
+# sandbox-compatible IPC startup and the macOS quarantine handoff. The kernel
+# derives the container path from its own session/artifact IDs, opens without
+# following symlinks, hashes the approved descriptor, and removes only quarantine;
+# the restricted loader uses that authenticated container copy in place and
+# rechecks its digest after dlopen. The signed-bundle qualification exercises the
+# complete transfer/load/registration path. This adds code to both sides of the
+# trust boundary, which is why the measured count is recorded explicitly; direct
+# dependencies and unsafe source in the kernel host remain within their ceilings.
+max_source_lines = 16529
 max_unsafe_occurrences = 288
 direct_dependency_digest = "c8645337cb08161f09d656950e3dd6c785ef92ff9c1f29ba39a8ef39d686f855"
 transitive_dependency_digest = "d6e5755cf0c3cbeff82281e73be9006ea21ade44d1f93f0c21feb94fb55976d5"

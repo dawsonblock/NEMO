@@ -114,6 +114,9 @@ pub struct NativePluginLoadSpec {
     pub manifest_ref: String,
     /// The artifact this load is allowed to open, when anything was approved.
     approval: Option<ApprovedPluginArtifact>,
+    /// The restricted process host may load its verified container-owned copy
+    /// in place; the service retains that staged artifact for the session.
+    load_approved_in_place: bool,
 }
 
 impl NativePluginLoadSpec {
@@ -133,6 +136,7 @@ impl NativePluginLoadSpec {
             plugin_id: plugin_id.into(),
             manifest_ref,
             approval: Some(artifact),
+            load_approved_in_place: false,
         })
     }
 
@@ -154,6 +158,24 @@ impl NativePluginLoadSpec {
             plugin_id: plugin_id.into(),
             manifest_ref: manifest_ref.into(),
             approval: Some(ApprovedPluginArtifact::from_identity(identity)),
+            load_approved_in_place: false,
+        }
+    }
+
+    /// Build an approval whose bytes already live in this restricted host's
+    /// private app container. The authenticated staging service owns the file's
+    /// lifetime, so making another copy in the sandbox's temporary directory is
+    /// unnecessary and can cross the sandbox's writable boundary.
+    pub(crate) fn with_approved_identity_in_place(
+        plugin_id: impl Into<String>,
+        manifest_ref: impl Into<String>,
+        identity: PluginArtifactIdentity,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            manifest_ref: manifest_ref.into(),
+            approval: Some(ApprovedPluginArtifact::from_identity(identity)),
+            load_approved_in_place: true,
         }
     }
 
@@ -170,6 +192,7 @@ impl NativePluginLoadSpec {
             plugin_id: plugin_id.into(),
             manifest_ref: manifest_ref.into(),
             approval: None,
+            load_approved_in_place: false,
         }
     }
 
@@ -823,15 +846,21 @@ fn load_one_native_plugin(
     {
         host_runtime().verify_path(&library_path, expected_digest)?;
     }
-    // The approved library identity is checked against the bytes of an open
-    // handle, immediately before the loader is given the path: the digest and
-    // the file it describes are then the same instance rather than two lookups.
-    // An approved load never executes the source path: the verified bytes are
-    // copied into a directory private to this account, re-hashed there, and the
-    // copy is what the loader opens. A load with nothing approved keeps the old
-    // in-place behaviour and its post-load re-check, because there is no identity to
-    // bind it to.
+    // Ordinary approved loads are copied into private staging. The restricted
+    // host instead loads the authenticated container copy in place, then checks
+    // the digest again after dlopen. Unapproved development loads retain their
+    // existing in-place behavior and post-load check.
     let (library_path, staging) = match spec.approval() {
+        Some(approved) if spec.load_approved_in_place => {
+            let measured = host_runtime().hash_path(&library_path)?;
+            if measured != approved.identity().library_sha256 {
+                return Err(PluginError::RegistrationFailed(format!(
+                    "the transferred library hashes to {measured}, while {} was approved",
+                    approved.identity().library_sha256
+                )));
+            }
+            (library_path.clone(), None)
+        }
         Some(approved) => {
             let (staged, guard) =
                 stage_verified_library(&library_path, &approved.identity().library_sha256)?;

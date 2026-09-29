@@ -110,6 +110,14 @@ fn a_verified_artifact_lands_in_approved_and_nowhere_else() {
         "the artifact is staged under approved/: {}",
         approved.library.display()
     );
+    assert_eq!(
+        approved
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(format!("artifact-{}", hash_name("artifact-one")).as_str()),
+        "the kernel can derive this artifact directory from its transfer id"
+    );
     assert!(
         approved
             .directory

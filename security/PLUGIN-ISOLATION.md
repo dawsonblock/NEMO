@@ -663,14 +663,15 @@ kernel. See *The nested codec call inherits the invocation's deadline* below.
    *trusted native plugin, unreliable implementation*; a plugin that is assumed
    hostile needs the platform mechanisms this document has not adopted.
    `security/MACOS-RESTRICTED-HOST.md` is where the first of those mechanisms is
-   being adopted: the policy, bundle, authenticated artifact-transfer protocol and
-   container-owned IPC are in place. The sandboxed test transfers and verifies the
-   artifact, but App Sandbox denies removing `com.apple.quarantine` from the
-   private load copy, so `dlopen` has not completed. The documented
-   executable-writing entitlement did not change this behavior. Apple DTS states
-   there is no in-sandbox removal API; resolving this requires a separate decision
-   about an operation outside the sandbox or a different plugin signing/trust
-   model. Restricted mode remains fail-closed.
+   being adopted: the policy, bundle, authenticated artifact transfer, container-
+   owned IPC and quarantine handoff are in place. The unconfined supervisor derives
+   the approved file's location from kernel-minted IDs, opens it without following
+   symlinks, checks the approved digest again and removes only
+   `com.apple.quarantine` by file descriptor. The restricted loader loads that
+   verified container copy in place and rechecks its digest after `dlopen`, avoiding
+   a second copy outside the sandbox. The signed-bundle macOS process test passes
+   transfer, load and registration; the sandbox probe separately verifies the
+   filesystem and network denials from the same entitlement set.
 
 The measurements that decide the milestone live in `just tcb-report`; the
 evidence for the claims above lives in the tests named next to the code, which

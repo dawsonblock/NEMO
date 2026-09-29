@@ -22,6 +22,8 @@ pub mod continuations;
 pub mod host_location;
 pub mod isolation_policy;
 pub mod limits;
+#[cfg(target_os = "macos")]
+mod macos_quarantine;
 pub mod observer;
 pub mod off_path;
 pub mod operation_context;

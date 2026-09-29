@@ -42,7 +42,7 @@ tonic = { version = "0.14.2", default-features = false, features = [
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["process", "thread"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
 
 [features]
 # The worker lane: a plugin whose code runs in a process the kernel starts and
@@ -52,4 +52,5 @@ worker-grpc = ["nemo-relay/worker-grpc"]
 
 [dev-dependencies]
 nemo-relay-native-loader.workspace = true
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

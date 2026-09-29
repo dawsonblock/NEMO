@@ -205,7 +205,10 @@ async fn a_real_native_plugin_loads_in_the_child_and_only_there() {
 #[ignore = "requires NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE from a signed app bundle"]
 async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
     use nemo_relay::plugin::dynamic::plugin_artifact_identity;
-    use nemo_relay_plugin_protocol::{PluginArtifactIdentity, PluginLoadRequest};
+    use nemo_relay_plugin_protocol::{
+        PluginActivateRequest, PluginArtifactIdentity, PluginComponentConfiguration,
+        PluginLoadRequest, PluginRegistrationOperation,
+    };
 
     let _lease = lease_guard().await;
     let executable = std::env::var_os("NEMO_RELAY_RESTRICTED_HOST_EXECUTABLE")
@@ -213,10 +216,10 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
         .expect("the macOS lane supplies the executable inside a signed bundle");
     assert!(executable.is_file(), "{executable:?}");
     let fixture = support::PreparedFixture::write(
-        "fixture_native",
+        "fixture_intercept",
         "nemo-ph-restricted",
-        support::native_fixture(),
-        "nemo_relay_fixture_native_plugin",
+        support::intercept_fixture(),
+        "nemo_relay_native_intercept_fixture",
     );
     let artifact = fixture.artifact();
     let (manifest_sha256, library_sha256) =
@@ -233,7 +236,7 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
     let loaded = backend
         .load(
             PluginLoadRequest {
-                plugin_id: "fixture_native".into(),
+                plugin_id: "fixture_intercept".into(),
                 artifact,
                 identity: PluginArtifactIdentity {
                     manifest_sha256: manifest_sha256.clone(),
@@ -258,7 +261,26 @@ async fn a_restricted_bundle_loads_only_the_transferred_approved_copy() {
         .await
         .expect("the confined host reports the loaded plugin");
     assert_eq!(inspected.len(), 1);
-    assert_eq!(inspected[0].plugin_id, "fixture_native");
+    assert_eq!(inspected[0].plugin_id, "fixture_intercept");
+    let registrations = backend
+        .activate(
+            PluginActivateRequest {
+                discovery: false,
+                components: vec![PluginComponentConfiguration {
+                    kind: "fixture_intercept".into(),
+                    config_json: "{}".into(),
+                }],
+            },
+            context(),
+        )
+        .await
+        .expect("the transferred plugin executes its registration callback");
+    assert!(registrations.iter().any(|descriptor| {
+        descriptor.plugin_id == "fixture_intercept"
+            && descriptor.registrations.iter().any(|registration| {
+                registration.operation == PluginRegistrationOperation::ToolRequestIntercept
+            })
+    }));
 }
 
 // Single-threaded, deliberately: an off-path callback's answer arrives over the

@@ -738,7 +738,7 @@ impl ProcessPluginBackend {
         request: &PluginLoadRequest,
         context: &PluginExecutionContext,
     ) -> Result<String, PluginProtocolError> {
-        let (manifest, library_path) = artifact_transfer_sources(request)?;
+        let (manifest, library_path, library_relative_path) = artifact_transfer_sources(request)?;
         let length = std::fs::metadata(&library_path)
             .map_err(|error| rejected(format!("cannot size approved plugin library: {error}")))?
             .len();
@@ -833,6 +833,41 @@ impl ProcessPluginBackend {
                     && approved.manifest_sha256 == request.identity.manifest_sha256
                     && approved.library_sha256 == request.identity.library_sha256 =>
             {
+                if self.config.isolation
+                    == crate::isolation_policy::NativeIsolationPolicy::RestrictedMacOS
+                {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let session_id = session_id.clone();
+                        let artifact_id = artifact_id.clone();
+                        let expected_sha256 = request.identity.library_sha256.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::macos_quarantine::clear_approved_quarantine(
+                                &session_id,
+                                &artifact_id,
+                                &library_relative_path,
+                                &expected_sha256,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            rejected(format!(
+                                "the approved macOS artifact quarantine handoff did not complete: {error}"
+                            ))
+                        })?
+                        .map_err(|error| {
+                            rejected(format!(
+                                "the approved macOS artifact quarantine handoff was refused: {error}"
+                            ))
+                        })?;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        return Err(rejected(
+                            "restricted artifact quarantine handoff is available only on macOS",
+                        ));
+                    }
+                }
                 Ok(artifact_id)
             }
             Some(v1::artifact_transfer_outcome::Result::Failure(failure)) => {
@@ -1281,7 +1316,7 @@ fn rejected(message: impl Into<String>) -> PluginProtocolError {
 /// hashes both streams before making either file loadable.
 fn artifact_transfer_sources(
     request: &PluginLoadRequest,
-) -> Result<(Vec<u8>, PathBuf), PluginProtocolError> {
+) -> Result<(Vec<u8>, PathBuf, String), PluginProtocolError> {
     let (manifest_digest, library_digest) =
         nemo_relay::plugin::dynamic::plugin_artifact_identity(&request.artifact)
             .map_err(|error| rejected(format!("the approved artifact cannot be read: {error}")))?;
@@ -1325,6 +1360,21 @@ fn artifact_transfer_sources(
         .library
         .ok_or_else(|| rejected("the approved plugin manifest has no library path"))?;
     let library = PathBuf::from(library);
+    if library.is_absolute()
+        || library.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(rejected(
+            "the approved plugin manifest library path must stay inside its artifact directory",
+        ));
+    }
+    let relative_library_path = library.to_string_lossy().into_owned();
     let library_path = if library.is_absolute() {
         library
     } else {
@@ -1333,7 +1383,7 @@ fn artifact_transfer_sources(
             .unwrap_or_else(|| Path::new("."))
             .join(library)
     };
-    Ok((manifest, library_path))
+    Ok((manifest, library_path, relative_library_path))
 }
 
 fn unavailable(message: impl Into<String>) -> PluginProtocolError {

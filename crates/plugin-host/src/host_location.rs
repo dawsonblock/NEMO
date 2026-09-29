@@ -40,6 +40,9 @@ pub const EXECUTABLE_ENV: &str = "NEMO_RELAY_PLUGIN_HOST";
 /// as one — see [`crate::isolation_policy::NativeIsolationPolicy`].
 pub const BUNDLE_NAME: &str = "nemo-plugin-host.app";
 
+/// The identifier whose App Sandbox container receives transferred artifacts.
+pub(crate) const BUNDLE_IDENTIFIER: &str = "com.nvidia.nemo-relay.nemo-plugin-host";
+
 /// The identity a runtime's plugin sessions are bound to.
 ///
 /// Bound to the implementation that asked and to the process it asked from, so a
