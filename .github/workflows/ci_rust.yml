@@ -144,7 +144,8 @@ jobs:
             throw "The Windows runner's vcpkg installation was not found"
           }
           "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
-          $triplet = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64-windows" } else { "x64-windows" }
+          $triplet = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64-windows-static-md" } else { "x64-windows-static-md" }
+          "VCPKGRS_TRIPLET=$triplet" >> $env:GITHUB_ENV
           & "$vcpkgRoot\vcpkg.exe" install "openssl:$triplet" --disable-metrics
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
