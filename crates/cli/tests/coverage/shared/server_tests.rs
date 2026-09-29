@@ -145,8 +145,10 @@ impl Drop for RequestInterceptCleanup {
     }
 }
 
+#[cfg(unix)]
 struct PluginKindCleanup(&'static str);
 
+#[cfg(unix)]
 impl Drop for PluginKindCleanup {
     fn drop(&mut self) {
         let _ = deregister_plugin(self.0);
@@ -302,6 +304,7 @@ fn startup_status_reports_not_configured_when_no_exporters() {
     assert!(output.contains("Exporters      not configured"));
 }
 
+#[cfg(unix)]
 fn write_missing_native_plugin_manifest(
     dir: &std::path::Path,
     plugin_id: &str,
