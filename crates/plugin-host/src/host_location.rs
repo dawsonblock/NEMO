@@ -72,6 +72,7 @@ pub fn plugin_runtime_binding(implementation: &str) -> String {
 }
 
 /// Where the host executable is, given where this process is.
+#[cfg(unix)]
 pub(crate) fn resolve_executable() -> PathBuf {
     resolve_from(
         std::env::var_os(EXECUTABLE_ENV),
@@ -138,6 +139,7 @@ pub(crate) fn is_bundled_executable(path: &Path) -> bool {
 /// asking where this process lives are the parts a test cannot vary without
 /// touching process-wide state, and the part that matters — which input wins —
 /// is neither of them.
+#[cfg(any(unix, test))]
 pub(crate) fn resolve_from(configured: Option<std::ffi::OsString>, beside: &Path) -> PathBuf {
     if let Some(configured) = configured {
         return PathBuf::from(configured);
@@ -157,6 +159,7 @@ pub(crate) fn resolve_from(configured: Option<std::ffi::OsString>, beside: &Path
 /// the interpreter an installation beside the thing that starts the host. A
 /// binding that knows where its own package is resolves there instead, and says
 /// so through the policy it hands the composition.
+#[cfg(unix)]
 fn directory_holding_this_process() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -169,11 +172,13 @@ fn directory_holding_this_process() -> PathBuf {
 /// The supervisor decides *which* executable to start, and under a confinement
 /// policy that decision needs the place a host is installed: the module that owns
 /// the rule answers it rather than the supervisor guessing.
+#[cfg(unix)]
 pub(crate) fn this_process_directory() -> PathBuf {
     directory_holding_this_process()
 }
 
 /// The places a host is looked for once nothing has named one.
+#[cfg(any(unix, test))]
 fn beside_this_process(beside: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![beside.join(executable_name())];
     candidates.extend(
@@ -211,6 +216,7 @@ pub(crate) fn bundle_search_locations(beside: &Path) -> Vec<PathBuf> {
 /// Read by the failure the supervisor reports rather than by the resolution
 /// above, so a deployment that received a runtime without the host is told which
 /// locations it was expected to fill instead of only which file was missing.
+#[cfg(unix)]
 pub(crate) fn host_search_locations() -> Vec<PathBuf> {
     let mut locations = Vec::new();
     if let Some(configured) = std::env::var_os(EXECUTABLE_ENV) {
